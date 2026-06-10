@@ -545,6 +545,19 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .mem-row .mr-meta .tag{color:var(--biolum);background:rgba(55,227,198,.08);padding:1px 7px;border-radius:6px;margin-right:6px}
 .mem-row .mr-del{background:none;border:none;color:var(--faint);cursor:pointer;font-size:16px;transition:.15s}
 .mem-row .mr-del:hover{color:var(--coral)}
+.mem-row.pinned{border-color:var(--line-strong);background:rgba(55,227,198,.05)}
+.mem-row .mr-pin{flex:none;background:none;border:none;cursor:pointer;font-size:14px;opacity:.3;filter:grayscale(1);transition:.15s;padding:1px}
+.mem-row .mr-pin:hover{opacity:.7}
+.mem-row .mr-pin.on{opacity:1;filter:none}
+.mem-row .mr-meta{display:flex;align-items:center;gap:8px}
+.mem-row .mr-cat{background:rgba(4,17,26,.5);border:1px solid var(--line);border-radius:6px;color:var(--biolum);font-family:var(--font-mono);font-size:10.5px;padding:2px 5px;outline:none;cursor:pointer}
+.mem-row .mr-date{font-family:var(--font-mono);font-size:11px;color:var(--faint)}
+/* memory injection policy (Settings → Memory) */
+.mem-policy{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
+.mp-row{display:flex;align-items:center;gap:10px}
+.mp-cat{flex:1;font-size:13.5px;color:var(--foam);text-transform:capitalize}
+.mp-sel{padding:7px 10px;background:rgba(4,17,26,.5);border:1px solid var(--line);border-radius:9px;color:var(--mist);font-family:var(--font-body);font-size:12.5px;outline:none;cursor:pointer}
+.mp-sel:focus{border-color:var(--biolum)}
 .empty-note{color:var(--faint);font-size:14px;text-align:center;padding:40px}
 
 /* chat: thinking + tool running */

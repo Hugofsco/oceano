@@ -29,17 +29,19 @@ def _date_note():
             "older year to the query unless the user explicitly asks for that year.")
 
 
-def _relevant_memories(user_message, k=5, threshold=0.28):
-    """Top memories semantically related to this turn — injected passively so the
-    model uses what it knows without having to call recall()."""
+def _relevant_memories(user_message, k=5):
+    """Memories to inject this turn, per the user's pinning + per-category injection
+    policy (always / when-relevant / off). Passive — the model needn't call recall()."""
     try:
         from oceano import memory
-        hits = [h for h in memory.search(user_message, k=k) if (h.get("score") or 0) >= threshold]
+        hits = memory.for_prompt(user_message, k=k)
         if not hits:
             return ""
-        return ("RELEVANT MEMORIES (things you've learned before — use only if helpful, "
-                "ignore if not):\n"
-                + "\n".join(f"- {h['text']}" + (f"  [{h['tags']}]" if h.get("tags") else "") for h in hits))
+        def label(h):
+            tag = h.get("category") or h.get("tags") or ""
+            return f"- {h['text']}" + (f"  [{tag}]" if tag else "") + ("  📌" if h.get("pinned") else "")
+        return ("WHAT YOU KNOW ABOUT THE USER (use if helpful, ignore if not):\n"
+                + "\n".join(label(h) for h in hits))
     except Exception:
         return ""
 
@@ -70,12 +72,18 @@ def _context_block(user_message):
 
 # --- self-learning memory: after each turn, extract durable facts in the background ---
 _LEARN_SYSTEM = (
-    "You extract DURABLE facts about the user worth remembering across future, separate "
-    "conversations: stable preferences, identity, relationships, ongoing projects, goals, "
-    "recurring constraints, and decisions. IGNORE the current task's transient details, "
-    "general knowledge, and anything not specifically about THIS user. Output ONLY a JSON "
-    'array of short third-person fact strings (e.g. ["User prefers dark mode", "User is '
-    'building a local AI agent called Oceano"]). If nothing is worth saving, output [].')
+    "From the USER'S MESSAGE below, extract durable facts the user reveals ABOUT THEMSELVES "
+    "— their identity, preferences, situation, ongoing projects, goals, or decisions — "
+    "stated in the first person (\"I…\", \"my…\", \"we…\", \"remember that I…\").\n"
+    "STRICT RULES:\n"
+    "- Save a fact ONLY if it is about the user themselves.\n"
+    "- NEVER save facts about other people, companies, social handles, or any subject the "
+    "user is asking you to look up, research, or describe. If the message is a question or "
+    "request ABOUT someone/something (e.g. \"who is X?\", \"research Y\", \"summarize Z\"), that "
+    "subject is NOT the user — output [].\n"
+    "- A message with no first-person self-disclosure → output [].\n"
+    "Output ONLY a JSON array of short third-person fact strings (e.g. [\"User is vegetarian\", "
+    "\"User is building a trading bot in Rust\"]). Nothing else.")
 
 
 def _parse_facts(text):
@@ -94,12 +102,20 @@ def _parse_facts(text):
     return out[:6]
 
 
-def _learn_from(exchange, model, base_url, api_key):
-    """Background pass: pull durable facts out of one exchange, save the new ones."""
+_WRAPUP_NUDGE = (
+    "You've reached the tool-step limit for this turn, so stop here — do NOT call any "
+    "more tools. In a few lines, tell me what you created or did so far (with the file "
+    "paths), and the exact next steps to finish. I can reply 'continue' to have you resume.")
+
+
+def _learn_from(user_message, model, base_url, api_key):
+    """Background pass: pull durable self-facts out of the USER'S message and save the
+    new ones. Only the user's own message is examined — never the assistant's reply —
+    so facts about people/topics the user merely researched aren't mis-saved as theirs."""
     try:
         from oceano import memory
         resp = llm.chat([{"role": "system", "content": _LEARN_SYSTEM},
-                         {"role": "user", "content": "Conversation:\n" + exchange[:6000]}],
+                         {"role": "user", "content": "USER'S MESSAGE:\n" + (user_message or "")[:4000]}],
                         tools=None, model=model, base_url=base_url, api_key=api_key)
         for fact in _parse_facts(getattr(resp, "content", "") or ""):
             memory.add_if_new(fact, tags="auto")
@@ -165,12 +181,13 @@ class Agent:
             self.messages[0]["content"] = SYSTEM_PROMPT + "\n\n" + _context_block(user_message)
 
     def _learn(self, user_message, answer):
-        """Kick off background fact-extraction from this exchange (non-blocking)."""
+        """Kick off background fact-extraction from the user's message (non-blocking).
+        `answer` only gates this (a completed turn); extraction reads the user message
+        only, so third-party research in the reply is never attributed to the user."""
         if not (config.AUTO_LEARN and answer):
             return
-        exchange = f"User: {user_message}\nAssistant: {answer}"
         threading.Thread(target=_learn_from,
-                         args=(exchange, self.model, self.base_url, self.api_key), daemon=True).start()
+                         args=(user_message, self.model, self.base_url, self.api_key), daemon=True).start()
 
     def _chat(self, with_tools, return_usage=False):
         return llm.chat(
@@ -200,7 +217,14 @@ class Agent:
                 result = tools.run(call.function.name, call.function.arguments)
                 self.on_event("tool_result", {"name": call.function.name, "result": result})
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-        return "(stopped: hit the max tool-step limit)"
+        # cap hit — one tool-less pass so the user gets a real summary + next steps
+        final = llm.chat(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
+                         tools=None, model=self.model, base_url=self.base_url, api_key=self.api_key)
+        text = (getattr(final, "content", "") or "").strip() or "(stopped at the tool-step limit)"
+        self.messages.append({"role": "assistant", "content": text})
+        self.on_event("answer", text)
+        self._learn(user_message, text)
+        return text
 
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
     def run_stream(self, user_message: str):
@@ -243,7 +267,19 @@ class Agent:
                 result = tools.run(c["name"], c["args"])
                 yield {"type": "tool_result", "name": c["name"], "result": result[:2000]}
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-        yield {"type": "answer", "text": "(stopped: hit the max tool-step limit)"}
+        # cap hit — stream one tool-less wrap-up (summary + next steps) instead of a dead-end
+        t = time.perf_counter(); tail = ""
+        for item in llm.stream(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
+                               model=self.model, base_url=self.base_url, api_key=self.api_key):
+            if "content" in item:
+                tail += item["content"]
+                yield {"type": "token", "text": item["content"]}
+            elif "usage" in item:
+                total_tok += item["usage"]
+        gen += time.perf_counter() - t
+        self.messages.append({"role": "assistant", "content": tail or "(stopped at the tool-step limit)"})
+        self._learn(user_message, tail)
+        yield {"type": "answer_done"}
         yield self._stats(total_tok, gen)
 
     # --- streaming: plain chat (reasoning + token deltas, no tools) --------

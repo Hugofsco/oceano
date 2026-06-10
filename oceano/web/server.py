@@ -604,13 +604,34 @@ def get_memories():
 @app.post("/api/memories")
 async def post_memory(req: Request):
     b = await req.json()
-    memory.remember(b["text"], b.get("tags", ""))
+    memory.remember(b["text"], b.get("tags", ""), b.get("category", "fact"), bool(b.get("pinned")))
+    return {"ok": True}
+
+
+@app.patch("/api/memories/{mid}")
+async def patch_memory(mid: int, req: Request):
+    b = await req.json()
+    if "pinned" in b:
+        memory.set_pinned(mid, bool(b["pinned"]))
+    if "category" in b:
+        memory.set_category(mid, b["category"])
     return {"ok": True}
 
 
 @app.delete("/api/memories/{mid}")
 def remove_memory(mid: int):
     return {"ok": memory.forget(mid)}
+
+
+# ---------------- memory injection policy (Settings → Memory) ----------------
+@app.get("/api/memory/policy")
+def get_memory_policy():
+    return {"policy": memory.get_policy(), "categories": memory.CATEGORIES}
+
+
+@app.post("/api/memory/policy")
+async def set_memory_policy(req: Request):
+    return {"ok": True, "policy": memory.set_policy(await req.json())}
 
 
 # ---------------- workspace files (fenced) ----------------

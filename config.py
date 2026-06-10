@@ -25,7 +25,7 @@ LLAMA_SWAP_CFG = Path(os.environ.get("OCEANO_LLAMA_SWAP_CFG", LLAMA_DIR / "llama
 HF_TOKEN = os.environ.get("HF_TOKEN", "") or os.environ.get("OCEANO_HF_TOKEN", "")
 
 # --- Agent safety knobs ---
-MAX_STEPS   = int(os.environ.get("OCEANO_MAX_STEPS", "12"))   # tool-call loop cap per turn
+MAX_STEPS   = int(os.environ.get("OCEANO_MAX_STEPS", "25"))   # tool-call loop cap per turn (multi-file builds need headroom)
 SHELL_TIMEOUT = int(os.environ.get("OCEANO_SHELL_TIMEOUT", "60"))
 CONFINE_TO_WORKSPACE = os.environ.get("OCEANO_CONFINE", "1") == "1"  # file ops stay inside workspace
 

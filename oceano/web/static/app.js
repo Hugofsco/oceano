@@ -511,7 +511,7 @@ async function loadServices() {
 /* ================= SETTINGS WINDOW ================= */
 const SETTINGS_TABS = [
   ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
-  ["tools", "⚒", "Tools"], ["services", "◉", "Services"], ["about", "≈", "About"],
+  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["services", "◉", "Services"], ["about", "≈", "About"],
 ];
 const SETTINGS_PAGES = {
   account: `
@@ -548,6 +548,13 @@ const SETTINGS_PAGES = {
       <label class="field-label">Allowed user IDs <span class="lbl-sub">comma-separated · agent can run shell, keep tight</span></label>
       <input id="tgAllowed" placeholder="e.g. 123456789, 987654321">
       <div class="tg-actions"><button class="ghost-btn sm" id="tgClearToken">Clear token</button><button class="primary" id="tgSave">Save &amp; apply</button></div>
+    </div>`,
+  memory: `
+    <div class="drawer-section">
+      <h3>Memory injection</h3>
+      <p class="sub">How each kind of memory reaches the model. <b>Always</b> = included every message; <b>When relevant</b> = only if it matches the prompt; <b>Off</b> = never. Pinned memories (📌 in Brain → Memory) are always included regardless.</p>
+      <div class="mem-policy" id="memPolicy"></div>
+      <div class="acct-actions"><span class="acct-msg" id="memPolMsg"></span><button class="primary sm" id="memPolSave">Save</button></div>
     </div>`,
   tools: `
     <div class="drawer-section">
@@ -587,9 +594,29 @@ function openSettings() {
   $("#tgClearToken", body).onclick = async () => { if (await confirmAction("Clear bot token?", "The Telegram bot will stop until you set a new token.", "Clear")) { $("#tgEnabled").checked = false; saveTelegram({ clear_token: true }); } };
   $("#acctSave", body).onclick = saveAccount;
   $("#logoutBtn", body).onclick = logout;
+  $("#memPolSave", body).onclick = saveMemoryPolicy;
   loadSettingsAll();
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadAccount(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadAccount(); loadMemoryPolicy(); }
+
+const POLICY_OPTS = [["always", "Always inject"], ["relevant", "When relevant"], ["off", "Off"]];
+async function loadMemoryPolicy() {
+  const box = $("#memPolicy"); if (!box) return;
+  let d; try { d = await api("/api/memory/policy"); } catch { return; }
+  box.innerHTML = d.categories.map(cat => {
+    const cur = d.policy[cat] || "relevant";
+    const opts = POLICY_OPTS.map(([v, l]) => `<option value="${v}"${v === cur ? " selected" : ""}>${l}</option>`).join("");
+    return `<div class="mp-row"><span class="mp-cat">${cat}</span><select class="mp-sel" data-cat="${cat}">${opts}</select></div>`;
+  }).join("");
+}
+async function saveMemoryPolicy() {
+  const msg = $("#memPolMsg");
+  const policy = {}; $$("#memPolicy .mp-sel").forEach(s => policy[s.dataset.cat] = s.value);
+  try {
+    await api("/api/memory/policy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(policy) });
+    if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+  } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+}
 
 async function loadTools() {
   const box = $("#toolList"); if (!box) return;
@@ -944,10 +971,14 @@ async function loadBrainMem() {
   const list = $("#bMemList"); if (!list) return;
   const mems = await api("/api/memories"); list.innerHTML = "";
   if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
+  const CATS = ["identity", "preference", "project", "fact", "task"];
   mems.forEach(m => {
-    const row = document.createElement("div"); row.className = "mem-row";
-    const tags = (m.tags || "").split(",").filter(Boolean).map(t => `<span class="tag">${escapeHtml(t.trim())}</span>`).join("");
-    row.innerHTML = `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${tags}${(m.ts || "").slice(0, 10)}</div></div><button class="mr-del">✕</button>`;
+    const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
+    const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
+    row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
+      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
+    $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); loadBrainMem(); };
+    $(".mr-cat", row).onchange = e => fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) });
     $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadBrainMem(); };
     list.appendChild(row);
   });
