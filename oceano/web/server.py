@@ -334,7 +334,9 @@ def remove_memory(mid: int):
 # ---------------- workspace files (fenced) ----------------
 def _wresolve(path):
     p = (config.WORKSPACE / (path or "")).resolve()
-    if not str(p).startswith(str(config.WORKSPACE)):
+    # is_relative_to, not startswith: a prefix match lets a sibling like
+    # '<workspace>-evil' escape the fence. config.WORKSPACE is already resolved.
+    if not p.is_relative_to(config.WORKSPACE):
         raise HTTPException(400, "path escapes workspace")
     return p
 

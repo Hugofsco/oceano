@@ -52,7 +52,9 @@ def run(name, arguments_json):
 def _resolve(path: str) -> Path:
     """Resolve a user/model-supplied path against the workspace, with a fence."""
     p = (config.WORKSPACE / path).resolve()
-    if config.CONFINE_TO_WORKSPACE and not str(p).startswith(str(config.WORKSPACE)):
+    # is_relative_to (not startswith): a plain prefix match lets '/ws-evil' slip
+    # past a workspace of '/ws'. config.WORKSPACE is already resolved.
+    if config.CONFINE_TO_WORKSPACE and not p.is_relative_to(config.WORKSPACE):
         raise ValueError(f"path {path!r} escapes the workspace")
     return p
 
