@@ -1,7 +1,7 @@
 /* Oceano web client */
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const api = (p, o) => fetch(p, o).then(r => r.json());
+const api = (p, o) => fetch(p, o).then(r => { if (r.status === 401) { showLogin(); throw new Error("unauthorized"); } return r.json(); });
 const escapeHtml = s => (s || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 /* themed confirm dialog — returns a Promise<boolean> */
@@ -25,6 +25,7 @@ function confirmAction(title, msg, okLabel = "Delete") {
 }
 
 const state = { session: null, model: null, baseUrl: null, agent: false, models: [], busy: false, view: "chat", cwd: "", file: null };
+let _chatAbort = null;   // AbortController for the in-flight /api/chat stream
 
 /* ---------------- markdown (sanitized) ---------------- */
 function renderMD(el, text, highlight = false) {
@@ -173,13 +174,20 @@ function addThinkCard() {
   $(".th2", card).onclick = () => card.classList.toggle("open");
   $("#thread").appendChild(el); toBottom(); return card;
 }
-function appendThink(card, text) { if (card) { $(".tk-body", card).textContent += text; toBottom(); } }
+function appendThink(card, text) {
+  if (!card) return;
+  const body = $(".tk-body", card);
+  const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 24;  // only follow if near bottom
+  body.textContent += text;
+  if (stick) body.scrollTop = body.scrollHeight;   // autoscroll the thinking box as it streams
+  toBottom();
+}
 function finalizeThink(card) { if (!card) return; const st = $(".tk-stat", card); st.classList.remove("run"); st.textContent = ""; }
 
 async function send() {
   const input = $("#input"), text = input.value.trim();
   if (!text || state.busy || !state.model) { if (!state.model) flashModel(); return; }
-  state.busy = true; $("#send").disabled = true;
+  state.busy = true; setSendMode(true);
   $("#send").classList.add("ping"); setTimeout(() => $("#send").classList.remove("ping"), 600);
   input.value = ""; autosize(input);
   addUser(text); touchTitle(text); appendT({ role: "user", content: text });
@@ -192,8 +200,9 @@ async function send() {
   // close the current answer bubble so the next segment (tool/think) doesn't slot UNDER it
   const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
 
+  _chatAbort = new AbortController();
   try {
-    const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: _chatAbort.signal });
     const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = "";
     while (true) {
       const { value, done } = await reader.read(); if (done) break;
@@ -232,15 +241,35 @@ async function send() {
     killSounding(); flushThink(); if (bubble) renderMD(bubble, acc, true);
   } catch (e) {
     killSounding(); flushThink();
-    if (bubble && acc) { acc += "\n\n*(stream interrupted)*"; renderMD(bubble, acc, true); }   // keep partial answer
+    if (e.name === "AbortError") {                                   // user hit Stop
+      if (bubble && acc) { acc += "\n\n*(stopped)*"; renderMD(bubble, acc, true); }
+      else { bubble = bubble || addAssistant(""); acc = "_(stopped)_"; renderMD(bubble, acc, true); }
+    } else if (bubble && acc) { acc += "\n\n*(stream interrupted)*"; renderMD(bubble, acc, true); }   // keep partial answer
     else { bubble = bubble || addAssistant(""); renderMD(bubble, "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + e.message + "`"); }
   }
   if (stats && bubble) renderMeta(bubble, stats);
   if (bubble) appendT({ role: "assistant", content: acc, meta: stats });
-  state.busy = false; $("#send").disabled = false; input.focus();
+  state.busy = false; setSendMode(false); _chatAbort = null; input.focus();
+}
+function setSendMode(stopping) {
+  const b = $("#send"); if (!b) return;
+  b.classList.toggle("stopping", stopping);
+  b.setAttribute("aria-label", stopping ? "stop" : "send");
+  b.title = stopping ? "Stop generating" : "Send";
+}
+function stopChat() {
+  fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: state.session }) }).catch(() => {});
+  if (_chatAbort) _chatAbort.abort();   // stops the client read; server cancels too
 }
 
 /* ---------------- models ---------------- */
+async function loadPrefs() {
+  try {
+    const cfg = await api("/api/config");
+    state.agent = !!(cfg.prefs && cfg.prefs.agent_mode);   // Agent mode persists across reloads
+    const t = $("#agentToggle"); if (t) t.checked = state.agent;
+  } catch {}
+}
 async function loadModels() {
   state.models = await api("/api/models");
   buildModelMenu();
@@ -477,6 +506,128 @@ async function loadServices() {
       _svc("Scheduler", schedOk, beat == null ? "no heartbeat" : `beat ${Math.round(beat)}s ago`) +
       _svc("Telegram", tg.running, tg.running ? "@" + (tg.username || "bot") : (tg.error ? "error" : "off"));
   } catch { box.innerHTML = `<div class="svc"><span class="svc-dot off"></span><span class="svc-name">status unavailable</span></div>`; }
+}
+
+/* ================= SETTINGS WINDOW ================= */
+const SETTINGS_TABS = [
+  ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
+  ["tools", "⚒", "Tools"], ["services", "◉", "Services"], ["about", "≈", "About"],
+];
+const SETTINGS_PAGES = {
+  account: `
+    <div class="drawer-section">
+      <h3>Account</h3>
+      <div class="acct-row">signed in as <span class="acct-who" id="acctWho">…</span></div>
+      <label class="field-label">Username</label>
+      <input id="acctUser" autocomplete="username" placeholder="username">
+      <label class="field-label">Current password <span class="lbl-sub">required to save changes</span></label>
+      <input id="acctCur" type="password" autocomplete="current-password" placeholder="current password">
+      <label class="field-label">New password <span class="lbl-sub">leave blank to keep current</span></label>
+      <input id="acctNew" type="password" autocomplete="new-password" placeholder="new password">
+      <div class="acct-actions"><button class="ghost-btn sm" id="logoutBtn">Log out</button><span class="acct-msg" id="acctMsg"></span><button class="primary sm" id="acctSave">Save</button></div>
+    </div>`,
+  endpoints: `
+    <div class="drawer-section">
+      <h3>Model endpoints</h3>
+      <p class="sub">Add a provider, paste a key, and its models appear in the composer.</p>
+      <div class="endpoints" id="endpoints"></div>
+      <div class="add-endpoint">
+        <select id="providerSelect"></select>
+        <input id="epName" placeholder="label (optional)">
+        <input id="epKey" type="password" placeholder="API key" autocomplete="off">
+        <button class="primary" id="addEndpoint">Add</button>
+      </div>
+    </div>`,
+  telegram: `
+    <div class="drawer-section">
+      <div class="sec-head"><h3>Telegram</h3>
+        <label class="agent-switch sm" title="Run the Telegram bot inside this daemon"><input type="checkbox" id="tgEnabled"><span class="track"><span class="thumb"></span></span></label></div>
+      <p class="sub">Chat with Oceano from your phone. Runs in this web process. <span id="tgStatus" class="tg-status">…</span></p>
+      <label class="field-label">Bot token <span class="lbl-sub">from @BotFather</span></label>
+      <input id="tgToken" type="password" autocomplete="off" placeholder="paste to set / change">
+      <label class="field-label">Allowed user IDs <span class="lbl-sub">comma-separated · agent can run shell, keep tight</span></label>
+      <input id="tgAllowed" placeholder="e.g. 123456789, 987654321">
+      <div class="tg-actions"><button class="ghost-btn sm" id="tgClearToken">Clear token</button><button class="primary" id="tgSave">Save &amp; apply</button></div>
+    </div>`,
+  tools: `
+    <div class="drawer-section">
+      <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
+      <p class="sub">What the agent can reach when Agent mode is on.</p>
+      <div class="tool-list" id="toolList"></div>
+    </div>`,
+  services: `
+    <div class="drawer-section">
+      <h3>Services</h3>
+      <p class="sub">Everything Oceano runs on this box.</p>
+      <div class="svc-list" id="svcList"></div>
+    </div>`,
+  about: `
+    <div class="drawer-section">
+      <h3>About</h3>
+      <p class="sub">Oceano · self-hosted · everything runs on your box. The agent writes only inside its workspace; the web UI is bound to localhost.</p>
+    </div>`,
+};
+function openSettings() {
+  const { body, reused } = createWindow({ id: "win-settings", title: "Settings", icon: "⚙", width: 660, height: 560 });
+  if (reused) { loadSettingsAll(); return; }
+  body.classList.add("set-win");
+  body.innerHTML = `
+    <div class="set-layout">
+      <div class="set-tabs">${SETTINGS_TABS.map((t, i) =>
+        `<button class="set-tab${i === 0 ? " active" : ""}" data-page="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}</button>`).join("")}</div>
+      <div class="set-pane">${SETTINGS_TABS.map((t, i) =>
+        `<div class="set-page${i === 0 ? " active" : ""}" data-page="${t[0]}">${SETTINGS_PAGES[t[0]]}</div>`).join("")}</div>
+    </div>`;
+  $$(".set-tab", body).forEach(t => t.onclick = () => {
+    $$(".set-tab", body).forEach(x => x.classList.toggle("active", x === t));
+    $$(".set-page", body).forEach(p => p.classList.toggle("active", p.dataset.page === t.dataset.page));
+  });
+  $("#addEndpoint", body).onclick = addEndpoint;
+  $("#tgSave", body).onclick = () => saveTelegram();
+  $("#tgClearToken", body).onclick = async () => { if (await confirmAction("Clear bot token?", "The Telegram bot will stop until you set a new token.", "Clear")) { $("#tgEnabled").checked = false; saveTelegram({ clear_token: true }); } };
+  $("#acctSave", body).onclick = saveAccount;
+  $("#logoutBtn", body).onclick = logout;
+  loadSettingsAll();
+}
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadAccount(); }
+
+async function loadTools() {
+  const box = $("#toolList"); if (!box) return;
+  try {
+    const tools = await api("/api/tools");
+    const cnt = $("#toolCount"); if (cnt) cnt.textContent = "· " + tools.length;
+    box.innerHTML = tools.map(t => {
+      const params = (t.params || []).length
+        ? t.params.map(p => `<span class="tp${p.required ? " req" : ""}" title="${escapeHtml((p.required ? "required · " : "optional · ") + p.type + (p.description ? " · " + p.description : ""))}">${escapeHtml(p.name)}<i>${escapeHtml(p.type)}</i></span>`).join("")
+        : `<span class="tp-none">no inputs</span>`;
+      return `<div class="tool-row"><div class="th"><span class="tcat">${escapeHtml(t.category || "other")}</span><span class="tn">${escapeHtml(t.name)}</span></div>` +
+             `<div class="td">${escapeHtml(t.description || "")}</div><div class="tparams">${params}</div></div>`;
+    }).join("");
+  } catch {}
+}
+
+/* ---------------- account / auth ---------------- */
+async function loadAccount() {
+  try {
+    const me = await api("/api/me");
+    const who = $("#acctWho"), u = $("#acctUser");
+    if (who) who.textContent = me.user || "—";
+    if (u) u.value = me.user || "";
+  } catch {}
+}
+async function saveAccount() {
+  const msg = $("#acctMsg"), cur = $("#acctCur").value, user = $("#acctUser").value.trim(), npw = $("#acctNew").value;
+  if (!cur) { msg.textContent = "enter current password"; msg.className = "acct-msg err"; return; }
+  const r = await fetch("/api/account", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ current_password: cur, user, new_password: npw }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { msg.textContent = d.detail || "save failed"; msg.className = "acct-msg err"; return; }
+  msg.textContent = "saved ✓"; msg.className = "acct-msg ok";
+  $("#acctCur").value = ""; $("#acctNew").value = "";
+  if ($("#acctWho")) $("#acctWho").textContent = d.user;
+}
+async function logout() {
+  await fetch("/api/logout", { method: "POST" }).catch(() => {});
+  location.reload();
 }
 
 /* ================= FLOATING WINDOWS ================= */
@@ -752,21 +903,37 @@ async function openFileWindow(path) {
 }
 
 /* ---------- Brain window (memory + skills) ---------- */
+const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"]];
 function openBrain() {
-  const { body, reused } = createWindow({ id: "win-brain", title: "Brain — memory & skills", icon: "✶", width: 620, height: 540 });
+  const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
+    onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } } });
   if (reused) return;
-  body.innerHTML = `<div class="tabs"><button class="tab active" data-tab="mem">Memory</button><button class="tab" data-tab="skills">Skills</button></div><div class="tab-body" id="brainBody"></div>`;
-  $$(".tab", body).forEach(t => t.onclick = () => { $$(".tab", body).forEach(x => x.classList.remove("active")); t.classList.add("active"); brainTab(t.dataset.tab); });
+  body.classList.add("set-win");
+  body.innerHTML = `
+    <div class="set-layout">
+      <div class="set-tabs">${BRAIN_TABS.map((t, i) =>
+        `<button class="set-tab${i === 0 ? " active" : ""}" data-tab="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}</button>`).join("")}</div>
+      <div class="set-pane brain-pane" id="brainBody"></div>
+    </div>`;
+  $$(".set-tab", body).forEach(t => t.onclick = () => {
+    $$(".set-tab", body).forEach(x => x.classList.toggle("active", x === t));
+    brainTab(t.dataset.tab);
+  });
   brainTab("mem");
 }
 function brainTab(which) {
   const c = $("#brainBody"); if (!c) return;
+  if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; }   // stop riverbook polling when leaving the tab
   if (which === "mem") {
     c.innerHTML = `<div class="mem-add"><input id="bMemText" placeholder="Teach Oceano a durable fact…"><input id="bMemTags" class="mem-tags" placeholder="tags"><button class="primary sm" id="bMemAdd">Remember</button></div><div class="mem-list" id="bMemList"></div>`;
     const add = async () => { const t = $("#bMemText").value.trim(); if (!t) return; await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t, tags: $("#bMemTags").value.trim() }) }); $("#bMemText").value = ""; $("#bMemTags").value = ""; loadBrainMem(); };
     $("#bMemAdd").onclick = add;
     $("#bMemText").addEventListener("keydown", e => { if (e.key === "Enter") add(); });
     loadBrainMem();
+  } else if (which === "kn") {
+    renderKnowledge(c);
+  } else if (which === "rivers") {
+    renderRivers(c);
   } else {
     c.innerHTML = `<div class="brain-head"><button class="exp-btn" id="bSkNew">＋ New skill</button></div><div class="brain-skills" id="bSkBody"></div>`;
     $("#bSkNew").onclick = () => openSkill(null);
@@ -794,6 +961,243 @@ async function loadBrainSkills() {
     c.innerHTML = `<h3>${escapeHtml(s.name)}</h3><div class="sc-desc">${escapeHtml(s.description)}</div><div class="sc-snip">${escapeHtml(s.body.slice(0, 90))}…</div>`;
     c.onclick = () => openSkill(s); body.appendChild(c);
   });
+}
+
+/* ---------- Brain → Knowledge (embedding engine: stats, indexing, search) ---------- */
+function renderKnowledge(c) {
+  c.innerHTML = `
+    <div class="kn-stats" id="knStats"></div>
+    <div class="kn-embed" id="knEmbed">checking embedding engine…</div>
+    <div class="kn-sec-label">Index documents</div>
+    <div class="kn-row"><input id="knFolder" placeholder="folder path — absolute, or relative to workspace"><button class="primary sm" id="knIndex">Index</button></div>
+    <div class="kn-note" id="knIndexNote"></div>
+    <div class="kn-sec-label">Semantic search</div>
+    <div class="kn-scope"><button data-scope="memory" class="on">Memories</button><button data-scope="docs">Documents</button></div>
+    <div class="kn-row"><input id="knQuery" placeholder="search by meaning, not keywords…"><button class="primary sm" id="knSearch">Search</button></div>
+    <div class="kn-note" id="knNote"></div>
+    <div class="kn-results" id="knResults"></div>`;
+  let scope = "memory";
+  $$(".kn-scope button", c).forEach(b => b.onclick = () => { scope = b.dataset.scope; $$(".kn-scope button", c).forEach(x => x.classList.toggle("on", x === b)); });
+  const doSearch = async () => {
+    const q = $("#knQuery").value.trim(); if (!q) return;
+    const note = $("#knNote"); note.textContent = "searching…"; note.className = "kn-note run";
+    try {
+      const r = await api("/api/brain/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope, query: q }) });
+      renderKnResults(r.results || [], scope, note);
+    } catch { note.textContent = "search failed"; note.className = "kn-note err"; }
+  };
+  $("#knSearch").onclick = doSearch;
+  $("#knQuery").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+  $("#knIndex").onclick = async () => {
+    const folder = $("#knFolder").value.trim(); if (!folder) return;
+    const note = $("#knIndexNote"); note.textContent = "indexing… (embedding each chunk — may take a moment)"; note.className = "kn-note run";
+    try {
+      const r = await api("/api/brain/index", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folder }) });
+      note.textContent = r.result; note.className = "kn-note " + (r.ok ? "ok" : "err");
+      loadKnStats();
+    } catch { note.textContent = "index failed"; note.className = "kn-note err"; }
+  };
+  loadKnStats();
+}
+async function loadKnStats() {
+  let s; try { s = await api("/api/brain/stats"); } catch { return; }
+  const st = $("#knStats");
+  if (st) st.innerHTML =
+    `<div class="kn-stat"><div class="kv">${s.memories}</div><div class="kl">memories</div></div>` +
+    `<div class="kn-stat"><div class="kv">${s.docs.files}</div><div class="kl">documents</div></div>` +
+    `<div class="kn-stat"><div class="kv">${s.docs.chunks}</div><div class="kl">chunks</div></div>` +
+    `<div class="kn-stat"><div class="kv">${s.embed.dims || "—"}</div><div class="kl">dimensions</div></div>`;
+  const em = $("#knEmbed");
+  if (em) em.innerHTML = `<span class="svc-dot ${s.embed.ok ? "on" : "off"}"></span><span>Embedding engine · <code>${escapeHtml(s.embed.model)}</code> · ${s.embed.ok ? "online" : "offline"} · <code>${escapeHtml(s.embed.url)}</code></span>`;
+}
+function renderKnResults(results, scope, note) {
+  const box = $("#knResults"); box.innerHTML = "";
+  if (!results.length) { note.textContent = "no matches"; note.className = "kn-note"; return; }
+  note.textContent = `${results.length} result${results.length > 1 ? "s" : ""} · best first`; note.className = "kn-note ok";
+  results.forEach(r => {
+    const div = document.createElement("div"); div.className = "kn-hit";
+    const src = scope === "memory" ? (r.tags || "memory") : r.name;
+    const text = scope === "memory" ? r.text : r.chunk;
+    div.innerHTML = `<div class="khh"><span class="ksrc">${escapeHtml(src)}</span><span class="kscore">${r.score}</span></div><div class="ktext">${escapeHtml(text)}</div>`;
+    box.appendChild(div);
+  });
+}
+
+/* ---------- Brain → Rivers (HF catalog · hwfit · download · serve) ---------- */
+let _riverTimer = null, _riverHw = null;
+const fmtNum = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : "" + (n || 0);
+const GB = 1073741824;
+function fitClient(size) {                       // mirrors riverbook.fit() for installed models
+  const v = _riverHw && _riverHw.vram_total; if (!v) return { verdict: "unknown", ngl: 99 };
+  const u = v * 0.92;
+  if (size <= u * 0.8) return { verdict: "fits", ngl: 99 };
+  if (size <= u * 1.5) return { verdict: "partial", ngl: Math.max(1, Math.floor(99 * u / size)) };
+  return { verdict: "cpu", ngl: 0 };
+}
+function renderRivers(c) {
+  c.innerHTML = `
+    <div class="river-hw" id="riverHw">detecting hardware…</div>
+    <div class="river-sec">Recommended for your machine <span class="river-subtle" id="riverRecHint"></span></div>
+    <div class="river-filters">
+      <div class="river-chips" id="riverRecChips">
+        <button class="river-chip on" data-f="all">All</button>
+        <button class="river-chip" data-f="fits">Fits</button>
+        <button class="river-chip" data-f="partial">Partial</button>
+        <button class="river-chip" data-f="cpu">Won't fit</button>
+      </div>
+      <select class="river-sortsel" id="riverRecSort">
+        <option value="score">order: score ▾</option>
+        <option value="size">order: size ▾</option>
+        <option value="name">order: name</option>
+      </select>
+    </div>
+    <div class="river-rec" id="riverRec"></div>
+    <div class="river-sec">Search Hugging Face</div>
+    <div class="river-search"><input id="riverQ" placeholder="search for any GGUF model…" autocomplete="off"><button class="primary sm" id="riverGo">Search</button></div>
+    <div class="river-note" id="riverNote"></div>
+    <div class="river-repos" id="riverRepos"></div>
+    <div id="riverJobsWrap"></div>
+    <div class="river-sec">Installed models <span class="river-subtle" id="riverInstCount"></span></div>
+    <input class="river-find" id="riverFind" placeholder="filter models on this device…" autocomplete="off">
+    <div id="riverInstalled"></div>`;
+  const go = () => riverSearch($("#riverQ").value.trim());
+  $("#riverGo").onclick = go;
+  $("#riverQ").addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  $$("#riverRecChips .river-chip").forEach(b => b.onclick = () => {
+    $$("#riverRecChips .river-chip").forEach(x => x.classList.toggle("on", x === b));
+    _riverRecFilter = b.dataset.f; riverRenderRec();
+  });
+  $("#riverRecSort").onchange = e => { _riverRecSort = e.target.value; riverRenderRec(); };
+  $("#riverFind").addEventListener("input", riverRenderInstalled);
+  riverLoadHw(); riverLoadRecommended(); riverLoadInstalled(); riverPoll();
+}
+async function riverLoadHw() {
+  try { _riverHw = await api("/api/rivers/hw"); } catch { return; }
+  const el = $("#riverHw"); if (!el) return;
+  const tot = _riverHw.vram_total ? (_riverHw.vram_total / GB).toFixed(1) + " GB" : "—";
+  const free = _riverHw.vram_free ? " · " + (_riverHw.vram_free / GB).toFixed(1) + " GB free" : "";
+  el.innerHTML = `<span class="svc-dot ${_riverHw.gpu ? "on" : "off"}"></span><span>Backend <code>${escapeHtml(_riverHw.backend)}</code> · <code>${escapeHtml(_riverHw.gpu || "CPU only")}</code></span><span class="vram">VRAM ${tot}${free}</span>`;
+}
+let _riverRec = [], _riverRecFilter = "all", _riverRecSort = "score";
+async function riverLoadRecommended() {
+  const box = $("#riverRec"); if (!box) return;
+  box.innerHTML = `<div class="river-note run">scoring models against your hardware…</div>`;
+  let d; try { d = await api("/api/rivers/recommended"); } catch { box.innerHTML = ""; return; }
+  _riverRec = d.models || [];
+  const hint = $("#riverRecHint"); if (hint) hint.textContent = "· auto-scored by GPU fit";
+  riverRenderRec();
+}
+function riverRenderRec() {
+  const box = $("#riverRec"); if (!box) return;
+  let list = _riverRec.filter(m => _riverRecFilter === "all" || m.fit.verdict === _riverRecFilter);
+  const by = { score: (a, b) => (b.fit.score || 0) - (a.fit.score || 0),
+               size: (a, b) => b.size - a.size,
+               name: (a, b) => a.label.localeCompare(b.label) };
+  list = list.slice().sort(by[_riverRecSort] || by.score);
+  if (!list.length) { box.innerHTML = `<div class="empty-note">No models in this category.</div>`; return; }
+  box.innerHTML = "";
+  list.forEach(m => {
+    const v = m.fit.verdict, score = m.fit.score == null ? "—" : m.fit.score;
+    const row = document.createElement("div"); row.className = "river-rec-row";
+    row.innerHTML =
+      `<div class="rr-score fit ${v}" title="${escapeHtml(m.fit.note)}"><b>${score}</b><span>${v}</span></div>` +
+      `<div class="rr-main"><div class="rr-name">${escapeHtml(m.label)} <span class="rr-params">${escapeHtml(m.params)}</span></div>` +
+      `<div class="rr-sub">${escapeHtml(m.quant)} · ${fmtSize(m.size)} · ${escapeHtml(m.repo)}</div></div>` +
+      (m.downloaded ? `<span class="served">on disk</span>` : `<button class="btn-mini rr-dl">Download</button>`);
+    const dl = $(".rr-dl", row);
+    if (dl) dl.onclick = () => riverDownload(m.repo, m.filename, dl);
+    box.appendChild(row);
+  });
+}
+async function riverSearch(q) {
+  if (!q) return;
+  const note = $("#riverNote"), repos = $("#riverRepos");
+  note.textContent = "searching Hugging Face…"; note.className = "river-note run"; repos.innerHTML = "";
+  let r; try { r = await api("/api/rivers/search?q=" + encodeURIComponent(q)); } catch { return; }
+  if (r.error) { note.textContent = r.error; note.className = "river-note err"; return; }
+  if (!r.results.length) { note.textContent = "no GGUF repos found"; note.className = "river-note"; return; }
+  note.textContent = `${r.results.length} repos · click one to see its quants`; note.className = "river-note ok";
+  r.results.forEach(m => {
+    const el = document.createElement("div"); el.className = "river-repo";
+    el.innerHTML = `<span class="rn">${escapeHtml(m.repo)}</span><span class="rd">↓${fmtNum(m.downloads)} · ♥${fmtNum(m.likes)}</span>`;
+    el.onclick = () => riverToggleRepo(el, m.repo);
+    repos.appendChild(el);
+  });
+}
+async function riverToggleRepo(el, repo) {
+  const open = el.classList.toggle("open");
+  const nx = el.nextElementSibling;
+  if (nx && nx.classList.contains("river-files")) nx.remove();
+  if (!open) return;
+  const box = document.createElement("div"); box.className = "river-files";
+  box.innerHTML = `<div class="river-note run">loading files…</div>`; el.after(box);
+  let d; try { d = await api("/api/rivers/files?repo=" + encodeURIComponent(repo)); } catch { box.innerHTML = `<div class="river-note err">failed to load files</div>`; return; }
+  if (d.gated || d.error) { box.innerHTML = `<div class="river-note err">${escapeHtml(d.error || "error")}</div>`; return; }
+  if (!d.files.length) { box.innerHTML = `<div class="river-note">no single-file GGUFs here (may be sharded)</div>`; return; }
+  box.innerHTML = "";
+  d.files.forEach(f => {
+    const row = document.createElement("div"); row.className = "river-file";
+    row.innerHTML = `<span class="cq">${escapeHtml(f.quant)}</span><span class="cs">${fmtSize(f.size)}</span><span class="fit ${f.fit.verdict}" title="${escapeHtml(f.fit.note)}">${f.fit.verdict}</span><button class="btn-mini cdl">Download</button>`;
+    $(".cdl", row).onclick = () => riverDownload(repo, f.filename, $(".cdl", row));
+    box.appendChild(row);
+  });
+}
+async function riverDownload(repo, filename, btn) {
+  btn.disabled = true; btn.textContent = "…";
+  let r; try { r = await api("/api/rivers/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo, filename }) }); } catch { btn.disabled = false; btn.textContent = "Download"; return; }
+  if (r.already) { btn.textContent = "on disk"; riverLoadInstalled(); return; }
+  if (r.error) { btn.textContent = "error"; const n = $("#riverNote"); if (n) { n.textContent = r.error; n.className = "river-note err"; } return; }
+  btn.textContent = "downloading"; riverPoll();
+}
+function riverPoll() {
+  if (_riverTimer) return;
+  const tick = async () => {
+    let d; try { d = await api("/api/rivers/jobs"); } catch { return; }
+    riverRenderJobs(d.jobs || []);
+    if (!(d.jobs || []).some(j => j.status === "downloading") && _riverTimer) { clearInterval(_riverTimer); _riverTimer = null; }
+  };
+  tick(); _riverTimer = setInterval(tick, 1500);
+}
+function riverRenderJobs(jobs) {
+  const wrap = $("#riverJobsWrap"); if (!wrap) return;
+  if (!jobs.length) { wrap.innerHTML = ""; return; }
+  wrap.innerHTML = `<div class="river-sec">Downloads</div>` + jobs.map(j => {
+    const pct = j.total ? Math.round(100 * j.downloaded / j.total) : 0;
+    const st = j.status === "downloading" ? `${pct}% · ${fmtSize(j.downloaded)} / ${fmtSize(j.total)}`
+      : j.status === "done" ? "done ✓" : "error: " + (j.error || "");
+    return `<div class="river-job"><div class="cjh"><span>${escapeHtml(j.filename)}</span><span>${escapeHtml(st)}</span></div><div class="river-bar"><i style="width:${j.status === "done" ? 100 : pct}%"></i></div></div>`;
+  }).join("");
+  if (jobs.some(j => j.status === "done")) riverLoadInstalled();
+}
+let _riverInstalled = [];
+async function riverLoadInstalled() {
+  let d; try { d = await api("/api/rivers/installed"); } catch { return; }
+  _riverInstalled = d.models || [];
+  riverRenderInstalled();
+}
+function riverRenderInstalled() {
+  const box = $("#riverInstalled"); if (!box) return;
+  const q = ($("#riverFind") ? $("#riverFind").value.trim().toLowerCase() : "");
+  const list = q ? _riverInstalled.filter(m => m.filename.toLowerCase().includes(q)) : _riverInstalled;
+  const cnt = $("#riverInstCount"); if (cnt) cnt.textContent = `· ${list.length}${q ? " of " + _riverInstalled.length : ""}`;
+  if (!_riverInstalled.length) { box.innerHTML = `<div class="empty-note">No models on disk yet.</div>`; return; }
+  if (!list.length) { box.innerHTML = `<div class="empty-note">No on-device model matches “${escapeHtml(q)}”.</div>`; return; }
+  box.innerHTML = list.map(m =>
+    `<div class="river-inst"><span class="in">${escapeHtml(m.filename)}</span><span class="cs">${fmtSize(m.size)}</span>` +
+    (m.served ? `<span class="served">▶ ${escapeHtml(m.served)}</span>`
+              : `<button class="btn-mini cserve" data-f="${escapeHtml(m.filename)}" data-sz="${m.size}">Serve</button>`) +
+    `</div>`).join("");
+  $$(".cserve", box).forEach(b => b.onclick = () => riverServe(b.dataset.f, +b.dataset.sz, b));
+}
+async function riverServe(filename, size, btn) {
+  btn.disabled = true; btn.textContent = "…";
+  const fitc = fitClient(size);
+  const name = filename.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  let r; try { r = await api("/api/rivers/serve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename, name, ngl: fitc.ngl, ctx: 8192 }) }); } catch { return; }
+  const n = $("#riverNote");
+  if (!r.ok) { btn.disabled = false; btn.textContent = "Serve"; if (n) { n.textContent = r.error; n.className = "river-note err"; } return; }
+  if (n) { n.textContent = `✓ serving as "${r.name}" (ngl ${r.ngl}, ctx ${r.ctx}) — now on :8081 + the model picker`; n.className = "river-note ok"; }
+  riverLoadInstalled(); loadModels();
 }
 
 /* ---------- Scheduler window (heartbeat + tasks) ---------- */
@@ -860,9 +1264,12 @@ function wire() {
   const input = $("#input");
   input.addEventListener("input", () => autosize(input));
   input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
-  $("#send").onclick = send;
+  $("#send").onclick = () => state.busy ? stopChat() : send();
   $("#newVoyage").onclick = newVoyage;
-  $("#agentToggle").onchange = e => state.agent = e.target.checked;
+  $("#agentToggle").onchange = e => {
+    state.agent = e.target.checked;
+    fetch("/api/prefs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agent_mode: state.agent }) }).catch(() => {});
+  };
 
   $$(".nav-item").forEach(n => n.onclick = () => {
     const v = n.dataset.view;
@@ -876,12 +1283,7 @@ function wire() {
   document.addEventListener("click", () => $("#modelMenu").classList.remove("open"));
   $("#modelMenu").onclick = e => e.stopPropagation();
 
-  const openS = () => { $("#drawer").classList.add("open"); $("#scrim").classList.add("open"); loadEndpoints(); loadTelegram(); loadServices(); };
-  const closeS = () => { $("#drawer").classList.remove("open"); $("#scrim").classList.remove("open"); };
-  $("#openSettings").onclick = openS; $("#closeSettings").onclick = closeS; $("#scrim").onclick = closeS;
-  $("#addEndpoint").onclick = addEndpoint;
-  $("#tgSave").onclick = () => saveTelegram();
-  $("#tgClearToken").onclick = async () => { if (await confirmAction("Clear bot token?", "The Telegram bot will stop until you set a new token.", "Clear")) { $("#tgEnabled").checked = false; saveTelegram({ clear_token: true }); } };
+  $("#openSettings").onclick = openSettings;
   $("#toggleSidebar").onclick = () => $("#sidebar").classList.toggle("open");
   $("#liveBtn").onclick = openLiveView;
 
@@ -899,14 +1301,47 @@ function wire() {
   $("#memText").addEventListener("keydown", e => { if (e.key === "Enter") addMemory(); });
 }
 
-async function boot() {
+/* ---------------- auth gate ---------------- */
+let _appStarted = false;
+function showLogin() {
+  const gate = $("#loginGate"); if (!gate) return;
+  gate.style.display = "grid";
+  const form = $("#loginForm");
+  if (form && !form.dataset.wired) {
+    form.dataset.wired = "1";
+    form.addEventListener("submit", async e => {
+      e.preventDefault();
+      const btn = $("#loginBtn"), err = $("#loginErr");
+      btn.disabled = true; err.textContent = "";
+      try {
+        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user: $("#loginUser").value, password: $("#loginPass").value }) });
+        if (!r.ok) { err.textContent = "Invalid username or password."; $("#loginPass").value = ""; $("#loginPass").focus(); return; }
+        gate.style.display = "none";
+        initApp();
+      } catch { err.textContent = "Could not reach the server."; }
+      finally { btn.disabled = false; }
+    });
+  }
+  setTimeout(() => { const p = $("#loginPass"); if (p && !p.value) p.focus(); }, 60);
+}
+function initApp() {
+  if (_appStarted) return;        // idempotent — survives a mid-session re-login
+  _appStarted = true;
   wire();
-  await loadProviders(); await loadModels();
+  loadModels();
+  loadPrefs();
   const active = localStorage.getItem("oceano.active");
   if (active && LS.index().some(s => s.id === active)) openVoyage(active);
   else if (LS.index().length) openVoyage(LS.index()[0].id);
   else newVoyage();
   setView("chat");
   setInterval(loadModels, 30000);
+}
+async function boot() {
+  try {
+    const r = await fetch("/api/me");
+    if (r.status === 401) { showLogin(); return; }
+  } catch { /* server unreachable — fall through and let the UI surface errors */ }
+  initApp();
 }
 boot();

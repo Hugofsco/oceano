@@ -7,20 +7,135 @@
 model/base_url/api_key can be set per instance or swapped between turns (so the
 web UI can change model mid-conversation).
 """
+import json
+import re
+import threading
 import time
+from datetime import datetime
 
 import config
 from oceano import llm, tools
 
+
+def _date_note():
+    """A fresh 'today is …' line so the model anchors to the real present, not its
+    training cutoff (otherwise it searches for stale years like '2024')."""
+    now = datetime.now()
+    return (f"CURRENT DATE: today is {now:%A, %Y-%m-%d}; the current year is {now:%Y}. "
+            "Treat this as the present moment — it is LATER than your training data, "
+            "so your prior knowledge of 'recent' events may be out of date. When the "
+            "user asks about what is current / latest / recent / now, reason from THIS "
+            "date. For web searches, default to the current year and do NOT append an "
+            "older year to the query unless the user explicitly asks for that year.")
+
+
+def _relevant_memories(user_message, k=5, threshold=0.28):
+    """Top memories semantically related to this turn — injected passively so the
+    model uses what it knows without having to call recall()."""
+    try:
+        from oceano import memory
+        hits = [h for h in memory.search(user_message, k=k) if (h.get("score") or 0) >= threshold]
+        if not hits:
+            return ""
+        return ("RELEVANT MEMORIES (things you've learned before — use only if helpful, "
+                "ignore if not):\n"
+                + "\n".join(f"- {h['text']}" + (f"  [{h['tags']}]" if h.get("tags") else "") for h in hits))
+    except Exception:
+        return ""
+
+
+def _workspace_note():
+    return (f"Your writable workspace is at {config.WORKSPACE} — create files and project "
+            "folders here. File and shell tools use paths relative to it.")
+
+
+def _skills_note():
+    try:
+        from oceano import skills
+        cat = skills.catalog()
+        if cat:
+            return ("SKILLS — reusable procedures you can pull in with load_skill(name) when a "
+                    "task matches one:\n" + cat)
+    except Exception:
+        pass
+    return ""
+
+
+def _context_block(user_message):
+    """Everything injected into the system message at the start of a turn: the date,
+    any relevant memories, and the skills catalog. Rebuilt each turn so it's fresh."""
+    return "\n\n".join(p for p in (_date_note(), _workspace_note(),
+                                   _relevant_memories(user_message), _skills_note()) if p)
+
+
+# --- self-learning memory: after each turn, extract durable facts in the background ---
+_LEARN_SYSTEM = (
+    "You extract DURABLE facts about the user worth remembering across future, separate "
+    "conversations: stable preferences, identity, relationships, ongoing projects, goals, "
+    "recurring constraints, and decisions. IGNORE the current task's transient details, "
+    "general knowledge, and anything not specifically about THIS user. Output ONLY a JSON "
+    'array of short third-person fact strings (e.g. ["User prefers dark mode", "User is '
+    'building a local AI agent called Oceano"]). If nothing is worth saving, output [].')
+
+
+def _parse_facts(text):
+    text = (text or "").strip()
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
+        try:
+            return [str(x).strip() for x in json.loads(m.group(0)) if str(x).strip()][:6]
+        except Exception:
+            pass
+    out = []                                  # lenient fallback if the model didn't emit clean JSON
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*•0123456789. ").strip().strip('"')
+        if len(line) > 4 and not line.lower().startswith(("here", "none", "no ", "[", "]")):
+            out.append(line)
+    return out[:6]
+
+
+def _learn_from(exchange, model, base_url, api_key):
+    """Background pass: pull durable facts out of one exchange, save the new ones."""
+    try:
+        from oceano import memory
+        resp = llm.chat([{"role": "system", "content": _LEARN_SYSTEM},
+                         {"role": "user", "content": "Conversation:\n" + exchange[:6000]}],
+                        tools=None, model=model, base_url=base_url, api_key=api_key)
+        for fact in _parse_facts(getattr(resp, "content", "") or ""):
+            memory.add_if_new(fact, tags="auto")
+    except Exception:
+        pass
+
 SYSTEM_PROMPT = """You are Oceano, a capable AI agent running locally on the user's machine.
 
 You have a workspace folder you can freely read, write, and run shell commands in.
-You can also search the web. Work toward the user's goal step by step:
+You can also search and browse the web. Work toward the user's goal step by step:
 - Call tools to gather information and take action, one or more at a time.
 - After acting, look at the results and decide the next step.
 - When the task is done, give a short, clear final answer.
 
 Be concrete. Prefer doing (using tools) over describing what you would do.
+
+WORKSPACE & CREATING THINGS: you have a real, writable workspace folder — your file
+and shell tools operate inside it (use relative paths). When the user asks you to
+create, build, make, write, generate, scaffold, or save something that is naturally
+a file or files — code, a script, a document, notes, config, data, a whole project —
+ACTUALLY create it with write_file (and make_folder), don't just paste it in chat.
+For anything spanning multiple files, make a dedicated project folder first (e.g.
+`todo-app/`) and put the files inside it. Use run_shell / python_exec to scaffold,
+run, or test what you made. When done, tell the user the exact path(s) you created.
+
+WEB RESEARCH: web_search returns only short snippets — not enough to answer from.
+After searching, OPEN the most relevant result(s) with fetch_url and read the
+actual page before answering. Reading a page also renders it live in the user's
+browser view so they can watch. Never repeat the same web_search again and again —
+if a search isn't enough, open a result with fetch_url or refine the query.
+
+MEMORY: you have long-term memory across conversations; relevant memories are shown
+to you automatically. When the user shares a durable fact about themselves (a
+preference, who they are, an ongoing project, a decision), save it with remember().
+If something you know becomes wrong or out of date, fix it with update_memory or drop
+it with forget_memory. (Routine facts are also captured automatically in the background.)
 
 IMAGES: you can create images (charts, diagrams, plots, generated graphics) by
 saving a file into the workspace — e.g. use python_exec with matplotlib or Pillow
@@ -40,7 +155,22 @@ class Agent:
         self.base_url = base_url
         self.api_key = api_key
         self.on_event = on_event or (lambda kind, data: None)
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + _date_note()}]
+
+    def _prepare_turn(self, user_message):
+        """Refresh the system message with this turn's context — current date,
+        relevant memories, and the skills catalog — so the model gets them passively
+        (it needn't call recall/list_skills). Rebuilt each turn, never accumulates."""
+        if self.messages and self.messages[0]["role"] == "system":
+            self.messages[0]["content"] = SYSTEM_PROMPT + "\n\n" + _context_block(user_message)
+
+    def _learn(self, user_message, answer):
+        """Kick off background fact-extraction from this exchange (non-blocking)."""
+        if not (config.AUTO_LEARN and answer):
+            return
+        exchange = f"User: {user_message}\nAssistant: {answer}"
+        threading.Thread(target=_learn_from,
+                         args=(exchange, self.model, self.base_url, self.api_key), daemon=True).start()
 
     def _chat(self, with_tools, return_usage=False):
         return llm.chat(
@@ -56,12 +186,14 @@ class Agent:
 
     # --- blocking (CLI / Telegram / scheduler) -----------------------------
     def run(self, user_message: str) -> str:
+        self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         for _ in range(config.MAX_STEPS):
             msg = self._chat(with_tools=True)
             self.messages.append(msg.model_dump(exclude_none=True))
             if not msg.tool_calls:
                 self.on_event("answer", msg.content)
+                self._learn(user_message, msg.content)
                 return msg.content or ""
             for call in msg.tool_calls:
                 self.on_event("tool_call", {"name": call.function.name, "args": call.function.arguments})
@@ -72,6 +204,7 @@ class Agent:
 
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
     def run_stream(self, user_message: str):
+        self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         total_tok, gen = 0, 0.0          # tokens + LLM time (excludes tool latency)
         for _ in range(config.MAX_STEPS):
@@ -93,6 +226,7 @@ class Agent:
 
             if not calls:                              # final answer (already streamed)
                 self.messages.append({"role": "assistant", "content": content})
+                self._learn(user_message, content)
                 yield {"type": "answer_done"}
                 yield self._stats(total_tok, gen)
                 return
@@ -114,6 +248,7 @@ class Agent:
 
     # --- streaming: plain chat (reasoning + token deltas, no tools) --------
     def chat_stream(self, user_message: str):
+        self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         content, tokens, tfirst = "", 0, None
         for item in llm.stream(self.messages, model=self.model,
@@ -128,6 +263,7 @@ class Agent:
             elif "usage" in item:
                 tokens = item["usage"]
         self.messages.append({"role": "assistant", "content": content})
+        self._learn(user_message, content)
         secs = (time.perf_counter() - tfirst) if tfirst else 0
         if not tokens:                                 # provider sent no usage → estimate
             tokens = max(1, len(content) // 4)

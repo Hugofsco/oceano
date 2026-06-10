@@ -42,6 +42,17 @@ def list_skills():
     return "\n".join(out) or "(no skills yet — create skills/<name>/SKILL.md)"
 
 
+def catalog():
+    """Compact 'name: description' list, for passively surfacing skills into the
+    agent's context each turn (so it needn't call list_skills). '' if none."""
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for sk in sorted(SKILLS_DIR.glob("*/SKILL.md")):
+        meta, _ = _parse(sk.read_text(encoding="utf-8"))
+        lines.append(f"- {meta.get('name', sk.parent.name)}: {meta.get('description', '')}")
+    return "\n".join(lines)
+
+
 def load_skill(name):
     path = SKILLS_DIR / name / "SKILL.md"
     if not path.exists():

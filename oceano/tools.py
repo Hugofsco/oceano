@@ -29,6 +29,20 @@ def tool(schema):
     return wrap
 
 
+def register(name, schema, fn):
+    """Register (or replace) a tool at runtime — used by the MCP client to expose
+    external servers' tools alongside the built-in ones."""
+    _TOOLS[name] = fn
+    _SCHEMAS[:] = [s for s in _SCHEMAS if s["function"]["name"] != name] + [schema]
+
+
+def unregister_prefix(prefix):
+    """Drop all tools whose name starts with `prefix` (e.g. reconnecting MCP)."""
+    for n in [n for n in _TOOLS if n.startswith(prefix)]:
+        _TOOLS.pop(n, None)
+    _SCHEMAS[:] = [s for s in _SCHEMAS if not s["function"]["name"].startswith(prefix)]
+
+
 def schemas():
     return _SCHEMAS
 
@@ -110,6 +124,34 @@ def write_file(path, content):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to {p.relative_to(config.WORKSPACE)}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "edit_file",
+        "description": "Edit part of an existing workspace text file by replacing an EXACT "
+                       "substring — safer/cheaper than rewriting the whole file with write_file. "
+                       "Read the file first and copy the exact text (including indentation) into "
+                       "`find`. Fails if `find` isn't found verbatim.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "find": {"type": "string", "description": "exact text to replace (copy it verbatim from the file)"},
+            "replace": {"type": "string", "description": "the new text"},
+        }, "required": ["path", "find", "replace"]},
+    },
+})
+def edit_file(path, find, replace):
+    p = _resolve(path)
+    if not p.is_file():
+        return f"(no such file: {path} — use write_file to create it)"
+    text = p.read_text(encoding="utf-8", errors="replace")
+    n = text.count(find)
+    if n == 0:
+        return ("ERROR: the `find` text was not found verbatim. Read the file and copy the exact "
+                "text (including whitespace) you want to replace.")
+    p.write_text(text.replace(find, replace), encoding="utf-8")
+    return f"edited {p.relative_to(config.WORKSPACE)}: replaced {n} occurrence(s)"
 
 
 @tool({
@@ -246,6 +288,47 @@ def remember(text, tags=""):
 })
 def recall(query):
     return memory.recall(query)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "update_memory",
+        "description": "Correct a stored memory when something you know becomes wrong or "
+                       "out of date. Describe the existing memory in `about`; it's replaced "
+                       "with `new_text`. If nothing close is stored, `new_text` is saved as new.",
+        "parameters": {"type": "object", "properties": {
+            "about": {"type": "string", "description": "what the old/wrong memory is about"},
+            "new_text": {"type": "string", "description": "the corrected fact to store"},
+        }, "required": ["about", "new_text"]},
+    },
+})
+def update_memory(about, new_text):
+    m = memory.best_match(about)
+    if not m or m["score"] < 0.5:
+        memory.remember(new_text)
+        return f"no close existing memory — saved as new: {new_text!r}"
+    memory.update(m["id"], new_text)
+    return f"updated memory → {new_text!r}  (was: {m['text']!r})"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "forget_memory",
+        "description": "Delete a stored memory that is no longer true or relevant. Describe "
+                       "it in `about`; the closest-matching memory is removed.",
+        "parameters": {"type": "object", "properties": {
+            "about": {"type": "string", "description": "what the memory to forget is about"},
+        }, "required": ["about"]},
+    },
+})
+def forget_memory(about):
+    m = memory.best_match(about)
+    if not m or m["score"] < 0.5:
+        return f"no clearly-matching memory found for {about!r} — nothing forgotten"
+    memory.forget(m["id"])
+    return f"forgot: {m['text']!r}"
 
 
 # --- skills ----------------------------------------------------------------

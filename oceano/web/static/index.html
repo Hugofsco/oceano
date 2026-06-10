@@ -59,6 +59,8 @@
       <!-- CHAT -->
       <section class="view active" id="view-chat">
         <div class="thread" id="thread"></div>
+        <!-- minimized windows dock — sits between the chat output and the input -->
+        <div id="winDock"></div>
         <div class="composer">
           <div class="composer-inner">
             <div class="composer-row">
@@ -133,8 +135,6 @@
 
 <!-- floating windows live here -->
 <div id="windows"></div>
-<!-- minimized windows dock (sits above the composer) -->
-<div id="winDock"></div>
 
 <!-- confirm dialog -->
 <div class="confirm-scrim" id="confirmScrim"></div>
@@ -148,51 +148,19 @@
   </div>
 </div>
 
-<!-- settings drawer -->
-<div class="drawer-scrim" id="scrim"></div>
-<aside class="drawer" id="drawer">
-  <div class="drawer-head"><h2>Settings</h2><button class="icon-btn ghost" id="closeSettings">✕</button></div>
-  <div class="drawer-section">
-    <h3>Model endpoints</h3>
-    <p class="sub">Add a provider, paste a key, and its models appear in the composer.</p>
-    <div class="endpoints" id="endpoints"></div>
-    <div class="add-endpoint">
-      <select id="providerSelect"></select>
-      <input id="epName" placeholder="label (optional)">
-      <input id="epKey" type="password" placeholder="API key" autocomplete="off">
-      <button class="primary" id="addEndpoint">Add</button>
-    </div>
-  </div>
-  <div class="drawer-section">
-    <div class="sec-head">
-      <h3>Telegram</h3>
-      <label class="agent-switch sm" title="Run the Telegram bot inside this daemon">
-        <input type="checkbox" id="tgEnabled">
-        <span class="track"><span class="thumb"></span></span>
-      </label>
-    </div>
-    <p class="sub">Chat with Oceano from your phone. Runs in this web process — no separate service. <span id="tgStatus" class="tg-status">…</span></p>
-    <label class="field-label">Bot token <span class="lbl-sub">from @BotFather</span></label>
-    <input id="tgToken" type="password" autocomplete="off" placeholder="paste to set / change">
-    <label class="field-label">Allowed user IDs <span class="lbl-sub">comma-separated · the agent can run shell, so keep this tight</span></label>
-    <input id="tgAllowed" placeholder="e.g. 123456789, 987654321">
-    <div class="tg-actions">
-      <button class="ghost-btn sm" id="tgClearToken">Clear token</button>
-      <button class="primary" id="tgSave">Save &amp; apply</button>
-    </div>
-  </div>
-
-  <div class="drawer-section">
-    <h3>Services</h3>
-    <p class="sub">Everything Oceano runs on this box.</p>
-    <div class="svc-list" id="svcList"></div>
-  </div>
-
-  <div class="drawer-section">
-    <h3>About</h3>
-    <p class="sub">Oceano · self-hosted · everything runs on your box. The agent writes only inside its workspace; the web UI is bound to localhost.</p>
-  </div>
-</aside>
+<!-- login gate (shown until authenticated) -->
+<div class="login-gate" id="loginGate" style="display:none">
+  <form class="login-card" id="loginForm">
+    <div class="login-orb"></div>
+    <h2>Oceano</h2>
+    <p class="login-sub">Sign in to your local agent.</p>
+    <input id="loginUser" placeholder="username" autocomplete="username" value="admin">
+    <input id="loginPass" type="password" placeholder="password" autocomplete="current-password">
+    <div class="login-err" id="loginErr"></div>
+    <button class="primary" type="submit" id="loginBtn">Dive in</button>
+    <div class="login-hint">default · admin / admin</div>
+  </form>
+</div>
 
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>

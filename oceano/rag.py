@@ -86,3 +86,31 @@ def search_docs(query, k=4):
               for path, chunk, emb in rows]
     scored.sort(reverse=True)
     return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in scored[:k])
+
+
+def stats():
+    """{files, chunks, dims} for the Brain knowledge panel. dims is read from a
+    stored embedding (free — no call to the embed server)."""
+    con = _db()
+    files = con.execute("SELECT COUNT(DISTINCT path) FROM chunks").fetchone()[0]
+    chunks = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    row = con.execute("SELECT embedding FROM chunks WHERE embedding IS NOT NULL LIMIT 1").fetchone()
+    con.close()
+    return {"files": files, "chunks": chunks, "dims": len(json.loads(row[0])) if row else None}
+
+
+def search(query, k=6):
+    """Structured semantic search for the UI: [{name, path, chunk, score}], best first."""
+    con = _db()
+    rows = con.execute("SELECT path, chunk, embedding FROM chunks").fetchall()
+    con.close()
+    if not rows:
+        return []
+    qvec = embeddings.embed(query)
+    if not qvec:
+        return []
+    scored = [(embeddings.cosine(qvec, json.loads(emb)), path, chunk)
+              for path, chunk, emb in rows if emb]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
+            for s, p, c in scored[:k]]

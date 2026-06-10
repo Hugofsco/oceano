@@ -14,21 +14,25 @@ expose this without auth. Reach it over SSH tunnel or Tailscale.
 """
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import shutil
 import threading
+import time
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
-from oceano import browser, livebrowser, memory, safety, scheduler, skills
+from oceano import browser, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -53,17 +57,35 @@ def _telegram_seed():
             "allowed": sorted(config.TELEGRAM_ALLOWED)}
 
 
+def _hash_pw(password, salt):
+    """PBKDF2-SHA256 — stdlib only, no bcrypt/passlib dependency."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def _auth_seed():
+    """Default login: admin / admin. Secret signs session cookies (persisted so
+    logins survive restarts). Override the default password in Settings → Account."""
+    salt = secrets.token_hex(16)
+    return {"user": "admin", "salt": salt, "pwhash": _hash_pw("admin", salt),
+            "secret": secrets.token_hex(32)}
+
+
 def load():
     if STORE.exists():
         data = json.loads(STORE.read_text())
-        if "telegram" not in data:          # migrate older stores in place
-            data["telegram"] = _telegram_seed()
+        changed = False
+        if "telegram" not in data:           # migrate older stores in place
+            data["telegram"] = _telegram_seed(); changed = True
+        if "auth" not in data:
+            data["auth"] = _auth_seed(); changed = True
+        if changed:
             save(data)
         return data
     seed = {"endpoints": [{"name": "Local (llama.cpp)",
                            "base_url": "http://127.0.0.1:8081/v1", "api_key": ""}],
             "prefs": {"agent_mode": False},
-            "telegram": _telegram_seed()}
+            "telegram": _telegram_seed(),
+            "auth": _auth_seed()}
     save(seed)
     return seed
 
@@ -83,12 +105,112 @@ async def lifespan(_app):
         await _apply_telegram()      # start the bot if it's enabled + has a token
     except Exception:
         traceback.print_exc()        # never let a bad token block the web UI from booting
+    try:
+        mcp_client.start()           # connect configured MCP servers + register their tools
+    except Exception:
+        traceback.print_exc()
     yield
     await telegram_runtime.stop()
 
 
 app = FastAPI(title="Oceano", lifespan=lifespan)
 _sessions = {}  # session_id -> Agent
+_cancels = {}   # session_id -> threading.Event (set to abort an in-flight query)
+
+SESSION_COOKIE = "oceano_sess"
+SESSION_TTL = 30 * 24 * 3600        # 30 days
+# /api paths reachable without a session (everything else under /api is gated).
+_PUBLIC_API = {"/api/login", "/api/me"}
+
+
+def _make_token(user, secret):
+    msg = f"{user}:{int(time.time())}"
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}:{sig}".encode()).decode()
+
+
+def _token_user(token, auth):
+    """Return the username a cookie authenticates, or None if invalid/expired."""
+    try:
+        user, ts, sig = base64.urlsafe_b64decode(token.encode()).decode().rsplit(":", 2)
+        good = hmac.new(auth["secret"].encode(), f"{user}:{ts}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, good):
+            return None
+        if time.time() - int(ts) > SESSION_TTL:
+            return None
+        if user != auth.get("user"):          # username changed → old tokens die
+            return None
+        return user
+    except Exception:
+        return None
+
+
+def _current_user(request):
+    return _token_user(request.cookies.get(SESSION_COOKIE, ""), load().get("auth", {}))
+
+
+def _set_session_cookie(response, user, secret):
+    response.set_cookie(SESSION_COOKIE, _make_token(user, secret), httponly=True,
+                        samesite="lax", max_age=SESSION_TTL, path="/")
+
+
+@app.middleware("http")
+async def _require_auth(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in _PUBLIC_API:
+        if not _current_user(request):
+            return JSONResponse({"error": "authentication required"}, status_code=401)
+    return await call_next(request)
+
+
+# ---------------- auth ----------------
+@app.get("/api/me")
+def whoami(request: Request):
+    user = _current_user(request)
+    if not user:
+        raise HTTPException(401, "not authenticated")
+    return {"user": user}
+
+
+@app.post("/api/login")
+async def login(request: Request, response: Response):
+    body = await request.json()
+    auth = load().get("auth", {})
+    user = (body.get("user") or "").strip()
+    pw = body.get("password") or ""
+    ok = (user == auth.get("user")
+          and hmac.compare_digest(_hash_pw(pw, auth["salt"]), auth["pwhash"]))
+    if not ok:
+        raise HTTPException(401, "invalid username or password")
+    _set_session_cookie(response, user, auth["secret"])
+    return {"ok": True, "user": user}
+
+
+@app.post("/api/logout")
+def logout(response: Response):
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.post("/api/account")
+async def change_account(request: Request, response: Response):
+    """Change the username/password. Gated by the middleware; requires the current
+    password too, so a hijacked open tab can't silently rotate credentials."""
+    body = await request.json()
+    data = load()
+    auth = data["auth"]
+    if not hmac.compare_digest(_hash_pw(body.get("current_password") or "", auth["salt"]), auth["pwhash"]):
+        raise HTTPException(403, "current password is incorrect")
+    new_user = (body.get("user") or auth["user"]).strip() or auth["user"]
+    new_pw = body.get("new_password") or ""
+    if new_pw:
+        auth["salt"] = secrets.token_hex(16)
+        auth["pwhash"] = _hash_pw(new_pw, auth["salt"])
+    auth["user"] = new_user
+    data["auth"] = auth
+    save(data)
+    _set_session_cookie(response, new_user, auth["secret"])   # re-issue (username may have changed)
+    return {"ok": True, "user": new_user}
 
 
 def _agent(sid):
@@ -197,20 +319,150 @@ async def set_telegram(req: Request):
     return {"ok": "error" not in result, **result, "status": telegram_runtime.status()}
 
 
+def _embed_reachable():
+    try:                                        # embed server (:8082) reachable?
+        requests.get(embeddings.EMBED_URL.rstrip("/") + "/models", timeout=2)
+        return True
+    except requests.RequestException:
+        return False
+
+
 @app.get("/api/status")
 def system_status():
     """Live state of the consolidated daemons, for the Settings → Services panel."""
-    import time as _t
-    try:                                        # embed server (:8082) reachable?
-        from oceano.embeddings import EMBED_URL
-        requests.get(EMBED_URL.rstrip("/") + "/models", timeout=2)
-        embed_ok = True
-    except requests.RequestException:
-        embed_ok = False
     beat = scheduler.last_beat()
-    return {"embed": embed_ok,
-            "scheduler_beat_ago": (_t.time() - beat) if beat else None,
+    return {"embed": _embed_reachable(),
+            "scheduler_beat_ago": (time.time() - beat) if beat else None,
             "telegram": telegram_runtime.status()}
+
+
+# ---------------- agent tools (read-only list for Settings → Tools) ----------
+_TOOL_CATEGORY = {
+    "list_files": "workspace", "read_file": "workspace", "write_file": "workspace",
+    "edit_file": "workspace", "make_folder": "workspace", "run_shell": "workspace",
+    "python_exec": "workspace",
+    "web_search": "web", "fetch_url": "web",
+    "browser_open": "browser", "browser_screenshot": "browser",
+    "browser_click": "browser", "browser_scroll": "browser",
+    "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
+    "index_docs": "documents", "search_docs": "documents",
+    "list_skills": "skills", "load_skill": "skills",
+    "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
+}
+
+
+@app.get("/api/tools")
+def list_tools():
+    """Each agent tool with its verifiable capability surface — the parameters it
+    actually accepts (read straight from the registered JSON schema)."""
+    from oceano import tools
+    out = []
+    for s in tools.schemas():
+        fn = s["function"]
+        params = fn.get("parameters", {}) or {}
+        props = params.get("properties", {}) or {}
+        required = set(params.get("required", []))
+        name = fn["name"]
+        cat = "mcp" if name.startswith("mcp__") else _TOOL_CATEGORY.get(name, "other")
+        out.append({
+            "name": name,
+            "description": fn.get("description", ""),
+            "category": cat,
+            "params": [{"name": k, "type": v.get("type", "any"),
+                        "required": k in required, "description": v.get("description", "")}
+                       for k, v in props.items()],
+        })
+    return out
+
+
+@app.get("/api/mcp")
+def mcp_status():
+    return mcp_client.status()
+
+
+# ---------------- brain: embedding-engine stats + semantic search ------------
+@app.get("/api/brain/stats")
+def brain_stats():
+    docs = rag.stats()
+    return {"memories": memory.count(),
+            "docs": docs,
+            "embed": {"ok": _embed_reachable(), "model": embeddings.EMBED_MODEL,
+                      "url": embeddings.EMBED_URL, "dims": docs.get("dims")}}
+
+
+@app.post("/api/brain/search")
+async def brain_search(request: Request):
+    """Semantic search over memories or indexed docs (uses the embedding engine)."""
+    b = await request.json()
+    query = (b.get("query") or "").strip()
+    scope = b.get("scope", "memory")
+    if not query:
+        return {"results": []}
+    fn = memory.search if scope == "memory" else rag.search
+    return {"results": await asyncio.to_thread(fn, query)}   # cosine scan off the event loop
+
+
+@app.post("/api/brain/index")
+async def brain_index(request: Request):
+    """Index a folder of documents into the RAG store (embeds each chunk)."""
+    folder = ((await request.json()).get("folder") or "").strip()
+    if not folder:
+        return {"ok": False, "result": "no folder given"}
+    result = await asyncio.to_thread(rag.index_docs, folder)
+    return {"ok": not result.startswith(("ERROR", "(no such")), "result": result}
+
+
+# ---------------- rivers: HF model catalog → hwfit → download → serve -------
+@app.get("/api/rivers/hw")
+def rivers_hw():
+    return rivers.hw()
+
+
+@app.get("/api/rivers/recommended")
+def rivers_recommended():
+    return rivers.recommended()
+
+
+@app.get("/api/rivers/search")
+async def rivers_search(q: str = ""):
+    try:
+        return {"results": await asyncio.to_thread(rivers.search, q)}
+    except Exception as e:
+        return {"results": [], "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/rivers/files")
+async def rivers_files(repo: str):
+    try:
+        return await asyncio.to_thread(rivers.files, repo)
+    except Exception as e:
+        return {"files": [], "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/rivers/installed")
+def rivers_installed():
+    return {"models": rivers.installed()}
+
+
+@app.post("/api/rivers/download")
+async def rivers_download(request: Request):
+    b = await request.json()
+    try:
+        return rivers.start_download(b.get("repo", ""), b.get("filename", ""))
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/rivers/jobs")
+def rivers_jobs():
+    return {"jobs": rivers.jobs()}
+
+
+@app.post("/api/rivers/serve")
+async def rivers_serve(request: Request):
+    b = await request.json()
+    return rivers.serve(b.get("filename", ""), b.get("name"),
+                          b.get("ngl", 99), b.get("ctx", 8192))
 
 
 @app.get("/api/models")
@@ -252,16 +504,31 @@ async def chat(req: Request):
     q: asyncio.Queue = asyncio.Queue()
     put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)
 
+    cancel = threading.Event()      # set by /api/chat/stop OR a client disconnect
+    _cancels[sid] = cancel
+
     def worker():
+        stream = None
         try:
             stream = ag.run_stream(message) if agent_mode else ag.chat_stream(message)
             for ev in stream:
+                if cancel.is_set():
+                    break               # stop feeding — query was aborted
                 put(ev)
-            put({"type": "done"})
+            if not cancel.is_set():
+                put({"type": "done"})
         except Exception as ex:
             traceback.print_exc()   # so it actually lands in the journal, not just the UI
             put({"type": "error", "message": f"{type(ex).__name__}: {ex}"})
-        put(None)  # sentinel: stream finished
+        finally:
+            # closing the generator unwinds its try/finally → closes the upstream
+            # LLM HTTP stream, so the local model stops generating too.
+            if cancel.is_set() and hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            put(None)  # sentinel: stream finished
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -276,6 +543,9 @@ async def chat(req: Request):
                 if ev is None:
                     break
                 yield _sse(ev)
+        except (asyncio.CancelledError, GeneratorExit):
+            cancel.set()                # client went away (aborted/closed) → stop the agent
+            raise
         except Exception:
             # never let the response generator die silently — log it and try to
             # send a clean error frame so the client shows a real message.
@@ -284,9 +554,21 @@ async def chat(req: Request):
                 yield _sse({"type": "error", "message": "stream closed unexpectedly (see server logs)"})
             except Exception:
                 pass
+        finally:
+            _cancels.pop(sid, None)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@app.post("/api/chat/stop")
+async def chat_stop(request: Request):
+    """Abort the in-flight query for a session — the Stop button calls this."""
+    sid = (await request.json()).get("session", "default")
+    ev = _cancels.get(sid)
+    if ev:
+        ev.set()
+    return {"ok": bool(ev)}
 
 
 @app.delete("/api/session/{sid}")

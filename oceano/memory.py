@@ -96,3 +96,84 @@ def forget(mid):
     con.commit()
     con.close()
     return True
+
+
+def count():
+    """Number of stored memories (for the Brain stats panel)."""
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    con.close()
+    return n
+
+
+def search(query, k=8):
+    """Structured semantic search for the UI: [{id, ts, text, tags, score}], best first.
+    Semantic when the embed server is up; keyword fallback otherwise."""
+    con = _db()
+    rows = con.execute("SELECT id, ts, text, tags, embedding FROM memories").fetchall()
+    con.close()
+    if not rows:
+        return []
+    qvec = _embed(query)
+    if qvec:
+        scored = [(_cosine(qvec, json.loads(emb)) if emb else -1.0, rid, ts, text, tags)
+                  for rid, ts, text, tags, emb in rows]
+    else:
+        words = set(query.lower().split())
+        scored = [(float(sum(w in text.lower() for w in words)), rid, ts, text, tags)
+                  for rid, ts, text, tags, _ in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{"id": rid, "ts": ts, "text": text, "tags": tags, "score": round(max(s, 0.0), 3)}
+            for s, rid, ts, text, tags in scored[:k]]
+
+
+def add_if_new(text, tags="", threshold=0.86):
+    """Save a memory only if it isn't a near-duplicate of an existing one (semantic
+    when the embed server is up, exact-text otherwise). Used by auto-learning so
+    repeated facts don't pile up. Returns True if saved."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    vec = _embed(text)
+    con = _db()
+    rows = con.execute("SELECT text, embedding FROM memories").fetchall()
+    if vec:
+        for t, emb in rows:
+            if emb and _cosine(vec, json.loads(emb)) >= threshold:
+                con.close(); return False
+    else:
+        low = text.lower()
+        if any(t.strip().lower() == low for t, _ in rows):
+            con.close(); return False
+    con.execute("INSERT INTO memories (ts, text, tags, embedding) VALUES (?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(), text, tags, json.dumps(vec) if vec else None))
+    con.commit(); con.close()
+    return True
+
+
+def best_match(query):
+    """The single closest memory to `query`: {id, text, score}, or None if empty."""
+    con = _db()
+    rows = con.execute("SELECT id, text, embedding FROM memories").fetchall()
+    con.close()
+    if not rows:
+        return None
+    qv = _embed(query)
+    if qv:
+        scored = [(_cosine(qv, json.loads(e)) if e else -1.0, i, t) for i, t, e in rows]
+    else:
+        ql = set(query.lower().split())
+        scored = [(float(sum(w in t.lower() for w in ql)), i, t) for i, t, e in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    s, i, t = scored[0]
+    return {"id": i, "text": t, "score": round(max(s, 0.0), 3)}
+
+
+def update(mid, text):
+    """Replace a memory's text (re-embeds it). For agent self-correction."""
+    vec = _embed(text)
+    con = _db()
+    con.execute("UPDATE memories SET text=?, embedding=? WHERE id=?",
+                (text, json.dumps(vec) if vec else None, mid))
+    con.commit(); con.close()
+    return True

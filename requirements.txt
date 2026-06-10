@@ -7,3 +7,5 @@ croniter>=2.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-telegram-bot>=21
+# MCP client — connect Oceano to external tool servers (Settings/data/mcp.json)
+mcp>=1.0

@@ -16,10 +16,22 @@ WORKSPACE = Path(os.environ.get("OCEANO_WORKSPACE", Path(__file__).parent / "wor
 # --- Web search (your running SearXNG) ---
 SEARXNG_URL = os.environ.get("OCEANO_SEARXNG", "http://127.0.0.1:8080")
 
+# --- Local model serving (llama.cpp + llama-swap), used by the Rivers ---
+LLAMA_DIR = Path(os.environ.get("OCEANO_LLAMA_DIR", Path.home() / "llama.cpp"))
+MODELS_DIR = Path(os.environ.get("OCEANO_MODELS_DIR", LLAMA_DIR / "models"))
+LLAMA_SERVER_BIN = os.environ.get("OCEANO_LLAMA_SERVER_BIN", str(LLAMA_DIR / "build/bin/llama-server"))
+LLAMA_SWAP_CFG = Path(os.environ.get("OCEANO_LLAMA_SWAP_CFG", LLAMA_DIR / "llama-swap.yaml"))
+# Optional Hugging Face token — only needed to list/download gated repos.
+HF_TOKEN = os.environ.get("HF_TOKEN", "") or os.environ.get("OCEANO_HF_TOKEN", "")
+
 # --- Agent safety knobs ---
 MAX_STEPS   = int(os.environ.get("OCEANO_MAX_STEPS", "12"))   # tool-call loop cap per turn
 SHELL_TIMEOUT = int(os.environ.get("OCEANO_SHELL_TIMEOUT", "60"))
 CONFINE_TO_WORKSPACE = os.environ.get("OCEANO_CONFINE", "1") == "1"  # file ops stay inside workspace
+
+# After each turn, a background LLM pass extracts durable facts and saves new ones
+# (self-learning memory). Set OCEANO_AUTO_LEARN=0 to disable.
+AUTO_LEARN = os.environ.get("OCEANO_AUTO_LEARN", "1") == "1"
 
 # --- Telegram frontend ---
 # Token from @BotFather. ALLOWED = comma-separated Telegram user IDs that may use
