@@ -2,17 +2,18 @@
 
 ONE long-lived Chromium owned by a SINGLE worker thread (Playwright is thread-bound;
 the web server is multi-threaded, so every action funnels through this thread's
-command queue). It now holds several tabs (Playwright pages). The ACTIVE tab is
-screencast (CDP JPEG frames → LATEST); switching tabs moves the screencast.
+command queue). It holds several tabs (Playwright pages). The ACTIVE tab is streamed
+to LATEST as periodic JPEG screenshots (relayed by /api/browser/stream) — simple and
+reliable across tab switches (CDP screencast only fires on visual change, so switching
+to an already-loaded tab would leave the view stale).
 
-Research lifecycle (what the user asked for):
+Research lifecycle:
   • a web_search arms "research mode" and clears the previous research's tabs
   • each fetch_url / browser_open while armed opens the source in a NEW tab, and the
     view follows the newest one
   • manual navigation (address bar) reuses the active tab; a one-off open with no
     preceding search just navigates — tabs are left alone
 """
-import base64
 import queue
 import threading
 
@@ -38,49 +39,25 @@ def _worker():
     with sync_playwright() as p:
         br = p.chromium.launch(headless=True)
         ctx = br.new_context(viewport=VIEWPORT)
-        tabs = []                  # [{page, cdp, id, title, fresh}]
+        tabs = []                  # [{page, id, title, fresh}]
         st = {"active": 0, "seq": 0, "armed": False}
 
-        # ---- screencast: only the active tab streams to LATEST ----
-        def caster(tab):
-            def on_frame(params):
-                if tabs and 0 <= st["active"] < len(tabs) and tabs[st["active"]] is tab:
-                    try:
-                        LATEST["frame"] = base64.b64decode(params["data"]); LATEST["v"] += 1
-                        tab["cdp"].send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
-                    except Exception:
-                        pass
-            return on_frame
+        def cur():
+            return tabs[st["active"]]["page"] if tabs else None
 
-        def start_cast(tab):
+        def grab():               # screenshot the active tab → LATEST (one live frame)
+            pg = cur()
+            if pg is None:
+                return
             try:
-                tab["cdp"].send("Page.startScreencast", {"format": "jpeg", "quality": 50,
-                    "maxWidth": VIEWPORT["width"], "maxHeight": VIEWPORT["height"], "everyNthFrame": 1})
-            except Exception:
-                pass
-
-        def stop_cast(tab):
-            try:
-                tab["cdp"].send("Page.stopScreencast")
+                LATEST["frame"] = pg.screenshot(type="jpeg", quality=55, timeout=4000)
+                LATEST["v"] += 1
             except Exception:
                 pass
 
         def make_tab():
-            pg = ctx.new_page()
-            cdp = ctx.new_cdp_session(pg)
             st["seq"] += 1
-            tab = {"page": pg, "cdp": cdp, "id": st["seq"], "title": "new tab", "fresh": True}
-            cdp.on("Page.screencastFrame", caster(tab))
-            return tab
-
-        def set_active(i):
-            i = max(0, min(i, len(tabs) - 1))
-            for idx, t in enumerate(tabs):
-                if idx != i:
-                    stop_cast(t)
-            st["active"] = i
-            if tabs:
-                start_cast(tabs[i])
+            return {"page": ctx.new_page(), "id": st["seq"], "title": "new tab", "fresh": True}
 
         def refresh():
             out = []
@@ -91,9 +68,9 @@ def _worker():
                     u = ""
                 out.append({"id": t["id"], "title": t["title"], "url": u, "active": idx == st["active"]})
             LATEST["tabs"] = out
-            if tabs and 0 <= st["active"] < len(tabs):
+            if cur():
                 try:
-                    LATEST["url"] = tabs[st["active"]]["page"].url
+                    LATEST["url"] = cur().url
                 except Exception:
                     pass
 
@@ -102,32 +79,33 @@ def _worker():
                 tab["page"].goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
                 pass
-            tab["page"].wait_for_timeout(700)
+            tab["page"].wait_for_timeout(500)
             tab["fresh"] = False
             try:
                 tab["title"] = (tab["page"].title() or url)[:48]
             except Exception:
                 tab["title"] = url[:48]
 
-        def cur():
-            return tabs[st["active"]]["page"] if tabs else None
+        def clamp_active():
+            st["active"] = max(0, min(st["active"], len(tabs) - 1))
 
-        tabs.append(make_tab()); set_active(0); refresh()
+        tabs.append(make_tab()); refresh()
 
         while True:
             try:
                 cmd, arg, resp = _CMD.get(timeout=0.05)
             except queue.Empty:
-                try:
+                try:                       # idle: let the active page paint, then stream a frame
                     if cur():
-                        cur().wait_for_timeout(80)   # pump → frames keep flowing while idle
+                        cur().wait_for_timeout(150)
+                        grab()
                         LATEST["url"] = cur().url
                 except Exception:
                     pass
                 continue
             out = {"ok": True}
             try:
-                if cmd == "research_reset":          # a web_search → fresh research group
+                if cmd == "research_reset":            # a web_search → fresh research group
                     for t in tabs[1:]:
                         try: t["page"].close()
                         except Exception: pass
@@ -135,42 +113,41 @@ def _worker():
                     try: tabs[0]["page"].goto("about:blank")
                     except Exception: pass
                     tabs[0]["title"] = "new tab"; tabs[0]["fresh"] = True
-                    st["armed"] = True; set_active(0)
-                elif cmd == "open":                  # agent fetch/open a source
+                    st["active"] = 0; st["armed"] = True
+                elif cmd == "open":                    # agent fetch/open a source
                     if st["armed"]:
                         c = tabs[st["active"]]
                         if c.get("fresh"):
-                            nav(c, arg)              # fill the blank tab first
+                            nav(c, arg)                # fill the blank tab first
                         else:
                             if len(tabs) >= MAX_TABS:
-                                old = tabs.pop(0)
-                                try: old["page"].close()
+                                try: tabs.pop(0)["page"].close()
                                 except Exception: pass
-                            t = make_tab(); tabs.append(t); set_active(len(tabs) - 1); nav(t, arg)
+                                clamp_active()
+                            t = make_tab(); tabs.append(t); st["active"] = len(tabs) - 1; nav(t, arg)
                     else:
-                        nav(tabs[st["active"]], arg)  # not researching → single-page behavior
-                elif cmd == "navigate":              # manual address bar → reuse active tab
+                        nav(tabs[st["active"]], arg)   # not researching → single-page behavior
+                elif cmd == "navigate":                # manual address bar → reuse active tab
                     nav(tabs[st["active"]], arg)
                 elif cmd == "switch_tab":
                     for idx, t in enumerate(tabs):
                         if t["id"] == arg:
-                            set_active(idx); break
+                            st["active"] = idx; break
                 elif cmd == "close_tab":
                     if len(tabs) > 1:
                         for idx, t in enumerate(tabs):
                             if t["id"] == arg:
                                 try: t["page"].close()
                                 except Exception: pass
-                                tabs.pop(idx)
-                                set_active(min(st["active"], len(tabs) - 1)); break
+                                tabs.pop(idx); clamp_active(); break
                 elif cmd == "click":
-                    cur().mouse.click(arg[0], arg[1]); cur().wait_for_timeout(500)
+                    cur().mouse.click(arg[0], arg[1]); cur().wait_for_timeout(400)
                 elif cmd == "click_text":
                     try:
                         cur().click(f"text={arg}", timeout=5000)
                     except Exception:
                         cur().get_by_role("link", name=arg, exact=False).first.click(timeout=5000)
-                    cur().wait_for_timeout(700)
+                    cur().wait_for_timeout(600)
                 elif cmd == "scroll":
                     cur().mouse.wheel(0, arg); cur().wait_for_timeout(120)
                 elif cmd == "type":
@@ -181,6 +158,7 @@ def _worker():
                     out = {"ok": True, "text": cur().inner_text("body")[:6000]}
                 elif cmd == "screenshot":
                     cur().screenshot(path=arg, full_page=True)
+                grab()                                 # reflect the result immediately
                 if cur():
                     out["url"] = cur().url
                 refresh()
