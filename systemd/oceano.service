@@ -1,0 +1,36 @@
+[Unit]
+Description=Oceano — local AI agent engine (web UI + Telegram + scheduler + embeddings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/Oceano
+EnvironmentFile=-/home/user/Oceano/oceano.env
+# Web UI binds localhost only. The agent can run shell commands — reach it over an
+# SSH tunnel or Tailscale; do NOT bind 0.0.0.0 without adding auth.
+Environment=OCEANO_WEB_HOST=127.0.0.1
+Environment=OCEANO_WEB_PORT=8800
+Environment=PYTHONUNBUFFERED=1
+# One process owns it all: web UI, Telegram bot, scheduler loop, and the embedding
+# server (spawned as a child). Set OCEANO_EMBED_MANAGED=0 to run embed separately.
+ExecStart=/home/user/Oceano/venv/bin/python -m oceano.engine
+Restart=on-failure
+RestartSec=10
+
+# This agent runs shell commands BOTH internet-facing (web + telegram) and with no
+# human in the loop (scheduler). Even though 'user' has passwordless sudo, neuter
+# privilege escalation and make all of $HOME read-only except the dirs Oceano must
+# write — this confines even run_shell (e.g. blocks writes to ~/.ssh/authorized_keys).
+NoNewPrivileges=true
+ProtectHome=read-only
+ReadWritePaths=/home/user/Oceano/workspace /home/user/Oceano/data /home/user/Oceano/skills
+PrivateTmp=true
+# SIGTERM the engine first so it can shut the embed child down cleanly, then
+# SIGKILL anything still in the cgroup after the grace period.
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

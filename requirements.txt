@@ -1,0 +1,9 @@
+openai>=1.40
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+croniter>=2.0
+# web frontend (also hosts the Telegram bot — toggle it in Settings → Telegram)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-telegram-bot>=21

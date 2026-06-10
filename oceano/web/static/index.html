@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oceano</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/vendor/atom-one-dark.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="bg-abyss"></div>
+<div class="bg-contour"></div>
+<div class="bg-glow"></div>
+<div class="bg-grain"></div>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">≈</div>
+      <div class="brand-text"><h1>Oceano</h1><span>local agent · deep waters</span></div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-view="chat"><span class="ni">◈</span> Chat</button>
+      <button class="nav-item" data-view="files"><span class="ni">▤</span> Files</button>
+      <button class="nav-item" data-view="brain"><span class="ni">✶</span> Brain</button>
+      <button class="nav-item" data-view="scheduler"><span class="ni">⏱</span> Scheduler</button>
+    </nav>
+
+    <div class="chat-nav" id="chatNav">
+      <button class="new-voyage" id="newVoyage"><span class="nv-icon">⊹</span> New voyage</button>
+      <div class="sessions" id="sessions"></div>
+    </div>
+
+    <div class="sidebar-foot">
+      <button class="foot-btn" id="openSettings"><span>⚙</span> Settings</button>
+      <div class="status" id="status"><span class="dot" id="statusDot"></span><span id="statusText">sounding…</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn ghost" id="toggleSidebar" aria-label="menu">☰</button>
+      <div class="depth-readout" id="depthReadout">— · —</div>
+      <div class="topbar-right">
+        <button class="icon-btn" id="liveBtn" title="Live browser — watch Oceano browse">◫</button>
+        <label class="agent-switch" id="agentSwitch" title="Agent mode — give it tools and let it run">
+          <input type="checkbox" id="agentToggle">
+          <span class="track"><span class="thumb"></span></span>
+          <span class="agent-label">Agent</span>
+        </label>
+      </div>
+    </header>
+
+    <div class="views">
+      <!-- CHAT -->
+      <section class="view active" id="view-chat">
+        <div class="thread" id="thread"></div>
+        <div class="composer">
+          <div class="composer-inner">
+            <div class="composer-row">
+              <button class="model-pill" id="modelPill"><span class="mp-dot"></span><span id="modelLabel">select model</span><span class="mp-caret">▾</span></button>
+              <div class="model-menu" id="modelMenu"></div>
+            </div>
+            <textarea id="input" rows="1" placeholder="Send a transmission…"></textarea>
+            <div class="composer-actions">
+              <span class="hint">↵ send · ⇧↵ newline</span>
+              <button class="send" id="send" aria-label="send">
+                <span class="send-sonar"></span>
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3 11l18-8-8 18-2-7-8-3z"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FILES -->
+      <section class="view" id="view-files">
+        <div class="panel-head"><h2>Workspace</h2><div class="ph-actions"><button class="chip" id="fNew">+ New file</button><button class="chip" id="fNewDir">+ New folder</button><button class="chip" id="fRefresh">↻</button></div></div>
+        <div class="files-layout">
+          <div class="file-browser">
+            <div class="crumbs" id="crumbs"></div>
+            <div class="file-list" id="fileList"></div>
+          </div>
+          <div class="file-editor" id="fileEditor">
+            <div class="fe-empty" id="feEmpty">Select a file to view or edit.</div>
+            <div class="fe-open" id="feOpen" style="display:none">
+              <div class="fe-bar"><span class="fe-name" id="feName"></span><button class="primary sm" id="fSave">Save</button></div>
+              <textarea id="feText" spellcheck="false"></textarea>
+              <div class="fe-image" id="feImage" style="display:none"><img id="feImg" alt="preview"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SKILLS -->
+      <section class="view" id="view-skills">
+        <div class="panel-head"><h2>Skills</h2><div class="ph-actions"><button class="chip" id="skNew">+ New skill</button></div></div>
+        <div class="panel-body" id="skillsBody"></div>
+      </section>
+
+      <!-- MEMORY -->
+      <section class="view" id="view-memory">
+        <div class="panel-head"><h2>Memory</h2></div>
+        <div class="panel-body">
+          <div class="mem-add">
+            <input id="memText" placeholder="Teach Oceano a durable fact…">
+            <input id="memTags" placeholder="tags" class="mem-tags">
+            <button class="primary sm" id="memAdd">Remember</button>
+          </div>
+          <div class="mem-list" id="memList"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- skill editor modal -->
+<div class="modal-scrim" id="skModalScrim"></div>
+<div class="modal" id="skModal">
+  <div class="modal-head"><h2 id="skModalTitle">Skill</h2><button class="icon-btn ghost" id="skClose">✕</button></div>
+  <div class="modal-body">
+    <label>Name</label><input id="skName" placeholder="research-report">
+    <label>Description <span class="lbl-sub">when should the agent reach for this?</span></label>
+    <input id="skDesc" placeholder="how to produce a cited research report">
+    <label>Instructions</label><textarea id="skBody" spellcheck="false" placeholder="Step-by-step instructions the agent follows…"></textarea>
+  </div>
+  <div class="modal-foot"><button class="ghost-btn" id="skDelete">Delete</button><button class="primary" id="skSave">Save skill</button></div>
+</div>
+
+<!-- floating windows live here -->
+<div id="windows"></div>
+<!-- minimized windows dock (sits above the composer) -->
+<div id="winDock"></div>
+
+<!-- confirm dialog -->
+<div class="confirm-scrim" id="confirmScrim"></div>
+<div class="confirm" id="confirmBox" role="dialog">
+  <div class="confirm-ic">⚠</div>
+  <h3 id="confirmTitle">Delete?</h3>
+  <p id="confirmMsg"></p>
+  <div class="confirm-actions">
+    <button class="ghost-btn" id="confirmCancel">Cancel</button>
+    <button class="danger-btn" id="confirmOk">Delete</button>
+  </div>
+</div>
+
+<!-- settings drawer -->
+<div class="drawer-scrim" id="scrim"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head"><h2>Settings</h2><button class="icon-btn ghost" id="closeSettings">✕</button></div>
+  <div class="drawer-section">
+    <h3>Model endpoints</h3>
+    <p class="sub">Add a provider, paste a key, and its models appear in the composer.</p>
+    <div class="endpoints" id="endpoints"></div>
+    <div class="add-endpoint">
+      <select id="providerSelect"></select>
+      <input id="epName" placeholder="label (optional)">
+      <input id="epKey" type="password" placeholder="API key" autocomplete="off">
+      <button class="primary" id="addEndpoint">Add</button>
+    </div>
+  </div>
+  <div class="drawer-section">
+    <div class="sec-head">
+      <h3>Telegram</h3>
+      <label class="agent-switch sm" title="Run the Telegram bot inside this daemon">
+        <input type="checkbox" id="tgEnabled">
+        <span class="track"><span class="thumb"></span></span>
+      </label>
+    </div>
+    <p class="sub">Chat with Oceano from your phone. Runs in this web process — no separate service. <span id="tgStatus" class="tg-status">…</span></p>
+    <label class="field-label">Bot token <span class="lbl-sub">from @BotFather</span></label>
+    <input id="tgToken" type="password" autocomplete="off" placeholder="paste to set / change">
+    <label class="field-label">Allowed user IDs <span class="lbl-sub">comma-separated · the agent can run shell, so keep this tight</span></label>
+    <input id="tgAllowed" placeholder="e.g. 123456789, 987654321">
+    <div class="tg-actions">
+      <button class="ghost-btn sm" id="tgClearToken">Clear token</button>
+      <button class="primary" id="tgSave">Save &amp; apply</button>
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <h3>Services</h3>
+    <p class="sub">Everything Oceano runs on this box.</p>
+    <div class="svc-list" id="svcList"></div>
+  </div>
+
+  <div class="drawer-section">
+    <h3>About</h3>
+    <p class="sub">Oceano · self-hosted · everything runs on your box. The agent writes only inside its workspace; the web UI is bound to localhost.</p>
+  </div>
+</aside>
+
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/highlight.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

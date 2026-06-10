@@ -1,0 +1,28 @@
+# --- secrets & runtime config (NEVER commit) ---
+oceano.env
+.env
+
+# --- runtime data: dbs, heartbeat, persisted web config (holds the bot token) ---
+data/*
+!data/.gitkeep
+
+# --- agent workspace: screenshots, notes, scratch files ---
+workspace/*
+!workspace/.gitkeep
+
+# --- logs ---
+*.log
+logs-*.txt
+
+# --- python ---
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- editor / OS / tooling ---
+.claude/
+.vscode/
+.idea/
+.DS_Store
