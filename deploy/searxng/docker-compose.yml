@@ -1,0 +1,12 @@
+# Bundled SearXNG for Oceano — the web_search / fetch_url backend on :8080.
+# Brought up by scripts/install.sh when :8080 isn't already served (so a fresh
+# box gets search without depending on any other project's compose).
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: oceano-searxng
+    ports:
+      - "127.0.0.1:8080:8080"      # localhost only — same posture as the rest of the stack
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml
+    restart: unless-stopped

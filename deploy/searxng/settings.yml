@@ -1,0 +1,16 @@
+# Minimal SearXNG settings for Oceano. Merges over the image defaults
+# (use_default_settings) — we only override what Oceano needs:
+#   • the JSON output format (web_search / fetch_url parse ?format=json)
+#   • a secret_key (scripts/install.sh replaces REPLACE_ME with a random value)
+use_default_settings: true
+
+server:
+  secret_key: "REPLACE_ME"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false                 # local, single-user — no bot rate-limiting needed
+
+search:
+  formats:
+    - html
+    - json

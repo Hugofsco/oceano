@@ -1,0 +1,15 @@
+[Unit]
+Description=Oceano llama-swap — chat model server on :8081 (one model resident at a time)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+# scripts/install.sh templates User= and the paths below to the real user / LLAMA_DIR.
+ExecStart=/usr/local/bin/llama-swap -config /home/user/llama.cpp/llama-swap.yaml -listen 127.0.0.1:8081 -watch-config
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
