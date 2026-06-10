@@ -836,6 +836,7 @@ function openLiveView() {
   if (reused) return;
   body.innerHTML = `
     <div class="live-addr"><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button></div>
+    <div class="live-tabs" id="liveTabs" style="display:none"></div>
     <div class="live-url" id="liveUrl">idle — type a URL, click into the page, or let the agent browse</div>
     <div class="live-stage" id="liveStage" tabindex="0"><span class="live-wait" id="liveWait">No frames yet. Enter a URL above, click into the page, or ask the agent to browse.</span><img id="liveImg" alt="live" draggable="false" style="display:none"></div>`;
   const post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
@@ -854,10 +855,25 @@ function openLiveView() {
   _liveES = new EventSource("/api/browser/stream");
   _liveES.onmessage = e => {
     let d; try { d = JSON.parse(e.data); } catch { return; }
-    if (img) { img.src = d.frame; img.style.display = "block"; }
-    const w = $("#liveWait", body); if (w) w.style.display = "none";
-    const u = $("#liveUrl", body); if (u) { u.textContent = d.url || "browsing…"; u.classList.add("on"); }
+    if (d.frame && img) { img.src = d.frame; img.style.display = "block"; const w = $("#liveWait", body); if (w) w.style.display = "none"; }
+    const u = $("#liveUrl", body); if (u && d.url) { u.textContent = d.url || "browsing…"; u.classList.add("on"); }
+    if (d.tabs) renderLiveTabs(d.tabs);
   };
+}
+const _post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+function renderLiveTabs(tabs) {
+  const bar = $("#liveTabs"); if (!bar) return;
+  if (!tabs || tabs.length <= 1) { bar.style.display = "none"; bar.innerHTML = ""; return; }
+  bar.style.display = "flex";
+  bar.innerHTML = "";
+  tabs.forEach(t => {
+    const el = document.createElement("div"); el.className = "live-tab" + (t.active ? " active" : "");
+    el.title = t.url || "";
+    el.innerHTML = `<span class="lt-title">${escapeHtml(t.title || t.url || "tab")}</span><button class="lt-close" title="close tab">✕</button>`;
+    el.onclick = e => { if (e.target.closest(".lt-close")) return; _post("/api/browser/tab", { id: t.id }); };
+    $(".lt-close", el).onclick = e => { e.stopPropagation(); _post("/api/browser/tab/close", { id: t.id }); };
+    bar.appendChild(el);
+  });
 }
 
 /* ---------- Explorer window ---------- */

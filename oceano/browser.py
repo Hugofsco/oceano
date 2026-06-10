@@ -12,11 +12,13 @@ LATEST = livebrowser.LATEST          # shared frame buffer (mutated in place by 
 
 
 def open_url(url):
-    """Navigate the shared browser and return the rendered text."""
+    """Open a URL in the shared browser and return the rendered text. While the
+    agent is researching (after a web_search) this lands in a NEW tab; otherwise it
+    reuses the active tab."""
     refusal = safety.check_url(url)
     if refusal:
         return refusal
-    return livebrowser.navigate(url, read=True)
+    return livebrowser.open(url, read=True)
 
 
 def screenshot(url, name="screenshot.png"):

@@ -681,6 +681,13 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .exp-empty{color:var(--faint);font-size:13px;text-align:center;padding:30px}
 
 /* drivable live browser address bar */
+.live-tabs{display:flex;gap:4px;padding:6px 10px 0;flex-wrap:wrap;max-height:62px;overflow-y:auto;background:rgba(4,17,26,.4)}
+.live-tab{display:flex;align-items:center;gap:6px;max-width:170px;padding:4px 9px;border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;background:rgba(4,17,26,.5);cursor:pointer;font-family:var(--font-body);font-size:11.5px;color:var(--mist);transition:.15s}
+.live-tab:hover{color:var(--foam);border-color:var(--line-strong)}
+.live-tab.active{background:rgba(55,227,198,.12);color:var(--biolum);border-color:var(--line-strong)}
+.live-tab .lt-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.live-tab .lt-close{background:none;border:none;color:var(--faint);cursor:pointer;font-size:10px;padding:0 1px;flex:none}
+.live-tab .lt-close:hover{color:var(--coral)}
 .live-addr{display:flex;gap:7px;padding:8px 10px;border-bottom:1px solid var(--line);background:rgba(4,17,26,.4)}
 .live-addr input{flex:1;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;padding:7px 11px;outline:none}
 .live-addr input:focus{border-color:var(--biolum)}

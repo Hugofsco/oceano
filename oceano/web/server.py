@@ -754,6 +754,18 @@ async def browser_key_ep(req: Request):
     return {"ok": True}
 
 
+@app.post("/api/browser/tab")
+async def browser_tab_switch(req: Request):
+    livebrowser.submit("switch_tab", (await req.json()).get("id"))
+    return {"ok": True}
+
+
+@app.post("/api/browser/tab/close")
+async def browser_tab_close(req: Request):
+    livebrowser.submit("close_tab", (await req.json()).get("id"))
+    return {"ok": True}
+
+
 # ---------------- scheduler ----------------
 @app.get("/api/scheduler")
 def get_scheduler():
@@ -786,13 +798,18 @@ def delete_task_api(tid: int):
 async def browser_stream():
     """Live JPEG frames of the agent's headless browser (the 'what Oceano sees' window)."""
     async def gen():
-        last_v, idle = -1, 0
+        last_v, last_tabs, idle = -1, None, 0
         while True:
-            v = livebrowser.LATEST["v"]
-            if v != last_v and livebrowser.LATEST["frame"]:
-                last_v, idle = v, 0
-                b64 = base64.b64encode(livebrowser.LATEST["frame"]).decode()
-                yield _sse({"url": livebrowser.LATEST["url"], "frame": "data:image/jpeg;base64," + b64})
+            L = livebrowser.LATEST
+            v, tabs = L["v"], L.get("tabs", [])
+            tabs_sig = json.dumps([[t["id"], t["url"], t["active"], t["title"]] for t in tabs])
+            if v != last_v and L["frame"]:
+                last_v, last_tabs, idle = v, tabs_sig, 0
+                b64 = base64.b64encode(L["frame"]).decode()
+                yield _sse({"url": L["url"], "frame": "data:image/jpeg;base64," + b64, "tabs": tabs})
+            elif tabs_sig != last_tabs:
+                last_tabs, idle = tabs_sig, 0    # tabs changed without a new frame → push the tab bar
+                yield _sse({"url": L["url"], "tabs": tabs})
             else:
                 idle += 1
                 if idle >= 50:          # ~5s keepalive when idle

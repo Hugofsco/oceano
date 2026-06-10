@@ -204,6 +204,7 @@ def run_shell(command):
     },
 })
 def web_search(query):
+    livebrowser.start_research()      # fresh research tab-group; results open as tabs via fetch_url
     r = requests.get(
         f"{config.SEARXNG_URL}/search",
         params={"q": query, "format": "json"},
