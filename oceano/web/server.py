@@ -70,6 +70,16 @@ def _auth_seed():
             "secret": secrets.token_hex(32)}
 
 
+def _is_default_pw(auth):
+    """True while the password is still the shipped default ('admin'). Stateless — the
+    UI uses it to force a password change before letting the user in. Self-clears the
+    moment the password is changed to anything else."""
+    try:
+        return hmac.compare_digest(_hash_pw("admin", auth.get("salt", "")), auth.get("pwhash", ""))
+    except Exception:
+        return False
+
+
 def load():
     if STORE.exists():
         data = json.loads(STORE.read_text())
@@ -182,7 +192,7 @@ def whoami(request: Request):
     user = _current_user(request)
     if not user:
         raise HTTPException(401, "not authenticated")
-    return {"user": user}
+    return {"user": user, "must_change": _is_default_pw(load().get("auth", {}))}
 
 
 @app.post("/api/login")
@@ -196,7 +206,7 @@ async def login(request: Request, response: Response):
     if not ok:
         raise HTTPException(401, "invalid username or password")
     _set_session_cookie(response, user, auth["secret"])
-    return {"ok": True, "user": user}
+    return {"ok": True, "user": user, "must_change": _is_default_pw(auth)}
 
 
 @app.post("/api/logout")
@@ -216,6 +226,8 @@ async def change_account(request: Request, response: Response):
         raise HTTPException(403, "current password is incorrect")
     new_user = (body.get("user") or auth["user"]).strip() or auth["user"]
     new_pw = body.get("new_password") or ""
+    if new_pw.strip().lower() == "admin":          # don't let the forced change loop back to the default
+        raise HTTPException(400, "choose a password other than the default 'admin'")
     if new_pw:
         auth["salt"] = secrets.token_hex(16)
         auth["pwhash"] = _hash_pw(new_pw, auth["salt"])

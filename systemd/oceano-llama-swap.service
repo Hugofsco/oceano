@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=user
-# scripts/install.sh templates User= and the paths below to the real user / LLAMA_DIR.
-ExecStart=/usr/local/bin/llama-swap -config /home/user/llama.cpp/llama-swap.yaml -listen 127.0.0.1:8081 -watch-config
+User=__OCEANO_USER__
+# scripts/install.sh templates the __OCEANO_USER__ / __LLAMA_DIR__ tokens and the
+# llama-swap binary path to the real user / LLAMA_DIR / installed binary.
+ExecStart=/usr/local/bin/llama-swap -config __LLAMA_DIR__/llama-swap.yaml -listen 127.0.0.1:8081 -watch-config
 Restart=on-failure
 RestartSec=5
 

@@ -189,6 +189,21 @@
   </form>
 </div>
 
+<!-- forced password change (shown on first login while the password is still the default) -->
+<div class="login-gate" id="pwGate" style="display:none">
+  <form class="login-card" id="pwForm">
+    <div class="login-orb"></div>
+    <h2>Set a password</h2>
+    <p class="login-sub">You're on the default password. Choose a new one to continue.</p>
+    <input id="pwCurrent" type="password" placeholder="current password" autocomplete="current-password">
+    <input id="pwNew" type="password" placeholder="new password" autocomplete="new-password">
+    <input id="pwConfirm" type="password" placeholder="confirm new password" autocomplete="new-password">
+    <div class="login-err" id="pwErr"></div>
+    <button class="primary" type="submit" id="pwBtn">Set password</button>
+    <div class="login-hint">required · the agent can run shell commands — protect it</div>
+  </form>
+</div>
+
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>

@@ -254,8 +254,8 @@ install_llama_swap() {
   # 3. durable systemd unit (templated). Start only if :8081 is free.
   local src="$ROOT/systemd/oceano-llama-swap.service" dst=/etc/systemd/system/oceano-llama-swap.service
   if [ -x "$LLAMA_SWAP_BIN" ] && [ -f "$src" ]; then
-    sed -e "s#/home/user/llama.cpp#$LLAMA_DIR#g" -e "s#/usr/local/bin/llama-swap#$LLAMA_SWAP_BIN#g" \
-        -e "s#^User=user#User=$(id -un)#" "$src" | sudo tee "$dst" >/dev/null
+    sed -e "s#__LLAMA_DIR__#$LLAMA_DIR#g" -e "s#/usr/local/bin/llama-swap#$LLAMA_SWAP_BIN#g" \
+        -e "s#^User=__OCEANO_USER__#User=$(id -un)#" "$src" | sudo tee "$dst" >/dev/null
     sudo systemctl daemon-reload
     if port_up 8081 "/v1/models"; then
       sudo systemctl enable oceano-llama-swap >/dev/null 2>&1 || true
@@ -275,9 +275,9 @@ install_service() {
   say "oceano.service (engine: web + telegram + scheduler + embeddings)"
   local src="$ROOT/systemd/oceano.service" dst=/etc/systemd/system/oceano.service
   [ -f "$src" ] || die "missing $src"
-  # Template the unit to THIS install: user + every /home/user/Oceano path (venv,
-  # ExecStart, EnvironmentFile, ReadWritePaths) → the real user / $ROOT.
-  local rendered; rendered=$(sed -e "s#/home/user/Oceano#$ROOT#g" -e "s#^User=user#User=$(id -un)#" "$src")
+  # Template the unit to THIS install: the __OCEANO_USER__ / __OCEANO_ROOT__ tokens
+  # (venv, ExecStart, EnvironmentFile, ReadWritePaths) → the real user / $ROOT.
+  local rendered; rendered=$(sed -e "s#__OCEANO_ROOT__#$ROOT#g" -e "s#^User=__OCEANO_USER__#User=$(id -un)#" "$src")
   if [ -f "$dst" ] && [ "$rendered" = "$(cat "$dst" 2>/dev/null)" ]; then ok "unit already installed + current"
   else
     warn "installing $dst (user=$(id -un), root=$ROOT)"

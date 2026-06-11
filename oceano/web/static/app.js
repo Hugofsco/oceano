@@ -2093,16 +2093,48 @@ function showLogin() {
       e.preventDefault();
       const btn = $("#loginBtn"), err = $("#loginErr");
       btn.disabled = true; err.textContent = "";
+      const pw = $("#loginPass").value;
       try {
-        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user: $("#loginUser").value, password: $("#loginPass").value }) });
+        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user: $("#loginUser").value, password: pw }) });
         if (!r.ok) { err.textContent = "Invalid username or password."; $("#loginPass").value = ""; $("#loginPass").focus(); return; }
+        const d = await r.json().catch(() => ({}));
         gate.style.display = "none";
+        if (d.must_change) { showPwChange(pw); return; }   // first login on the default password
         initApp();
       } catch { err.textContent = "Could not reach the server."; }
       finally { btn.disabled = false; }
     });
   }
   setTimeout(() => { const p = $("#loginPass"); if (p && !p.value) p.focus(); }, 60);
+}
+function showPwChange(currentPw) {
+  const lg = $("#loginGate"); if (lg) lg.style.display = "none";
+  const gate = $("#pwGate"); if (!gate) return;
+  gate.style.display = "grid";
+  if (currentPw) $("#pwCurrent").value = currentPw;
+  const form = $("#pwForm");
+  if (form && !form.dataset.wired) {
+    form.dataset.wired = "1";
+    form.addEventListener("submit", async e => {
+      e.preventDefault();
+      const btn = $("#pwBtn"), err = $("#pwErr");
+      const cur = $("#pwCurrent").value, np = $("#pwNew").value, cf = $("#pwConfirm").value;
+      err.textContent = "";
+      if (!np || np.length < 4) { err.textContent = "Use at least 4 characters."; return; }
+      if (np !== cf) { err.textContent = "The two new passwords don't match."; return; }
+      if (np.trim().toLowerCase() === "admin") { err.textContent = "Choose something other than the default."; return; }
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/account", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ current_password: cur, new_password: np }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { err.textContent = d.detail || "Could not set the password."; $("#pwCurrent").focus(); return; }
+        gate.style.display = "none";
+        initApp();
+      } catch { err.textContent = "Could not reach the server."; }
+      finally { btn.disabled = false; }
+    });
+  }
+  setTimeout(() => { const f = $(currentPw ? "#pwNew" : "#pwCurrent"); if (f) f.focus(); }, 60);
 }
 function initApp() {
   if (_appStarted) return;        // idempotent — survives a mid-session re-login
@@ -2121,6 +2153,8 @@ async function boot() {
   try {
     const r = await fetch("/api/me");
     if (r.status === 401) { showLogin(); return; }
+    const me = await r.json().catch(() => ({}));
+    if (me.must_change) { showPwChange(); return; }   // already authed but still on the default pw
   } catch { /* server unreachable — fall through and let the UI surface errors */ }
   initApp();
 }
