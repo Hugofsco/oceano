@@ -1655,17 +1655,40 @@ function riverRenderInstalled() {
     (m.served ? `<span class="served">▶ ${escapeHtml(m.served)}</span>`
               : `<button class="btn-mini cserve" data-f="${escapeHtml(m.filename)}" data-sz="${m.size}">Serve</button>`) +
     `</div>`).join("");
-  $$(".cserve", box).forEach(b => b.onclick = () => riverServe(b.dataset.f, +b.dataset.sz, b));
+  $$(".cserve", box).forEach(b => b.onclick = () => riverServeDialog(b.dataset.f, +b.dataset.sz));
 }
-async function riverServe(filename, size, btn) {
-  btn.disabled = true; btn.textContent = "…";
+function riverServeDialog(filename, size) {
   const fitc = fitClient(size);
-  const name = filename.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-  let r; try { r = await api("/api/rivers/serve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename, name, ngl: fitc.ngl, ctx: 8192 }) }); } catch { return; }
-  const n = $("#riverNote");
-  if (!r.ok) { btn.disabled = false; btn.textContent = "Serve"; if (n) { n.textContent = r.error; n.className = "river-note err"; } return; }
-  if (n) { n.textContent = `✓ serving as "${r.name}" (ngl ${r.ngl}, ctx ${r.ctx}) — now on :8081 + the model picker`; n.className = "river-note ok"; }
-  riverLoadInstalled(); loadModels();
+  const defName = filename.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  const { body } = createWindow({ id: "win-serve", title: "Serve model — parameters", icon: "🌊", width: 470, height: 440 });
+  body.classList.add("set-win");
+  body.innerHTML = `<div class="drawer-section">
+    <h3>Serve <code>${escapeHtml(filename)}</code></h3>
+    <label class="field-label">Name <span class="lbl-sub">how it shows in the model picker</span></label>
+    <input id="svName" value="${escapeHtml(defName)}" autocomplete="off">
+    <div class="serve-grid">
+      <div><label class="field-label">Context (tokens)</label><input id="svCtx" type="number" value="8192" min="256" step="1024"></div>
+      <div><label class="field-label">GPU layers (ngl)</label><input id="svNgl" type="number" value="${fitc.ngl}" min="0" max="999"></div>
+      <div><label class="field-label">KV cache</label><select id="svKv"><option value="f16">f16 (fastest)</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0 (smallest)</option></select></div>
+      <div><label class="field-label">TTL (sec resident)</label><input id="svTtl" type="number" value="600" min="0"></div>
+    </div>
+    <label class="serve-fa"><input type="checkbox" id="svFa" checked> Flash attention (<code>-fa</code>)</label>
+    <div class="serve-hint">Bigger context needs more VRAM — the KV cache grows with it. On AMD/Vulkan, <b>f16</b> KV is usually fastest; quantize KV only if a huge context won't otherwise fit.</div>
+    <div class="acct-actions"><span class="acct-msg" id="svMsg"></span><button class="primary sm" id="svGo">Serve</button></div>
+  </div>`;
+  $("#svGo", body).onclick = async () => {
+    const msg = $("#svMsg", body), go = $("#svGo", body); go.disabled = true;
+    const payload = { filename, name: $("#svName", body).value.trim(), ctx: +$("#svCtx", body).value,
+      ngl: +$("#svNgl", body).value, kv: $("#svKv", body).value, fa: $("#svFa", body).checked, ttl: +$("#svTtl", body).value };
+    let r; try { r = await api("/api/rivers/serve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); }
+    catch { go.disabled = false; msg.textContent = "request failed"; msg.className = "acct-msg err"; return; }
+    if (!r.ok) { msg.textContent = r.error; msg.className = "acct-msg err"; go.disabled = false; return; }
+    msg.textContent = `✓ serving as "${r.name}"`; msg.className = "acct-msg ok";
+    const note = $("#riverNote"); if (note) { note.textContent = `✓ "${r.name}" — ngl ${r.ngl} · ctx ${r.ctx} · KV ${r.kv} · fa ${r.fa ? "on" : "off"} · on :8081 + the picker`; note.className = "river-note ok"; }
+    riverLoadInstalled(); loadModels();
+    setTimeout(() => { const w = document.getElementById("win-serve"); if (w) w.remove(); }, 800);
+  };
+  setTimeout(() => { const e = $("#svName", body); if (e) e.focus(); }, 40);
 }
 
 /* ---------- Scheduler window (heartbeat + tasks) ---------- */

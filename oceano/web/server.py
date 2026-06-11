@@ -489,7 +489,8 @@ def rivers_jobs():
 async def rivers_serve(request: Request):
     b = await request.json()
     return rivers.serve(b.get("filename", ""), b.get("name"),
-                          b.get("ngl", 99), b.get("ctx", 8192))
+                          b.get("ngl", 99), b.get("ctx", 8192),
+                          fa=b.get("fa", True), kv=b.get("kv", "f16"), ttl=b.get("ttl", 600))
 
 
 def list_models():

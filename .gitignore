@@ -31,3 +31,7 @@ __pycache__/
 #     (GitHub rejects files >100MB; the whisper model alone is ~139MB). See assets/README.md.
 assets/*
 !assets/README.md
+
+# --- llama.cpp now lives under the Oceano dir (build tree + GGUF models, ~tens of GB);
+#     never commit it — GitHub caps files at 100MB and these are machine-built binaries.
+llama.cpp/

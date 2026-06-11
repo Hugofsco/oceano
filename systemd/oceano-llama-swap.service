@@ -8,6 +8,9 @@ Type=simple
 User=__OCEANO_USER__
 # scripts/install.sh templates the __OCEANO_USER__ / __LLAMA_DIR__ tokens and the
 # llama-swap binary path to the real user / LLAMA_DIR / installed binary.
+# llama.cpp's shared libs sit next to llama-server; expose them so a relocated build
+# (RUNPATH baked at build time) still resolves them — children inherit this.
+Environment=LD_LIBRARY_PATH=__LLAMA_DIR__/build/bin
 ExecStart=/usr/local/bin/llama-swap -config __LLAMA_DIR__/llama-swap.yaml -listen 127.0.0.1:8081 -watch-config
 Restart=on-failure
 RestartSec=5

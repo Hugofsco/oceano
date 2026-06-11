@@ -299,12 +299,21 @@ def _cmd_uses(filename):
     return None
 
 
-def serve(filename, name=None, ngl=99, ctx=8192):
+_KV_TYPES = ("f16", "q8_0", "q4_0")     # KV-cache dtype the GUI may pick
+
+
+def serve(filename, name=None, ngl=99, ctx=8192, fa=True, kv="f16", ttl=600):
     """Append a model block to llama-swap.yaml (comment-preserving: we append text
     rather than re-dump). llama-swap's -watch-config hot-reloads it.
 
+    Serving params (all settable from the GUI):
+      ngl  GPU layers (0 = CPU)         ctx  context window (tokens)
+      fa   flash attention on/off       kv   KV-cache dtype: f16 | q8_0 | q4_0
+      ttl  seconds llama-swap keeps the model resident after last use
+
     `filename` and `name` end up inside a shell-executed `cmd`, so both are strictly
-    validated — only [A-Za-z0-9._-] survives, which can't break YAML or inject shell."""
+    validated — only [A-Za-z0-9._-] survives, which can't break YAML or inject shell.
+    The numeric/enum params are clamped/allowlisted, so they're shell-safe too."""
     base = Path(filename or "").name
     if not _safe_gguf(base):
         return {"ok": False, "error": "invalid filename — must be a plain .gguf name"}
@@ -329,19 +338,25 @@ def serve(filename, name=None, ngl=99, ctx=8192):
         return {"ok": False, "error": "this file is already served by llama-swap"}
 
     try:
-        ngl = int(ngl); ctx = int(ctx)
+        ngl = int(ngl); ctx = int(ctx); ttl = int(ttl)
     except (TypeError, ValueError):
-        ngl, ctx = 99, 8192
-    ngl = max(0, min(ngl, 999)); ctx = max(256, min(ctx, 1_048_576))   # clamp to sane ranges
+        ngl, ctx, ttl = 99, 8192, 600
+    ngl = max(0, min(ngl, 999)); ctx = max(256, min(ctx, 1_048_576)); ttl = max(0, min(ttl, 86400))
+    kv = kv if kv in _KV_TYPES else "f16"          # allowlist → shell-safe
+    # build the flag string from the chosen params (only allowlisted/clamped values)
+    flags = f"-ngl {ngl} -fa {'1' if fa else '0'} --parallel 1 -c {ctx}"
+    if kv != "f16":                                 # f16 is llama.cpp's default; only emit when quantized
+        flags += f" -ctk {kv} -ctv {kv}"
+    flags += " --jinja"
 
     block = (
         f'\n  "{name}":\n'
         f'    cmd: |\n'
         f'      {config.LLAMA_SERVER_BIN}\n'
         f'      -m {path}\n'
-        f'      -ngl {ngl} -fa 1 --parallel 1 -c {ctx} --jinja\n'
+        f'      {flags}\n'
         f'      --host 127.0.0.1 --port ${{PORT}}\n'
-        f'    ttl: 600\n'
+        f'    ttl: {ttl}\n'
     )
     original = cfg.read_text()
     if "models:" not in original:
@@ -355,4 +370,4 @@ def serve(filename, name=None, ngl=99, ctx=8192):
     except (yaml.YAMLError, ValueError) as e:
         return {"ok": False, "error": f"refused to write — would corrupt config: {e}"}
     cfg.write_text(updated)
-    return {"ok": True, "name": name, "ngl": ngl, "ctx": ctx}
+    return {"ok": True, "name": name, "ngl": ngl, "ctx": ctx, "fa": fa, "kv": kv, "ttl": ttl}

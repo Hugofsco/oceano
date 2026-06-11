@@ -2,11 +2,22 @@
 # Dedicated llama.cpp embedding server for Oceano's memory.
 # Tiny model, CPU-only (-ngl 0) so it never touches the 8GB GPU or evicts the
 # chat model in llama-swap. Listens on :8082, separate from llama-swap (:8081).
+#
+# Paths come from config.py (so this follows OCEANO_LLAMA_DIR / the install layout
+# and survives relocating llama.cpp — no hardcoded home paths).
 set -euo pipefail
 
-LLAMA_BIN=/home/user/llama.cpp/build/bin/llama-server
-MODEL=/home/user/llama.cpp/models/nomic-embed-text-v1.5.Q8_0.gguf
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+eval "$("$ROOT/venv/bin/python" - <<'PY'
+import shlex, config
+print("LLAMA_BIN=" + shlex.quote(str(config.LLAMA_SERVER_BIN)))
+print("MODEL=" + shlex.quote(str(config.EMBED_MODEL)))
+PY
+)"
 
+if [[ ! -x "$LLAMA_BIN" ]]; then
+  echo "llama-server not found/executable: $LLAMA_BIN (build llama.cpp first)"; exit 1
+fi
 if [[ ! -f "$MODEL" ]]; then
   echo "Embedding model not found: $MODEL"
   echo "Download it (~140 MB) with:"
@@ -14,6 +25,10 @@ if [[ ! -f "$MODEL" ]]; then
   echo "    https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
   exit 1
 fi
+
+# llama.cpp's shared libs sit next to the binary; point the linker at them so a
+# relocated build (its RUNPATH is baked at build time) still resolves them.
+export LD_LIBRARY_PATH="$(dirname "$LLAMA_BIN")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "$LLAMA_BIN" \
   -m "$MODEL" \
