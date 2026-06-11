@@ -8,6 +8,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/vendor/atom-one-dark.min.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/codemirror.min.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/material-darker.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/addon/dialog/dialog.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -28,6 +31,8 @@
       <button class="nav-item" data-view="files"><span class="ni">▤</span> Files</button>
       <button class="nav-item" data-view="brain"><span class="ni">✶</span> Brain</button>
       <button class="nav-item" data-view="scheduler"><span class="ni">⏱</span> Scheduler</button>
+      <button class="nav-item" data-view="calendar"><span class="ni">◷</span> Calendar</button>
+      <button class="nav-item" data-view="researcher"><span class="ni">⌖</span> Researcher</button>
     </nav>
 
     <div class="chat-nav" id="chatNav">
@@ -90,8 +95,18 @@
           <div class="file-editor" id="fileEditor">
             <div class="fe-empty" id="feEmpty">Select a file to view or edit.</div>
             <div class="fe-open" id="feOpen" style="display:none">
-              <div class="fe-bar"><span class="fe-name" id="feName"></span><button class="primary sm" id="fSave">Save</button></div>
-              <textarea id="feText" spellcheck="false"></textarea>
+              <div class="fe-bar">
+                <span class="fe-name" id="feName"></span>
+                <span class="fe-dirty" id="feDirty" title="unsaved changes">●</span>
+                <span class="fe-spacer"></span>
+                <select class="fe-lang" id="feLang" title="syntax mode"></select>
+                <button class="ed-btn" id="feFind" title="Find / replace (Ctrl-F)">⌕</button>
+                <button class="ed-btn" id="feWrap" title="Toggle line wrap">⏎</button>
+                <button class="ed-btn" id="feSaveAs" title="Save as a new file">Save as…</button>
+                <button class="primary sm" id="fSave">Save</button>
+              </div>
+              <div class="fe-cm" id="feCm"></div>
+              <textarea id="feText" spellcheck="false" style="display:none"></textarea>
               <div class="fe-image" id="feImage" style="display:none"><img id="feImg" alt="preview"></div>
             </div>
           </div>
@@ -148,6 +163,18 @@
   </div>
 </div>
 
+<!-- text-input prompt dialog (themed replacement for window.prompt) -->
+<div class="confirm-scrim" id="promptScrim"></div>
+<div class="confirm prompt-dlg" id="promptBox" role="dialog">
+  <h3 id="promptTitle">Name</h3>
+  <p id="promptMsg" style="display:none"></p>
+  <input id="promptInput" autocomplete="off" spellcheck="false">
+  <div class="confirm-actions">
+    <button class="ghost-btn" id="promptCancel">Cancel</button>
+    <button class="primary" id="promptOk">OK</button>
+  </div>
+</div>
+
 <!-- login gate (shown until authenticated) -->
 <div class="login-gate" id="loginGate" style="display:none">
   <form class="login-card" id="loginForm">
@@ -165,6 +192,36 @@
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
+<!-- CodeMirror 5 (vendored): the IDE-grade editor for the Files view -->
+<script src="/static/vendor/codemirror/codemirror.min.js"></script>
+<script src="/static/vendor/codemirror/mode/meta.js"></script>
+<script src="/static/vendor/codemirror/addon/search/searchcursor.js"></script>
+<script src="/static/vendor/codemirror/addon/search/search.js"></script>
+<script src="/static/vendor/codemirror/addon/search/jump-to-line.js"></script>
+<script src="/static/vendor/codemirror/addon/dialog/dialog.js"></script>
+<script src="/static/vendor/codemirror/addon/edit/matchbrackets.js"></script>
+<script src="/static/vendor/codemirror/addon/edit/closebrackets.js"></script>
+<script src="/static/vendor/codemirror/addon/selection/active-line.js"></script>
+<script src="/static/vendor/codemirror/addon/display/placeholder.js"></script>
+<script src="/static/vendor/codemirror/addon/comment/comment.js"></script>
+<script src="/static/vendor/codemirror/mode/javascript.js"></script>
+<script src="/static/vendor/codemirror/mode/python.js"></script>
+<script src="/static/vendor/codemirror/mode/clike.js"></script>
+<script src="/static/vendor/codemirror/mode/css.js"></script>
+<script src="/static/vendor/codemirror/mode/xml.js"></script>
+<script src="/static/vendor/codemirror/mode/htmlmixed.js"></script>
+<script src="/static/vendor/codemirror/mode/markdown.js"></script>
+<script src="/static/vendor/codemirror/mode/shell.js"></script>
+<script src="/static/vendor/codemirror/mode/yaml.js"></script>
+<script src="/static/vendor/codemirror/mode/sql.js"></script>
+<script src="/static/vendor/codemirror/mode/rust.js"></script>
+<script src="/static/vendor/codemirror/mode/go.js"></script>
+<script src="/static/vendor/codemirror/mode/php.js"></script>
+<script src="/static/vendor/codemirror/mode/ruby.js"></script>
+<script src="/static/vendor/codemirror/mode/lua.js"></script>
+<script src="/static/vendor/codemirror/mode/dockerfile.js"></script>
+<script src="/static/vendor/codemirror/mode/toml.js"></script>
+<script src="/static/vendor/codemirror/mode/swift.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

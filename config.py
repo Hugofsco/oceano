@@ -42,4 +42,16 @@ TELEGRAM_ALLOWED = {
     int(x) for x in os.environ.get("OCEANO_TELEGRAM_ALLOWED", "").replace(" ", "").split(",") if x
 }
 
+# --- Voice (Telegram speech in/out) ---
+# Everything lives under Oceano/assets so the whole thing packages cleanly.
+#   STT: faster-whisper (model cached in assets/whisper)
+#   TTS: Piper (voice .onnx in assets/voice) → ffmpeg → OGG/Opus
+ASSETS = WORKSPACE.parent / "assets"
+STT_MODEL = os.environ.get("OCEANO_STT_MODEL", "base.en")          # faster-whisper model id
+STT_DIR = Path(os.environ.get("OCEANO_STT_DIR", ASSETS / "whisper"))
+STT_DEVICE = os.environ.get("OCEANO_STT_DEVICE", "cpu")
+STT_COMPUTE = os.environ.get("OCEANO_STT_COMPUTE", "int8")         # int8 = fast on CPU
+TTS_VOICE = Path(os.environ.get("OCEANO_TTS_VOICE", ASSETS / "voice" / "alan.onnx"))
+TTS_MAX_CHARS = int(os.environ.get("OCEANO_TTS_MAX_CHARS", "900")) # cap spoken length
+
 WORKSPACE.mkdir(parents=True, exist_ok=True)

@@ -26,3 +26,8 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# --- bundled models: large binaries fetched at install time, NOT committed
+#     (GitHub rejects files >100MB; the whisper model alone is ~139MB). See assets/README.md.
+assets/*
+!assets/README.md

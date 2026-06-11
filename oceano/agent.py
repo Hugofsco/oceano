@@ -51,10 +51,10 @@ def _workspace_note():
             "folders here. File and shell tools use paths relative to it.")
 
 
-def _skills_note():
+def _skills_note(user_message):
     try:
         from oceano import skills
-        cat = skills.catalog()
+        cat = skills.relevant(user_message)    # semantic top-k (full catalog if small/embed down)
         if cat:
             return ("SKILLS — reusable procedures you can pull in with load_skill(name) when a "
                     "task matches one:\n" + cat)
@@ -63,11 +63,34 @@ def _skills_note():
     return ""
 
 
+def _channel_note():
+    """Tell the model where it's talking, so it doesn't reach for tools the user on
+    this channel can't experience (live browser, screenshots, inline images)."""
+    try:
+        from oceano import tools
+        ch = tools.current_channel()
+    except Exception:
+        return ""
+    if ch == "telegram":
+        return ("CHANNEL: you are talking to the user over TELEGRAM. You CAN send them images — "
+                "save a PNG to the workspace (a chart via python_exec, or a page screenshot via "
+                "browser_screenshot) and reference it in your reply with markdown "
+                "![description](path); it's delivered as a photo. You do NOT have the live "
+                "interactive browser here (no clicking/scrolling a streamed page), so use "
+                "fetch_url to read pages and browser_screenshot to capture one. Keep replies "
+                "concise and chat-friendly.")
+    if ch == "background":
+        return ("CHANNEL: you are running as an UNATTENDED background job — no human is watching. "
+                "Don't ask questions or wait for input; finish the task and report. The visual "
+                "browser is unavailable; use fetch_url to read web pages.")
+    return ""
+
+
 def _context_block(user_message):
     """Everything injected into the system message at the start of a turn: the date,
-    any relevant memories, and the skills catalog. Rebuilt each turn so it's fresh."""
-    return "\n\n".join(p for p in (_date_note(), _workspace_note(),
-                                   _relevant_memories(user_message), _skills_note()) if p)
+    the channel, any relevant memories, and the skills catalog. Rebuilt each turn."""
+    return "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note(),
+                                   _relevant_memories(user_message), _skills_note(user_message)) if p)
 
 
 # --- self-learning memory: after each turn, extract durable facts in the background ---
@@ -82,23 +105,38 @@ _LEARN_SYSTEM = (
     "request ABOUT someone/something (e.g. \"who is X?\", \"research Y\", \"summarize Z\"), that "
     "subject is NOT the user — output [].\n"
     "- A message with no first-person self-disclosure → output [].\n"
-    "Output ONLY a JSON array of short third-person fact strings (e.g. [\"User is vegetarian\", "
-    "\"User is building a trading bot in Rust\"]). Nothing else.")
+    "Output ONLY a JSON array of objects, each {\"text\": short third-person fact, "
+    "\"category\": one of \"identity\" (who the user is), \"preference\" (what they like/want/"
+    "prefer), \"project\" (ongoing work or goals), \"task\" (something to do), \"fact\" (anything "
+    "else durable)}. Example: [{\"text\": \"User is vegetarian\", \"category\": \"preference\"}, "
+    "{\"text\": \"User is building a trading bot in Rust\", \"category\": \"project\"}]. Nothing else.")
 
 
 def _parse_facts(text):
+    """Returns [(fact_text, category), ...]. Accepts the {"text","category"} objects the
+    prompt asks for, but tolerates plain strings and non-JSON output (category → 'fact')."""
+    from oceano import memory
+
+    def norm(item):
+        if isinstance(item, dict):
+            t = str(item.get("text", "")).strip()
+            c = str(item.get("category", "")).strip().lower()
+        else:
+            t, c = str(item).strip(), ""
+        return (t, c if c in memory.CATEGORIES else "fact") if t else None
+
     text = (text or "").strip()
     m = re.search(r"\[.*\]", text, re.DOTALL)
     if m:
         try:
-            return [str(x).strip() for x in json.loads(m.group(0)) if str(x).strip()][:6]
+            return [f for f in (norm(x) for x in json.loads(m.group(0))) if f][:6]
         except Exception:
             pass
     out = []                                  # lenient fallback if the model didn't emit clean JSON
     for line in text.splitlines():
         line = line.strip().lstrip("-*•0123456789. ").strip().strip('"')
         if len(line) > 4 and not line.lower().startswith(("here", "none", "no ", "[", "]")):
-            out.append(line)
+            out.append((line, "fact"))
     return out[:6]
 
 
@@ -117,8 +155,8 @@ def _learn_from(user_message, model, base_url, api_key):
         resp = llm.chat([{"role": "system", "content": _LEARN_SYSTEM},
                          {"role": "user", "content": "USER'S MESSAGE:\n" + (user_message or "")[:4000]}],
                         tools=None, model=model, base_url=base_url, api_key=api_key)
-        for fact in _parse_facts(getattr(resp, "content", "") or ""):
-            memory.add_if_new(fact, tags="auto")
+        for fact, category in _parse_facts(getattr(resp, "content", "") or ""):
+            memory.add_if_new(fact, tags="auto", category=category)
     except Exception:
         pass
 
@@ -152,6 +190,15 @@ to you automatically. When the user shares a durable fact about themselves (a
 preference, who they are, an ongoing project, a decision), save it with remember().
 If something you know becomes wrong or out of date, fix it with update_memory or drop
 it with forget_memory. (Routine facts are also captured automatically in the background.)
+
+SELF-IMPROVEMENT: when you finish a task where you worked out a non-obvious,
+REUSABLE approach (a workflow, a tricky integration, a search strategy that paid
+off), distill it with learn_skill(name, description, body) — short imperative
+steps, written for your future self. It enters review and only joins your active
+skills once an independent model approves it, so save genuinely useful candidates
+without fear — but not trivial or one-off details. For a heavy, self-contained
+subtask you may hand work to a stronger coding agent with delegate_to_claude:
+give it precise instructions, the relevant file paths, and what it must produce.
 
 IMAGES: you can create images (charts, diagrams, plots, generated graphics) by
 saving a file into the workspace — e.g. use python_exec with matplotlib or Pillow
@@ -197,9 +244,16 @@ class Agent:
             return_usage=return_usage,
         )
 
-    def _stats(self, tokens, secs):
-        return {"type": "stats", "tokens": tokens, "model": self.model,
-                "tok_s": round(tokens / secs, 1) if secs > 0 and tokens else 0}
+    def _stats(self, tokens, secs, tok_s=None, ctx=None):
+        """`tokens` is shown to the user; `tok_s` is the DECODE rate (tokens/sec measured
+        from the first generated token, excluding prompt processing) so it means the same
+        thing in plain chat and agent mode. `ctx` is the actual context size (prompt tokens)
+        the model just processed. If tok_s isn't given, derive it from secs."""
+        s = {"type": "stats", "tokens": tokens, "model": self.model,
+             "tok_s": tok_s if tok_s is not None else (round(tokens / secs, 1) if secs > 0 and tokens else 0)}
+        if ctx:
+            s["ctx"] = ctx
+        return s
 
     # --- blocking (CLI / Telegram / scheduler) -----------------------------
     def run(self, user_message: str) -> str:
@@ -230,29 +284,43 @@ class Agent:
     def run_stream(self, user_message: str):
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
-        total_tok, gen = 0, 0.0          # tokens + LLM time (excludes tool latency)
+        total_tok = 0                    # tokens generated across the whole turn (incl. tool steps)
         for _ in range(config.MAX_STEPS):
-            t = time.perf_counter()
-            content, calls, ntok = "", None, 0
+            seg_first = None             # time the first token of THIS segment arrived (for decode rate)
+            content, reason, calls, ntok, ptok = "", "", None, 0, 0
             for item in llm.stream(self.messages, tools=tools.schemas(),
                                    model=self.model, base_url=self.base_url, api_key=self.api_key):
                 if "reasoning" in item:
+                    if seg_first is None: seg_first = time.perf_counter()
+                    reason += item["reasoning"]
                     yield {"type": "reasoning", "text": item["reasoning"]}
                 elif "content" in item:
+                    if seg_first is None: seg_first = time.perf_counter()
                     content += item["content"]
                     yield {"type": "token", "text": item["content"]}   # final answer streams live
                 elif "tool_calls" in item:
                     calls = item["tool_calls"]
                 elif "usage" in item:
-                    ntok = item["usage"]
-            gen += time.perf_counter() - t
+                    ntok = item["usage"]; ptok = item.get("prompt_tokens", 0)
             total_tok += ntok
 
-            if not calls:                              # final answer (already streamed)
+            if not calls:                              # final answer
+                if not content.strip() and reason.strip():
+                    # some llama.cpp builds stream a model's answer into the reasoning
+                    # channel (e.g. Qwen3.5) — recover it so the user isn't left blank
+                    content = re.sub(r"<tool_call>.*?</tool_call>", "", reason, flags=re.DOTALL).strip()
+                    if content:
+                        yield {"type": "token", "text": content}
                 self.messages.append({"role": "assistant", "content": content})
                 self._learn(user_message, content)
+                # tok/s = decode rate of the ANSWER segment (from its first token), matching
+                # plain chat — so agent mode / Telegram report a comparable number, not one
+                # dragged down by the tool-schema prompt-processing time.
+                dsecs = (time.perf_counter() - seg_first) if seg_first else 0
+                dtok = ntok or max(1, len(content) // 4)
                 yield {"type": "answer_done"}
-                yield self._stats(total_tok, gen)
+                yield self._stats(total_tok, dsecs,
+                                  tok_s=round(dtok / dsecs, 1) if dsecs > 0 else 0, ctx=ptok)
                 return
 
             norm = [{"id": c["id"] or f"call_{i}", "name": c["name"], "args": c["args"]}
@@ -268,25 +336,28 @@ class Agent:
                 yield {"type": "tool_result", "name": c["name"], "result": result[:2000]}
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         # cap hit — stream one tool-less wrap-up (summary + next steps) instead of a dead-end
-        t = time.perf_counter(); tail = ""
+        seg_first = None; tail = ""; tail_tok = 0; tail_ptok = 0
         for item in llm.stream(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
                                model=self.model, base_url=self.base_url, api_key=self.api_key):
             if "content" in item:
+                if seg_first is None: seg_first = time.perf_counter()
                 tail += item["content"]
                 yield {"type": "token", "text": item["content"]}
             elif "usage" in item:
-                total_tok += item["usage"]
-        gen += time.perf_counter() - t
+                tail_tok = item["usage"]; tail_ptok = item.get("prompt_tokens", 0); total_tok += item["usage"]
         self.messages.append({"role": "assistant", "content": tail or "(stopped at the tool-step limit)"})
         self._learn(user_message, tail)
+        dsecs = (time.perf_counter() - seg_first) if seg_first else 0
         yield {"type": "answer_done"}
-        yield self._stats(total_tok, gen)
+        yield self._stats(total_tok, dsecs,
+                          tok_s=round((tail_tok or max(1, len(tail) // 4)) / dsecs, 1) if dsecs > 0 else 0,
+                          ctx=tail_ptok)
 
     # --- streaming: plain chat (reasoning + token deltas, no tools) --------
     def chat_stream(self, user_message: str):
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
-        content, tokens, tfirst = "", 0, None
+        content, tokens, ptok, tfirst = "", 0, 0, None
         for item in llm.stream(self.messages, model=self.model,
                                base_url=self.base_url, api_key=self.api_key):
             if "reasoning" in item:
@@ -297,10 +368,10 @@ class Agent:
                 content += item["content"]
                 yield {"type": "token", "text": item["content"]}
             elif "usage" in item:
-                tokens = item["usage"]
+                tokens = item["usage"]; ptok = item.get("prompt_tokens", 0)
         self.messages.append({"role": "assistant", "content": content})
         self._learn(user_message, content)
         secs = (time.perf_counter() - tfirst) if tfirst else 0
         if not tokens:                                 # provider sent no usage → estimate
             tokens = max(1, len(content) // 4)
-        yield self._stats(tokens, secs)
+        yield self._stats(tokens, secs, ctx=ptok)

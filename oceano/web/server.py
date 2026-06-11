@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
-from oceano import browser, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
+from oceano import browser, calsync, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -109,8 +109,21 @@ async def lifespan(_app):
         mcp_client.start()           # connect configured MCP servers + register their tools
     except Exception:
         traceback.print_exc()
+    try:
+        skills.ensure_eval_task()    # the locked '[ SKILLS ] evaluate' schedule must exist
+    except Exception:
+        traceback.print_exc()
+    try:
+        evals.ensure_eval_task()     # the locked '[ EVAL ]' suite schedule
+        evals.seed_cases()           # install starter eval cases on first boot
+    except Exception:
+        traceback.print_exc()
     yield
     await telegram_runtime.stop()
+    try:
+        await asyncio.to_thread(livebrowser.shutdown)   # close Chrome on its own thread
+    except Exception:
+        traceback.print_exc()
 
 
 app = FastAPI(title="Oceano", lifespan=lifespan)
@@ -346,8 +359,10 @@ _TOOL_CATEGORY = {
     "browser_click": "browser", "browser_scroll": "browser",
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
     "index_docs": "documents", "search_docs": "documents",
-    "list_skills": "skills", "load_skill": "skills",
+    "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills",
+    "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
+    "calendar_events": "calendar",
 }
 
 
@@ -465,8 +480,9 @@ async def rivers_serve(request: Request):
                           b.get("ngl", 99), b.get("ctx", 8192))
 
 
-@app.get("/api/models")
-def models():
+def list_models():
+    """Models aggregated across all configured endpoints. Reusable (the web /api/models
+    route and the Telegram bot both call it)."""
     data, out = load(), []
     for e in data["endpoints"]:
         try:
@@ -478,6 +494,17 @@ def models():
             out.append({"id": f"⚠ {e['name']} unreachable", "endpoint": e["name"],
                         "base_url": e["base_url"], "error": True})
     return out
+
+
+def endpoint_key(base_url):
+    """The API key configured for the endpoint serving `base_url` (or '')."""
+    return next((e.get("api_key", "") for e in load()["endpoints"]
+                 if e["base_url"] == base_url), "")
+
+
+@app.get("/api/models")
+def models():
+    return list_models()
 
 
 @app.post("/api/chat")
@@ -586,13 +613,92 @@ def get_skills():
 @app.post("/api/skills")
 async def post_skill(req: Request):
     b = await req.json()
-    slug = skills.save_skill(b["name"], b.get("description", ""), b.get("body", ""), b.get("dir"))
+    slug = skills.save_skill(b["name"], b.get("description", ""), b.get("body", ""), b.get("dir"),
+                             status=b.get("status", "published"), notes=b.get("notes", ""))
     return {"ok": True, "dir": slug}
+
+
+@app.patch("/api/skills/{dir}")
+async def patch_skill(dir: str, req: Request):
+    """Move a skill through the lifecycle (publish / send back to learning)."""
+    b = await req.json()
+    return {"ok": skills.set_status(dir, b.get("status", ""), b.get("notes"))}
 
 
 @app.delete("/api/skills/{dir}")
 def remove_skill(dir: str):
     return {"ok": skills.delete_skill(dir)}
+
+
+@app.post("/api/skills/evaluate")
+def evaluate_skills_api():
+    """Kick off review → staging → publish in the background (it shells out to
+    Claude Code, which can take minutes)."""
+    if skills.eval_state()["running"]:
+        return {"ok": False, "running": True, "error": "an evaluation is already running"}
+    threading.Thread(target=skills.evaluate_all, daemon=True).start()
+    return {"ok": True, "running": True}
+
+
+@app.get("/api/skills-eval")
+def skills_eval_state():
+    return skills.eval_state()
+
+
+# ---------------- evals: model eval harness ----------------
+@app.get("/api/evals/cases")
+def evals_cases():
+    return {"cases": evals.all_cases(), "categories": list(evals.CATEGORIES),
+            "grader_types": list(evals.GRADER_TYPES)}
+
+
+@app.post("/api/evals/cases")
+async def evals_save_case(req: Request):
+    b = await req.json()
+    rid = evals.save_case(b.get("id"), b.get("name", ""), b.get("category", "qa"),
+                          b.get("prompt", ""), b.get("rubric", ""), b.get("graders", []),
+                          b.get("seed"), b.get("timeout"), b.get("weight", 1.0),
+                          bool(b.get("enabled", True)))
+    return {"ok": True, "id": rid}
+
+
+@app.delete("/api/evals/cases/{cid}")
+def evals_delete_case(cid: int):
+    return {"ok": evals.delete_case(cid)}
+
+
+@app.get("/api/evals/models")
+def evals_models():
+    return {"models": evals.available_models()}
+
+
+@app.post("/api/evals/run")
+async def evals_run(req: Request):
+    if evals.state()["running"]:
+        return {"ok": False, "running": True, "error": "an eval run is already in progress"}
+    b = await req.json()
+    evals.run_all_bg(b.get("models") or None)
+    return {"ok": True, "running": True}
+
+
+@app.get("/api/evals/state")
+def evals_state():
+    return evals.state()
+
+
+@app.get("/api/evals/leaderboard")
+def evals_leaderboard(run_id: int = None):
+    return evals.leaderboard(run_id)
+
+
+@app.get("/api/evals/runs")
+def evals_runs():
+    return {"runs": evals.runs()}
+
+
+@app.get("/api/evals/results")
+def evals_results(run_id: int):
+    return {"results": evals.results(run_id)}
 
 
 # ---------------- memories ----------------
@@ -784,14 +890,76 @@ async def add_task_api(req: Request):
 @app.patch("/api/tasks/{tid}")
 async def update_task_api(tid: int, req: Request):
     b = await req.json()
-    scheduler.update_task(tid, b.get("cron"), b.get("instruction"), b.get("enabled"))
-    return {"ok": True}
+    ok = scheduler.update_task(tid, b.get("cron"), b.get("instruction"), b.get("enabled"))
+    return {"ok": ok, **({} if ok else {"error": "invalid cron expression (format: min hr day mon wkday)"})}
 
 
 @app.delete("/api/tasks/{tid}")
 def delete_task_api(tid: int):
-    scheduler.delete_task(tid)
-    return {"ok": True}
+    ok = scheduler.delete_task(tid)
+    return {"ok": ok, **({} if ok else {"error": "this entry is managed by the Researcher — delete the topic there"})}
+
+
+# ---------------- calendar (local copy, synced from ICS feeds) ----------------
+@app.get("/api/calendar")
+def get_calendar(days: int = 30):
+    return {"feeds": calsync.feeds(), "events": calsync.upcoming(max(1, min(days, 365)))}
+
+
+@app.post("/api/calendar/feeds")
+async def add_calendar_feed(req: Request):
+    b = await req.json()
+    refusal = safety.check_url((b.get("url") or "").strip().replace("webcal://", "https://", 1))
+    if refusal:
+        return {"ok": False, "error": refusal}
+    fid = calsync.add_feed(b.get("name", ""), b.get("url", ""))
+    if fid is None:
+        return {"ok": False, "error": "invalid URL — paste the calendar's secret .ics address"}
+    result = await asyncio.to_thread(calsync.sync_feed, fid)   # first sync right away
+    return {"ok": True, "id": fid, "sync": result}
+
+
+@app.delete("/api/calendar/feeds/{fid}")
+def delete_calendar_feed(fid: int):
+    return {"ok": calsync.delete_feed(fid)}
+
+
+@app.post("/api/calendar/sync")
+async def sync_calendar():
+    results = await asyncio.to_thread(calsync.sync_all)
+    return {"ok": all(r.get("ok") for r in results.values()) if results else True, "results": results}
+
+
+# ---------------- researcher (scheduled deep-dives → living docs) -------------
+@app.get("/api/research")
+def get_research():
+    return researcher.all_topics()
+
+
+@app.post("/api/research")
+async def add_research(req: Request):
+    b = await req.json()
+    rid = researcher.add_topic(b.get("topic", ""), b.get("focus", ""), b.get("cron", "0 8 * * *"))
+    return {"ok": rid is not None, "id": rid,
+            **({} if rid is not None else {"error": "topic and a valid cron are required"})}
+
+
+@app.patch("/api/research/{rid}")
+async def update_research(rid: int, req: Request):
+    b = await req.json()
+    ok = researcher.update_topic(rid, b.get("topic"), b.get("focus"), b.get("cron"), b.get("enabled"))
+    return {"ok": ok}
+
+
+@app.delete("/api/research/{rid}")
+def delete_research(rid: int):
+    return {"ok": researcher.delete_topic(rid)}
+
+
+@app.post("/api/research/{rid}/run")
+def run_research_now(rid: int):
+    researcher.run_topic_bg(rid)        # long-running — fire in the background
+    return {"ok": True, "started": True}
 
 
 @app.get("/api/browser/stream")

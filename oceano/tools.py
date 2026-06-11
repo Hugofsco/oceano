@@ -4,9 +4,11 @@ function (run by us). Add a tool by writing a function and decorating it.
 File/shell ops default to the WORKSPACE folder so the agent has a real place to
 work, without roaming the whole disk. Set OCEANO_CONFINE=0 to lift the fence.
 """
+import contextlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import requests
@@ -14,6 +16,76 @@ from bs4 import BeautifulSoup
 
 import config
 from oceano import memory, skills, rag, browser, scheduler, safety, livebrowser
+
+# --- channels --------------------------------------------------------------
+# Oceano is driven from several places, and they don't share a screen. The live
+# browser is ONE Chromium streamed to the WEB UI — so only the "web" channel may
+# drive it. Telegram (the user can't see the browser) and unattended jobs
+# (Researcher / scheduler / evals — nobody is watching) must NOT, or they'd hijack
+# whatever the web view is showing. Off-web channels fall back to a plain HTTP
+# fetch and decline the interactive browser tools. The channel is thread-local
+# because each frontend/job runs on its own thread and drives tools synchronously.
+#   web        → full interactive: live browser + screenshots
+#   telegram   → attended chat, but no shared browser (HTTP fetch instead)
+#   background → unattended job (Researcher/scheduler/evals): no browser
+_local = threading.local()
+
+
+def current_channel():
+    return getattr(_local, "channel", "web")
+
+
+def live_browser_available():
+    """True only on the web channel — the only place a human can see the shared browser."""
+    return current_channel() == "web"
+
+
+def is_background():
+    """An unattended job (no human in the loop) — distinct from an attended Telegram chat."""
+    return current_channel() == "background"
+
+
+@contextlib.contextmanager
+def channel(name):
+    """Run the enclosed agent work as a given channel (web/telegram/background)."""
+    prev = getattr(_local, "channel", "web")
+    _local.channel = name
+    try:
+        yield
+    finally:
+        _local.channel = prev
+
+
+@contextlib.contextmanager
+def background():
+    """Run unattended agent work — no shared live browser (Researcher/scheduler/evals)."""
+    with channel("background"):
+        yield
+
+
+def _ws():
+    """The workspace root for file/shell tools on THIS thread — a per-run override
+    (set by the eval harness for isolation) or the global workspace by default."""
+    return getattr(_local, "workspace", None) or config.WORKSPACE
+
+
+@contextlib.contextmanager
+def background_workspace(path):
+    """Redirect this thread's file/shell tools to an isolated root (used by the eval
+    harness so each case runs in a clean, throwaway workspace). Implies background()."""
+    from pathlib import Path as _P
+    root = _P(path).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    prev_ws = getattr(_local, "workspace", None)
+    prev_ch = getattr(_local, "channel", "web")
+    _local.workspace = root
+    _local.channel = "background"
+    try:
+        yield root
+    finally:
+        _local.workspace = prev_ws
+        _local.channel = prev_ch
+
 
 # --- registry --------------------------------------------------------------
 _TOOLS = {}        # name -> python function
@@ -64,11 +136,12 @@ def run(name, arguments_json):
 
 
 def _resolve(path: str) -> Path:
-    """Resolve a user/model-supplied path against the workspace, with a fence."""
-    p = (config.WORKSPACE / path).resolve()
+    """Resolve a user/model-supplied path against the (possibly overridden) workspace."""
+    root = _ws()
+    p = (root / path).resolve()
     # is_relative_to (not startswith): a plain prefix match lets '/ws-evil' slip
-    # past a workspace of '/ws'. config.WORKSPACE is already resolved.
-    if config.CONFINE_TO_WORKSPACE and not p.is_relative_to(config.WORKSPACE):
+    # past a workspace of '/ws'. root is already resolved.
+    if config.CONFINE_TO_WORKSPACE and not p.is_relative_to(root):
         raise ValueError(f"path {path!r} escapes the workspace")
     return p
 
@@ -89,7 +162,7 @@ def list_files(path="."):
     if not base.exists():
         return f"(no such path: {path})"
     return "\n".join(sorted(
-        f"{'DIR ' if c.is_dir() else 'FILE'}  {c.relative_to(config.WORKSPACE)}"
+        f"{'DIR ' if c.is_dir() else 'FILE'}  {c.relative_to(_ws())}"
         for c in base.iterdir()
     )) or "(empty)"
 
@@ -123,7 +196,7 @@ def write_file(path, content):
     p = _resolve(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return f"wrote {len(content)} chars to {p.relative_to(config.WORKSPACE)}"
+    return f"wrote {len(content)} chars to {p.relative_to(_ws())}"
 
 
 @tool({
@@ -151,7 +224,7 @@ def edit_file(path, find, replace):
         return ("ERROR: the `find` text was not found verbatim. Read the file and copy the exact "
                 "text (including whitespace) you want to replace.")
     p.write_text(text.replace(find, replace), encoding="utf-8")
-    return f"edited {p.relative_to(config.WORKSPACE)}: replaced {n} occurrence(s)"
+    return f"edited {p.relative_to(_ws())}: replaced {n} occurrence(s)"
 
 
 @tool({
@@ -167,7 +240,7 @@ def edit_file(path, find, replace):
 def make_folder(path):
     p = _resolve(path)
     p.mkdir(parents=True, exist_ok=True)
-    return f"created folder {p.relative_to(config.WORKSPACE)}"
+    return f"created folder {p.relative_to(_ws())}"
 
 
 @tool({
@@ -186,11 +259,45 @@ def run_shell(command):
     if refusal:
         return refusal
     r = subprocess.run(
-        command, shell=True, cwd=str(config.WORKSPACE),
+        command, shell=True, cwd=str(_ws()),
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
     return f"(exit {r.returncode})\n{out[:8000]}" or f"(exit {r.returncode}, no output)"
+
+
+_HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _http_fetch(url, max_redirects=4):
+    """Fetch + extract readable text over plain HTTP — no shared browser, no live
+    frames. Used by background jobs. Redirects are followed manually so every hop
+    is re-checked against the SSRF guard (a fetched page could 302 to an internal
+    address). Returns extracted text, or an error string."""
+    for _ in range(max_redirects + 1):
+        refusal = safety.check_url(url)
+        if refusal:
+            return refusal
+        try:
+            r = requests.get(url, timeout=25, allow_redirects=False, headers=_HTTP_HEADERS)
+        except requests.RequestException as e:
+            return f"(could not fetch {url}: {type(e).__name__})"
+        loc = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            url = requests.compat.urljoin(url, loc)
+            continue
+        if r.status_code >= 400:
+            return f"(HTTP {r.status_code} fetching {url})"
+        soup = BeautifulSoup(r.text, "lxml")
+        for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+            tag.decompose()
+        text = "\n".join(line for line in (ln.strip() for ln in soup.get_text("\n").splitlines()) if line)
+        return text[:6000] or "(page had no readable text)"
+    return f"(too many redirects fetching {url})"
 
 
 @tool({
@@ -204,7 +311,8 @@ def run_shell(command):
     },
 })
 def web_search(query):
-    livebrowser.start_research()      # fresh research tab-group; results open as tabs via fetch_url
+    if live_browser_available():
+        livebrowser.start_research()  # fresh research tab-group; results open as tabs via fetch_url
     r = requests.get(
         f"{config.SEARXNG_URL}/search",
         params={"q": query, "format": "json"},
@@ -235,8 +343,10 @@ def fetch_url(url):
     refusal = safety.check_url(url)
     if refusal:
         return refusal
-    # Read the page in the real headless browser: renders JS the requests/BS4 path
-    # couldn't, AND streams frames to the Live browser window so you watch it read.
+    if not live_browser_available():  # off-web channel → plain HTTP, never the shared browser
+        return safety.wrap_untrusted(url, _http_fetch(url))
+    # Web channel: read the page in the real headless browser — renders JS the plain
+    # path can't, AND streams frames to the Live browser window so you watch it read.
     text = browser.open_url(url)
     return safety.wrap_untrusted(url, text)
 
@@ -254,7 +364,7 @@ def fetch_url(url):
 })
 def python_exec(code):
     r = subprocess.run(
-        [sys.executable, "-"], input=code, cwd=str(config.WORKSPACE),
+        [sys.executable, "-"], input=code, cwd=str(_ws()),
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
@@ -266,15 +376,20 @@ def python_exec(code):
     "function": {
         "name": "remember",
         "description": "Save a durable fact, preference, or note to long-term memory "
-                       "so you recall it in future conversations.",
+                       "so you recall it in future conversations. Pick the category that "
+                       "fits best: identity (who the user is), preference (what they like/"
+                       "want/prefer), project (ongoing work or goals), task (something to "
+                       "do), fact (anything else durable).",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"},
+            "category": {"type": "string", "enum": memory.CATEGORIES,
+                         "description": "memory category — controls when it is injected"},
             "tags": {"type": "string", "description": "optional comma-separated tags"},
-        }, "required": ["text"]},
+        }, "required": ["text", "category"]},
     },
 })
-def remember(text, tags=""):
-    return memory.remember(text, tags)
+def remember(text, category="fact", tags=""):
+    return memory.remember(text, tags, category=category)
 
 
 @tool({
@@ -391,6 +506,10 @@ def search_docs(query):
 
 
 # --- headless browser ------------------------------------------------------
+_BG_BROWSER_NOTE = ("(the interactive/visual browser is only available in the web UI — the "
+                    "user on this channel can't see it. Use fetch_url to read pages instead.)")
+
+
 @tool({
     "type": "function",
     "function": {
@@ -406,6 +525,8 @@ def browser_open(url):
     refusal = safety.check_url(url)
     if refusal:
         return refusal
+    if not live_browser_available():  # off-web channel → plain HTTP, never the shared browser
+        return safety.wrap_untrusted(url, _http_fetch(url))
     return safety.wrap_untrusted(url, browser.open_url(url))
 
 
@@ -422,7 +543,11 @@ def browser_open(url):
     },
 })
 def browser_screenshot(url, name="screenshot.png"):
-    return browser.screenshot(url, name)
+    # Unattended jobs have no one to show a screenshot to; everyone else gets one —
+    # the web UI watches the shared browser, other channels get a throwaway capture.
+    if is_background():
+        return _BG_BROWSER_NOTE
+    return browser.screenshot(url, name, shared=live_browser_available())
 
 
 @tool({
@@ -437,6 +562,8 @@ def browser_screenshot(url, name="screenshot.png"):
     },
 })
 def browser_click(text):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
     r = livebrowser.click_text(text)
     if not r.get("ok"):
         return f"could not click {text!r}: {r.get('error')}"
@@ -454,6 +581,8 @@ def browser_click(text):
     },
 })
 def browser_scroll(amount=600):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
     livebrowser.submit("scroll", int(amount))
     return f"scrolled {amount}px"
 
@@ -501,3 +630,68 @@ def list_tasks():
 })
 def notify(message, title="Oceano"):
     return scheduler.notify(message, title)
+
+
+# --- self-improvement: learned skills + delegation ---------------------------
+@tool({
+    "type": "function",
+    "function": {
+        "name": "learn_skill",
+        "description": "Save a NEW reusable skill you worked out during this task, for your "
+                       "future self. It is stored as 'learning' and reviewed by an independent "
+                       "model before being published into your active skills. Use only for "
+                       "genuinely reusable know-how, not one-off details.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "short kebab-case name, e.g. scrape-paginated-site"},
+            "description": {"type": "string", "description": "one line: when should this skill be used?"},
+            "body": {"type": "string", "description": "the instructions: short imperative steps"},
+        }, "required": ["name", "description", "body"]},
+    },
+})
+def learn_skill(name, description, body):
+    return skills.learn_skill(name, description, body)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "delegate_to_claude",
+        "description": "Hand a self-contained subtask to Claude Code (a stronger coding model) "
+                       "running headless in the workspace. Give it precise, complete instructions "
+                       "— the relevant file paths and exactly what it must produce — because it "
+                       "cannot ask you questions. Returns its final report. Use sparingly, for "
+                       "work that is genuinely beyond you or needs independent judgment.",
+        "parameters": {"type": "object", "properties": {
+            "instructions": {"type": "string"},
+        }, "required": ["instructions"]},
+    },
+})
+def delegate_to_claude(instructions):
+    from oceano import delegate
+    r = delegate.to_claude(instructions, cwd=config.WORKSPACE)
+    if not r["ok"]:
+        return f"delegation failed: {r['error']}"
+    return r["output"][:8000] or "(claude finished but returned no text)"
+
+
+# --- calendar (local copy, synced from Google Calendar / any ICS feed) -------
+@tool({
+    "type": "function",
+    "function": {
+        "name": "calendar_events",
+        "description": "Read the user's calendar: upcoming events for the next N days. "
+                       "This is the local copy, kept in sync from their Google Calendar — "
+                       "use it whenever the user asks about their schedule, availability, "
+                       "appointments, or plans.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "how many days ahead to look (default 7)"},
+        }},
+    },
+})
+def calendar_events(days=7):
+    from oceano import calsync
+    try:
+        days = max(1, min(int(days), 365))
+    except (TypeError, ValueError):
+        days = 7
+    return calsync.agenda(days)

@@ -27,7 +27,7 @@ async def start(token, allowed):
     telegram_bot.ALLOWED = {int(x) for x in (allowed or [])}
     app = telegram_bot.build_application(token)
     try:
-        await app.initialize()
+        await app.initialize()                     # runs post_init → registers the "/" command menu
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
     except Exception as e:

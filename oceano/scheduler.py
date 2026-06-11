@@ -27,8 +27,19 @@ def _db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS tasks ("
                 "id INTEGER PRIMARY KEY, cron TEXT, instruction TEXT, "
-                "last_run TEXT, enabled INTEGER DEFAULT 1)")
+                "last_run TEXT, enabled INTEGER DEFAULT 1, source TEXT)")
+    cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "source" not in cols:                         # migrate an older DB in place
+        con.execute("ALTER TABLE tasks ADD COLUMN source TEXT")
+        con.commit()
     return con
+
+
+def _managed(con, tid):
+    """A task with a source (e.g. 'research:3') is owned by another module — the
+    Scheduler shows it but must not edit it."""
+    row = con.execute("SELECT source FROM tasks WHERE id=?", (tid,)).fetchone()
+    return bool(row and row[0])
 
 
 def schedule_task(cron, instruction):
@@ -92,13 +103,14 @@ def _next_run(cron, last_run):
 
 def all_tasks():
     con = _db()
-    rows = con.execute("SELECT id, cron, instruction, last_run, enabled FROM tasks ORDER BY id").fetchall()
+    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source FROM tasks ORDER BY id").fetchall()
     con.close()
     return [{"id": r[0], "cron": r[1], "instruction": r[2], "last_run": r[3],
-             "enabled": bool(r[4]), "next_run": _next_run(r[1], r[3])} for r in rows]
+             "enabled": bool(r[4]), "next_run": _next_run(r[1], r[3]),
+             "source": r[5], "managed": bool(r[5])} for r in rows]
 
 
-def add_task(cron, instruction):
+def add_task(cron, instruction, source=None):
     try:
         from croniter import croniter
         if not croniter.is_valid(cron):
@@ -106,15 +118,37 @@ def add_task(cron, instruction):
     except ImportError:
         pass
     con = _db()
-    cur = con.execute("INSERT INTO tasks (cron, instruction) VALUES (?,?)", (cron, instruction))
+    cur = con.execute("INSERT INTO tasks (cron, instruction, source) VALUES (?,?,?)",
+                      (cron, instruction, source))
     con.commit()
     tid = cur.lastrowid
     con.close()
     return tid
 
 
-def update_task(tid, cron=None, instruction=None, enabled=None):
+def _cron_ok(cron):
+    try:
+        from croniter import croniter
+        return croniter.is_valid(cron)
+    except ImportError:
+        return bool(cron)
+
+
+def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=False):
+    """Edit a task. A LOCKED job (one with a `source`, owned by the Researcher or the
+    skills evaluator) can't be deleted and its instruction is owned by its manager —
+    but the user may still retime it (cron) and toggle it on/off from the Scheduler.
+    `allow_managed=True` is the owner's full-control path (used internally)."""
+    if cron is not None and not _cron_ok(cron):
+        return False
     con = _db()
+    managed = _managed(con, tid)
+    row = con.execute("SELECT source FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not row:
+        con.close()
+        return False
+    if managed and not allow_managed:
+        instruction = None                       # instruction is owned by the manager
     if cron is not None:
         con.execute("UPDATE tasks SET cron=? WHERE id=?", (cron, tid))
     if instruction is not None:
@@ -123,11 +157,23 @@ def update_task(tid, cron=None, instruction=None, enabled=None):
         con.execute("UPDATE tasks SET enabled=? WHERE id=?", (1 if enabled else 0, tid))
     con.commit()
     con.close()
+    # user retimed/toggled a research job from the Scheduler → mirror it into the
+    # topic record so the Researcher view stays in sync (skip on the owner's own path)
+    src = row[0]
+    if managed and not allow_managed and src and src.startswith("research:"):
+        try:
+            from oceano import researcher
+            researcher.note_schedule(int(src.split(":", 1)[1]), cron=cron, enabled=enabled)
+        except Exception:
+            pass
     return True
 
 
-def delete_task(tid):
+def delete_task(tid, allow_managed=False):
     con = _db()
+    if not allow_managed and _managed(con, tid):
+        con.close()
+        return False
     con.execute("DELETE FROM tasks WHERE id=?", (tid,))
     con.commit()
     con.close()
@@ -150,17 +196,32 @@ def run_due_once():
     last_run still advances) so one bad task can't wedge the whole loop.
     """
     from oceano.agent import Agent
+    from oceano import tools
     beat()                                  # tell the UI we're alive
     con = _db()
-    rows = con.execute("SELECT id, cron, instruction, last_run, enabled FROM tasks").fetchall()
+    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source FROM tasks").fetchall()
     now = datetime.now(timezone.utc)
     ran = 0
-    for tid, cron, instruction, last_run, enabled in rows:
+    for tid, cron, instruction, last_run, enabled, source in rows:
         if not (enabled and is_due(cron, last_run, now)):
             continue
         print(f"[scheduler] running #{tid}: {instruction}")
         try:
-            answer = Agent().run(instruction)
+            # everything the scheduler runs is unattended → never drive the user's
+            # shared live browser (applies uniformly to research, skills-eval, tasks)
+            with tools.background():
+                if source and source.startswith("research:"):    # Researcher-owned entry
+                    from oceano import researcher
+                    answer = researcher.run_topic(int(source.split(":", 1)[1]))
+                elif source == "skills:eval":                    # locked skills-evaluation entry
+                    from oceano import skills
+                    answer = skills.evaluate_all()
+                elif source == "evals:run":                      # locked model-eval suite
+                    from oceano import evals
+                    evals.run_all_bg()                           # long → background, don't wedge the loop
+                    answer = "model eval suite started in the background"
+                else:
+                    answer = Agent().run(instruction)
             notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task")
         except Exception as e:
             print(f"[scheduler] task #{tid} failed: {e}")

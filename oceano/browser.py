@@ -21,14 +21,26 @@ def open_url(url):
     return livebrowser.open(url, read=True)
 
 
-def screenshot(url, name="screenshot.png"):
-    """Navigate the shared browser to a URL and save a full-page screenshot."""
+def screenshot(url, name="screenshot.png", shared=True):
+    """Save a full-page screenshot of a URL into the workspace and return a markdown
+    image reference (so it renders in the web chat / is delivered as a Telegram photo).
+
+    shared=True  → drive the shared live browser (web UI: the user watches it happen).
+    shared=False → a throwaway headless capture that doesn't disturb the shared view
+                   (off-web channels like Telegram)."""
     refusal = safety.check_url(url)
     if refusal:
         return refusal
     if not name.lower().endswith((".png", ".jpg", ".jpeg")):
         name += ".png"
     path = config.WORKSPACE / name
-    livebrowser.navigate(url)
-    livebrowser.save_screenshot(path)
-    return f"saved screenshot of {url} to {path.relative_to(config.WORKSPACE)}"
+    if shared:
+        livebrowser.navigate(url)
+        livebrowser.save_screenshot(path)
+    else:
+        try:
+            livebrowser.capture(url, path)
+        except Exception as e:
+            return f"could not capture {url}: {type(e).__name__}: {e}"
+    rel = path.relative_to(config.WORKSPACE)
+    return f"saved screenshot of {url} to {rel}\n\n![screenshot of {url}]({rel})"

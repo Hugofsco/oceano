@@ -9,3 +9,8 @@ uvicorn[standard]>=0.29
 python-telegram-bot>=21
 # MCP client — connect Oceano to external tool servers (Settings/data/mcp.json)
 mcp>=1.0
+# Voice over Telegram (speech-in/out). Models live under Oceano/assets; needs ffmpeg
+# on the host. STT = faster-whisper, TTS = Piper (espeak-ng is the fallback voice).
+faster-whisper>=1.0
+piper-tts>=1.2
+pathvalidate>=3.0

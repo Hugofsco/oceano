@@ -24,6 +24,47 @@ function confirmAction(title, msg, okLabel = "Delete") {
   });
 }
 
+/* themed text-input dialog — replaces window.prompt. Resolves to the string, or null
+   if cancelled. opts: {value, placeholder, okLabel, message}. */
+function promptDialog(title, opts = {}) {
+  return new Promise(resolve => {
+    const box = $("#promptBox"), input = $("#promptInput"), msg = $("#promptMsg");
+    $("#promptTitle").textContent = title;
+    if (opts.message) { msg.textContent = opts.message; msg.style.display = "block"; } else { msg.style.display = "none"; }
+    input.value = opts.value || "";
+    input.placeholder = opts.placeholder || "";
+    $("#promptOk").textContent = opts.okLabel || "OK";
+    box.classList.add("open"); $("#promptScrim").classList.add("open");
+    const close = v => {
+      box.classList.remove("open"); $("#promptScrim").classList.remove("open");
+      document.removeEventListener("keydown", onKey);
+      input.onkeydown = null;
+      resolve(v);
+    };
+    const submit = () => close(input.value.trim());   // "" on empty-OK; null only on cancel/escape
+    const onKey = e => { if (e.key === "Escape") { e.stopPropagation(); close(null); } };
+    input.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
+    $("#promptOk").onclick = submit;
+    $("#promptCancel").onclick = () => close(null);
+    $("#promptScrim").onclick = () => close(null);
+    document.addEventListener("keydown", onKey);
+    // focus + select the suggested value so editing/replacing is one keystroke
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
+}
+
+/* transient, non-blocking notification (replaces alert()) */
+function toast(msg, kind = "info") {
+  let host = $("#toastHost");
+  if (!host) { host = document.createElement("div"); host.id = "toastHost"; document.body.appendChild(host); }
+  const t = document.createElement("div");
+  t.className = "toast " + kind;
+  t.textContent = msg;
+  host.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 250); }, 3200);
+}
+
 const state = { session: null, model: null, baseUrl: null, agent: false, models: [], busy: false, view: "chat", cwd: "", file: null };
 let _chatAbort = null;   // AbortController for the in-flight /api/chat stream
 
@@ -306,7 +347,7 @@ function setView(v) {
   state.view = v; document.body.dataset.view = v;
   $$(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.view === v));
   $$(".view").forEach(s => s.classList.toggle("active", s.id === "view-" + v));
-  if (v === "files") loadFiles(state.cwd);
+  if (v === "files") { loadFiles(state.cwd); if (_cm) setTimeout(() => _cm.refresh(), 0); }
   if (v === "skills") loadSkills();
   if (v === "memory") loadMemory();
 }
@@ -349,33 +390,84 @@ async function loadFiles(path = "") {
   });
 }
 const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " K" : (n / 1048576).toFixed(1) + " M";
+/* ---- CodeMirror code editor (Files view) ---- */
+let _cm = null, _cmDirty = false;
+const CM_LANGS = [["", "Plain text"], ["javascript", "JavaScript"], ["application/json", "JSON"],
+  ["text/x-python", "Python"], ["text/x-csrc", "C"], ["text/x-c++src", "C++"], ["text/x-java", "Java"],
+  ["css", "CSS"], ["xml", "XML"], ["htmlmixed", "HTML"], ["text/x-markdown", "Markdown"], ["shell", "Shell"],
+  ["yaml", "YAML"], ["sql", "SQL"], ["rust", "Rust"], ["go", "Go"], ["php", "PHP"], ["ruby", "Ruby"],
+  ["lua", "Lua"], ["dockerfile", "Dockerfile"]];
+function _cmInit() {
+  if (_cm) return _cm;
+  _cm = CodeMirror($("#feCm"), {
+    value: "", mode: null, theme: "material-darker", lineNumbers: true, lineWrapping: false,
+    matchBrackets: true, autoCloseBrackets: true, styleActiveLine: true, indentUnit: 2, tabSize: 2,
+    extraKeys: {
+      "Ctrl-S": () => saveFile(), "Cmd-S": () => saveFile(),
+      "Ctrl-F": "findPersistent", "Cmd-F": "findPersistent",
+      "Alt-F": "replace", "Shift-Ctrl-F": "replaceAll",
+      "Ctrl-/": "toggleComment", "Cmd-/": "toggleComment",
+    },
+  });
+  _cm.on("change", () => { if (!_cmDirty) { _cmDirty = true; $("#feDirty").classList.add("on"); } });
+  const sel = $("#feLang");
+  sel.innerHTML = CM_LANGS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+  sel.onchange = () => _cm.setOption("mode", sel.value || null);
+  return _cm;
+}
+function _applyMode(path) {                       // pick syntax mode from the file's extension/name
+  let mime = "";
+  try { const info = CodeMirror.findModeByFileName(path.split("/").pop()); if (info) mime = info.mime || info.mode; } catch {}
+  _cm.setOption("mode", mime || null);
+  const sel = $("#feLang"); sel.value = [...sel.options].some(o => o.value === mime) ? mime : "";
+}
 async function openFile(path) {
   state.file = path;
   $("#feEmpty").style.display = "none"; $("#feOpen").style.display = "flex";
   $("#feName").textContent = path;
   const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
   $("#feImage").style.display = isImg ? "flex" : "none";
-  $("#feText").style.display = isImg ? "none" : "block";
-  $("#fSave").style.display = isImg ? "none" : "";              // images aren't text-editable
+  $("#feCm").style.display = isImg ? "none" : "block";
+  $("#feOpen").classList.toggle("is-image", isImg);
   if (isImg) { $("#feImg").src = "/api/raw?path=" + encodeURIComponent(path); return; }
   const d = await api("/api/file?path=" + encodeURIComponent(path));
-  $("#feText").value = d.binary ? "(binary file — not editable here)" : d.content;
-  $("#feText").readOnly = !!d.binary;
+  _cmInit();
+  _cm.setOption("readOnly", !!d.binary);
+  _cm.setValue(d.binary ? "(binary file — not editable here)" : d.content);
+  _cm.clearHistory();
+  _applyMode(path);
+  _cmDirty = false; $("#feDirty").classList.remove("on");
+  setTimeout(() => _cm.refresh(), 0);             // CM mis-measures in a freshly-shown flex box
 }
 async function newFolder() {
-  const name = prompt("New folder name (relative to current folder):"); if (!name) return;
+  const name = await promptDialog("New folder", { placeholder: "folder name", okLabel: "Create" }); if (!name) return;
   const path = state.cwd ? state.cwd + "/" + name : name;
   await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
   loadFiles(state.cwd);
 }
 async function saveFile() {
-  if (!state.file) return;
-  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: state.file, content: $("#feText").value }) });
+  if (!state.file || !_cm) return;
+  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: state.file, content: _cm.getValue() }) });
+  _cmDirty = false; $("#feDirty").classList.remove("on");
   const btn = $("#fSave"); btn.textContent = "Saved ✓"; setTimeout(() => btn.textContent = "Save", 1200);
   loadFiles(state.cwd);
 }
+async function saveFileAs() {
+  if (!_cm) return;
+  const suggested = state.file || (state.cwd ? state.cwd + "/untitled.txt" : "untitled.txt");
+  const path = await promptDialog("Save as", { value: suggested, message: "Path relative to the workspace", okLabel: "Save" });
+  if (!path || path === state.file) { if (path === state.file) saveFile(); return; }
+  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: _cm.getValue() }) });
+  await loadFiles(state.cwd);
+  openFile(path);
+}
+function toggleWrap() {
+  if (!_cm) return;
+  const w = !_cm.getOption("lineWrapping");
+  _cm.setOption("lineWrapping", w); $("#feWrap").classList.toggle("on", w);
+}
 async function newFile() {
-  const name = prompt("New file path (relative to current folder):"); if (!name) return;
+  const name = await promptDialog("New file", { placeholder: "file name (e.g. notes.md)", okLabel: "Create" }); if (!name) return;
   const path = state.cwd ? state.cwd + "/" + name : name;
   await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: "" }) });
   loadFiles(state.cwd); openFile(path);
@@ -396,15 +488,19 @@ async function loadSkills() {
   });
 }
 function openSkill(s) {
-  $("#skModalTitle").textContent = s ? "Edit skill" : "New skill";
+  $("#skModalTitle").textContent = s ? `Edit skill${s.status && s.status !== "published" ? " · " + s.status : ""}` : "New skill";
   $("#skName").value = s ? s.name : ""; $("#skDesc").value = s ? s.description : ""; $("#skBody").value = s ? s.body : "";
   $("#skModal").dataset.dir = s ? s.dir : "";
+  $("#skModal").dataset.status = s ? (s.status || "published") : "published";
+  $("#skModal").dataset.notes = s ? (s.notes || "") : "";
   $("#skDelete").style.display = s ? "block" : "none";
   $("#skModal").classList.add("open"); $("#skModalScrim").classList.add("open");
 }
 const closeSkill = () => { $("#skModal").classList.remove("open"); $("#skModalScrim").classList.remove("open"); };
 async function saveSkill() {
-  const body = { name: $("#skName").value.trim(), description: $("#skDesc").value.trim(), body: $("#skBody").value, dir: $("#skModal").dataset.dir || undefined };
+  const m = $("#skModal");
+  const body = { name: $("#skName").value.trim(), description: $("#skDesc").value.trim(), body: $("#skBody").value,
+    dir: m.dataset.dir || undefined, status: m.dataset.status || "published", notes: m.dataset.notes || "" };
   if (!body.name) return;
   await fetch("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   closeSkill(); loadBrainSkills();
@@ -439,27 +535,49 @@ async function addMemory() {
 /* ---------------- settings ---------------- */
 async function loadProviders() {
   const provs = await api("/api/providers");
-  $("#providerSelect").innerHTML = provs.map(p => `<option value="${p.base_url}" data-needs="${p.needs_key}" data-name="${p.name}">${p.name}</option>`).join("");
+  $("#providerSelect").innerHTML = provs.map(p => `<option value="${p.base_url}" data-needs="${p.needs_key}" data-name="${p.name}">${p.name}</option>`).join("")
+    + `<option value="" data-needs="false" data-name="">Custom (any OpenAI-compatible URL)…</option>`;
   $("#providerSelect").onchange = syncProviderFields; syncProviderFields();
 }
 function syncProviderFields() {
-  const o = $("#providerSelect").selectedOptions[0];
+  const o = $("#providerSelect").selectedOptions[0]; if (!o) return;
+  const custom = !o.value;
+  $("#epUrl").value = o.value;
+  $("#epUrl").placeholder = custom ? "base URL, e.g. http://192.168.1.20:11434/v1" : o.value;
   $("#epName").value = o.dataset.name;
-  $("#epKey").style.display = o.dataset.needs === "true" ? "block" : "none"; $("#epKey").value = "";
+  $("#epKey").style.display = (custom || o.dataset.needs === "true") ? "block" : "none"; $("#epKey").value = "";
+  if (custom) $("#epUrl").focus();
 }
 async function loadEndpoints() {
-  const cfg = await api("/api/config"); const box = $("#endpoints"); box.innerHTML = "";
+  const cfg = await api("/api/config"); const box = $("#endpoints"); if (!box) return; box.innerHTML = "";
   cfg.endpoints.forEach(e => {
     const el = document.createElement("div"); el.className = "ep";
-    el.innerHTML = `<div class="ep-info"><div class="ep-name">${escapeHtml(e.name)}</div><div class="ep-url">${escapeHtml(e.base_url)}</div>${e.has_key ? '<div class="ep-key">● key set</div>' : ''}</div><button class="ep-del">✕</button>`;
+    el.innerHTML = `<div class="ep-info"><div class="ep-name">${escapeHtml(e.name)}</div><div class="ep-url">${escapeHtml(e.base_url)}</div>${e.has_key ? '<div class="ep-key">● key set</div>' : ''}</div><span class="ep-count" data-ep="${escapeHtml(e.name)}">…</span><button class="ep-del">✕</button>`;
     $(".ep-del", el).onclick = async () => { if (!await confirmAction("Remove endpoint?", `“${e.name}” will be removed.`)) return; await fetch("/api/endpoints/" + encodeURIComponent(e.name), { method: "DELETE" }); loadEndpoints(); loadModels(); };
     box.appendChild(el);
   });
+  try {                                  // model count + reachability per endpoint
+    const models = await api("/api/models");
+    const counts = {}, errs = {};
+    models.forEach(m => { if (m.error) errs[m.endpoint] = 1; else counts[m.endpoint] = (counts[m.endpoint] || 0) + 1; });
+    $$(".ep-count", box).forEach(b => {
+      if (errs[b.dataset.ep]) { b.textContent = "⚠ unreachable"; b.className = "ep-count err"; }
+      else { const n = counts[b.dataset.ep] || 0; b.textContent = n + (n === 1 ? " model" : " models"); b.className = "ep-count ok"; }
+    });
+  } catch {}
 }
 async function addEndpoint() {
-  const o = $("#providerSelect").selectedOptions[0];
-  await fetch("/api/endpoints", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: $("#epName").value || o.dataset.name, base_url: o.value, api_key: $("#epKey").value }) });
-  $("#epKey").value = ""; loadEndpoints(); loadModels();
+  const o = $("#providerSelect").selectedOptions[0], msg = $("#epMsg");
+  const url = $("#epUrl").value.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//.test(url)) {
+    if (msg) { msg.textContent = "enter a base URL starting with http(s):// — usually ending in /v1"; msg.className = "kn-note err"; }
+    return;
+  }
+  const name = $("#epName").value.trim() || o.dataset.name || url.replace(/^https?:\/\//, "").replace(/\/v\d+$/, "");
+  await fetch("/api/endpoints", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, base_url: url, api_key: $("#epKey").value }) });
+  $("#epKey").value = "";
+  if (msg) { msg.textContent = `added “${name}” ✓ — counting its models…`; msg.className = "kn-note ok"; }
+  await loadEndpoints(); loadModels();
 }
 
 /* ---------------- telegram ---------------- */
@@ -529,13 +647,15 @@ const SETTINGS_PAGES = {
   endpoints: `
     <div class="drawer-section">
       <h3>Model endpoints</h3>
-      <p class="sub">Add a provider, paste a key, and its models appear in the composer.</p>
+      <p class="sub">Pick a provider — or choose <b>Custom</b> and point Oceano at any OpenAI-compatible server (another llama-swap box, Ollama, LM Studio, vLLM…). Each endpoint shows how many models it serves; they all appear in the composer.</p>
       <div class="endpoints" id="endpoints"></div>
       <div class="add-endpoint">
         <select id="providerSelect"></select>
+        <input id="epUrl" placeholder="base URL, e.g. http://192.168.1.20:11434/v1" autocomplete="off" spellcheck="false">
         <input id="epName" placeholder="label (optional)">
         <input id="epKey" type="password" placeholder="API key" autocomplete="off">
         <button class="primary" id="addEndpoint">Add</button>
+        <div class="kn-note" id="epMsg"></div>
       </div>
     </div>`,
   telegram: `
@@ -688,7 +808,11 @@ function createWindow(opts) {
   $(".win-min", win).onclick = e => { e.stopPropagation(); minimizeWindow(win); };
   $(".win-max", win).onclick = e => { e.stopPropagation(); maximizeWindow(win); };
   $(".win-bar", win).addEventListener("dblclick", e => { if (!e.target.closest("button")) maximizeWindow(win); });
-  $(".win-close", win).onclick = () => { if (opts.onClose) opts.onClose(); if (win._chip) win._chip.remove(); win.remove(); };
+  $(".win-close", win).onclick = async () => {
+    if (opts.onClose && (await opts.onClose()) === false) return;   // onClose may veto the close
+    if (win._chip) win._chip.remove();
+    win.remove();
+  };
   _dragify($(".win-bar", win), win, "move");
   _dragify($(".win-rz", win), win, "resize");
   return { body: $(".win-body", win), reused: false };
@@ -846,23 +970,42 @@ function openLiveView() {
 
   const img = $("#liveImg", body), stage = $("#liveStage", body);
   img.addEventListener("click", e => { const pt = _mapToPage(img, e.clientX, e.clientY); if (pt) post("/api/browser/click", pt); stage.focus(); });
-  stage.addEventListener("wheel", e => { e.preventDefault(); post("/api/browser/scroll", { dy: Math.round(e.deltaY) }); }, { passive: false });
+  // throttle the wheel: trackpads fire dozens of events/sec — accumulate the delta
+  // and post at most every 80ms, so the server isn't flooded with tiny scrolls
+  let _wheelAcc = 0, _wheelTimer = null;
+  stage.addEventListener("wheel", e => {
+    e.preventDefault();
+    _wheelAcc += e.deltaY;
+    if (_wheelTimer) return;
+    _wheelTimer = setTimeout(() => {
+      const dy = Math.round(_wheelAcc); _wheelAcc = 0; _wheelTimer = null;
+      if (dy) post("/api/browser/scroll", { dy });
+    }, 80);
+  }, { passive: false });
   stage.addEventListener("keydown", e => {
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { post("/api/browser/type", { text: e.key }); e.preventDefault(); }
     else if (["Enter", "Backspace", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End"].includes(e.key)) { post("/api/browser/key", { key: e.key }); e.preventDefault(); }
   });
 
+  _lastTabsSig = null;                       // force a tab-bar rebuild on (re)open
   _liveES = new EventSource("/api/browser/stream");
   _liveES.onmessage = e => {
     let d; try { d = JSON.parse(e.data); } catch { return; }
     if (d.frame && img) { img.src = d.frame; img.style.display = "block"; const w = $("#liveWait", body); if (w) w.style.display = "none"; }
-    const u = $("#liveUrl", body); if (u && d.url) { u.textContent = d.url || "browsing…"; u.classList.add("on"); }
+    const u = $("#liveUrl", body);
+    if (u && d.url && u.textContent !== d.url) { u.textContent = d.url; u.classList.add("on"); }
     if (d.tabs) renderLiveTabs(d.tabs);
   };
 }
 const _post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+let _lastTabsSig = null;
 function renderLiveTabs(tabs) {
   const bar = $("#liveTabs"); if (!bar) return;
+  // frames arrive ~10×/s and carry the tab list — only rebuild the DOM when the
+  // tabs actually changed, otherwise hover states die mid-hover (the flicker)
+  const sig = JSON.stringify((tabs || []).map(t => [t.id, t.title, t.url, t.active]));
+  if (sig === _lastTabsSig) return;
+  _lastTabsSig = sig;
   if (!tabs || tabs.length <= 1) { bar.style.display = "none"; bar.innerHTML = ""; return; }
   bar.style.display = "flex";
   bar.innerHTML = "";
@@ -879,17 +1022,39 @@ function renderLiveTabs(tabs) {
 /* ---------- Explorer window ---------- */
 let _expCwd = "";
 function openExplorer() {
-  const { body, reused } = createWindow({ id: "win-explorer", title: "Files — workspace", icon: "▤", width: 600, height: 470 });
+  const { body, reused } = createWindow({ id: "win-explorer", title: "Files — workspace", icon: "▤", width: 880, height: 580,
+    onClose: async () => {                          // warn before discarding unsaved (dirty) tabs
+      const dirty = _edTabs.filter(t => t.dirty);
+      if (!dirty.length) return;
+      const names = dirty.map(t => t.path.split("/").pop()).join(", ");
+      const ok = await confirmAction("Close with unsaved changes?",
+        `${dirty.length} file${dirty.length > 1 ? "s have" : " has"} unsaved edits (${names}). Closing the window loses them.`,
+        "Close anyway");
+      if (!ok) return false;                        // veto — keep the window open
+    } });
   if (reused) return;
+  body.classList.add("exp-win");
+  const r = parseFloat(localStorage.getItem("oceano.exp.ratio"));
+  const ratio = (r >= 15 && r <= 72) ? r : 35;                 // file tree / editor split, %
   body.innerHTML = `
-    <div class="exp-bar">
-      <button class="exp-btn" id="expUp" title="up">↰</button>
-      <div class="exp-crumbs" id="expCrumbs"></div>
-      <button class="exp-btn" id="expNewDir">＋ folder</button>
-      <button class="exp-btn" id="expNewFile">＋ file</button>
-      <button class="exp-btn" id="expRefresh">↻</button>
-    </div>
-    <div class="exp-list" id="expList"></div>`;
+    <div class="exp-split">
+      <div class="exp-left" id="expLeft" style="width:${ratio}%">
+        <div class="exp-bar">
+          <button class="exp-btn" id="expUp" title="up a folder">↰</button>
+          <div class="exp-crumbs" id="expCrumbs"></div>
+          <button class="exp-btn" id="expNewDir" title="new folder">＋▱</button>
+          <button class="exp-btn" id="expNewFile" title="new file">＋▤</button>
+          <button class="exp-btn" id="expRefresh" title="refresh">↻</button>
+        </div>
+        <div class="exp-list" id="expList"></div>
+      </div>
+      <div class="exp-divider" id="expDivider" title="drag to resize"></div>
+      <div class="exp-right" id="expRight">
+        <div class="ed-tabs" id="edTabs" style="display:none"></div>
+        <div class="ed-stack" id="edStack"><div class="exp-edit-empty">Select a file in the tree to open it. Open several — they become tabs.</div></div>
+      </div>
+    </div>`;
+  _edTabs = []; _edActive = null;                  // fresh editor tabs for this window
   $("#expUp", body).onclick = () => expLoad(_expCwd.split("/").slice(0, -1).join("/"));
   $("#expNewDir", body).onclick = expNewFolder;
   $("#expNewFile", body).onclick = expNewFile;
@@ -899,7 +1064,95 @@ function openExplorer() {
     e.preventDefault();
     showCtx(e.clientX, e.clientY, [{ label: "New folder", action: expNewFolder }, { label: "New file", action: expNewFile }, { label: "Refresh", action: () => expLoad(_expCwd) }]);
   });
+  _wireExpDivider(body);
   expLoad("");
+  _edRestore();                                    // reopen the tabs from last time
+}
+function _wireExpDivider(body) {
+  const div = $("#expDivider", body), left = $("#expLeft", body), split = $(".exp-split", body);
+  div.addEventListener("mousedown", e => {
+    e.preventDefault();
+    const move = ev => {
+      const r = split.getBoundingClientRect();
+      const pct = Math.max(15, Math.min(72, ((ev.clientX - r.left) / r.width) * 100));
+      left.style.width = pct + "%";
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up);
+      document.body.style.userSelect = "";
+      const pct = parseFloat(left.style.width); if (pct) localStorage.setItem("oceano.exp.ratio", pct.toFixed(0));
+    };
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+  });
+}
+/* ---- editor tabs (multiple files open at once in the Files window, persisted) ---- */
+let _edTabs = [], _edActive = null;
+const ED_EMPTY = `<div class="exp-edit-empty">Select a file in the tree to open it. Open several — they become tabs.</div>`;
+function _edPersist() {                                         // remember which files are open + active
+  try {
+    localStorage.setItem("oceano.exp.tabs", JSON.stringify({
+      paths: _edTabs.map(t => t.path), active: _edActive ? _edActive.path : null,
+    }));
+  } catch {}
+}
+function expOpenFile(path, activate = true) {
+  const stack = $("#edStack"); if (!stack) return null;        // Files window not open
+  const existing = _edTabs.find(t => t.path === path);
+  if (existing) { if (activate) _edActivate(existing); return existing; }
+  if (!_edTabs.length) stack.innerHTML = "";                   // drop the empty placeholder
+  const pane = document.createElement("div"); pane.className = "ed-pane"; pane.style.display = "none"; stack.appendChild(pane);
+  const tabEl = document.createElement("div"); tabEl.className = "ed-tab"; tabEl.title = path;
+  tabEl.innerHTML = `<span class="ed-tab-dot">●</span><span class="ed-tab-name">${escapeHtml(path.split("/").pop())}</span><button class="ed-tab-x" title="close">✕</button>`;
+  const tab = { path, pane, tabEl, cm: null, dirty: false };
+  tabEl.onclick = e => { if (!e.target.closest(".ed-tab-x")) _edActivate(tab); };
+  $(".ed-tab-x", tabEl).onclick = e => { e.stopPropagation(); _edClose(tab); };
+  $("#edTabs").appendChild(tabEl);
+  _edTabs.push(tab);
+  $("#edTabs").style.display = "flex";
+  if (activate) _edActivate(tab);
+  const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
+  _mountEditor(pane, path, {
+    onSaved: () => expLoad(_expCwd),
+    onDirty: d => { tab.dirty = d; tabEl.classList.toggle("dirty", d); },
+    onPathChange: np => { tab.path = np; $(".ed-tab-name", tabEl).textContent = np.split("/").pop(); tabEl.title = np; _edPersist(); },
+  }).then(cm => {
+    tab.cm = cm;
+    if (!cm && !isImg) { _edClose(tab, true); toast("Couldn't open " + path.split("/").pop(), "err"); return; }  // file gone
+    if (_edActive === tab && cm) setTimeout(() => cm.refresh(), 10);
+  });
+  _edPersist();
+  return tab;
+}
+function _edActivate(tab) {
+  _edActive = tab;
+  _edTabs.forEach(t => { t.pane.style.display = t === tab ? "flex" : "none"; t.tabEl.classList.toggle("active", t === tab); });
+  $("#edTabs").style.display = _edTabs.length ? "flex" : "none";
+  if (tab.cm) setTimeout(() => { tab.cm.refresh(); tab.cm.focus(); }, 10);
+  _edPersist();
+}
+async function _edClose(tab, force = false) {
+  if (!force && tab.dirty && !await confirmAction("Close without saving?",
+      `“${tab.path.split("/").pop()}” has unsaved changes — they'll be lost.`, "Discard")) return;
+  const i = _edTabs.indexOf(tab);
+  if (i < 0) return;
+  tab.pane.remove(); tab.tabEl.remove(); _edTabs.splice(i, 1);
+  if (_edActive === tab) {
+    _edActive = null;
+    const next = _edTabs[i] || _edTabs[i - 1];
+    if (next) _edActivate(next);
+    else { $("#edStack").innerHTML = ED_EMPTY; $("#edTabs").style.display = "none"; }
+  } else {
+    $("#edTabs").style.display = _edTabs.length ? "flex" : "none";
+  }
+  _edPersist();
+}
+function _edRestore() {                                         // reopen the tabs from the last session
+  let saved; try { saved = JSON.parse(localStorage.getItem("oceano.exp.tabs") || "null"); } catch { saved = null; }
+  if (!saved || !Array.isArray(saved.paths) || !saved.paths.length) return;
+  saved.paths.forEach(p => expOpenFile(p, false));             // open all without stealing focus
+  const act = _edTabs.find(t => t.path === saved.active) || _edTabs[_edTabs.length - 1];
+  if (act) _edActivate(act);                                   // then focus the one that was active
 }
 async function expLoad(path) {
   const d = await api("/api/files?path=" + encodeURIComponent(path || ""));
@@ -913,60 +1166,155 @@ async function expLoad(path) {
   d.entries.forEach(e => {
     const row = document.createElement("div"); row.className = "exp-row" + (e.dir ? " dir" : "");
     row.innerHTML = `<span class="ei">${e.dir ? "▸" : "·"}</span><span class="en">${escapeHtml(e.name)}</span>` + (e.dir ? "" : `<span class="es">${fmtSize(e.size)}</span>`);
-    row.onclick = () => { $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel"); };
-    row.ondblclick = () => e.dir ? expLoad(e.path) : openFileWindow(e.path);
+    row.onclick = () => {                                      // single-click: select; files open in the pane
+      $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
+      if (!e.dir) expOpenFile(e.path);
+    };
+    row.ondblclick = () => { if (e.dir) expLoad(e.path); };     // double-click a folder to enter it
     row.oncontextmenu = ev => {
       ev.preventDefault();
       $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
       const items = e.dir
         ? [{ label: "Open", action: () => expLoad(e.path) }]
-        : [{ label: "Open", action: () => openFileWindow(e.path) }, { label: "Download", action: () => window.open("/api/raw?path=" + encodeURIComponent(e.path), "_blank") }];
+        : [{ label: "Open here", action: () => expOpenFile(e.path) },
+           { label: "Open in new window", action: () => openFileWindow(e.path) },
+           { label: "Download", action: () => window.open("/api/raw?path=" + encodeURIComponent(e.path), "_blank") }];
       items.push({ label: "Rename", action: () => expRename(e) }, { sep: true }, { label: "Delete", danger: true, action: () => expDelete(e) });
       showCtx(ev.clientX, ev.clientY, items);
     };
     list.appendChild(row);
   });
 }
-async function expNewFolder() { const n = prompt("New folder name:"); if (!n) return; await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: _expCwd ? _expCwd + "/" + n : n }) }); expLoad(_expCwd); }
-async function expNewFile() { const n = prompt("New file name:"); if (!n) return; await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: _expCwd ? _expCwd + "/" + n : n, content: "" }) }); expLoad(_expCwd); }
-async function expRename(e) { const n = prompt("Rename to:", e.name); if (!n || n === e.name) return; await fetch("/api/rename", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: e.path, to: _expCwd ? _expCwd + "/" + n : n }) }); expLoad(_expCwd); }
+async function expNewFolder() { const n = await promptDialog("New folder", { placeholder: "folder name", okLabel: "Create" }); if (!n) return; await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: _expCwd ? _expCwd + "/" + n : n }) }); expLoad(_expCwd); }
+async function expNewFile() { const n = await promptDialog("New file", { placeholder: "file name (e.g. notes.md)", okLabel: "Create" }); if (!n) return; await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: _expCwd ? _expCwd + "/" + n : n, content: "" }) }); expLoad(_expCwd); }
+async function expRename(e) { const n = await promptDialog("Rename", { value: e.name, okLabel: "Rename" }); if (!n || n === e.name) return; await fetch("/api/rename", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: e.path, to: _expCwd ? _expCwd + "/" + n : n }) }); expLoad(_expCwd); }
 async function expDelete(e) { if (!await confirmAction("Delete " + (e.dir ? "folder" : "file") + "?", `“${e.name}” will be deleted${e.dir ? " with its contents" : ""}.`)) return; await fetch("/api/file?path=" + encodeURIComponent(e.path), { method: "DELETE" }); expLoad(_expCwd); }
 
-/* ---------- file viewer / editor window ---------- */
-async function openFileWindow(path) {
+/* ---------- file viewer / editor window (CodeMirror code editor) ---------- */
+// Major languages to offer in the dropdown. We list one only if its CodeMirror mode
+// is actually loaded, and we key options on the MIME meta returns — so the dropdown
+// always matches what extension-detection picks (that's why Rust now shows as Rust,
+// not "Plain text"). clike covers C/C++/C#/Java/Kotlin/Scala/Objective-C; javascript
+// covers JS/TS/JSON — so they appear without separate mode files.
+const ED_MAJOR = ["Plain Text", "Python", "JavaScript", "TypeScript", "JSON", "HTML", "CSS", "Java",
+  "C", "C++", "C#", "Go", "Rust", "Ruby", "PHP", "Swift", "Kotlin", "Scala", "Objective-C",
+  "Shell", "SQL", "YAML", "TOML", "Markdown", "Lua", "Dockerfile", "XML"];
+let _edLangCache = null;
+function _edLangOptions() {
+  if (_edLangCache) return _edLangCache;
+  const out = [["", "Plain text"]], seen = new Set();
+  (CodeMirror.modeInfo || []).forEach(m => {
+    if (seen.has(m.name) || !ED_MAJOR.includes(m.name)) return;
+    if (!m.mode || !CodeMirror.modes[m.mode]) return;   // mode script not loaded → don't offer it
+    seen.add(m.name); out.push([m.mime || m.mode, m.name]);
+  });
+  out.splice(1, out.length, ...out.slice(1).sort((a, b) => a[1].localeCompare(b[1])));  // alpha, after Plain text
+  _edLangCache = out;
+  return out;
+}
+function _fwMime(path) {
+  try { const i = CodeMirror.findModeByFileName(path.split("/").pop()); if (i) return i.mime || i.mode; } catch {}
+  return "";
+}
+/* Build a full CodeMirror editor (toolbar + buffer) inside `container`. Reused by the
+   Files window's editor pane AND the standalone file window. opts.onSaved fires after
+   a successful save/save-as (used to refresh the tree). Returns the CM instance. */
+async function _mountEditor(container, path, opts = {}) {
+  const onSaved = opts.onSaved || (() => {});
+  const onDirty = opts.onDirty || (() => {});       // (bool) — for the tab's unsaved dot
+  const onPathChange = opts.onPathChange || (() => {});   // (newPath) — after Save as…
+  const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
+  if (isImg) { container.innerHTML = `<div class="fw-img"><img src="/api/raw?path=${encodeURIComponent(path)}"></div>`; return null; }
+  const d = await api("/api/file?path=" + encodeURIComponent(path));
+  if (d.content == null && !d.binary) {            // missing/unreadable (e.g. a remembered file that was deleted)
+    container.innerHTML = `<div class="exp-edit-empty">⚠ Couldn't open <b>${escapeHtml(path)}</b> — it may have been moved or deleted.</div>`;
+    return null;
+  }
+  const langs = _edLangOptions().map(([v, l]) => `<option value="${v}">${escapeHtml(l)}</option>`).join("");
+  container.innerHTML = `
+    <div class="fw-bar">
+      <span class="fw-name" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+      <span class="fe-dirty fw-dirty" title="unsaved changes">●</span>
+      <span class="fe-spacer"></span>
+      <select class="fe-lang fw-lang" title="syntax mode">${langs}</select>
+      <button class="ed-btn fw-find" title="Find / replace (Ctrl-F)">⌕</button>
+      <button class="ed-btn fw-wrap" title="Toggle line wrap">⏎</button>
+      <button class="ed-btn fw-saveas" title="Save as a new file">Save as…</button>
+      <button class="primary sm fw-save">Save</button>
+    </div>
+    <div class="fw-cm"></div>`;
+  const cm = CodeMirror($(".fw-cm", container), {
+    value: d.binary ? "(binary file — not editable here)" : d.content,
+    mode: _fwMime(path) || null, theme: "material-darker", lineNumbers: true, lineWrapping: false,
+    readOnly: !!d.binary, matchBrackets: true, autoCloseBrackets: true, styleActiveLine: true,
+    indentUnit: 2, tabSize: 2,
+    extraKeys: { "Ctrl-S": () => save(), "Cmd-S": () => save(),
+                 "Ctrl-F": "findPersistent", "Cmd-F": "findPersistent", "Alt-F": "replace",
+                 "Shift-Ctrl-F": "replaceAll", "Ctrl-/": "toggleComment", "Cmd-/": "toggleComment" } });
+  let curPath = path, dirty = false;
+  const dot = $(".fw-dirty", container);
+  cm.on("change", () => { if (!dirty) { dirty = true; dot.classList.add("on"); onDirty(true); } });
+  const sel = $(".fw-lang", container), mime = _fwMime(path);
+  sel.value = [...sel.options].some(o => o.value === mime) ? mime : "";
+  sel.onchange = () => cm.setOption("mode", sel.value || null);
+  async function write(p) {
+    await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: p, content: cm.getValue() }) });
+  }
+  async function save() {
+    await write(curPath); dirty = false; dot.classList.remove("on"); onDirty(false);
+    const b = $(".fw-save", container); b.textContent = "Saved ✓"; setTimeout(() => b.textContent = "Save", 1000);
+    onSaved();
+  }
+  $(".fw-save", container).onclick = save;
+  $(".fw-saveas", container).onclick = async () => {
+    const np = await promptDialog("Save as", { value: curPath, message: "Path relative to the workspace", okLabel: "Save" }); if (!np || np === curPath) { if (np === curPath) save(); return; }
+    await write(np); curPath = np;
+    $(".fw-name", container).textContent = np; $(".fw-name", container).title = np;
+    dirty = false; dot.classList.remove("on"); onDirty(false); onPathChange(np); onSaved();
+  };
+  $(".fw-wrap", container).onclick = () => { const w = !cm.getOption("lineWrapping"); cm.setOption("lineWrapping", w); $(".fw-wrap", container).classList.toggle("on", w); };
+  $(".fw-find", container).onclick = () => { cm.focus(); cm.execCommand("findPersistent"); };
+  setTimeout(() => cm.refresh(), 30);             // CM mis-measures in a freshly-shown box
+  if (window.ResizeObserver) new ResizeObserver(() => cm.refresh()).observe($(".fw-cm", container));  // re-layout on resize
+  return cm;
+}
+async function openFileWindow(path) {                          // standalone pop-out editor window
   const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
   const name = path.split("/").pop();
-  const { body, reused } = createWindow({ id: "fw-" + path.replace(/[^a-z0-9]/gi, "_"), title: name, icon: isImg ? "▦" : "ℜ", width: 560, height: 460 });
+  const { body, reused } = createWindow({ id: "fw-" + path.replace(/[^a-z0-9]/gi, "_"), title: name, icon: isImg ? "▦" : "ℜ", width: 640, height: 520 });
   if (reused) return;
-  if (isImg) { body.innerHTML = `<div class="fw-img"><img src="/api/raw?path=${encodeURIComponent(path)}"></div>`; return; }
-  const d = await api("/api/file?path=" + encodeURIComponent(path));
-  body.innerHTML = `<div class="fw-bar"><span class="fw-name">${escapeHtml(path)}</span><button class="primary sm fw-save">Save</button></div><textarea class="fw-text" spellcheck="false"></textarea>`;
-  const ta = $(".fw-text", body); ta.value = d.binary ? "(binary file — not editable here)" : d.content; ta.readOnly = !!d.binary;
-  $(".fw-save", body).onclick = async () => { await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: ta.value }) }); const b = $(".fw-save", body); b.textContent = "Saved ✓"; setTimeout(() => b.textContent = "Save", 1000); };
+  await _mountEditor(body, path, { onSaved: () => { if (typeof _expCwd === "string") expLoad(_expCwd); } });
 }
 
 /* ---------- Brain window (memory + skills) ---------- */
-const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"]];
-function openBrain() {
+const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
+function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
-    onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } } });
-  if (reused) return;
-  body.classList.add("set-win");
-  body.innerHTML = `
-    <div class="set-layout">
-      <div class="set-tabs">${BRAIN_TABS.map((t, i) =>
-        `<button class="set-tab${i === 0 ? " active" : ""}" data-tab="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}</button>`).join("")}</div>
-      <div class="set-pane brain-pane" id="brainBody"></div>
-    </div>`;
-  $$(".set-tab", body).forEach(t => t.onclick = () => {
-    $$(".set-tab", body).forEach(x => x.classList.toggle("active", x === t));
-    brainTab(t.dataset.tab);
-  });
-  brainTab("mem");
+    onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; } if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; } } });
+  if (!reused) {
+    body.classList.add("set-win");
+    body.innerHTML = `
+      <div class="set-layout">
+        <div class="set-tabs">${BRAIN_TABS.map((t, i) =>
+          `<button class="set-tab${i === 0 ? " active" : ""}" data-tab="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}</button>`).join("")}</div>
+        <div class="set-pane brain-pane" id="brainBody"></div>
+      </div>`;
+    $$(".set-tab", body).forEach(t => t.onclick = () => {
+      $$(".set-tab", body).forEach(x => x.classList.toggle("active", x === t));
+      brainTab(t.dataset.tab);
+    });
+  }
+  const want = tab || (reused ? null : "mem");
+  if (want) {
+    const btn = $$(".set-tab", body).find(x => x.dataset.tab === want);
+    if (btn) btn.click(); else if (!reused) brainTab("mem");
+  }
 }
 function brainTab(which) {
   const c = $("#brainBody"); if (!c) return;
   if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; }   // stop riverbook polling when leaving the tab
+  if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; }
+  if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; }
   if (which === "mem") {
     c.innerHTML = `<div class="mem-add"><input id="bMemText" placeholder="Teach Oceano a durable fact…"><input id="bMemTags" class="mem-tags" placeholder="tags"><button class="primary sm" id="bMemAdd">Remember</button></div><div class="mem-list" id="bMemList"></div>`;
     const add = async () => { const t = $("#bMemText").value.trim(); if (!t) return; await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t, tags: $("#bMemTags").value.trim() }) }); $("#bMemText").value = ""; $("#bMemTags").value = ""; loadBrainMem(); };
@@ -977,10 +1325,29 @@ function brainTab(which) {
     renderKnowledge(c);
   } else if (which === "rivers") {
     renderRivers(c);
+  } else if (which === "evals") {
+    renderEvals(c);
   } else {
-    c.innerHTML = `<div class="brain-head"><button class="exp-btn" id="bSkNew">＋ New skill</button></div><div class="brain-skills" id="bSkBody"></div>`;
+    c.innerHTML = `
+      <div class="brain-head">
+        <div class="sk-tabs">
+          <button class="sk-tab on" data-f="published">Published<span class="sk-cnt" id="skCntPub"></span></button>
+          <button class="sk-tab" data-f="review">In review<span class="sk-cnt" id="skCntRev"></span></button>
+        </div>
+        <span style="flex:1"></span>
+        <button class="exp-btn" id="bSkEval" title="review learning skills now — independent review by Claude Code, then the local model publishes from staging">⚖ Evaluate now</button>
+        <button class="exp-btn" id="bSkNew">＋ New skill</button>
+      </div>
+      <div class="kn-note" id="skMsg"></div>
+      <div class="brain-skills" id="bSkBody"></div>`;
     $("#bSkNew").onclick = () => openSkill(null);
-    loadBrainSkills();
+    $("#bSkEval").onclick = startSkillEval;
+    $$(".sk-tab", c).forEach(b => b.onclick = () => {
+      $$(".sk-tab", c).forEach(x => x.classList.toggle("on", x === b));
+      _skillFilter = b.dataset.f; loadBrainSkills();
+    });
+    _skillFilter = "published";
+    loadBrainSkills(); refreshSkillEval(false);
   }
 }
 async function loadBrainMem() {
@@ -999,15 +1366,69 @@ async function loadBrainMem() {
     list.appendChild(row);
   });
 }
+let _skillFilter = "published", _skillEvalTimer = null;
+const patchSkill = (dir, status, notes) =>
+  fetch("/api/skills/" + encodeURIComponent(dir), { method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(notes === undefined ? { status } : { status, notes }) });
 async function loadBrainSkills() {
   const body = $("#bSkBody"); if (!body) return;
-  skillsCache = await api("/api/skills"); body.innerHTML = "";
-  if (!skillsCache.length) { body.innerHTML = `<div class="empty-note">No skills yet — teach Oceano a reusable procedure.</div>`; return; }
-  skillsCache.forEach(s => {
-    const c = document.createElement("div"); c.className = "skill-card";
-    c.innerHTML = `<h3>${escapeHtml(s.name)}</h3><div class="sc-desc">${escapeHtml(s.description)}</div><div class="sc-snip">${escapeHtml(s.body.slice(0, 90))}…</div>`;
+  skillsCache = await api("/api/skills");
+  const pub = skillsCache.filter(s => s.status === "published");
+  const rev = skillsCache.filter(s => s.status !== "published");
+  const cp = $("#skCntPub"), cr = $("#skCntRev");
+  if (cp) cp.textContent = pub.length; if (cr) cr.textContent = rev.length;
+  const list = _skillFilter === "review" ? rev : pub;
+  body.innerHTML = "";
+  if (!list.length) {
+    body.innerHTML = `<div class="empty-note">${_skillFilter === "review"
+      ? "Nothing in review. When the agent teaches itself something (learn_skill), it lands here for independent validation before going live."
+      : "No published skills yet — create one, or let Oceano learn its own as it works."}</div>`;
+    return;
+  }
+  list.forEach(s => {
+    const c = document.createElement("div"); c.className = "skill-card st-" + s.status;
+    const chip = s.status === "published" ? `<span class="sk-chip pub">published</span>`
+               : s.status === "staged" ? `<span class="sk-chip stg">staged · approved</span>`
+               : `<span class="sk-chip lrn">learning · awaiting review</span>`;
+    c.innerHTML = `<div class="sk-head"><h3>${escapeHtml(s.name)}</h3>${chip}</div>
+      <div class="sc-desc">${escapeHtml(s.description)}</div>
+      ${s.notes ? `<div class="sk-notes">${escapeHtml(s.notes)}</div>` : ""}
+      <div class="sc-snip">${escapeHtml((s.body || "").slice(0, 90))}…</div>
+      <div class="sk-actions"></div>`;
+    const acts = $(".sk-actions", c);
+    const mk = (label, fn) => { const b = document.createElement("button"); b.className = "sr-btn"; b.textContent = label;
+      b.onclick = e => { e.stopPropagation(); fn(); }; acts.appendChild(b); };
+    if (s.status === "staged") {
+      mk("publish", async () => { await patchSkill(s.dir, "published"); loadBrainSkills(); });
+      mk("reject", async () => { await patchSkill(s.dir, "learning", "✗ rejected by user"); loadBrainSkills(); });
+    } else if (s.status === "learning") {
+      mk("publish anyway", async () => {
+        if (!await confirmAction("Publish without review?", `“${s.name}” hasn't been validated by the independent reviewer.`, "Publish")) return;
+        await patchSkill(s.dir, "published", "published manually — skipped review"); loadBrainSkills();
+      });
+    } else {
+      mk("unpublish", async () => { await patchSkill(s.dir, "staged", "unpublished by user"); loadBrainSkills(); });
+    }
     c.onclick = () => openSkill(s); body.appendChild(c);
   });
+}
+async function startSkillEval() {
+  const msg = $("#skMsg");
+  if (msg) { msg.textContent = "starting evaluation — delegating review to Claude Code (can take a few minutes)…"; msg.className = "kn-note run"; }
+  await fetch("/api/skills/evaluate", { method: "POST" });
+  refreshSkillEval(true);
+}
+async function refreshSkillEval(loop) {
+  const msg = $("#skMsg"); if (!msg) { _skillEvalTimer = null; return; }
+  let st; try { st = await api("/api/skills-eval"); } catch { _skillEvalTimer = null; return; }
+  if (st.running) {
+    msg.textContent = "evaluation running — independent review in progress…"; msg.className = "kn-note run";
+    _skillEvalTimer = setTimeout(() => refreshSkillEval(loop), 3000);
+  } else {
+    _skillEvalTimer = null;
+    if (loop) loadBrainSkills();
+    if (st.last) { msg.textContent = "last evaluation: " + st.last; msg.className = "kn-note ok"; }
+  }
 }
 
 /* ---------- Brain → Knowledge (embedding engine: stats, indexing, search) ---------- */
@@ -1283,12 +1704,23 @@ async function loadScheduler() {
   d.tasks.forEach(t => {
     const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
     const nxt = t.next_run ? t.next_run.slice(0, 16).replace("T", " ") : "—";
+    const isSkills = (t.source || "").startsWith("skills");
+    const mgrName = isSkills ? "Skills" : "Researcher";
+    // Locked jobs (managed by Researcher/Skills): the schedule + on/off are yours to
+    // change here; the instruction is owned by the manager and it can't be deleted.
+    const lock = t.managed ? ` · <span class="sr-lock" title="created by ${mgrName} — schedule & on/off are editable here; managed there">🔒 ${mgrName}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
-      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}</div></div>
-      <button class="sr-btn sr-edit">edit</button><button class="sr-btn sr-del">✕</button>`;
+      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${lock}</div></div>` +
+      `<button class="sr-btn sr-edit">${t.managed ? "schedule" : "edit"}</button>` +
+      (t.managed ? `<button class="sr-btn sr-res" title="manage in ${mgrName}">${mgrName.toLowerCase()}</button>`
+                 : `<button class="sr-btn sr-del">✕</button>`);
     $("input", row).onchange = async e => { await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadScheduler(); };
-    $(".sr-edit", row).onclick = () => editTask(t);
-    $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return; await fetch("/api/tasks/" + t.id, { method: "DELETE" }); loadScheduler(); };
+    $(".sr-edit", row).onclick = () => t.managed ? editTaskSchedule(t) : editTask(t);
+    if (t.managed) {
+      $(".sr-res", row).onclick = isSkills ? () => openBrain("skills") : openResearcher;
+    } else {
+      $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return; await fetch("/api/tasks/" + t.id, { method: "DELETE" }); loadScheduler(); };
+    }
     list.appendChild(row);
   });
 }
@@ -1299,10 +1731,306 @@ function renderBeat(ago) {
   else if (ago < 90) { if (dot) dot.classList.add("on"); txt.textContent = `♥ heartbeat alive · last beat ${Math.round(ago)}s ago`; }
   else { if (dot) dot.classList.remove("on"); txt.textContent = `⚠ scheduler stale · last beat ${Math.round(ago)}s ago`; }
 }
-function editTask(t) {
-  const cron = prompt("Cron schedule:", t.cron); if (cron === null) return;
-  const instr = prompt("Instruction:", t.instruction); if (instr === null) return;
+async function editTask(t) {
+  const cron = await promptDialog("Edit schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Next" }); if (cron === null) return;
+  const instr = await promptDialog("Edit instruction", { value: t.instruction, okLabel: "Save" }); if (instr === null) return;
   fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron, instruction: instr }) }).then(() => loadScheduler());
+}
+async function editTaskSchedule(t) {  // locked job: only its schedule is user-editable here
+  const cron = await promptDialog("Edit schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Save" }); if (cron === null) return;
+  fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron: cron.trim() }) })
+    .then(r => r.json()).then(r => { if (!r.ok && r.error) toast(r.error, "err"); loadScheduler(); });
+}
+
+/* ---------- Brain → Evals (model eval harness · judged by Claude Code) ---------- */
+let _evalTimer = null, _evalModels = [], _evalRunSel = null;
+function renderEvals(c) {
+  c.innerHTML = `
+    <div class="brain-head">
+      <div class="sk-tabs">
+        <button class="sk-tab on" data-f="board">Leaderboard</button>
+        <button class="sk-tab" data-f="cases">Cases<span class="sk-cnt" id="evCntCases"></span></button>
+        <button class="sk-tab" data-f="history">History</button>
+      </div>
+      <span style="flex:1"></span>
+      <button class="exp-btn" id="evRun" title="run the suite against the selected models — judged by Claude Code">⚖ Run now</button>
+    </div>
+    <div class="kn-note" id="evMsg"></div>
+    <div id="evBody"></div>`;
+  $("#evRun").onclick = startEvalRun;
+  $$(".sk-tab", c).forEach(b => b.onclick = () => {
+    $$(".sk-tab", c).forEach(x => x.classList.toggle("on", x === b));
+    _evalTab = b.dataset.f; evalRenderTab();
+  });
+  _evalTab = "board";
+  evalRenderTab();
+  refreshEvalState(false);
+}
+let _evalTab = "board";
+function evalRenderTab() {
+  if (_evalTab === "cases") loadEvalCases();
+  else if (_evalTab === "history") loadEvalHistory();
+  else loadEvalBoard();
+}
+async function startEvalRun() {
+  const msg = $("#evMsg");
+  if (msg) { msg.textContent = "starting eval run — each model runs every case, graded by Claude Code (minutes)…"; msg.className = "kn-note run"; }
+  await fetch("/api/evals/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+  refreshEvalState(true);
+}
+async function refreshEvalState(loop) {
+  const msg = $("#evMsg"); if (!msg) { _evalTimer = null; return; }
+  let st; try { st = await api("/api/evals/state"); } catch { _evalTimer = null; return; }
+  if (st.running) {
+    const pct = st.total ? Math.round(100 * st.done / st.total) : 0;
+    msg.textContent = `running ${st.done}/${st.total} (${pct}%) · ${st.phase || ""}`; msg.className = "kn-note run";
+    _evalTimer = setTimeout(() => refreshEvalState(loop), 3000);
+  } else {
+    _evalTimer = null;
+    if (st.last) { msg.textContent = "last run: " + st.last; msg.className = "kn-note ok"; }
+    else if (msg.classList.contains("run")) { msg.textContent = ""; }
+    if (loop) evalRenderTab();
+  }
+}
+async function loadEvalBoard() {
+  const body = $("#evBody"); if (!body) return;
+  let d; try { d = await api("/api/evals/leaderboard"); } catch { return; }
+  if (!d.run_id || !d.rows.length) {
+    body.innerHTML = `<div class="empty-note">No completed runs yet. Add cases, then hit <b>⚖ Run now</b> — Oceano runs every case on each local model and Claude Code grades the results.</div>`;
+    return;
+  }
+  const rows = d.rows.map((r, i) => `
+    <div class="ev-board-row${i === 0 ? " top" : ""}">
+      <span class="ev-rank">${i + 1}</span>
+      <span class="ev-model">${escapeHtml(r.model)}</span>
+      <span class="ev-score" title="mean score 0–100">${r.score}</span>
+      <span class="ev-bar"><i style="width:${r.score}%"></i></span>
+      <span class="ev-meta">${r.pass_rate}% pass · ${r.cases} cases · ~${(r.avg_ms/1000).toFixed(1)}s · ${r.avg_steps} steps · ${fmtNum(r.tokens)} tok</span>
+    </div>`).join("");
+  body.innerHTML = `<div class="ev-board-head">Leaderboard · run #${d.run_id} · score = mean of Claude's 0–100 grades</div>${rows}`;
+}
+async function loadEvalCases() {
+  const body = $("#evBody"); if (!body) return;
+  let d; try { d = await api("/api/evals/cases"); } catch { return; }
+  _evalCats = d.categories; _evalGraderTypes = d.grader_types;
+  const cnt = $("#evCntCases"); if (cnt) cnt.textContent = d.cases.length;
+  const head = `<div class="ev-cases-head"><button class="exp-btn" id="evNewCase">＋ New case</button></div>`;
+  if (!d.cases.length) { body.innerHTML = head + `<div class="empty-note">No eval cases. Add one — a task plus how to grade it.</div>`; $("#evNewCase").onclick = () => openEvalCase(null); return; }
+  body.innerHTML = head + d.cases.map(cs => `
+    <div class="ev-case${cs.enabled ? "" : " off"}" data-id="${cs.id}">
+      <div class="ev-case-main">
+        <div class="ev-case-name"><span class="ev-cat">${escapeHtml(cs.category)}</span>${escapeHtml(cs.name)}</div>
+        <div class="ev-case-prompt">${escapeHtml(cs.prompt.slice(0, 110))}</div>
+        <div class="ev-case-graders">${cs.graders.map(g => `<span class="ev-grader">${escapeHtml(g.type)}</span>`).join("")}</div>
+      </div>
+      <label class="sw sm"><input type="checkbox" ${cs.enabled ? "checked" : ""}><span></span></label>
+      <button class="sr-btn ev-edit">edit</button><button class="sr-btn ev-del">✕</button>
+    </div>`).join("");
+  $("#evNewCase").onclick = () => openEvalCase(null);
+  $$(".ev-case", body).forEach(el => {
+    const cs = d.cases.find(x => x.id == el.dataset.id);
+    $("input", el).onchange = e => fetch("/api/evals/cases", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...cs, enabled: e.target.checked }) });
+    $(".ev-edit", el).onclick = () => openEvalCase(cs);
+    $(".ev-del", el).onclick = async () => { if (!await confirmAction("Delete eval case?", cs.name)) return; await fetch("/api/evals/cases/" + cs.id, { method: "DELETE" }); loadEvalCases(); };
+  });
+}
+let _evalCats = ["qa"], _evalGraderTypes = ["judge"];
+function openEvalCase(cs) {
+  const cats = _evalCats.map(x => `<option value="${x}"${cs && cs.category === x ? " selected" : ""}>${x}</option>`).join("");
+  const graders = JSON.stringify(cs ? cs.graders : [{ type: "judge" }], null, 0);
+  const { body } = createWindow({ id: "win-evalcase", title: cs ? "Edit eval case" : "New eval case", icon: "⚖", width: 560, height: 560 });
+  body.classList.add("set-win");
+  body.innerHTML = `<div class="drawer-section">
+    <label class="field-label">Name</label><input id="ecName" value="${cs ? escapeHtml(cs.name) : ""}" placeholder="capital-of-japan">
+    <label class="field-label">Category</label><select id="ecCat">${cats}</select>
+    <label class="field-label">Prompt <span class="lbl-sub">the task given to the agent</span></label>
+    <textarea id="ecPrompt" spellcheck="false" style="min-height:64px">${cs ? escapeHtml(cs.prompt) : ""}</textarea>
+    <label class="field-label">Rubric <span class="lbl-sub">what a good result looks like — the judge uses this</span></label>
+    <textarea id="ecRubric" spellcheck="false" style="min-height:56px">${cs ? escapeHtml(cs.rubric) : ""}</textarea>
+    <label class="field-label">Graders <span class="lbl-sub">JSON · types: ${_evalGraderTypes.join(", ")}</span></label>
+    <textarea id="ecGraders" spellcheck="false" style="min-height:64px;font-family:var(--font-mono)">${escapeHtml(graders)}</textarea>
+    <div class="ev-grader-hint">e.g. [{"type":"file_exists","path":"out.txt","nonempty":true},{"type":"contains","value":"hello"},{"type":"tool_called","name":"fetch_url"},{"type":"judge"}]</div>
+    <div class="acct-actions"><span class="acct-msg" id="ecMsg"></span><button class="primary sm" id="ecSave">Save case</button></div>
+  </div>`;
+  $("#ecSave", body).onclick = async () => {
+    const msg = $("#ecMsg");
+    let graders;
+    try { graders = JSON.parse($("#ecGraders").value); if (!Array.isArray(graders)) throw 0; }
+    catch { msg.textContent = "graders must be a JSON array"; msg.className = "acct-msg err"; return; }
+    const name = $("#ecName").value.trim(); if (!name) { msg.textContent = "name required"; msg.className = "acct-msg err"; return; }
+    await fetch("/api/evals/cases", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: cs ? cs.id : null, name, category: $("#ecCat").value,
+        prompt: $("#ecPrompt").value, rubric: $("#ecRubric").value, graders, enabled: cs ? cs.enabled : true }) });
+    msg.textContent = "saved ✓"; msg.className = "acct-msg ok";
+    if (_evalTab === "cases") loadEvalCases();
+  };
+}
+async function loadEvalHistory() {
+  const body = $("#evBody"); if (!body) return;
+  let d; try { d = await api("/api/evals/runs"); } catch { return; }
+  if (!d.runs.length) { body.innerHTML = `<div class="empty-note">No runs yet.</div>`; return; }
+  body.innerHTML = d.runs.map(r => `
+    <div class="ev-run" data-id="${r.id}">
+      <div class="ev-run-main"><div class="ev-run-sum">${escapeHtml(r.summary || "(no summary)")}</div>
+      <div class="ev-run-meta">#${r.id} · ${(r.ts || "").slice(0, 16).replace("T", " ")} · ${escapeHtml(r.status)} · ${r.models.length} model(s)</div></div>
+      <button class="sr-btn ev-view">results</button></div>`).join("");
+  $$(".ev-run", body).forEach(el => $(".ev-view", el).onclick = () => openEvalResults(+el.dataset.id));
+}
+async function openEvalResults(runId) {
+  const { body } = createWindow({ id: "win-evalresults", title: "Eval results · run #" + runId, icon: "⚖", width: 680, height: 600 });
+  body.innerHTML = `<div class="ev-results" id="evResults">loading…</div>`;
+  let d; try { d = await api("/api/evals/results?run_id=" + runId); } catch { return; }
+  const box = $("#evResults", body);
+  if (!d.results.length) { box.innerHTML = `<div class="empty-note">No results for this run.</div>`; return; }
+  box.innerHTML = d.results.map(r => {
+    const v = r.verdict || {};
+    const reason = v.reasoning ? `<div class="ev-reason">${escapeHtml(v.reasoning)}</div>` : "";
+    const det = (v.deterministic || []).length ? `<div class="ev-det">${(v.deterministic).map(escapeHtml).join(" · ")}</div>` : "";
+    return `<div class="ev-res ${r.passed ? "pass" : "fail"}">
+      <div class="ev-res-head"><span class="ev-res-score">${Math.round(r.score)}</span>
+        <span class="ev-res-case">${escapeHtml(r.case)}</span><span class="ev-res-model">${escapeHtml(r.model)}</span>
+        <span class="ev-res-flag">${r.passed ? "✓" : "✗"}</span></div>
+      ${det}${reason}
+      ${r.error ? `<div class="ev-err">error: ${escapeHtml(r.error)}</div>` : ""}
+      <div class="ev-res-meta">${r.tokens} tok · ${(r.ms/1000).toFixed(1)}s · ${r.steps} steps${r.tools.length ? " · tools: " + escapeHtml(r.tools.join(", ")) : ""}</div>
+    </div>`;
+  }).join("");
+}
+
+/* ---------- Calendar window (local copy, one-way synced from ICS feeds) ---------- */
+function openCalendar() {
+  const { body, reused } = createWindow({ id: "win-cal", title: "Calendar — synced, read-only", icon: "◷", width: 680, height: 580 });
+  if (reused) { loadCalendar(); return; }
+  body.innerHTML = `
+    <div class="sched-add">
+      <input id="calName" placeholder="name · e.g. Personal" style="flex:0 0 140px">
+      <input id="calUrl" placeholder="secret iCal address (…/basic.ics)" style="flex:1;min-width:160px" spellcheck="false">
+      <button class="primary sm" id="calAdd">Add</button>
+      <button class="exp-btn" id="calSync" title="sync all feeds now">↻ Sync now</button>
+    </div>
+    <div class="cal-hint">Google Calendar → Settings → your calendar → <b>Integrate calendar</b> → copy the <b>Secret address in iCal format</b> and paste it here. Sync is one-way: Oceano reads your calendar, it never writes to Google.</div>
+    <div class="kn-note" id="calMsg"></div>
+    <div class="cal-feeds" id="calFeeds"></div>
+    <div class="cal-events" id="calEvents"></div>`;
+  $("#calAdd", body).onclick = async () => {
+    const name = $("#calName").value.trim(), url = $("#calUrl").value.trim(), msg = $("#calMsg");
+    if (!url) return;
+    const btn = $("#calAdd"); btn.disabled = true; btn.textContent = "syncing…";
+    try {
+      const r = await api("/api/calendar/feeds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, url }) });
+      if (!r.ok) { msg.textContent = r.error || "could not add feed"; msg.className = "kn-note err"; return; }
+      const s = r.sync || {};
+      msg.textContent = s.ok ? `feed added ✓ · ${s.events} events synced` : `feed added, but first sync failed: ${s.error || "?"}`;
+      msg.className = "kn-note " + (s.ok ? "ok" : "err");
+      $("#calName").value = ""; $("#calUrl").value = "";
+      loadCalendar();
+    } finally { btn.disabled = false; btn.textContent = "Add"; }
+  };
+  $("#calSync", body).onclick = async () => {
+    const btn = $("#calSync"), msg = $("#calMsg");
+    btn.disabled = true; btn.textContent = "syncing…";
+    try {
+      const r = await api("/api/calendar/sync", { method: "POST" });
+      msg.textContent = r.ok ? "all feeds synced ✓" : "some feeds failed to sync — see the feed list";
+      msg.className = "kn-note " + (r.ok ? "ok" : "err");
+      loadCalendar();
+    } finally { btn.disabled = false; btn.textContent = "↻ Sync now"; }
+  };
+  loadCalendar();
+}
+function calDayLabel(iso) {
+  const d = new Date(iso + "T00:00"), today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((d - today) / 86400000);
+  const nice = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+  return diff === 0 ? "Today · " + nice : diff === 1 ? "Tomorrow · " + nice : nice;
+}
+async function loadCalendar() {
+  const feedsBox = $("#calFeeds"), evBox = $("#calEvents");
+  if (!feedsBox || !evBox) return;
+  let d; try { d = await api("/api/calendar?days=30"); } catch { return; }
+  feedsBox.innerHTML = "";
+  if (!d.feeds.length) feedsBox.innerHTML = `<div class="empty-note" style="padding:14px">No calendar feeds yet — paste your Google Calendar's secret iCal address above.</div>`;
+  d.feeds.forEach(f => {
+    const row = document.createElement("div"); row.className = "ep";
+    const sync = f.last_error ? `⚠ ${f.last_error}` : f.last_sync ? `synced ${f.last_sync.slice(0, 16).replace("T", " ")} UTC` : "never synced";
+    row.innerHTML = `<div class="ep-info"><div class="ep-name">${escapeHtml(f.name)}</div><div class="ep-url">${escapeHtml(sync)}</div></div><span class="ep-count ${f.last_error ? "err" : "ok"}">${f.event_count} events</span><button class="ep-del">✕</button>`;
+    $(".ep-del", row).onclick = async () => { if (!await confirmAction("Remove feed?", `“${f.name}” and its local events will be removed. Google is not touched.`, "Remove")) return; await fetch("/api/calendar/feeds/" + f.id, { method: "DELETE" }); loadCalendar(); };
+    feedsBox.appendChild(row);
+  });
+  evBox.innerHTML = "";
+  if (!d.events.length) { if (d.feeds.length) evBox.innerHTML = `<div class="empty-note">No events in the next 30 days.</div>`; return; }
+  let lastDay = null;
+  d.events.forEach(e => {
+    const day = e.start.slice(0, 10);
+    if (day !== lastDay) { const h = document.createElement("div"); h.className = "cal-day"; h.textContent = calDayLabel(day); evBox.appendChild(h); lastDay = day; }
+    const row = document.createElement("div"); row.className = "cal-ev";
+    const when = e.all_day ? "all day" : e.start.slice(11, 16) + (e.end && e.end.slice(0, 10) === day ? "–" + e.end.slice(11, 16) : "");
+    row.innerHTML = `<span class="cal-when">${escapeHtml(when)}</span><span class="cal-title">${escapeHtml(e.title || "(untitled)")}</span>${e.location ? `<span class="cal-loc">${escapeHtml(e.location)}</span>` : ""}`;
+    if (e.description) row.title = e.description;
+    evBox.appendChild(row);
+  });
+}
+
+/* ---------- Researcher window (scheduled deep-dives → living docs) ---------- */
+let _resTimer = null;
+function openResearcher() {
+  const { body, reused } = createWindow({ id: "win-research", title: "Researcher — scheduled deep-dives", icon: "⌖", width: 740, height: 580,
+    onClose: () => { if (_resTimer) { clearInterval(_resTimer); _resTimer = null; } } });
+  if (reused) { loadResearch(); return; }
+  body.innerHTML = `
+    <div class="cal-hint">Each topic runs on its own schedule, researches the web, and maintains a living document in <code>workspace/research/</code> — consultable by you (Files) and by the model (ask it, or it searches its knowledge). Runs appear in the Scheduler as <code>[ RESEARCH ]</code> entries, locked there — manage them here.</div>
+    <div class="sched-add">
+      <input id="resTopic" placeholder="topic · e.g. Solana MEV landscape" style="flex:1;min-width:150px">
+      <input id="resFocus" placeholder="focus / guidance (optional)" style="flex:1;min-width:150px">
+      <select id="resPreset" class="sched-preset"></select>
+      <input id="resCron" class="sched-cron" placeholder="cron" value="0 8 * * *">
+      <button class="primary sm" id="resAdd">Add</button>
+    </div>
+    <div class="kn-note" id="resMsg"></div>
+    <div class="sched-list" id="resList"></div>`;
+  const RES_PRESETS = { "daily 8am": "0 8 * * *", "every 12h": "0 */12 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1", "monthly (1st, 9am)": "0 9 1 * *" };
+  $("#resPreset", body).innerHTML = `<option value="">preset…</option>` + Object.entries(RES_PRESETS).map(([k, v]) => `<option value="${v}">${k}</option>`).join("");
+  $("#resPreset", body).onchange = e => { if (e.target.value) $("#resCron").value = e.target.value; };
+  $("#resAdd", body).onclick = async () => {
+    const topic = $("#resTopic").value.trim(), focus = $("#resFocus").value.trim(), cron = $("#resCron").value.trim(), msg = $("#resMsg");
+    if (!topic || !cron) return;
+    const r = await api("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) });
+    if (!r.ok) { msg.textContent = r.error || "could not add topic"; msg.className = "kn-note err"; return; }
+    msg.textContent = "research topic added ✓ — it will run on its schedule (or hit ▶ to run now)"; msg.className = "kn-note ok";
+    $("#resTopic").value = ""; $("#resFocus").value = "";
+    loadResearch();
+  };
+  loadResearch();
+  _resTimer = setInterval(() => { if ($("#resList")) loadResearch(); }, 5000);   // keeps "running…" fresh
+}
+async function loadResearch() {
+  const list = $("#resList"); if (!list) return;
+  let topics; try { topics = await api("/api/research"); } catch { return; }
+  list.innerHTML = "";
+  if (!topics.length) { list.innerHTML = `<div class="empty-note">No research topics yet. Add one above — Oceano will study it on schedule and build up documentation.</div>`; return; }
+  topics.forEach(t => {
+    const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
+    const last = t.last_run ? t.last_run.slice(0, 16).replace("T", " ") + " UTC" : "never";
+    const status = t.running ? `<span class="res-running">⟳ researching now…</span>` : `last run ${escapeHtml(last)}`;
+    row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
+      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.topic)}</div>
+      <div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · ${status}${t.focus ? `<div class="res-focus">focus: ${escapeHtml(t.focus)}</div>` : ""}</div></div>
+      <button class="sr-btn res-run" title="run this research now" ${t.running ? "disabled" : ""}>▶ run</button>
+      <button class="sr-btn res-doc" title="open the research document" ${t.doc_exists ? "" : "disabled"}>doc</button>
+      <button class="sr-btn sr-edit">edit</button><button class="sr-btn sr-del">✕</button>`;
+    $("input", row).onchange = async e => { await fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadResearch(); };
+    $(".res-run", row).onclick = async () => { await fetch("/api/research/" + t.id + "/run", { method: "POST" }); loadResearch(); };
+    $(".res-doc", row).onclick = () => openFileWindow(t.doc);
+    $(".sr-edit", row).onclick = () => editResearch(t);
+    $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete research topic?", `“${t.topic}” and its scheduler entry will be removed. The document in workspace/research/ is kept.`)) return; await fetch("/api/research/" + t.id, { method: "DELETE" }); loadResearch(); };
+    list.appendChild(row);
+  });
+}
+async function editResearch(t) {
+  const topic = await promptDialog("Research topic", { value: t.topic, okLabel: "Next" }); if (topic === null) return;
+  const focus = await promptDialog("Focus / guidance", { value: t.focus || "", message: "Optional — leave blank for none", okLabel: "Next" }); if (focus === null) return;
+  const cron = await promptDialog("Schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Save" }); if (cron === null) return;
+  fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) }).then(() => loadResearch());
 }
 
 /* ---------------- wiring ---------------- */
@@ -1323,6 +2051,8 @@ function wire() {
     if (v === "files") openExplorer();
     else if (v === "brain") openBrain();
     else if (v === "scheduler") openScheduler();
+    else if (v === "calendar") openCalendar();
+    else if (v === "researcher") openResearcher();
     else setView(v);
   });
 
@@ -1339,6 +2069,9 @@ function wire() {
   $("#fNew").onclick = newFile;
   $("#fNewDir").onclick = newFolder;
   $("#fSave").onclick = saveFile;
+  $("#feSaveAs").onclick = saveFileAs;
+  $("#feWrap").onclick = toggleWrap;
+  $("#feFind").onclick = () => { if (_cm) { _cm.focus(); _cm.execCommand("findPersistent"); } };
   // skills
   $("#skNew").onclick = () => openSkill(null);
   $("#skClose").onclick = closeSkill; $("#skModalScrim").onclick = closeSkill;

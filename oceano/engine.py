@@ -83,6 +83,21 @@ async def embed_supervisor(stop):
         backoff = min(backoff * 2, 30)         # back off on a crash-loop, cap at 30s
 
 
+async def calendar_loop(stop):
+    """Refresh calendar feeds that are due for a sync (calsync decides which)."""
+    from oceano import calsync
+    log(f"[calendar] feed sync every {calsync.SYNC_INTERVAL}s when feeds are configured")
+    while not stop.is_set():
+        try:
+            n = await asyncio.to_thread(calsync.maybe_sync)
+            if n:
+                log(f"[calendar] synced {n} feed(s)")
+        except Exception as e:
+            log(f"[calendar] sync error: {e}")
+        await _sleep_or_stop(stop, 60)
+    log("[calendar] stopped")
+
+
 async def scheduler_loop(stop):
     """Check for due scheduled tasks every SCHED_INTERVAL seconds."""
     log(f"[scheduler] watching for due tasks (every {SCHED_INTERVAL}s)")
@@ -115,7 +130,8 @@ async def run():
         loop.add_signal_handler(sig, request_stop)
 
     bg = [asyncio.create_task(embed_supervisor(stop), name="embed"),
-          asyncio.create_task(scheduler_loop(stop), name="scheduler")]
+          asyncio.create_task(scheduler_loop(stop), name="scheduler"),
+          asyncio.create_task(calendar_loop(stop), name="calendar")]
 
     log(f"⚓ Oceano engine — web http://{host}:{port} · telegram + scheduler + embeddings in-process")
     try:
