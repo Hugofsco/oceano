@@ -21,18 +21,24 @@
 #   scripts/install.sh --with-models     # also download the chat models (several GB)
 #   scripts/install.sh --yes      # don't prompt before the heavy steps
 #
-# Override paths via env: LLAMA_DIR, EMBED_MODEL, SEARXNG_COMPOSE, LLAMA_SWAP_BIN.
+# Override paths via env (same names config.py uses): OCEANO_LLAMA_DIR,
+# OCEANO_MODELS_DIR, OCEANO_LLAMA_SWAP_BIN, OCEANO_LLAMA_SWAP_CFG, EMBED_MODEL, SEARXNG_COMPOSE.
+# llama.cpp defaults to <oceano>/llama.cpp (a pre-existing ~/llama.cpp is reused).
 set -euo pipefail
 
 # ---- paths (override via env) ----------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_DIR="${LLAMA_DIR:-$HOME/llama.cpp}"
+# llama.cpp location — same knob + same default logic as config.py: keep it under
+# the Oceano dir for fresh installs, but reuse a pre-existing ~/llama.cpp if present.
+if   [ -n "${OCEANO_LLAMA_DIR:-}" ]; then LLAMA_DIR="$OCEANO_LLAMA_DIR"
+elif [ ! -d "$ROOT/llama.cpp" ] && [ -d "$HOME/llama.cpp" ]; then LLAMA_DIR="$HOME/llama.cpp"
+else LLAMA_DIR="$ROOT/llama.cpp"; fi
 LLAMA_BUILD="$LLAMA_DIR/build"
-MODELS_DIR="$LLAMA_DIR/models"
+MODELS_DIR="${OCEANO_MODELS_DIR:-$LLAMA_DIR/models}"
 EMBED_MODEL="${EMBED_MODEL:-$MODELS_DIR/nomic-embed-text-v1.5.Q8_0.gguf}"
 EMBED_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
-LLAMA_SWAP_BIN="${LLAMA_SWAP_BIN:-/usr/local/bin/llama-swap}"
-LLAMA_SWAP_CFG="${LLAMA_SWAP_CFG:-$LLAMA_DIR/llama-swap.yaml}"
+LLAMA_SWAP_BIN="${OCEANO_LLAMA_SWAP_BIN:-/usr/local/bin/llama-swap}"
+LLAMA_SWAP_CFG="${OCEANO_LLAMA_SWAP_CFG:-$LLAMA_DIR/llama-swap.yaml}"
 SEARXNG_COMPOSE="${SEARXNG_COMPOSE:-$ROOT/deploy/searxng/docker-compose.yml}"
 VENV="$ROOT/venv"
 

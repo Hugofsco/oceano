@@ -17,7 +17,17 @@ WORKSPACE = Path(os.environ.get("OCEANO_WORKSPACE", Path(__file__).parent / "wor
 SEARXNG_URL = os.environ.get("OCEANO_SEARXNG", "http://127.0.0.1:8080")
 
 # --- Local model serving (llama.cpp + llama-swap), used by the Rivers ---
-LLAMA_DIR = Path(os.environ.get("OCEANO_LLAMA_DIR", Path.home() / "llama.cpp"))
+# Knob: OCEANO_LLAMA_DIR (single, canonical — install.sh reads the same name).
+# Default: keep the stack tidy under the Oceano dir (fresh installs build there),
+# but honour a pre-existing ~/llama.cpp so older setups aren't relocated/broken.
+_OCEANO_ROOT = Path(__file__).resolve().parent
+def _default_llama_dir():
+    env = os.environ.get("OCEANO_LLAMA_DIR")
+    if env:
+        return Path(env)
+    local, legacy = _OCEANO_ROOT / "llama.cpp", Path.home() / "llama.cpp"
+    return legacy if (not local.exists() and legacy.exists()) else local
+LLAMA_DIR = _default_llama_dir()
 MODELS_DIR = Path(os.environ.get("OCEANO_MODELS_DIR", LLAMA_DIR / "models"))
 LLAMA_SERVER_BIN = os.environ.get("OCEANO_LLAMA_SERVER_BIN", str(LLAMA_DIR / "build/bin/llama-server"))
 LLAMA_SWAP_CFG = Path(os.environ.get("OCEANO_LLAMA_SWAP_CFG", LLAMA_DIR / "llama-swap.yaml"))
