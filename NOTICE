@@ -1,0 +1,34 @@
+Oceano
+Copyright (c) 2026 Hugofsco
+Licensed under the MIT License (see LICENSE).
+
+This product bundles the following third-party components, vendored under
+oceano/web/static/vendor/. Each is the property of its respective authors and
+distributed under its own license:
+
+- CodeMirror 5 (oceano/web/static/vendor/codemirror/)
+  Code editor — core, addons, language modes, and the material-darker theme.
+  Copyright (c) by Marijn Haverbeke and others.
+  License: MIT — https://github.com/codemirror/codemirror5/blob/master/LICENSE
+
+- marked (oceano/web/static/vendor/marked.min.js)
+  Markdown parser/renderer.
+  Copyright (c) Christopher Jeffrey and contributors.
+  License: MIT — https://github.com/markedjs/marked/blob/master/LICENSE.md
+
+- DOMPurify (oceano/web/static/vendor/purify.min.js)
+  HTML sanitizer.
+  Copyright (c) Cure53 and contributors.
+  License: Apache-2.0 OR MPL-2.0 (dual) —
+  https://github.com/cure53/DOMPurify/blob/main/LICENSE
+
+- highlight.js (oceano/web/static/vendor/highlight.min.js and the
+  atom-one-dark.min.css theme)
+  Syntax highlighting for chat code blocks.
+  Copyright (c) Ivan Sagalaev and other contributors.
+  License: BSD-3-Clause — https://github.com/highlightjs/highlight.js/blob/main/LICENSE
+
+Runtime model engines (faster-whisper, Piper, plus the GGUF/ONNX model files
+themselves) are installed via pip and downloaded at install/first-run — they are
+NOT bundled in this repository. See assets/README.md and requirements.txt; each
+carries its own upstream license.

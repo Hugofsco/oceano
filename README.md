@@ -175,7 +175,7 @@ alongside the built-ins. Graceful no-op when none are configured.
 {
   "servers": [
     { "name": "fs", "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/Oceano/workspace"] }
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/Oceano/workspace"] }
   ]
 }
 ```
@@ -286,6 +286,11 @@ cli.py               run the agent from the terminal
 ```
 
 Runtime data (`data/`, `workspace/`), the virtualenv, and `oceano.env` are gitignored.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Bundled third-party libraries (CodeMirror, marked,
+DOMPurify, highlight.js) are credited with their own licenses in [NOTICE](NOTICE).
 
 ---
 

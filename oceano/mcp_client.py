@@ -7,7 +7,7 @@ can call Gmail, Calendar, filesystem servers, etc. through the same tool loop.
 data/mcp.json:
   {"servers": [
      {"name": "fs", "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/Oceano/workspace"]}
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/Oceano/workspace"]}
   ]}
 
 Graceful by design: no config file, no servers, or a missing `mcp` SDK → no MCP
