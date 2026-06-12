@@ -81,30 +81,37 @@ function renderMD(el, text, highlight = false) {
   });
 }
 
-/* ================= CHAT ================= */
-const LS = {
-  index: () => JSON.parse(localStorage.getItem("oceano.sessions") || "[]"),
-  saveIndex: x => localStorage.setItem("oceano.sessions", JSON.stringify(x)),
-  transcript: id => JSON.parse(localStorage.getItem("oceano.t." + id) || "[]"),
-  saveT: (id, t) => localStorage.setItem("oceano.t." + id, JSON.stringify(t)),
+/* ================= CHAT (persisted server-side in dated folders) ================= */
+const LS = {   // legacy localStorage — read once, only to migrate old browser chats to Oceano
+  index: () => { try { return JSON.parse(localStorage.getItem("oceano.sessions") || "[]"); } catch { return []; } },
+  transcript: id => { try { return JSON.parse(localStorage.getItem("oceano.t." + id) || "[]"); } catch { return []; } },
 };
 const uid = () => "v" + Math.random().toString(36).slice(2, 9);
 const toBottom = () => { const t = $("#thread"); if (t) t.scrollTop = t.scrollHeight; };
 
+let _chats = [];          // session metas from the server: [{id,title,date,updated,count}]
+let _curT = [];           // the open chat's transcript (in memory; saved at the end of each turn)
+let _curTitle = "New voyage";
+
+async function loadChats() {
+  try { _chats = (await api("/api/chats")).chats || []; } catch { _chats = []; }
+  renderSessions();
+}
 function newVoyage() {
   setView("chat");
-  const id = uid(), idx = LS.index();
-  idx.unshift({ id, title: "New voyage" });
-  LS.saveIndex(idx); LS.saveT(id, []);
-  openVoyage(id);
+  state.session = uid(); _curT = []; _curTitle = "New voyage";
+  localStorage.setItem("oceano.active", state.session);
+  const thread = $("#thread"); thread.innerHTML = ""; thread.appendChild(welcomeNode());
+  renderSessions(); $("#input").focus();
 }
-function openVoyage(id) {
-  state.session = id;
-  localStorage.setItem("oceano.active", id);
-  const t = LS.transcript(id), thread = $("#thread");
-  thread.innerHTML = "";
-  if (!t.length) thread.appendChild(welcomeNode());
-  else t.forEach(m => {
+async function openVoyage(id) {
+  setView("chat");
+  state.session = id; localStorage.setItem("oceano.active", id);
+  let data; try { data = await api("/api/chats/" + encodeURIComponent(id)); } catch { data = { messages: [] }; }
+  _curT = data.messages || []; _curTitle = data.title || "New voyage";
+  const thread = $("#thread"); thread.innerHTML = "";
+  if (!_curT.length) thread.appendChild(welcomeNode());
+  else _curT.forEach(m => {
     if (m.role === "user") addUser(m.content, false);
     else if (m.role === "thinking") { const c = addThinkCard(); appendThink(c, m.text); finalizeThink(c); }
     else if (m.role === "tool") fillTool(addTool(m.name, m.args), m.result);
@@ -113,34 +120,76 @@ function openVoyage(id) {
   });
   renderSessions(); $("#input").focus();
 }
+function _fmtChatDate(d) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - new Date(d + "T00:00")) / 86400000);
+  if (diff === 0) return "Today"; if (diff === 1) return "Yesterday";
+  return new Date(d + "T00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
 function renderSessions() {
-  const box = $("#sessions"); box.innerHTML = "";
-  LS.index().forEach(s => {
-    const el = document.createElement("div");
-    el.className = "session" + (s.id === state.session ? " active" : "");
-    el.innerHTML = `<span class="s-title"></span><button class="s-del" title="delete voyage">✕</button>`;
-    $(".s-title", el).textContent = s.title;
-    el.onclick = () => openVoyage(s.id);
-    $(".s-del", el).onclick = (e) => { e.stopPropagation(); deleteVoyage(s.id); };
-    box.appendChild(el);
+  const box = $("#sessions"); if (!box) return; box.innerHTML = "";
+  const groups = {};                               // group by date → dated folders
+  _chats.forEach(s => (groups[s.date || "—"] ||= []).push(s));
+  Object.keys(groups).sort().reverse().forEach(date => {
+    const h = document.createElement("div"); h.className = "s-date"; h.textContent = _fmtChatDate(date);
+    box.appendChild(h);
+    groups[date].forEach(s => {
+      const el = document.createElement("div");
+      el.className = "session" + (s.id === state.session ? " active" : "");
+      el.innerHTML = `<span class="s-title"></span><button class="s-del" title="delete voyage">✕</button>`;
+      $(".s-title", el).textContent = s.title;
+      el.onclick = () => openVoyage(s.id);
+      $(".s-del", el).onclick = e => { e.stopPropagation(); deleteVoyage(s.id); };
+      box.appendChild(el);
+    });
   });
+  if (state.session && !_chats.some(s => s.id === state.session)) {   // brand-new chat, not yet saved
+    const el = document.createElement("div"); el.className = "session active";
+    el.innerHTML = `<span class="s-title"></span>`; $(".s-title", el).textContent = _curTitle;
+    box.insertBefore(el, box.firstChild);
+  }
 }
 async function deleteVoyage(id) {
-  const s = LS.index().find(x => x.id === id);
+  const s = _chats.find(x => x.id === id);
   if (!await confirmAction("Delete voyage?", `“${s?.title || "this chat"}” and its history will be permanently removed.`)) return;
-  const idx = LS.index().filter(x => x.id !== id);
-  LS.saveIndex(idx);
-  localStorage.removeItem("oceano.t." + id);
-  fetch("/api/session/" + id, { method: "DELETE" }).catch(() => {});   // free the server-side Agent
-  if (state.session === id) {
-    if (idx.length) openVoyage(idx[0].id); else newVoyage();
-  } else renderSessions();
+  await fetch("/api/chats/" + encodeURIComponent(id), { method: "DELETE" }).catch(() => {});
+  _chats = _chats.filter(x => x.id !== id);
+  if (state.session === id) { if (_chats.length) openVoyage(_chats[0].id); else newVoyage(); }
+  else renderSessions();
 }
 function touchTitle(text) {
-  const idx = LS.index(), s = idx.find(x => x.id === state.session);
-  if (s && s.title === "New voyage") { s.title = text.slice(0, 38); LS.saveIndex(idx); renderSessions(); }
+  if (_curTitle === "New voyage" && text) { _curTitle = text.slice(0, 38); renderSessions(); }
 }
-function appendT(entry) { const t = LS.transcript(state.session); t.push(entry); LS.saveT(state.session, t); }
+function appendT(entry) { _curT.push(entry); }      // in memory during a turn; persistChat() writes it
+async function persistChat() {
+  if (!state.session || !_curT.length) return;
+  try {
+    await fetch("/api/chats/" + encodeURIComponent(state.session), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: _curTitle, messages: _curT }),
+    });
+  } catch {}
+  const ex = _chats.find(s => s.id === state.session), iso = new Date().toISOString();
+  if (ex) { ex.title = _curTitle; ex.count = _curT.length; ex.updated = iso; }
+  else { _chats.unshift({ id: state.session, title: _curTitle, date: iso.slice(0, 10), updated: iso, count: _curT.length }); }
+  renderSessions();
+}
+async function migrateLocalChats() {               // one-time: lift old browser chats into Oceano
+  if (localStorage.getItem("oceano.migrated")) return;
+  const old = LS.index();
+  if (old.length && !_chats.length) {
+    for (const s of old) {
+      const t = LS.transcript(s.id);
+      if (t.length) await fetch("/api/chats/" + encodeURIComponent(s.id), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: s.title || "Imported chat", messages: t }),
+      }).catch(() => {});
+    }
+    await loadChats();
+  }
+  localStorage.setItem("oceano.migrated", "1");
+}
 
 function welcomeNode() {
   const w = document.createElement("div");
@@ -290,6 +339,7 @@ async function send() {
   }
   if (stats && bubble) renderMeta(bubble, stats);
   if (bubble) appendT({ role: "assistant", content: acc, meta: stats });
+  persistChat();                                   // save the whole turn to Oceano (dated folder)
   state.busy = false; setSendMode(false); _chatAbort = null; input.focus();
 }
 function setSendMode(stopping) {
@@ -629,7 +679,16 @@ async function loadServices() {
 /* ================= SETTINGS WINDOW ================= */
 const SETTINGS_TABS = [
   ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
-  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["services", "◉", "Services"], ["about", "≈", "About"],
+  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["services", "◉", "Services"],
+  ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
+];
+// each wipe target: [key, label, description, confirm-detail]
+const WIPE_TARGETS = [
+  ["chats", "Chats", "Every saved conversation (all dated folders).", "All chat history will be permanently deleted."],
+  ["documents", "Documents", "Everything inside the workspace folder.", "All files & folders in the workspace will be deleted."],
+  ["knowledge", "Indexed knowledge", "The RAG store of embedded document chunks.", "All indexed document chunks will be removed (re-index to restore)."],
+  ["skills", "Learnt skills", "Skills the agent taught itself (not your published ones).", "All learning/staged skills will be deleted; published skills are kept."],
+  ["memory", "Memories", "All long-term memories about you.", "Every stored memory will be permanently deleted."],
 ];
 const SETTINGS_PAGES = {
   account: `
@@ -688,6 +747,14 @@ const SETTINGS_PAGES = {
       <p class="sub">Everything Oceano runs on this box.</p>
       <div class="svc-list" id="svcList"></div>
     </div>`,
+  wipe: `
+    <div class="drawer-section">
+      <h3>Wipe data</h3>
+      <p class="sub">Permanently clear a category of Oceano's data. Each is separate and irreversible — you'll be asked to confirm.</p>
+      <div class="wipe-list">${WIPE_TARGETS.map(([k, l, d]) =>
+        `<div class="wipe-row"><div class="wipe-info"><div class="wipe-name">${l}</div><div class="wipe-desc">${d}</div></div><button class="danger-btn sm wipe-btn" data-wipe="${k}">Wipe</button></div>`).join("")}</div>
+      <div class="kn-note" id="wipeMsg"></div>
+    </div>`,
   about: `
     <div class="drawer-section">
       <h3>About</h3>
@@ -715,7 +782,21 @@ function openSettings() {
   $("#acctSave", body).onclick = saveAccount;
   $("#logoutBtn", body).onclick = logout;
   $("#memPolSave", body).onclick = saveMemoryPolicy;
+  $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
   loadSettingsAll();
+}
+async function wipeTarget(key) {
+  const t = WIPE_TARGETS.find(x => x[0] === key); if (!t) return;
+  if (!await confirmAction(`Wipe ${t[1].toLowerCase()}?`, t[3] + " This cannot be undone.", "Wipe")) return;
+  const msg = $("#wipeMsg");
+  try {
+    const r = await api("/api/wipe/" + encodeURIComponent(key), { method: "POST" });
+    if (msg) { msg.textContent = `✓ wiped ${r.removed} ${r.what}`; msg.className = "kn-note ok"; }
+    if (key === "chats") { _chats = []; localStorage.removeItem("oceano.active"); newVoyage(); }
+    if (key === "memory") { if (typeof loadBrainMem === "function") loadBrainMem(); }
+    if (key === "documents" && typeof expLoad === "function" && typeof _expCwd === "string") expLoad("");
+    if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
+  } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
 function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadAccount(); loadMemoryPolicy(); }
 
@@ -2159,17 +2240,19 @@ function showPwChange(currentPw) {
   }
   setTimeout(() => { const f = $(currentPw ? "#pwNew" : "#pwCurrent"); if (f) f.focus(); }, 60);
 }
-function initApp() {
+async function initApp() {
   if (_appStarted) return;        // idempotent — survives a mid-session re-login
   _appStarted = true;
   wire();
   loadModels();
   loadPrefs();
-  const active = localStorage.getItem("oceano.active");
-  if (active && LS.index().some(s => s.id === active)) openVoyage(active);
-  else if (LS.index().length) openVoyage(LS.index()[0].id);
-  else newVoyage();
   setView("chat");
+  await loadChats();              // chats now live on Oceano (dated folders), not the browser
+  await migrateLocalChats();      // lift any pre-existing browser chats over, once
+  const active = localStorage.getItem("oceano.active");
+  if (active && _chats.some(s => s.id === active)) openVoyage(active);
+  else if (_chats.length) openVoyage(_chats[0].id);
+  else newVoyage();
   setInterval(loadModels, 30000);
 }
 async function boot() {

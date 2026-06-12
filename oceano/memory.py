@@ -192,6 +192,16 @@ def forget(mid):
     return True
 
 
+def wipe():
+    """Delete ALL memories (Settings → Wipe). Returns the number removed."""
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    con.execute("DELETE FROM memories")
+    con.commit()
+    con.close()
+    return n
+
+
 def count():
     """Number of stored memories (for the Brain stats panel)."""
     con = _db()

@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
-from oceano import browser, calsync, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
+from oceano import browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -615,6 +615,60 @@ async def chat_stop(request: Request):
 def end_session(sid: str):
     _sessions.pop(sid, None)
     return {"ok": True}
+
+
+# ---------------- chats (server-side, dated-folder persistence) ----------------
+@app.get("/api/chats")
+def chats_list():
+    return {"chats": chats.list_all()}
+
+
+@app.get("/api/chats/{cid}")
+def chats_get(cid: str):
+    c = chats.get(cid)
+    return c or {"id": cid, "title": "New voyage", "messages": []}
+
+
+@app.post("/api/chats/{cid}")
+async def chats_save(cid: str, req: Request):
+    b = await req.json()
+    ok = chats.save(cid, b.get("title", ""), b.get("messages", []), b.get("created"))
+    return {"ok": ok}
+
+
+@app.delete("/api/chats/{cid}")
+def chats_delete(cid: str):
+    _sessions.pop(cid, None)        # also free the in-memory Agent
+    _cancels.pop(cid, None)
+    return {"ok": chats.delete(cid)}
+
+
+# ---------------- wipe (Settings → destructive, per-target) ----------------
+@app.post("/api/wipe/{target}")
+def wipe(target: str):
+    if target == "chats":
+        return {"ok": True, "removed": chats.wipe(), "what": "chats"}
+    if target == "documents":
+        n = 0
+        for c in config.WORKSPACE.iterdir():
+            if c.name == ".gitkeep":
+                continue
+            try:
+                shutil.rmtree(c) if c.is_dir() else c.unlink()
+                n += 1
+            except OSError:
+                pass
+        return {"ok": True, "removed": n, "what": "workspace items"}
+    if target == "skills":                          # the agent's self-learned (non-published) skills
+        learnt = [s for s in skills.all_skills() if s.get("status") != "published"]
+        for s in learnt:
+            skills.delete_skill(s["dir"])
+        return {"ok": True, "removed": len(learnt), "what": "learnt skills"}
+    if target == "memory":
+        return {"ok": True, "removed": memory.wipe(), "what": "memories"}
+    if target == "knowledge":
+        return {"ok": True, "removed": rag.wipe(), "what": "indexed chunks"}
+    raise HTTPException(400, f"unknown wipe target: {target}")
 
 
 # ---------------- skills ----------------

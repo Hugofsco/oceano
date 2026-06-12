@@ -88,6 +88,16 @@ def search_docs(query, k=4):
     return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in scored[:k])
 
 
+def wipe():
+    """Delete ALL indexed document chunks (Settings → Wipe). Returns count removed."""
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    con.execute("DELETE FROM chunks")
+    con.commit()
+    con.close()
+    return n
+
+
 def stats():
     """{files, chunks, dims} for the Brain knowledge panel. dims is read from a
     stored embedding (free — no call to the embed server)."""
