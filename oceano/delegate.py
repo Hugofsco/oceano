@@ -8,24 +8,42 @@ Containment: the subprocess runs with cwd inside the workspace (or a caller-chos
 folder) and ONLY the tools listed in `tools` are allowed — no Bash unless a caller
 explicitly grants it. Claude Code itself blocks edits outside its working directory.
 """
+import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import config
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 
 
+def find_claude():
+    """Locate the `claude` binary. PATH first, then common install dirs — because the
+    engine runs under systemd with a minimal PATH that omits ~/.local/bin (where the
+    official installer puts it), so shutil.which() alone reports it 'not installed'."""
+    found = shutil.which("claude") or (os.environ.get("OCEANO_CLAUDE_BIN") or None)
+    if found and os.access(found, os.X_OK):
+        return found
+    home = Path.home()
+    for c in (home / ".local/bin/claude", Path("/usr/local/bin/claude"),
+              Path("/usr/bin/claude"), home / ".npm-global/bin/claude",
+              home / ".local/share/claude/bin/claude"):
+        if c.exists() and os.access(c, os.X_OK):
+            return str(c)
+    return None
+
+
 def available():
-    return shutil.which("claude") is not None
+    return find_claude() is not None
 
 
 def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30):
     """Run one headless Claude Code task. Returns {ok, output, error}."""
-    binary = shutil.which("claude")
+    binary = find_claude()
     if not binary:
         return {"ok": False, "output": "",
-                "error": "claude CLI not found on PATH — install Claude Code to use delegation"}
+                "error": "claude CLI not found — install Claude Code, or set OCEANO_CLAUDE_BIN"}
     cmd = [binary, "-p", instructions, "--output-format", "text",
            "--max-turns", str(int(max_turns))]
     if tools:

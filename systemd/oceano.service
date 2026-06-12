@@ -15,6 +15,9 @@ EnvironmentFile=-__OCEANO_ROOT__/oceano.env
 Environment=OCEANO_WEB_HOST=127.0.0.1
 Environment=OCEANO_WEB_PORT=8800
 Environment=PYTHONUNBUFFERED=1
+# Put the user's local bin on PATH so delegate_to_claude finds the `claude` CLI
+# (the official installer drops it in ~/.local/bin, which systemd's default PATH omits).
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # One process owns it all: web UI, Telegram bot, scheduler loop, and the embedding
 # server (spawned as a child). Set OCEANO_EMBED_MANAGED=0 to run embed separately.
 ExecStart=__OCEANO_ROOT__/venv/bin/python -m oceano.engine
@@ -25,9 +28,11 @@ RestartSec=10
 # human in the loop (scheduler). Even if the service user has passwordless sudo,
 # neuter privilege escalation and make all of $HOME read-only except the dirs Oceano
 # must write — this confines even run_shell (e.g. blocks writes to ~/.ssh/authorized_keys).
+# %h/.claude is the one HOME exception: Claude Code (used by delegate_to_claude / the
+# skills + eval reviewers) must write its session/config state there.
 NoNewPrivileges=true
 ProtectHome=read-only
-ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills
+ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills %h/.claude
 PrivateTmp=true
 # SIGTERM the engine first so it can shut the embed child down cleanly, then
 # SIGKILL anything still in the cgroup after the grace period.
