@@ -659,8 +659,9 @@ def learn_skill(name, description, body):
         "description": "Hand a self-contained subtask to Claude Code (a stronger coding model) "
                        "running headless in the workspace. Give it precise, complete instructions "
                        "— the relevant file paths and exactly what it must produce — because it "
-                       "cannot ask you questions. Returns its final report. Use sparingly, for "
-                       "work that is genuinely beyond you or needs independent judgment.",
+                       "cannot ask you questions. Returns its final report. CALL THIS whenever the "
+                       "user asks you to 'use Claude' / 'delegate' / 'have Claude do it', or for a "
+                       "heavy subtask beyond you. The capability is available — don't claim you can't.",
         "parameters": {"type": "object", "properties": {
             "instructions": {"type": "string"},
         }, "required": ["instructions"]},

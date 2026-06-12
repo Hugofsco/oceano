@@ -535,6 +535,9 @@ async def chat(req: Request):
     ag.base_url = base_url
     ag.api_key = api_key
     agent_mode = bool(body.get("agent_mode"))
+    # so it's verifiable in the journal which mode a message actually ran in (tools
+    # are only attached in agent mode) — settles "the toggle was on but it didn't use tools".
+    print(f"[chat] model={ag.model!r} agent_mode={agent_mode}", flush=True)
 
     # The agent is blocking (a single LLM step or a slow tool can take 20s+ with no
     # output). Run it in a worker thread and feed events through a queue, so the
