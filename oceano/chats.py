@@ -13,7 +13,7 @@ import config
 
 CHATS_DIR = config.WORKSPACE.parent / "data" / "chats"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")          # session ids come from the client → validate
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")         # the dated-folder component must be a real date
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")  # the dated-folder component must be a real date (ASCII)
 
 
 def _safe_id(sid):
@@ -44,9 +44,10 @@ def save(sid, title, messages, created=None):
             created = created or _now()
         path = existing
     else:
-        if not _DATE_RE.match(created or ""):        # client-supplied → never trust it as a path
-            created = _now()
-        folder = CHATS_DIR / created[:10]            # YYYY-MM-DD (validated above)
+        day = (created or "")[:10]                   # the dated folder = YYYY-MM-DD
+        if not _DATE_RE.fullmatch(day):              # anything not a clean ASCII date → today
+            created = _now(); day = created[:10]
+        folder = CHATS_DIR / day
         # defense in depth: the day folder must be a direct child of CHATS_DIR
         if folder.resolve().parent != CHATS_DIR.resolve():
             return False

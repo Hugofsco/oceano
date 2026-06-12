@@ -632,7 +632,9 @@ def chats_get(cid: str):
 @app.post("/api/chats/{cid}")
 async def chats_save(cid: str, req: Request):
     b = await req.json()
-    ok = chats.save(cid, b.get("title", ""), b.get("messages", []), b.get("created"))
+    # creation date is assigned server-side (never trust the client for a path component);
+    # existing chats keep their original date inside chats.save().
+    ok = chats.save(cid, b.get("title", ""), b.get("messages", []))
     return {"ok": ok}
 
 
