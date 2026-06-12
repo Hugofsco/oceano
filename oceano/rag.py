@@ -1,5 +1,6 @@
 """RAG over the user's own documents: index a folder, search it by meaning.
 Reuses the shared embedding server (:8082) + SQLite — same machinery as memory."""
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,7 @@ from oceano import embeddings
 DB_PATH = config.WORKSPACE.parent / "data" / "rag.db"
 CHUNK_WORDS = 250
 TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".rst"}
+RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes its living docs
 
 
 def _db():
@@ -17,6 +19,8 @@ def _db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS chunks ("
                 "id INTEGER PRIMARY KEY, path TEXT, chunk TEXT, embedding TEXT)")
+    # per-file content hash so re-indexing skips unchanged docs (incremental)
+    con.execute("CREATE TABLE IF NOT EXISTS docmeta (path TEXT PRIMARY KEY, hash TEXT)")
     return con
 
 
@@ -38,8 +42,13 @@ def _chunks(text):
         yield " ".join(words[i:i + CHUNK_WORDS])
 
 
-def index_docs(folder):
-    """Embed every readable file under `folder` (recursively) into the RAG store."""
+def index_docs(folder, only=None):
+    """Embed readable files under `folder` (recursively) into the RAG store.
+
+    Incremental: a file whose content hash matches its last index is skipped, so a
+    re-run only re-embeds what actually changed. Files that vanished from disk (under
+    `folder`) are pruned. Pass `only=<path>` to index a single file (e.g. the one doc
+    a Researcher run just rewrote) without walking the whole tree."""
     base = Path(folder).expanduser()
     if not base.is_absolute():
         base = config.WORKSPACE / folder
@@ -47,29 +56,54 @@ def index_docs(folder):
     if not base.exists():
         return f"(no such folder: {folder})"
 
+    if only is not None:
+        op = Path(only).expanduser()
+        if not op.is_absolute():
+            op = config.WORKSPACE / only
+        paths = [op.resolve()]
+        prune = False                     # single-file mode never prunes siblings
+    else:
+        paths = [p for p in base.rglob("*") if p.is_file()]
+        prune = True
+
     con = _db()
-    n_files = n_chunks = 0
-    for path in base.rglob("*"):
+    seen = set()
+    n_files = n_chunks = skipped = 0
+    for path in paths:
         if not path.is_file():
             continue
         text = _read(path)
         if not text.strip():
             continue
-        con.execute("DELETE FROM chunks WHERE path=?", (str(path),))  # re-index cleanly
+        sp = str(path)
+        seen.add(sp)
+        h = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+        row = con.execute("SELECT hash FROM docmeta WHERE path=?", (sp,)).fetchone()
+        if row and row[0] == h:
+            skipped += 1
+            continue                      # unchanged since last index — keep its chunks
+        con.execute("DELETE FROM chunks WHERE path=?", (sp,))  # re-index cleanly
         added = False
         for ch in _chunks(text):
             vec = embeddings.embed(ch)
             if not vec:
-                con.close()
+                con.close()               # uncommitted → the DELETE above rolls back
                 return "ERROR: embed server down — start scripts/serve-embeddings.sh"
             con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)",
-                        (str(path), ch, json.dumps(vec)))
+                        (sp, ch, json.dumps(vec)))
             n_chunks += 1
             added = True
+        con.execute("INSERT OR REPLACE INTO docmeta (path, hash) VALUES (?,?)", (sp, h))
         n_files += added
+    if prune:                             # drop chunks for files removed from disk
+        bp = str(base)
+        for (sp,) in con.execute("SELECT path FROM docmeta").fetchall():
+            if sp.startswith(bp) and sp not in seen and not Path(sp).is_file():
+                con.execute("DELETE FROM chunks WHERE path=?", (sp,))
+                con.execute("DELETE FROM docmeta WHERE path=?", (sp,))
     con.commit()
     con.close()
-    return f"indexed {n_chunks} chunks from {n_files} files under {base}"
+    return f"indexed {n_chunks} chunks from {n_files} changed file(s); {skipped} unchanged"
 
 
 def search_docs(query, k=4):
@@ -93,9 +127,31 @@ def wipe():
     con = _db()
     n = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     con.execute("DELETE FROM chunks")
+    con.execute("DELETE FROM docmeta")   # clear hashes too, else a re-index skips wiped files
     con.commit()
     con.close()
     return n
+
+
+def research_context(query, k=3, threshold=0.55):
+    """Top research-doc chunks relevant to `query`, for auto-injection into the agent's
+    context (like memory). Scoped to the Researcher's living docs under research/ only —
+    user-indexed documents stay on-demand via search_docs. Returns [(score, topic, chunk)]
+    above `threshold`, best first; [] if nothing clears the bar or the embed server is down."""
+    prefix = str(RESEARCH_DIR.resolve())
+    con = _db()
+    rows = con.execute("SELECT path, chunk, embedding FROM chunks WHERE path LIKE ?",
+                       (prefix + "%",)).fetchall()
+    con.close()
+    if not rows:
+        return []
+    qvec = embeddings.embed(query)
+    if not qvec:
+        return []
+    scored = [(embeddings.cosine(qvec, json.loads(emb)), path, chunk)
+              for path, chunk, emb in rows if emb]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(round(s, 3), Path(p).stem, c) for s, p, c in scored[:k] if s >= threshold]
 
 
 def stats():

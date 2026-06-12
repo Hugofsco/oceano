@@ -280,3 +280,99 @@ def update(mid, text):
                 (text, json.dumps(vec) if vec else None, mid))
     con.commit(); con.close()
     return True
+
+
+# ============================ scheduled maintenance (locked, Claude-judged) ============================
+# A locked scheduler job that delegates memory hygiene to Claude Code (no API key → the
+# `claude -p` CLI), mirroring the locked eval + skills-evaluation jobs. The local model never
+# judges its own memory; Claude reviews the whole store and returns a plan, which we apply.
+MAINT_SOURCE = "memory:maintain"
+MAINT_PREFIX = "[ MEMORY ] "
+
+_MAINT_PROMPT = """You are doing maintenance on an AI agent's long-term memory about its user.
+Below are the {count} stored memories, one per line as:  #<id> [<category>]<📌 if pinned>: <text>
+
+YOUR JOB: keep the store clean, non-redundant, and accurate. Look for:
+- exact or near duplicates (keep ONE; delete the rest);
+- facts fully subsumed by a more complete memory (delete the weaker one);
+- stale facts contradicted by a newer memory (delete the outdated one);
+- memories filed under the wrong category (categories: identity, preference, project, fact, task).
+
+RULES:
+- NEVER delete a memory marked 📌 pinned — the user chose to keep it. You MAY rewrite a pinned one for clarity.
+- Be conservative: when unsure, leave it. Don't merge distinct facts into one vague memory.
+- To merge duplicates, rewrite the survivor (in "update") to be complete, then "delete" the others.
+
+Output ONLY a JSON object, nothing else:
+{{"delete": [<ids>],
+  "update": [{{"id": <id>, "text": "<rewritten text>"}}],
+  "recategorize": [{{"id": <id>, "category": "<one of the categories>"}}],
+  "notes": "<one line: what you changed and why>"}}
+
+MEMORIES:
+{listing}"""
+
+
+def _parse_plan(output):
+    import re
+    m = re.search(r"\{.*\}", output or "", re.DOTALL)
+    if not m:
+        return None
+    try:
+        plan = json.loads(m.group(0))
+    except ValueError:
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
+def maintain():
+    """One maintenance run: hand the whole memory store to Claude Code, apply its plan.
+    Pinned memories are never deleted; a plan that would wipe most of the store is refused
+    as a safety net. Returns a short summary. Called by the scheduler's locked job."""
+    from oceano import delegate
+    items = list_all(limit=1000)
+    if not items:
+        return "memory is empty — nothing to maintain"
+    listing = "\n".join(
+        f'#{m["id"]} [{m["category"]}]{" 📌" if m["pinned"] else ""}: {m["text"]}' for m in items)
+    prompt = _MAINT_PROMPT.format(count=len(items), listing=listing[:14000])
+    # role="improve": memory maintenance is a self-improvement job with its own delegate.
+    r = delegate.run(prompt, cwd=config.WORKSPACE, tools="Read", timeout=600, role="improve")
+    if not r["ok"]:
+        return f"maintenance skipped — Claude unavailable: {r['error']}"
+    plan = _parse_plan(r["output"])
+    if plan is None:
+        return "maintenance skipped — no parsable plan from the reviewer"
+
+    ids = {m["id"] for m in items}
+    pinned = {m["id"] for m in items if m["pinned"]}
+    to_delete = [i for i in plan.get("delete", []) if isinstance(i, int) and i in ids and i not in pinned]
+    if len(to_delete) > max(2, len(items) // 2):        # safety net: never let one run gut the store
+        return (f"maintenance aborted — reviewer proposed deleting {len(to_delete)}/{len(items)} "
+                "memories (over half); skipped to be safe")
+
+    deleted = edited = recat = 0
+    for mid in to_delete:
+        forget(mid); deleted += 1
+    for upd in plan.get("update", []) if isinstance(plan.get("update"), list) else []:
+        mid = upd.get("id") if isinstance(upd, dict) else None
+        if isinstance(mid, int) and mid in ids and upd.get("text"):
+            update(mid, str(upd["text"])); edited += 1
+    for rc in plan.get("recategorize", []) if isinstance(plan.get("recategorize"), list) else []:
+        mid = rc.get("id") if isinstance(rc, dict) else None
+        if isinstance(mid, int) and mid in ids and rc.get("category"):
+            set_category(mid, str(rc["category"])); recat += 1
+    note = str(plan.get("notes", "")).strip()
+    return (f"reviewed {len(items)} memories · removed {deleted} · rewrote {edited} · "
+            f"recategorized {recat}" + (f" — {note}" if note else ""))
+
+
+def ensure_maintenance_task():
+    """Make sure the locked '[ MEMORY ]' schedule exists (visible + retimable + toggleable
+    in the Scheduler, but not deletable). Weekly, Mondays 06:00."""
+    from oceano import scheduler
+    if any(t.get("source") == MAINT_SOURCE for t in scheduler.all_tasks()):
+        return
+    scheduler.add_task("0 6 * * 1",
+                       MAINT_PREFIX + "Evaluate & maintain long-term memory (dedupe, optimize) — reviewed by Claude Code",
+                       source=MAINT_SOURCE)

@@ -181,9 +181,9 @@ def run_topic(rid):
         with tools.background():       # unattended → never drive the user's live browser
             answer = Agent().run(_RUN_PROMPT.format(topic=topic, focus_block=focus_block,
                                                     doc=doc, doc_dir=DOC_DIR))
-        try:                                  # make the fresh doc semantically searchable
+        try:                                  # re-embed only THIS topic's doc, not the whole folder
             from oceano import rag
-            rag.index_docs(DOC_DIR)
+            rag.index_docs(DOC_DIR, only=doc)
         except Exception:
             pass
         result = (answer or "").strip()[:500]

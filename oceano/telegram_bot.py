@@ -155,28 +155,13 @@ async def model_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- context / compaction ----------------
 def _ctx_metrics(agent):
-    chars = sum(len(str(msg.get("content") or "")) for msg in agent.messages)
-    return len(agent.messages), chars // 4          # (#messages, ~tokens)
+    return agent.context_metrics()                  # (#messages, ~tokens) — shared with the web
 
 
 def _compact(agent):
     """Summarize everything but the system message into one note, shrinking context.
-    Returns the number of messages dropped."""
-    convo = [f"{m.get('role')}: {m.get('content')}"
-             for m in agent.messages[1:] if m.get("content")]
-    if not convo:
-        return 0
-    resp = llm.chat(
-        [{"role": "system", "content": "Summarize this conversation concisely for the assistant "
-          "to continue later. Preserve facts about the user, decisions made, open tasks, and any "
-          "important state. Compact bullet points, no preamble."},
-         {"role": "user", "content": "\n".join(convo)[:12000]}],
-        model=agent.model, base_url=agent.base_url, api_key=agent.api_key)
-    summary = (getattr(resp, "content", "") or "").strip() or "(nothing notable)"
-    before = len(agent.messages)
-    agent.messages = [agent.messages[0],
-                      {"role": "assistant", "content": "📋 Summary of our earlier conversation:\n" + summary}]
-    return before - len(agent.messages)
+    Returns the number of messages dropped. Delegates to Agent.compact (shared logic)."""
+    return agent.compact()
 
 
 async def compact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -473,12 +458,24 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init(app):
-    """Register the slash-command menu so typing '/' shows the options + descriptions."""
+    """Register the slash-command menu so typing '/' shows the options + descriptions
+    (Telegram's native autocomplete). Kept in sync with BOT_COMMANDS on every startup."""
     from telegram import BotCommand
     try:
         await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
     except Exception:
         pass
+
+
+async def unknown_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """A /command that isn't one of ours — nudge the user to the menu instead of going
+    silent (typing '/' shows the same list as autocomplete)."""
+    if _denied(update):
+        await update.message.reply_text(_denied(update)); return
+    await update.message.reply_text(
+        "🤔 I don't know that command. I can do:\n"
+        + "\n".join(f"/{c} — {d}" for c, d in BOT_COMMANDS)
+        + "\n\n_Type / to see the menu._", parse_mode="Markdown")
 
 
 def build_application(token):
@@ -495,6 +492,7 @@ def build_application(token):
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^tgmodel:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))   # any unregistered /command (after the real ones)
     return app
 
 

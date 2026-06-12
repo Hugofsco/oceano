@@ -115,13 +115,93 @@ def unregister_prefix(prefix):
     _SCHEMAS[:] = [s for s in _SCHEMAS if not s["function"]["name"].startswith(prefix)]
 
 
+# --- per-tool enable/disable + chat-mode memory tools (Settings → Tools) -----
+# Persisted so a user can hide tools from the model — turning one off removes it from
+# the prompt, shrinking the context. Stored by NAME so it survives MCP reconnects
+# (which re-register tools) and process restarts.
+_STATE_PATH = config.WORKSPACE.parent / "data" / "tools.json"
+_DISABLED = set()      # tools withheld from the model entirely (both modes)
+_CHAT_OFF = set()      # memory tools the user turned OFF for plain chat mode specifically
+
+# Memory tools that may be exposed in plain chat mode (Agent mode off), so the model can
+# still recall/manage what it knows about the user without full tool access.
+MEMORY_TOOLS = ("recall", "remember", "update_memory", "forget_memory")
+
+
+def _load_state():
+    global _DISABLED, _CHAT_OFF
+    try:
+        d = json.loads(_STATE_PATH.read_text())
+    except (OSError, ValueError):
+        d = {}
+    _DISABLED = set(d.get("disabled", []))
+    _CHAT_OFF = set(d.get("chat_off", []))
+
+
+def _save_state():
+    try:
+        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_PATH.write_text(json.dumps({"disabled": sorted(_DISABLED), "chat_off": sorted(_CHAT_OFF)}))
+    except OSError:
+        pass
+
+
+_load_state()
+
+
+def all_schemas():
+    """Every registered tool schema, enabled or not — for the Settings → Tools list."""
+    return list(_SCHEMAS)
+
+
 def schemas():
-    return _SCHEMAS
+    """Tool schemas EXPOSED to the model. Disabled tools (Settings → Tools) are withheld,
+    so turning a tool off removes it from the prompt and lowers the context cost."""
+    return [s for s in _SCHEMAS if s["function"]["name"] not in _DISABLED]
+
+
+def is_enabled(name):
+    return name not in _DISABLED
+
+
+def set_enabled(name, on):
+    _DISABLED.discard(name) if on else _DISABLED.add(name)
+    _save_state()
+
+
+def set_all(on):
+    """Enable or disable every currently-registered tool at once."""
+    global _DISABLED
+    _DISABLED = set() if on else {s["function"]["name"] for s in _SCHEMAS}
+    _save_state()
+
+
+def chat_tools():
+    """Tool names available in plain chat mode (Agent mode off): the user-kept memory tools,
+    intersected with globally-enabled tools. Empty list → chat mode is fully tool-free."""
+    return [m for m in MEMORY_TOOLS if m not in _CHAT_OFF and m not in _DISABLED]
+
+
+def chat_tool_state():
+    """For the Settings UI: each memory tool with its chat-mode + global state + description."""
+    by_name = {s["function"]["name"]: s["function"].get("description", "") for s in _SCHEMAS}
+    return [{"name": m, "description": by_name.get(m, ""), "in_chat": m not in _CHAT_OFF,
+             "enabled": m not in _DISABLED} for m in MEMORY_TOOLS if m in by_name]
+
+
+def set_chat_tool(name, on):
+    """Toggle whether a memory tool is offered in plain chat mode."""
+    if name not in MEMORY_TOOLS:
+        return
+    _CHAT_OFF.discard(name) if on else _CHAT_OFF.add(name)
+    _save_state()
 
 
 def run(name, arguments_json):
     """Execute a tool call and return its result as a string (always a string —
     that's what we feed back to the model)."""
+    if name in _DISABLED:                         # the model can't see it, but never run it anyway
+        return f"ERROR: tool {name!r} is disabled in Settings → Tools"
     fn = _TOOLS.get(name)
     if fn is None:
         return f"ERROR: unknown tool {name!r}"
@@ -656,12 +736,14 @@ def learn_skill(name, description, body):
     "type": "function",
     "function": {
         "name": "delegate_to_claude",
-        "description": "Hand a self-contained subtask to Claude Code (a stronger coding model) "
-                       "running headless in the workspace. Give it precise, complete instructions "
-                       "— the relevant file paths and exactly what it must produce — because it "
-                       "cannot ask you questions. Returns its final report. CALL THIS whenever the "
-                       "user asks you to 'use Claude' / 'delegate' / 'have Claude do it', or for a "
-                       "heavy subtask beyond you. The capability is available — don't claim you can't.",
+        "description": "Hand a self-contained subtask to the configured delegate — a stronger "
+                       "assistant running headless in the workspace (Claude Code by default, or the "
+                       "user's configured cloud model run as a full agent). Either way it can read, "
+                       "write, and run things to complete the task. Give precise, complete "
+                       "instructions — the relevant file paths and exactly what it must produce — "
+                       "because it cannot ask you questions. Returns its final report. CALL THIS "
+                       "whenever the user asks you to 'use Claude' / 'delegate' / 'have Claude do it', "
+                       "or for a heavy subtask beyond you. The capability is available — don't claim you can't.",
         "parameters": {"type": "object", "properties": {
             "instructions": {"type": "string"},
         }, "required": ["instructions"]},
@@ -669,10 +751,10 @@ def learn_skill(name, description, body):
 })
 def delegate_to_claude(instructions):
     from oceano import delegate
-    r = delegate.to_claude(instructions, cwd=config.WORKSPACE)
+    r = delegate.run(instructions, cwd=config.WORKSPACE)   # honours Settings → Delegation
     if not r["ok"]:
         return f"delegation failed: {r['error']}"
-    return r["output"][:8000] or "(claude finished but returned no text)"
+    return r["output"][:8000] or "(the delegate finished but returned no text)"
 
 
 # --- calendar (local copy, synced from Google Calendar / any ICS feed) -------

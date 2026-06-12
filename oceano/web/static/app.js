@@ -114,7 +114,7 @@ async function openVoyage(id) {
   else _curT.forEach(m => {
     if (m.role === "user") addUser(m.content, false);
     else if (m.role === "thinking") { const c = addThinkCard(); appendThink(c, m.text); finalizeThink(c); }
-    else if (m.role === "tool") fillTool(addTool(m.name, m.args), m.result);
+    else if (m.role === "tool") { const tc = addTool(m.name, m.args); fillTool(tc, m.result); maybePreviewChip(tc, m.name, m.args); }
     else if (m.role === "tools") m.items.forEach(it => fillTool(addTool(it.name, it.args), it.result));  // old format
     else { const bb = addAssistant(m.content, true); if (m.meta) renderMeta(bb, m.meta); }
   });
@@ -276,7 +276,14 @@ function finalizeThink(card) { if (!card) return; const st = $(".tk-stat", card)
 
 async function send() {
   const input = $("#input"), text = input.value.trim();
-  if (!text || state.busy || !state.model) { if (!state.model) flashModel(); return; }
+  if (!text || state.busy) return;
+  const sc = slashName(text);                       // composer command (/status, /compact, …)?
+  if (sc) {
+    input.value = ""; autosize(input); state.busy = true;
+    try { await runSlash(sc, text); } finally { state.busy = false; input.focus(); }
+    return;
+  }
+  if (!state.model) { flashModel(); return; }
   state.busy = true; setSendMode(true);
   $("#send").classList.add("ping"); setTimeout(() => $("#send").classList.remove("ping"), 600);
   input.value = ""; autosize(input);
@@ -313,6 +320,7 @@ async function send() {
           killSounding(); flushThink(); flushBubble();
           if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
           lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args };
+          maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
         } else if (ev.type === "tool_result") {
           fillTool(lastCard, ev.result);
           if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
@@ -323,6 +331,8 @@ async function send() {
           killSounding(); flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom();
         } else if (ev.type === "stats") {
           stats = ev;
+        } else if (ev.type === "notice") {
+          killSounding(); flushThink(); flushBubble(); addSysNote(escapeHtml(ev.text));
         } else if (ev.type === "error") {
           killSounding(); flushThink(); if (!bubble) bubble = addAssistant(""); acc = "⚠️ " + ev.message; renderMD(bubble, acc);
         }
@@ -351,6 +361,143 @@ function setSendMode(stopping) {
 function stopChat() {
   fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: state.session }) }).catch(() => {});
   if (_chatAbort) _chatAbort.abort();   // stops the client read; server cancels too
+}
+
+/* ---------------- composer slash-commands (mirror Telegram, minus model selection) ---------------- */
+// single source of truth — drives autocomplete, /help, and recognition
+const CHAT_COMMANDS = [
+  { name: "status", args: "", desc: "model, context size & live metrics" },
+  { name: "context", args: "[n|off]", desc: "show context size, or set/clear auto-compact" },
+  { name: "compact", args: "", desc: "summarize & shrink the context now" },
+  { name: "tools", args: "", desc: "list the tools the agent can call" },
+  { name: "agent", args: "[on|off]", desc: "toggle agent mode (tools)" },
+  { name: "reset", args: "", desc: "start a fresh conversation" },
+  { name: "help", args: "", desc: "show this list" },
+];
+const SLASH_CMDS = CHAT_COMMANDS.map(c => c.name).concat("clear");   // clear = hidden alias for reset
+function slashName(text) {
+  if (text[0] !== "/") return null;
+  const c = text.slice(1).split(/\s+/)[0].toLowerCase();
+  return SLASH_CMDS.includes(c) ? c : null;         // unknown /foo → falls through, sent to the model
+}
+// ---- composer command autocomplete (popover above the input) ----
+let _acIdx = 0, _acMatches = [];
+function ensureCmdAC() {
+  let ac = $("#cmdAC");
+  if (!ac) {
+    ac = document.createElement("div"); ac.id = "cmdAC"; ac.className = "cmd-ac"; ac.style.display = "none";
+    const host = $(".composer-inner"); if (host) host.appendChild(ac);
+  }
+  return ac;
+}
+function cmdACHide() { const ac = $("#cmdAC"); if (ac) ac.style.display = "none"; _acMatches = []; }
+function cmdACPaint() {
+  $$("#cmdAC .cmd-ac-item").forEach((el, i) => el.classList.toggle("active", i === _acIdx));
+  const a = $(`#cmdAC .cmd-ac-item.active`); if (a) a.scrollIntoView({ block: "nearest" });
+}
+function cmdACUpdate() {
+  const m = /^\/(\w*)$/.exec($("#input").value);    // only while typing the command name (no space/arg yet)
+  if (!m) return cmdACHide();
+  const partial = m[1].toLowerCase();
+  const matches = CHAT_COMMANDS.filter(c => c.name.startsWith(partial));
+  if (!matches.length) return cmdACHide();
+  const ac = ensureCmdAC();
+  _acMatches = matches; _acIdx = 0;
+  ac.innerHTML = matches.map((c, i) =>
+    `<div class="cmd-ac-item" data-i="${i}"><span class="cmd-ac-name">/${c.name}` +
+    `${c.args ? ` <span class="cmd-ac-args">${escapeHtml(c.args)}</span>` : ""}</span>` +
+    `<span class="cmd-ac-desc">${escapeHtml(c.desc)}</span></div>`).join("");
+  ac.style.display = ""; cmdACPaint();
+  $$("#cmdAC .cmd-ac-item").forEach(el => {
+    el.onmousedown = e => { e.preventDefault(); cmdACAccept(+el.dataset.i); };  // mousedown beats blur
+    el.onmouseenter = () => { _acIdx = +el.dataset.i; cmdACPaint(); };
+  });
+}
+function cmdACAccept(i) {
+  const c = _acMatches[i]; if (!c) return;
+  const input = $("#input");
+  input.value = "/" + c.name + " ";                 // leave a space so args can follow / Enter runs it
+  cmdACHide(); autosize(input); input.focus();
+}
+function cmdACKey(e) {                               // returns true if it consumed the key
+  const ac = $("#cmdAC");
+  if (!ac || ac.style.display === "none" || !_acMatches.length) return false;
+  if (e.key === "ArrowDown") { e.preventDefault(); _acIdx = (_acIdx + 1) % _acMatches.length; cmdACPaint(); return true; }
+  if (e.key === "ArrowUp") { e.preventDefault(); _acIdx = (_acIdx - 1 + _acMatches.length) % _acMatches.length; cmdACPaint(); return true; }
+  if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); cmdACAccept(_acIdx); return true; }
+  if (e.key === "Escape") { e.preventDefault(); cmdACHide(); return true; }
+  return false;
+}
+// display-only note in the thread (never persisted, never sent to the model)
+function addSysNote(html) {
+  clearWelcome();
+  const el = document.createElement("div"); el.className = "sys-note";
+  el.innerHTML = `<span class="sys-ic">⌘</span><div class="sys-body">${html}</div>`;
+  $("#thread").appendChild(el); toBottom();
+  return $(".sys-body", el);
+}
+function setSysNote(body, html) { if (body) { body.innerHTML = html; toBottom(); } }
+const _postJ = (url, obj) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) }).then(r => r.json());
+function _ctxLine(d) {
+  const tok = d.ctx_tokens ? `${fmtNum(d.ctx_tokens)} tok` : `~${fmtNum(d.approx_tokens)} tok (est.)`;
+  const cap = d.cap ? `auto-compact at ${d.cap} msgs` : "auto-compact off";
+  return `${d.messages} msgs · ${tok} · ${d.compactions} compaction(s) · ${cap}`;
+}
+async function runSlash(cmd, text) {
+  const arg = text.slice(1).split(/\s+/).slice(1).join(" ").trim();
+  const sid = state.session, qs = "?session=" + encodeURIComponent(sid);
+  if (cmd === "help") {
+    addSysNote("<b>Chat commands</b> <span class=\"sys-hint\">— type / for autocomplete</span><br>"
+      + CHAT_COMMANDS.map(c => `<div class="sys-cmd"><code>/${c.name}${c.args ? " " + c.args : ""}</code> — ${c.desc}</div>`).join(""));
+    return;
+  }
+  if (cmd === "reset" || cmd === "clear") { fetch("/api/session/" + encodeURIComponent(sid), { method: "DELETE" }).catch(() => {}); newVoyage(); return; }
+  if (cmd === "agent") {
+    const on = /^(on|off)$/i.test(arg) ? /on/i.test(arg) : !state.agent;
+    state.agent = on; const t = $("#agentToggle"); if (t) t.checked = on;
+    _postJ("/api/prefs", { agent_mode: on }).catch(() => {});
+    addSysNote(`Agent mode <b>${on ? "on" : "off"}</b> — ${on ? "tools enabled (browsing, files, shell, …)." : "plain chat, no tools."}`);
+    return;
+  }
+  if (cmd === "tools") {
+    const note = addSysNote("…");
+    let d; try { d = await api("/api/chat/status" + qs); } catch { setSysNote(note, "unavailable"); return; }
+    setSysNote(note, `<b>${d.tool_count}</b> tools available<br><span class="sys-tools">${d.tools.map(escapeHtml).join(", ")}</span>`);
+    return;
+  }
+  if (cmd === "context") {
+    if (arg) {
+      const d = await _postJ("/api/chat/context", { session: sid, value: arg });
+      if (d.ok === false) addSysNote(escapeHtml(d.error));
+      else addSysNote(d.cap ? `Auto-compact set — I'll summarize once this chat passes <b>${d.cap}</b> messages.` : "Auto-compact <b>off</b>.");
+    } else {
+      let d; try { d = await api("/api/chat/context" + qs); } catch { return; }
+      addSysNote("📜 <b>Context</b> · " + _ctxLine(d));
+    }
+    return;
+  }
+  if (cmd === "compact") {
+    const note = addSysNote("🗜 compacting…");
+    let d; try { d = await _postJ("/api/chat/compact", { session: sid }); } catch { setSysNote(note, "compact failed"); return; }
+    if (d.ok === false) setSysNote(note, escapeHtml(d.error));
+    else setSysNote(note, `🗜 Compacted — folded <b>${d.dropped}</b> messages into a summary.<br>Context now ${_ctxLine(d)}`);
+    return;
+  }
+  if (cmd === "status") {
+    const note = addSysNote("…");
+    let d; try { d = await api("/api/chat/status" + qs); } catch { setSysNote(note, "status unavailable"); return; }
+    const tok = d.ctx_tokens ? `${fmtNum(d.ctx_tokens)} tok` : `~${fmtNum(d.approx_tokens)} tok (est.)`;
+    setSysNote(note, "<b>🌊 Oceano — status</b>" + [
+      ["model", escapeHtml(d.model || "—")],
+      ["mode", state.agent ? "agent (tools on)" : "plain chat"],
+      ["context", `${d.messages} msgs · ${tok}`],
+      ["auto-compact", d.cap ? `> ${d.cap} msgs` : "off"],
+      ["compactions", `${d.compactions} this session`],
+      ["tools", `${d.tool_count} available`],
+      ["memory", `${d.memory} facts · ${d.docs} docs indexed`],
+    ].map(([k, v]) => `<div class="sys-row"><span class="sys-k">${k}</span><span class="sys-v">${v}</span></div>`).join(""));
+    return;
+  }
 }
 
 /* ---------------- models ---------------- */
@@ -585,17 +732,23 @@ async function addMemory() {
 /* ---------------- settings ---------------- */
 async function loadProviders() {
   const provs = await api("/api/providers");
-  $("#providerSelect").innerHTML = provs.map(p => `<option value="${p.base_url}" data-needs="${p.needs_key}" data-name="${p.name}">${p.name}</option>`).join("")
-    + `<option value="" data-needs="false" data-name="">Custom (any OpenAI-compatible URL)…</option>`;
+  $("#providerSelect").innerHTML = provs.map(p => `<option value="${p.base_url}" data-needs="${p.needs_key}" data-name="${escapeHtml(p.name)}" data-console="${escapeHtml(p.console || "")}">${escapeHtml(p.name)}</option>`).join("")
+    + `<option value="" data-needs="false" data-name="" data-console="">Custom (any OpenAI-compatible URL)…</option>`;
   $("#providerSelect").onchange = syncProviderFields; syncProviderFields();
 }
 function syncProviderFields() {
   const o = $("#providerSelect").selectedOptions[0]; if (!o) return;
-  const custom = !o.value;
+  const custom = !o.value, needsKey = custom || o.dataset.needs === "true";
   $("#epUrl").value = o.value;
   $("#epUrl").placeholder = custom ? "base URL, e.g. http://192.168.1.20:11434/v1" : o.value;
   $("#epName").value = o.dataset.name;
-  $("#epKey").style.display = (custom || o.dataset.needs === "true") ? "block" : "none"; $("#epKey").value = "";
+  $("#epKey").style.display = needsKey ? "block" : "none"; $("#epKey").value = "";
+  const link = $("#epConsole");                         // "Get an API key →" for this provider
+  if (link) {
+    const url = o.dataset.console || "";
+    if (needsKey && url) { link.href = url; link.textContent = "Get an API key for " + (o.dataset.name || "this provider") + " →"; link.style.display = "block"; }
+    else link.style.display = "none";
+  }
   if (custom) $("#epUrl").focus();
 }
 async function loadEndpoints() {
@@ -679,8 +832,8 @@ async function loadServices() {
 /* ================= SETTINGS WINDOW ================= */
 const SETTINGS_TABS = [
   ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
-  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["services", "◉", "Services"],
-  ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
+  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
+  ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
 // each wipe target: [key, label, description, confirm-detail]
 const WIPE_TARGETS = [
@@ -713,6 +866,7 @@ const SETTINGS_PAGES = {
         <input id="epUrl" placeholder="base URL, e.g. http://192.168.1.20:11434/v1" autocomplete="off" spellcheck="false">
         <input id="epName" placeholder="label (optional)">
         <input id="epKey" type="password" placeholder="API key" autocomplete="off">
+        <a id="epConsole" class="ep-console" target="_blank" rel="noopener" style="display:none"></a>
         <button class="primary" id="addEndpoint">Add</button>
         <div class="kn-note" id="epMsg"></div>
       </div>
@@ -738,8 +892,43 @@ const SETTINGS_PAGES = {
   tools: `
     <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
-      <p class="sub">What the agent can reach when Agent mode is on.</p>
+      <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
+      <div class="chat-tools">
+        <div class="ct-head">⌘ Memory in chat-only mode</div>
+        <p class="sub">Even with Agent mode off, the model can use these memory tools to recall, store, edit, or forget what it knows about you. Pick which are available in plain chat — reading your memories is always on; these add deliberate actions. Uncheck all to keep chat fully tool-free.</p>
+        <div class="ct-list" id="chatToolList"></div>
+      </div>
+      <div class="tool-acts"><span class="lbl-sub" style="flex:1">All tools (both modes)</span><button class="exp-btn" id="toolAllOn">Enable all</button><button class="exp-btn" id="toolAllOff">Disable all</button></div>
       <div class="tool-list" id="toolList"></div>
+    </div>`,
+  delegate: `
+    <div class="drawer-section">
+      <h3>Delegation</h3>
+      <p class="sub">Who handles delegated subtasks. The local model never reviews its own work. A cloud model runs through Oceano's own agent loop with your tools — it can read, write, and run things, just like a local model.</p>
+      <div class="dg-status" id="dgStatus">checking…</div>
+
+      <div class="dg-role">
+        <div class="dg-h">General <span class="lbl-sub">— the agent's “delegate” tool</span></div>
+        <div class="dg-providers">
+          <label class="dg-prov"><input type="radio" name="dg-default" value="claude_cli"><span><b>Claude Code</b><i>CLI agent · your subscription (no API key)</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-default" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
+        </div>
+        <select class="dg-model" id="dgModel-default" style="display:none"></select>
+        <div class="dg-row"><button class="exp-btn dg-test" data-role="default">Test / Re-check</button><span class="dg-probe" id="dgProbe-default"></span></div>
+      </div>
+
+      <div class="dg-role">
+        <div class="dg-h">Self-improvement jobs <span class="lbl-sub">— skills review · eval judging · memory maintenance</span></div>
+        <div class="dg-providers">
+          <label class="dg-prov"><input type="radio" name="dg-improve" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-improve" value="claude_cli"><span><b>Claude Code</b></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-improve" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
+        </div>
+        <select class="dg-model" id="dgModel-improve" style="display:none"></select>
+        <div class="dg-row"><button class="exp-btn dg-test" data-role="improve">Test / Re-check</button><span class="dg-probe" id="dgProbe-improve"></span></div>
+      </div>
+
+      <div class="acct-actions"><span class="acct-msg" id="dgMsg"></span><button class="primary sm" id="dgSave">Save</button></div>
     </div>`,
   services: `
     <div class="drawer-section">
@@ -782,6 +971,10 @@ function openSettings() {
   $("#acctSave", body).onclick = saveAccount;
   $("#logoutBtn", body).onclick = logout;
   $("#memPolSave", body).onclick = saveMemoryPolicy;
+  $("#toolAllOn", body).onclick = () => toggleAllTools(true);
+  $("#toolAllOff", body).onclick = () => toggleAllTools(false);
+  $("#dgSave", body).onclick = saveDelegation;
+  $$(".dg-test", body).forEach(b => b.onclick = () => testDelegation(b.dataset.role));
   $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
   loadSettingsAll();
 }
@@ -798,7 +991,7 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadAccount(); loadMemoryPolicy(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); }
 
 const POLICY_OPTS = [["always", "Always inject"], ["relevant", "When relevant"], ["off", "Off"]];
 async function loadMemoryPolicy() {
@@ -821,17 +1014,120 @@ async function saveMemoryPolicy() {
 
 async function loadTools() {
   const box = $("#toolList"); if (!box) return;
+  let tools; try { tools = await api("/api/tools"); } catch { return; }
+  const setCount = () => { const c = $("#toolCount"); if (c) c.textContent = `· ${$$(".tool-row input", box).filter(x => x.checked).length}/${tools.length} on`; };
+  box.innerHTML = tools.map(t => {
+    const params = (t.params || []).length
+      ? t.params.map(p => `<span class="tp${p.required ? " req" : ""}" title="${escapeHtml((p.required ? "required · " : "optional · ") + p.type + (p.description ? " · " + p.description : ""))}">${escapeHtml(p.name)}<i>${escapeHtml(p.type)}</i></span>`).join("")
+      : `<span class="tp-none">no inputs</span>`;
+    return `<div class="tool-row${t.enabled ? "" : " off"}" data-tool="${escapeHtml(t.name)}">
+        <div class="tr-main">
+          <div class="th"><span class="tcat">${escapeHtml(t.category || "other")}</span><span class="tn">${escapeHtml(t.name)}</span></div>
+          <div class="td">${escapeHtml(t.description || "")}</div><div class="tparams">${params}</div>
+        </div>
+        <label class="sw sm" title="enable / disable this tool"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
+      </div>`;
+  }).join("");
+  setCount();
+  $$(".tool-row", box).forEach(row => {
+    $("input", row).onchange = async e => {
+      row.classList.toggle("off", !e.target.checked); setCount();
+      await fetch("/api/tools/toggle", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: row.dataset.tool, enabled: e.target.checked }) }).catch(() => {});
+      loadChatMemoryTools();   // a globally-disabled memory tool must grey out in the chat section
+    };
+  });
+  loadChatMemoryTools();
+}
+async function loadChatMemoryTools() {
+  const box = $("#chatToolList"); if (!box) return;
+  let d; try { d = await api("/api/tools/chat"); } catch { return; }
+  box.innerHTML = d.tools.map(t => `
+    <div class="ct-row${t.enabled ? "" : " goff"}" data-tool="${escapeHtml(t.name)}">
+      <div class="ct-main"><span class="tn">${escapeHtml(t.name)}</span>
+        <span class="ct-desc">${escapeHtml((t.description || "").split(".")[0].slice(0, 80))}</span>
+        ${t.enabled ? "" : '<span class="ct-note">off globally ↓</span>'}</div>
+      <label class="sw sm" title="${t.enabled ? "available in chat-only mode" : "enable it below first"}"><input type="checkbox" ${t.in_chat ? "checked" : ""} ${t.enabled ? "" : "disabled"}><span></span></label>
+    </div>`).join("");
+  $$(".ct-row", box).forEach(row => {
+    const inp = $("input", row); if (!inp) return;
+    inp.onchange = e => fetch("/api/tools/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: row.dataset.tool, enabled: e.target.checked }) }).catch(() => {});
+  });
+}
+async function toggleAllTools(on) {
+  await fetch("/api/tools/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ all: on }) }).catch(() => {});
+  loadTools();
+}
+
+/* ---------------- delegation (Claude Code readiness + per-role provider choice) ---------------- */
+let _dgModels = [];
+async function loadDelegation() {
+  const box = $("#dgStatus"); if (!box) return;
+  let d; try { d = await api("/api/delegate"); } catch { return; }
+  dgRenderStatus(d);
+  try { _dgModels = (await api("/api/models")).filter(m => !m.error); } catch { _dgModels = []; }
+  ["default", "improve"].forEach(role => dgInitRole(role, d[role] || {}));
+}
+function dgInitRole(role, cfg) {
+  $$(`input[name="dg-${role}"]`).forEach(r => { r.checked = (r.value === cfg.provider); r.onchange = () => dgSyncRole(role); });
+  const sel = $(`#dgModel-${role}`);
+  if (sel) {
+    sel.innerHTML = _dgModels.length
+      ? _dgModels.map(m => `<option value="${escapeHtml(m.id)}" data-base="${escapeHtml(m.base_url)}"${(m.base_url === cfg.base_url && m.id === cfg.model) ? " selected" : ""}>${escapeHtml(m.id)} — ${escapeHtml(m.endpoint)}</option>`).join("")
+      : `<option value="">no endpoints configured — add one under Endpoints</option>`;
+  }
+  dgSyncRole(role);
+}
+function dgSyncRole(role) {                                    // show the model picker only for "Cloud model"
+  const prov = ($(`input[name="dg-${role}"]:checked`) || {}).value;
+  const sel = $(`#dgModel-${role}`); if (sel) sel.style.display = prov === "api" ? "" : "none";
+}
+function dgRenderStatus(d) {
+  const box = $("#dgStatus"); if (!box) return;
+  const c = d.claude || {};
+  box.innerHTML = (c.installed
+    ? `<div class="dg-line ok">✓ Claude Code installed · <code>${escapeHtml(c.version || "")}</code></div>`
+    : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`)
+    + `<div class="dg-hint">Authentication is confirmed only when you press <b>Test / Re-check</b> in a section below.</div>`;
+}
+function dgRolePayload(role) {
+  const prov = ($(`input[name="dg-${role}"]:checked`) || {}).value || (role === "improve" ? "inherit" : "claude_cli");
+  let base_url = "", model = "";
+  if (prov === "api") {
+    const opt = $(`#dgModel-${role}`) && $(`#dgModel-${role}`).selectedOptions[0];
+    if (!opt || !opt.value) return { error: "pick a model for the " + (role === "improve" ? "self-improvement" : "general") + " delegate" };
+    model = opt.value; base_url = opt.dataset.base || "";
+  }
+  return { role, provider: prov, base_url, model };
+}
+async function saveDelegation() {
+  const msg = $("#dgMsg");
+  const payloads = ["default", "improve"].map(dgRolePayload);
+  const bad = payloads.find(p => p.error);
+  if (bad) { if (msg) { msg.textContent = bad.error; msg.className = "acct-msg err"; } return; }
   try {
-    const tools = await api("/api/tools");
-    const cnt = $("#toolCount"); if (cnt) cnt.textContent = "· " + tools.length;
-    box.innerHTML = tools.map(t => {
-      const params = (t.params || []).length
-        ? t.params.map(p => `<span class="tp${p.required ? " req" : ""}" title="${escapeHtml((p.required ? "required · " : "optional · ") + p.type + (p.description ? " · " + p.description : ""))}">${escapeHtml(p.name)}<i>${escapeHtml(p.type)}</i></span>`).join("")
-        : `<span class="tp-none">no inputs</span>`;
-      return `<div class="tool-row"><div class="th"><span class="tcat">${escapeHtml(t.category || "other")}</span><span class="tn">${escapeHtml(t.name)}</span></div>` +
-             `<div class="td">${escapeHtml(t.description || "")}</div><div class="tparams">${params}</div></div>`;
-    }).join("");
-  } catch {}
+    let last;
+    for (const p of payloads) last = await _postJ("/api/delegate", p);
+    dgRenderStatus(last);
+    if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+  } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+}
+async function testDelegation(role) {
+  const box = $(`#dgProbe-${role}`);
+  if (box) { box.innerHTML = "testing…"; box.className = "dg-probe"; }
+  let r; try { r = await _postJ("/api/delegate/test", { role }); } catch { if (box) { box.innerHTML = "test failed"; box.className = "dg-probe err"; } return; }
+  if (!box) return;
+  if (r.ok) {
+    box.className = "dg-probe ok";
+    box.innerHTML = `✓ ${escapeHtml(r.provider === "api" ? "cloud model responded" : "Claude Code authenticated")}`;
+  } else {
+    box.className = "dg-probe err";
+    const fix = r.provider === "claude_cli"
+      ? ` — run <code>claude login</code> on the host (as the Oceano user), then re-check`
+      : ` — check the endpoint/model/key under Endpoints`;
+    box.innerHTML = `✗ ${escapeHtml(r.detail || "not ready")}${fix}`;
+  }
 }
 
 /* ---------------- account / auth ---------------- */
@@ -1257,7 +1553,8 @@ async function expLoad(path) {
       $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
       const items = e.dir
         ? [{ label: "Open", action: () => expLoad(e.path) }]
-        : [{ label: "Open here", action: () => expOpenFile(e.path) },
+        : [...(isWebPage(e.name) ? [{ label: "▶ Preview", action: () => openPreview(e.path) }] : []),
+           { label: "Open here", action: () => expOpenFile(e.path) },
            { label: "Open in new window", action: () => openFileWindow(e.path) },
            { label: "Download", action: () => window.open("/api/raw?path=" + encodeURIComponent(e.path), "_blank") }];
       items.push({ label: "Rename", action: () => expRename(e) }, { sep: true }, { label: "Delete", danger: true, action: () => expDelete(e) });
@@ -1320,6 +1617,7 @@ async function _mountEditor(container, path, opts = {}) {
       <select class="fe-lang fw-lang" title="syntax mode">${langs}</select>
       <button class="ed-btn fw-find" title="Find / replace (Ctrl-F)">⌕</button>
       <button class="ed-btn fw-wrap" title="Toggle line wrap">⏎</button>
+      ${isWebPage(path) ? '<button class="ed-btn fw-preview" title="Preview in a sandboxed window">▶ Preview</button>' : ""}
       <button class="ed-btn fw-saveas" title="Save as a new file">Save as…</button>
       <button class="primary sm fw-save">Save</button>
     </div>
@@ -1355,6 +1653,7 @@ async function _mountEditor(container, path, opts = {}) {
   };
   $(".fw-wrap", container).onclick = () => { const w = !cm.getOption("lineWrapping"); cm.setOption("lineWrapping", w); $(".fw-wrap", container).classList.toggle("on", w); };
   $(".fw-find", container).onclick = () => { cm.focus(); cm.execCommand("findPersistent"); };
+  { const pv = $(".fw-preview", container); if (pv) pv.onclick = () => openPreview(curPath); }   // curPath tracks Save as…
   setTimeout(() => cm.refresh(), 30);             // CM mis-measures in a freshly-shown box
   if (window.ResizeObserver) new ResizeObserver(() => cm.refresh()).observe($(".fw-cm", container));  // re-layout on resize
   return cm;
@@ -1367,17 +1666,70 @@ async function openFileWindow(path) {                          // standalone pop
   await _mountEditor(body, path, { onSaved: () => { if (typeof _expCwd === "string") expLoad(_expCwd); } });
 }
 
+/* ---------- Preview: render a workspace web app in a sandboxed iframe (device simulator + live reload) ---------- */
+const isWebPage = p => /\.html?$/i.test(p || "");
+const _previewURL = p => "/api/preview/" + p.split("/").map(encodeURIComponent).join("/");
+let _previewTimer = null;
+function openPreview(path) {
+  const name = path.split("/").pop() || path, id = "win-preview";
+  const { body } = createWindow({ id, title: "Preview — " + name, icon: "▶", width: 920, height: 660,
+    onClose: () => { if (_previewTimer) { clearInterval(_previewTimer); _previewTimer = null; } } });
+  body.classList.add("pv-win");
+  body.innerHTML = `
+    <div class="pv-bar">
+      <div class="pv-devices">
+        <button class="pv-dev on" data-w="100%">Desktop</button>
+        <button class="pv-dev" data-w="820px">Tablet</button>
+        <button class="pv-dev" data-w="390px">Phone</button>
+      </div>
+      <span class="pv-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+      <span class="fe-spacer"></span>
+      <label class="pv-auto" title="reload when the files change"><input type="checkbox" checked> auto-reload</label>
+      <button class="ed-btn pv-reload" title="Reload now">↻</button>
+    </div>
+    <div class="pv-stage"><div class="pv-frame" style="width:100%"><iframe class="pv-iframe"
+        sandbox="allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"></iframe></div></div>`;
+  const iframe = $(".pv-iframe", body), frame = $(".pv-frame", body), auto = $(".pv-auto input", body);
+  const load = () => { iframe.src = _previewURL(path) + "?t=" + Date.now(); };   // new URL each time → forces reload
+  load();
+  $(".pv-reload", body).onclick = load;
+  $$(".pv-dev", body).forEach(b => b.onclick = () => {
+    $$(".pv-dev", body).forEach(x => x.classList.toggle("on", x === b));
+    frame.style.width = b.dataset.w; frame.classList.toggle("device", b.dataset.w !== "100%");
+  });
+  if (_previewTimer) clearInterval(_previewTimer);
+  let last = 0;
+  const poll = async () => {
+    if (!auto.checked) return;
+    let d; try { d = await api("/api/preview-mtime?path=" + encodeURIComponent(path)); } catch { return; }
+    if (last && d.mtime > last) load();
+    last = d.mtime;
+  };
+  poll(); _previewTimer = setInterval(poll, 1500);
+}
+// artifact-style chip: when the agent writes an .html file, offer a Preview on that tool card
+function maybePreviewChip(card, name, argsJson) {
+  if (!card || name !== "write_file") return;
+  let path; try { path = JSON.parse(argsJson).path; } catch { return; }
+  if (!isWebPage(path)) return;
+  const th = $(".th", card); if (!th || $(".tool-preview", th)) return;
+  const b = document.createElement("button");
+  b.className = "tool-preview"; b.textContent = "▶ Preview";
+  b.onclick = e => { e.stopPropagation(); openPreview(path); };
+  th.appendChild(b);
+}
+
 /* ---------- Brain window (memory + skills) ---------- */
 const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
 function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
-    onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; } if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; } } });
+    onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; } if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; } if (_brainEvalDotTimer) { clearInterval(_brainEvalDotTimer); _brainEvalDotTimer = null; } } });
   if (!reused) {
     body.classList.add("set-win");
     body.innerHTML = `
       <div class="set-layout">
         <div class="set-tabs">${BRAIN_TABS.map((t, i) =>
-          `<button class="set-tab${i === 0 ? " active" : ""}" data-tab="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}</button>`).join("")}</div>
+          `<button class="set-tab${i === 0 ? " active" : ""}" data-tab="${t[0]}"><span class="sti">${t[1]}</span>${t[2]}${t[0] === "evals" ? '<span class="brain-run-dot" id="brainEvalDot" style="display:none" title="eval running"></span>' : ""}</button>`).join("")}</div>
         <div class="set-pane brain-pane" id="brainBody"></div>
       </div>`;
     $$(".set-tab", body).forEach(t => t.onclick = () => {
@@ -1385,6 +1737,7 @@ function openBrain(tab) {
       brainTab(t.dataset.tab);
     });
   }
+  startBrainEvalDot();   // keep the Evals tab's "running" dot live regardless of active tab
   const want = tab || (reused ? null : "mem");
   if (want) {
     const btn = $$(".set-tab", body).find(x => x.dataset.tab === want);
@@ -1847,21 +2200,37 @@ async function editTaskSchedule(t) {  // locked job: only its schedule is user-e
 }
 
 /* ---------- Brain → Evals (model eval harness · judged by Claude Code) ---------- */
-let _evalTimer = null, _evalModels = [], _evalRunSel = null;
+let _evalTimer = null, _evalModels = [], _evalRunSel = null, _brainEvalDotTimer = null;
+function startBrainEvalDot() {
+  if (_brainEvalDotTimer) clearInterval(_brainEvalDotTimer);
+  pollBrainEvalDot();
+  _brainEvalDotTimer = setInterval(pollBrainEvalDot, 3000);
+}
+async function pollBrainEvalDot() {
+  const dot = $("#brainEvalDot");
+  if (!dot) { if (_brainEvalDotTimer) { clearInterval(_brainEvalDotTimer); _brainEvalDotTimer = null; } return; }
+  let st; try { st = await api("/api/evals/state"); } catch { return; }
+  dot.style.display = st.running ? "" : "none";
+  dot.classList.toggle("cancelling", !!st.cancelling);
+  dot.title = st.running ? ("eval running — " + (st.phase || "")) : "";
+}
 function renderEvals(c) {
   c.innerHTML = `
     <div class="brain-head">
       <div class="sk-tabs">
         <button class="sk-tab on" data-f="board">Leaderboard</button>
         <button class="sk-tab" data-f="cases">Cases<span class="sk-cnt" id="evCntCases"></span></button>
+        <button class="sk-tab" data-f="models">Models<span class="sk-cnt" id="evCntModels"></span></button>
         <button class="sk-tab" data-f="history">History</button>
       </div>
       <span style="flex:1"></span>
+      <button class="exp-btn danger" id="evCancel" style="display:none" title="stop the in-progress run after the current case">✕ Cancel</button>
       <button class="exp-btn" id="evRun" title="run the suite against the selected models — judged by Claude Code">⚖ Run now</button>
     </div>
     <div class="kn-note" id="evMsg"></div>
     <div id="evBody"></div>`;
   $("#evRun").onclick = startEvalRun;
+  $("#evCancel").onclick = cancelEvalRun;
   $$(".sk-tab", c).forEach(b => b.onclick = () => {
     $$(".sk-tab", c).forEach(x => x.classList.toggle("on", x === b));
     _evalTab = b.dataset.f; evalRenderTab();
@@ -1873,6 +2242,7 @@ function renderEvals(c) {
 let _evalTab = "board";
 function evalRenderTab() {
   if (_evalTab === "cases") loadEvalCases();
+  else if (_evalTab === "models") loadEvalModels();
   else if (_evalTab === "history") loadEvalHistory();
   else loadEvalBoard();
 }
@@ -1882,12 +2252,27 @@ async function startEvalRun() {
   await fetch("/api/evals/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
   refreshEvalState(true);
 }
+async function cancelEvalRun() {
+  const c = $("#evCancel"); if (c) { c.disabled = true; c.textContent = "cancelling…"; }
+  await fetch("/api/evals/cancel", { method: "POST" }).catch(() => {});
+  refreshEvalState(true);
+}
+function evalRunControls(st) {
+  const run = $("#evRun"), cancel = $("#evCancel");
+  if (!run || !cancel) return;
+  run.style.display = st.running ? "none" : "";
+  cancel.style.display = st.running ? "" : "none";
+  cancel.disabled = !!st.cancelling;
+  cancel.textContent = st.cancelling ? "cancelling…" : "✕ Cancel";
+}
 async function refreshEvalState(loop) {
   const msg = $("#evMsg"); if (!msg) { _evalTimer = null; return; }
   let st; try { st = await api("/api/evals/state"); } catch { _evalTimer = null; return; }
+  evalRunControls(st);
   if (st.running) {
     const pct = st.total ? Math.round(100 * st.done / st.total) : 0;
-    msg.textContent = `running ${st.done}/${st.total} (${pct}%) · ${st.phase || ""}`; msg.className = "kn-note run";
+    msg.textContent = (st.cancelling ? "cancelling — " : `running ${st.done}/${st.total} (${pct}%) · `) + (st.phase || "");
+    msg.className = "kn-note run";
     _evalTimer = setTimeout(() => refreshEvalState(loop), 3000);
   } else {
     _evalTimer = null;
@@ -1969,16 +2354,56 @@ function openEvalCase(cs) {
     if (_evalTab === "cases") loadEvalCases();
   };
 }
+async function loadEvalModels() {
+  const body = $("#evBody"); if (!body) return;
+  let d; try { d = await api("/api/evals/models"); } catch { return; }
+  const sel = new Set(d.selected || []);
+  const cnt = $("#evCntModels"); if (cnt) cnt.textContent = sel.size;
+  const sch = d.scheduled
+    ? `Scheduled run: <code>${escapeHtml(d.scheduled.cron)}</code> · ${d.scheduled.enabled ? "on" : "off"} — edit its time in the Scheduler.`
+    : "No scheduled run configured.";
+  if (!(d.available || []).length) {
+    body.innerHTML = `<div class="empty-note">No local models served. Install one in Brain → Rivers.</div>`;
+    return;
+  }
+  body.innerHTML = `
+    <div class="ev-models-note">Target models for the eval suite. This selection drives both <b>⚖ Run now</b> and the scheduled run. If none are checked, <b>all</b> installed models run.<br>${sch}</div>
+    ${d.available.map(m => `
+      <div class="ev-model-row" data-m="${escapeHtml(m)}">
+        <span class="ev-model-name">${escapeHtml(m)}</span>
+        <label class="sw sm"><input type="checkbox" ${sel.has(m) ? "checked" : ""}><span></span></label>
+      </div>`).join("")}`;
+  $$(".ev-model-row", body).forEach(el => {
+    $("input", el).onchange = async () => {
+      const chosen = $$(".ev-model-row input", body).filter(x => x.checked)
+        .map(x => x.closest(".ev-model-row").dataset.m);
+      await fetch("/api/evals/models", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ models: chosen }) });
+      const c = $("#evCntModels"); if (c) c.textContent = chosen.length;
+    };
+  });
+}
 async function loadEvalHistory() {
   const body = $("#evBody"); if (!body) return;
   let d; try { d = await api("/api/evals/runs"); } catch { return; }
   if (!d.runs.length) { body.innerHTML = `<div class="empty-note">No runs yet.</div>`; return; }
-  body.innerHTML = d.runs.map(r => `
+  const head = `<div class="ev-cases-head"><span style="flex:1"></span><button class="sr-btn" id="evClear">Clear history</button></div>`;
+  body.innerHTML = head + d.runs.map(r => `
     <div class="ev-run" data-id="${r.id}">
       <div class="ev-run-main"><div class="ev-run-sum">${escapeHtml(r.summary || "(no summary)")}</div>
-      <div class="ev-run-meta">#${r.id} · ${(r.ts || "").slice(0, 16).replace("T", " ")} · ${escapeHtml(r.status)} · ${r.models.length} model(s)</div></div>
-      <button class="sr-btn ev-view">results</button></div>`).join("");
-  $$(".ev-run", body).forEach(el => $(".ev-view", el).onclick = () => openEvalResults(+el.dataset.id));
+      <div class="ev-run-meta">#${r.id} · ${(r.ts || "").slice(0, 16).replace("T", " ")} · ${escapeHtml(r.status)} · ${r.models.length} model(s): ${escapeHtml((r.models || []).join(", ")) || "—"}</div></div>
+      <button class="sr-btn ev-view">results</button><button class="sr-btn ev-del">✕</button></div>`).join("");
+  $("#evClear", body).onclick = async () => {
+    if (!await confirmAction("Clear eval history?", "Deletes all runs and their results. Cases and model selection are kept.")) return;
+    await fetch("/api/evals/runs/clear", { method: "POST" }); loadEvalHistory();
+  };
+  $$(".ev-run", body).forEach(el => {
+    $(".ev-view", el).onclick = () => openEvalResults(+el.dataset.id);
+    $(".ev-del", el).onclick = async () => {
+      if (!await confirmAction("Delete this run?", "Run #" + el.dataset.id)) return;
+      await fetch("/api/evals/runs/" + el.dataset.id, { method: "DELETE" }); loadEvalHistory();
+    };
+  });
 }
 async function openEvalResults(runId) {
   const { body } = createWindow({ id: "win-evalresults", title: "Eval results · run #" + runId, icon: "⚖", width: 680, height: 600 });
@@ -2141,8 +2566,12 @@ async function editResearch(t) {
 const autosize = t => { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; };
 function wire() {
   const input = $("#input");
-  input.addEventListener("input", () => autosize(input));
-  input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+  input.addEventListener("input", () => { autosize(input); cmdACUpdate(); });
+  input.addEventListener("keydown", e => {
+    if (cmdACKey(e)) return;                      // autocomplete consumed the key (nav/accept/dismiss)
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("blur", () => setTimeout(cmdACHide, 120));
   $("#send").onclick = () => state.busy ? stopChat() : send();
   $("#newVoyage").onclick = newVoyage;
   $("#agentToggle").onchange = e => {

@@ -13,6 +13,7 @@ Runs are grouped BY MODEL so llama-swap swaps once per model, not once per case.
 import json
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -25,7 +26,8 @@ CASE_TIMEOUT = 240                                 # default per-case wall-clock
 GRADER_TYPES = ("judge", "contains", "file_exists", "tool_called")
 CATEGORIES = ("qa", "research", "code", "file", "reasoning", "tool-use")
 
-_STATE = {"running": False, "phase": "", "done": 0, "total": 0, "last": None}
+_STATE = {"running": False, "phase": "", "done": 0, "total": 0, "last": None, "cancelling": False}
+_CANCEL = threading.Event()                        # set by cancel() to stop an in-progress run
 
 
 def _db():
@@ -40,7 +42,28 @@ def _db():
                 "id INTEGER PRIMARY KEY, run_id INTEGER, case_id INTEGER, case_name TEXT, model TEXT, "
                 "score REAL, passed INTEGER, tokens INTEGER, ms INTEGER, steps INTEGER, "
                 "tools TEXT, error TEXT, verdict TEXT, answer TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     return con
+
+
+def _get_setting(key, default=None):
+    con = _db()
+    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    con.close()
+    if row is None:
+        return default
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return default
+
+
+def _set_setting(key, value):
+    con = _db()
+    con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                (key, json.dumps(value)))
+    con.commit()
+    con.close()
 
 
 # ============================ cases CRUD ============================
@@ -98,8 +121,8 @@ def delete_case(case_id):
 
 # ============================ target models ============================
 def available_models():
-    """Served local models (llama-swap), newest registration first — the default
-    targets for a run. Falls back to the configured default model."""
+    """Served local models (llama-swap), newest registration first — the universe a
+    run can target. Falls back to the configured default model."""
     try:
         from oceano import rivers
         served = [m["served"] for m in rivers.installed() if m.get("served")]
@@ -114,10 +137,54 @@ def available_models():
     return [config.MODEL]
 
 
+def set_selected_models(models):
+    """Persist the user's eval target selection (Brain → Evals → Models). Stored as the
+    subset of model names to run; [] means 'no explicit choice → run all available'.
+    This selection drives BOTH the manual 'Run now' and the scheduled [ EVAL ] run."""
+    avail = set(available_models())
+    chosen = [m for m in (models or []) if isinstance(m, str) and m in avail]
+    _set_setting("models", chosen)
+    return chosen
+
+
+def selected_models():
+    """The models a run actually targets: the saved selection intersected with what's
+    currently served. Empty selection, or none of the saved models still served, → all
+    available (a run is never silently empty)."""
+    avail = available_models()
+    saved = _get_setting("models") or []
+    keep = [m for m in avail if m in saved]   # availability order; drops uninstalled
+    return keep or avail
+
+
+def models_config():
+    """For the Models tab: every available model and whether it's currently a target.
+    With no saved selection yet, all models count as selected (default = run all)."""
+    avail = available_models()
+    saved = _get_setting("models")
+    chosen = set(saved) if saved else set(avail)
+    return {"available": avail,
+            "selected": [m for m in avail if m in chosen],
+            "scheduled": _scheduled_note()}
+
+
+def _scheduled_note():
+    """Human-readable schedule of the locked [ EVAL ] task, for the Models tab hint."""
+    try:
+        from oceano import scheduler
+        for t in scheduler.all_tasks():
+            if t.get("source") == EVAL_SOURCE:
+                return {"cron": t.get("cron"), "enabled": bool(t.get("enabled"))}
+    except Exception:
+        pass
+    return None
+
+
 # ============================ running a single case ============================
-def _run_case(case, model):
+def _run_case(case, model, cancel=None):
     """Drive the agent through one case in an isolated workspace; capture answer,
-    tools used, tokens, steps, wall-time, created files. Returns a result dict."""
+    tools used, tokens, steps, wall-time, created files. Returns a result dict.
+    Aborts mid-case if `cancel` (a threading.Event) is set."""
     from oceano.agent import Agent
     from oceano import tools
     safe = re.sub(r"[^a-z0-9]+", "-", case["name"].lower()).strip("-")[:40] or "case"
@@ -145,6 +212,9 @@ def _run_case(case, model):
                     tools_used.append(ev.get("name", "")); steps += 1
                 elif kind == "stats":
                     tokens = ev.get("tokens", 0)
+                if cancel is not None and cancel.is_set():
+                    err = "cancelled"
+                    break
                 if time.time() > deadline:
                     err = "timeout"
                     break
@@ -213,7 +283,8 @@ def _judge(case, run):
         prompt=case["prompt"], rubric=case.get("rubric") or "(use your judgment)",
         scratch=run["scratch"], files=", ".join(run["files"]) or "(none)",
         answer=(run["answer"] or "(no answer produced)")[:4000])
-    r = delegate.to_claude(prompt, cwd=Path(run["scratch"]), tools="Read,Glob,Grep", timeout=600)
+    # role="improve": self-improvement jobs use their own configurable delegate (Settings → Delegation).
+    r = delegate.run(prompt, cwd=Path(run["scratch"]), tools="Read,Glob,Grep", timeout=600, role="improve")
     if not r["ok"]:
         return {"score": 0, "pass": False, "reasoning": f"judge unavailable: {r['error']}", "judge_error": True}
     m = re.search(r"\{.*\}", r["output"], re.DOTALL)
@@ -257,14 +328,16 @@ def run_all(models=None):
     if _STATE["running"]:
         return "(an eval run is already in progress)"
     cases = [c for c in all_cases() if c["enabled"]]
-    models = [m for m in (models or available_models()) if m]
+    # explicit override wins; otherwise the saved selection (also used by the scheduler)
+    models = [m for m in (models or selected_models()) if m]
     if not cases:
         return "(no eval cases defined yet — add some in Brain → Evals)"
     if not models:
         return "(no target models available)"
 
+    _CANCEL.clear()
     _STATE.update({"running": True, "phase": "starting", "done": 0,
-                   "total": len(cases) * len(models), "last": None})
+                   "total": len(cases) * len(models), "last": None, "cancelling": False})
     con = _db()
     cur = con.execute("INSERT INTO runs (ts, models, status, summary) VALUES (?,?,?,?)",
                       (datetime.now(timezone.utc).isoformat(), json.dumps(models), "running", ""))
@@ -273,11 +346,18 @@ def run_all(models=None):
     con.close()
 
     per_model = {m: [] for m in models}
+    cancelled = False
     try:
         for model in models:                       # group by model → one llama-swap per model
             for case in cases:
+                if _CANCEL.is_set():
+                    cancelled = True
+                    break
                 _STATE["phase"] = f"{model} · {case['name']}"
-                run = _run_case(case, model)
+                run = _run_case(case, model, cancel=_CANCEL)
+                if _CANCEL.is_set():               # aborted mid-case → don't grade/store a partial
+                    cancelled = True
+                    break
                 graded = _grade(case, run)
                 per_model[model].append(graded["score"])
                 con = _db()
@@ -290,9 +370,13 @@ def run_all(models=None):
                 con.commit()
                 con.close()
                 _STATE["done"] += 1
+            if cancelled:
+                break
         ranked = sorted(((sum(v) / len(v), m) for m, v in per_model.items() if v), reverse=True)
         summary = " · ".join(f"{m}: {avg:.0f}" for avg, m in ranked) or "no results"
-        status = "done"
+        if cancelled:
+            summary = "cancelled — " + summary
+        status = "cancelled" if cancelled else "done"
     except Exception as e:
         summary = f"run failed: {type(e).__name__}: {e}"
         status = "error"
@@ -301,9 +385,21 @@ def run_all(models=None):
         con.execute("UPDATE runs SET status=?, summary=? WHERE id=?", (status, summary, run_id))
         con.commit()
         con.close()
-        _STATE.update({"running": False, "phase": "", "last": summary})
+        _STATE.update({"running": False, "phase": "", "last": summary, "cancelling": False})
+        _CANCEL.clear()
         _cleanup_scratch()
     return summary
+
+
+def cancel():
+    """Request the in-progress run stop. It finishes/aborts the current case, marks the
+    run 'cancelled', and keeps whatever results it already stored. No-op if idle."""
+    if not _STATE["running"]:
+        return False
+    _CANCEL.set()
+    _STATE["cancelling"] = True
+    _STATE["phase"] = "cancelling — finishing the current case…"
+    return True
 
 
 def _cleanup_scratch():
@@ -328,6 +424,28 @@ def runs(limit=20):
     con.close()
     return [{"id": r[0], "ts": r[1], "models": json.loads(r[2] or "[]"),
              "status": r[3], "summary": r[4]} for r in rows]
+
+
+def delete_run(run_id):
+    """Remove one run from history along with its per-case results."""
+    con = _db()
+    con.execute("DELETE FROM results WHERE run_id=?", (run_id,))
+    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+    con.commit()
+    con.close()
+    return True
+
+
+def clear_runs():
+    """Wipe ALL run history + results (cases and the model selection are kept).
+    Returns the number of runs removed."""
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    con.execute("DELETE FROM results")
+    con.execute("DELETE FROM runs")
+    con.commit()
+    con.close()
+    return n
 
 
 def leaderboard(run_id=None):

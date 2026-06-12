@@ -220,6 +220,9 @@ def run_due_once():
                     from oceano import evals
                     evals.run_all_bg()                           # long → background, don't wedge the loop
                     answer = "model eval suite started in the background"
+                elif source == "memory:maintain":                # locked memory-hygiene job
+                    from oceano import memory
+                    answer = memory.maintain()                   # delegates to Claude Code, applies the plan
                 else:
                     answer = Agent().run(instruction)
             notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task")

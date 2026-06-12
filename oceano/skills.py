@@ -240,8 +240,9 @@ def _evaluate():
     review_err = ""
     if learning:
         files = "\n".join(f"- {s['dir']}/SKILL.md" for s in learning)
-        r = delegate.to_claude(_REVIEW_PROMPT.format(files=files),
-                               cwd=SKILLS_DIR, tools="Read,Glob,Grep", timeout=900)
+        # role="improve": self-improvement jobs use their own configurable delegate.
+        r = delegate.run(_REVIEW_PROMPT.format(files=files), cwd=SKILLS_DIR,
+                         tools="Read,Glob,Grep", timeout=900, role="improve")
         if not r["ok"]:
             review_err = r["error"] or "delegate failed"
         else:

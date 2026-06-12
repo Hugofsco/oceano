@@ -39,14 +39,23 @@ from oceano.web import telegram_runtime
 STATIC = Path(__file__).parent / "static"
 STORE = config.WORKSPACE.parent / "data" / "web.json"
 
+# Pre-built OpenAI-compatible endpoints. `console` is where the user gets an API key —
+# the UI links to it when a provider needs a key. base_url must end where the OpenAI SDK
+# expects (…/v1 for most), since model listing hits base_url + "/models".
 PROVIDERS = [
-    {"name": "Local (llama.cpp)", "base_url": "http://127.0.0.1:8081/v1", "needs_key": False},
-    {"name": "OpenAI",     "base_url": "https://api.openai.com/v1",       "needs_key": True},
-    {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",    "needs_key": True},
-    {"name": "Groq",       "base_url": "https://api.groq.com/openai/v1",  "needs_key": True},
-    {"name": "Together",   "base_url": "https://api.together.xyz/v1",     "needs_key": True},
-    {"name": "DeepSeek",   "base_url": "https://api.deepseek.com/v1",     "needs_key": True},
-    {"name": "Mistral",    "base_url": "https://api.mistral.ai/v1",       "needs_key": True},
+    {"name": "Local (llama.cpp)", "base_url": "http://127.0.0.1:8081/v1", "needs_key": False, "console": ""},
+    {"name": "OpenAI",        "base_url": "https://api.openai.com/v1",        "needs_key": True,  "console": "https://platform.openai.com/api-keys"},
+    {"name": "xAI (Grok)",    "base_url": "https://api.x.ai/v1",              "needs_key": True,  "console": "https://console.x.ai"},
+    {"name": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "needs_key": True, "console": "https://aistudio.google.com/apikey"},
+    {"name": "OpenRouter",    "base_url": "https://openrouter.ai/api/v1",     "needs_key": True,  "console": "https://openrouter.ai/keys"},
+    {"name": "Groq",          "base_url": "https://api.groq.com/openai/v1",   "needs_key": True,  "console": "https://console.groq.com/keys"},
+    {"name": "DeepSeek",      "base_url": "https://api.deepseek.com/v1",      "needs_key": True,  "console": "https://platform.deepseek.com/api_keys"},
+    {"name": "Mistral",       "base_url": "https://api.mistral.ai/v1",        "needs_key": True,  "console": "https://console.mistral.ai/api-keys"},
+    {"name": "Together",      "base_url": "https://api.together.xyz/v1",      "needs_key": True,  "console": "https://api.together.ai/settings/api-keys"},
+    {"name": "Fireworks",     "base_url": "https://api.fireworks.ai/inference/v1", "needs_key": True, "console": "https://fireworks.ai/account/api-keys"},
+    {"name": "Cerebras",      "base_url": "https://api.cerebras.ai/v1",       "needs_key": True,  "console": "https://cloud.cerebras.ai"},
+    {"name": "Perplexity",    "base_url": "https://api.perplexity.ai",        "needs_key": True,  "console": "https://www.perplexity.ai/settings/api"},
+    {"name": "Ollama (local)", "base_url": "http://127.0.0.1:11434/v1",       "needs_key": False, "console": ""},
 ]
 
 
@@ -128,6 +137,10 @@ async def lifespan(_app):
         evals.seed_cases()           # install starter eval cases on first boot
     except Exception:
         traceback.print_exc()
+    try:
+        memory.ensure_maintenance_task()   # the locked '[ MEMORY ]' hygiene schedule
+    except Exception:
+        traceback.print_exc()
     yield
     await telegram_runtime.stop()
     try:
@@ -139,6 +152,10 @@ async def lifespan(_app):
 app = FastAPI(title="Oceano", lifespan=lifespan)
 _sessions = {}  # session_id -> Agent
 _cancels = {}   # session_id -> threading.Event (set to abort an in-flight query)
+# per-session chat state for the composer's slash-commands (/context, /compact, /status)
+_ctx_cap = {}      # session_id -> auto-compact threshold (messages), or absent
+_compactions = {}  # session_id -> how many times the context was compacted this session
+_last_ctx = {}     # session_id -> real prompt-token count from the last turn's stats
 
 SESSION_COOKIE = "oceano_sess"
 SESSION_TTL = 30 * 24 * 3600        # 30 days
@@ -384,7 +401,7 @@ def list_tools():
     actually accepts (read straight from the registered JSON schema)."""
     from oceano import tools
     out = []
-    for s in tools.schemas():
+    for s in tools.all_schemas():                 # ALL tools (incl. disabled) so the toggles show
         fn = s["function"]
         params = fn.get("parameters", {}) or {}
         props = params.get("properties", {}) or {}
@@ -395,11 +412,76 @@ def list_tools():
             "name": name,
             "description": fn.get("description", ""),
             "category": cat,
+            "enabled": tools.is_enabled(name),
             "params": [{"name": k, "type": v.get("type", "any"),
                         "required": k in required, "description": v.get("description", "")}
                        for k, v in props.items()],
         })
     return out
+
+
+@app.post("/api/tools/toggle")
+async def toggle_tool(req: Request):
+    """Enable/disable a tool (or all of them) for the model. Disabled tools are dropped
+    from the prompt, lowering context. body: {name, enabled} or {all: true|false}."""
+    from oceano import tools
+    b = await req.json()
+    if "all" in b:
+        tools.set_all(bool(b["all"]))
+    elif b.get("name"):
+        tools.set_enabled(b["name"], bool(b.get("enabled", True)))
+    return {"ok": True, "enabled": len(tools.schemas()), "total": len(tools.all_schemas())}
+
+
+@app.get("/api/tools/chat")
+def chat_tools_state():
+    """Which memory tools are offered in plain chat mode (Agent mode off)."""
+    from oceano import tools
+    return {"tools": tools.chat_tool_state()}
+
+
+@app.post("/api/tools/chat")
+async def chat_tools_set(req: Request):
+    """Toggle a memory tool's availability in chat-only mode. body: {name, enabled}."""
+    from oceano import tools
+    b = await req.json()
+    if b.get("name"):
+        tools.set_chat_tool(b["name"], bool(b.get("enabled", True)))
+    return {"ok": True, "tools": tools.chat_tool_state()}
+
+
+# ---------------- delegation (Claude Code readiness + per-role provider config) ----------------
+@app.get("/api/delegate")
+def delegate_status():
+    """Claude readiness (shared) + per-role config/readiness: 'default' (agent delegate tool)
+    and 'improve' (self-improving jobs: skills, evals, memory)."""
+    from oceano import delegate
+    return delegate.status_all()
+
+
+@app.post("/api/delegate")
+async def delegate_set(req: Request):
+    from oceano import delegate
+    b = await req.json()
+    role = b.get("role", "default")
+    if role not in delegate.ROLES:
+        return {"ok": False, "error": "unknown role"}
+    delegate.set_config(b, role=role)
+    return {"ok": True, **delegate.status_all()}
+
+
+@app.post("/api/delegate/test")
+async def delegate_test(req: Request):
+    """Live probe of a role's provider (proves Claude Code auth, or the API model works).
+    Runs in a thread so the ~minute timeout can't block the event loop."""
+    from oceano import delegate
+    try:
+        b = await req.json()
+    except Exception:
+        b = {}
+    role = b.get("role", "default")
+    role = role if role in delegate.ROLES else "default"
+    return await asyncio.to_thread(delegate.probe, role)
 
 
 @app.get("/api/mcp")
@@ -553,8 +635,20 @@ async def chat(req: Request):
     def worker():
         stream = None
         try:
-            stream = ag.run_stream(message) if agent_mode else ag.chat_stream(message)
+            cap = _ctx_cap.get(sid)                  # /context <n> → auto-compact before the turn
+            if cap and len(ag.messages) > cap:
+                dropped = ag.compact()
+                if dropped:
+                    _compactions[sid] = _compactions.get(sid, 0) + 1
+                    put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
+                                                    f"(context passed {cap})."})
+            # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
+            # manage what it knows about you without full agent mode; agent mode → all tools.
+            from oceano import tools as _tools
+            stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
             for ev in stream:
+                if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
+                    _last_ctx[sid] = ev["ctx"]       # remember real prompt tokens for /status
                 if cancel.is_set():
                     break               # stop feeding — query was aborted
                 put(ev)
@@ -617,7 +711,69 @@ async def chat_stop(request: Request):
 @app.delete("/api/session/{sid}")
 def end_session(sid: str):
     _sessions.pop(sid, None)
+    _ctx_cap.pop(sid, None); _compactions.pop(sid, None); _last_ctx.pop(sid, None)
     return {"ok": True}
+
+
+# ---------------- chat composer slash-commands (mirror Telegram /context /compact /status) ----------------
+def _ctx_payload(sid):
+    ag = _agent(sid)
+    n, approx = ag.context_metrics()
+    return {"model": ag.model, "messages": n, "approx_tokens": approx,
+            "ctx_tokens": _last_ctx.get(sid), "compactions": _compactions.get(sid, 0),
+            "cap": _ctx_cap.get(sid)}
+
+
+@app.get("/api/chat/context")
+def chat_context(session: str = "default"):
+    return _ctx_payload(session)
+
+
+@app.post("/api/chat/context")
+async def chat_set_context(req: Request):
+    """Set/clear the auto-compact threshold for a session. value: <n> | off."""
+    b = await req.json()
+    sid = b.get("session", "default")
+    raw = str(b.get("value", "")).strip().lower()
+    if raw in ("", "off", "0", "none"):
+        _ctx_cap.pop(sid, None)
+        return {"ok": True, **_ctx_payload(sid)}
+    try:
+        _ctx_cap[sid] = max(4, int(raw))
+    except ValueError:
+        return {"ok": False, "error": "usage: /context <n> (messages before auto-compact) or /context off"}
+    return {"ok": True, **_ctx_payload(sid)}
+
+
+@app.post("/api/chat/compact")
+async def chat_compact(req: Request):
+    b = await req.json()
+    sid = b.get("session", "default")
+    ag = _agent(sid)
+    if len(ag.messages) <= 2:
+        return {"ok": False, "error": "nothing to compact yet — the context is already small",
+                **_ctx_payload(sid)}
+    dropped = ag.compact()
+    if dropped:
+        _compactions[sid] = _compactions.get(sid, 0) + 1
+    return {"ok": True, "dropped": dropped, **_ctx_payload(sid)}
+
+
+@app.get("/api/chat/status")
+def chat_status(session: str = "default"):
+    from oceano import tools, memory, rag
+    ag = _agent(session)
+    try:
+        docs = rag.stats().get("files", 0)
+    except Exception:
+        docs = 0
+    try:
+        facts = memory.count()
+    except Exception:
+        facts = 0
+    tool_names = sorted(s["function"]["name"] for s in tools.schemas())
+    return {**_ctx_payload(session), "tools": tool_names, "tool_count": len(tool_names),
+            "memory": facts, "docs": docs}
 
 
 # ---------------- chats (server-side, dated-folder persistence) ----------------
@@ -741,7 +897,15 @@ def evals_delete_case(cid: int):
 
 @app.get("/api/evals/models")
 def evals_models():
-    return {"models": evals.available_models()}
+    """Available local models + which are selected as eval targets (drives Run-now
+    AND the scheduled run), plus the locked schedule for context."""
+    return evals.models_config()
+
+
+@app.post("/api/evals/models")
+async def evals_set_models(req: Request):
+    b = await req.json()
+    return {"ok": True, "selected": evals.set_selected_models(b.get("models") or [])}
 
 
 @app.post("/api/evals/run")
@@ -749,8 +913,14 @@ async def evals_run(req: Request):
     if evals.state()["running"]:
         return {"ok": False, "running": True, "error": "an eval run is already in progress"}
     b = await req.json()
-    evals.run_all_bg(b.get("models") or None)
+    evals.run_all_bg(b.get("models") or None)   # None → use the saved selection
     return {"ok": True, "running": True}
+
+
+@app.post("/api/evals/cancel")
+def evals_cancel():
+    """Stop an in-progress run (after the current case). The ✕ Cancel button calls this."""
+    return {"ok": evals.cancel()}
 
 
 @app.get("/api/evals/state")
@@ -766,6 +936,16 @@ def evals_leaderboard(run_id: int = None):
 @app.get("/api/evals/runs")
 def evals_runs():
     return {"runs": evals.runs()}
+
+
+@app.delete("/api/evals/runs/{run_id}")
+def evals_delete_run(run_id: int):
+    return {"ok": evals.delete_run(run_id)}
+
+
+@app.post("/api/evals/runs/clear")
+def evals_clear_runs():
+    return {"ok": True, "removed": evals.clear_runs()}
 
 
 @app.get("/api/evals/results")
@@ -844,6 +1024,59 @@ def raw_file(path: str):
     if not p.is_file():
         raise HTTPException(404, "not a file")
     return FileResponse(str(p))
+
+
+@app.get("/api/preview-mtime")
+def preview_mtime(path: str):
+    """Latest mtime among the files in the previewed app's folder. The Preview window
+    polls this to auto-reload when the agent (or you) edits the app. Defined BEFORE the
+    /api/preview/{path} catch-all so it isn't swallowed by it."""
+    p = _wresolve(path)
+    base = p.parent if p.is_file() else (p if p.is_dir() else config.WORKSPACE)
+    latest, n = 0.0, 0
+    for f in base.rglob("*"):
+        if f.is_file():
+            try:
+                latest = max(latest, f.stat().st_mtime)
+            except OSError:
+                pass
+            n += 1
+            if n >= 1000:           # cap the walk so a huge folder can't stall the poll
+                break
+    return {"mtime": latest}
+
+
+# Sandbox flags for previewed content — kept in sync with the iframe's sandbox attribute in
+# app.js. Note the deliberate ABSENCE of allow-same-origin: that's what keeps the rendered
+# page in an opaque origin so it can't reuse the session cookie against /api/*.
+_PREVIEW_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"
+
+
+@app.get("/api/preview/{path:path}")
+def preview_file(path: str):
+    """Serve a workspace file for the in-app Preview iframe. PATH-BASED (not ?path=) so an
+    app's relative assets — ./style.css, ./app.js — resolve correctly against the iframe URL.
+    Auth-gated by the middleware (the iframe navigation carries the same-site cookie).
+
+    SECURITY: this serves agent/user-generated HTML from the app's OWN origin, so we must not
+    let it act with the session. The iframe sandbox attribute alone isn't enough — it's bypassed
+    if the page is opened directly (new tab, window.open, a crafted link). So we ALSO send
+    `Content-Security-Policy: sandbox …` (without allow-same-origin), which forces the browser to
+    treat the response as an opaque origin HOWEVER it's loaded. An opaque-origin document can't
+    send the cookie to /api/* (default fetch creds are dropped cross-origin; Lax cookies aren't
+    sent on cross-site sub-requests), so stored-XSS in a previewed page can't escalate to the API.
+    The sandbox directive doesn't restrict resource loading, so multi-file apps still render their
+    relative assets. nosniff stops MIME confusion; no-store keeps auto-reload fetching fresh."""
+    p = _wresolve(path)
+    if p.is_dir():
+        p = p / "index.html"
+    if not p.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(str(p), headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": f"sandbox {_PREVIEW_SANDBOX}",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 @app.get("/api/file")
