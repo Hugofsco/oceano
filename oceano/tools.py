@@ -698,6 +698,57 @@ def list_tasks():
 @tool({
     "type": "function",
     "function": {
+        "name": "run_workflow",
+        "description": "Run one of the user's saved workflows (a named, multi-step recipe) "
+                       "right now, by name or id. Use this when the user asks to run a workflow, "
+                       "or when a task matches a workflow they've defined. You can RUN workflows "
+                       "but not create them — the user authors workflows in the UI. To see what "
+                       "exists, call list_workflows first.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "the workflow's name (or its numeric id)"},
+        }, "required": ["name"]},
+    },
+})
+def run_workflow(name):
+    from oceano import workflows
+    name = str(name or "").strip()
+    wf = workflows.get_by_name(name)
+    if not wf and name.isdigit():
+        wf = workflows.get(int(name))
+    if not wf:
+        avail = ", ".join(w["name"] for w in workflows.list_all()) or "(none defined)"
+        return f"no workflow named {name!r}. Available: {avail}"
+    rec = workflows.run(wf, trigger="agent")
+    lines = [f"Workflow '{wf['name']}' — {rec['summary']}"]
+    for s in rec.get("steps", []):
+        mark = "✓" if s["ok"] else "✗"
+        lines.append(f"  {mark} {s['label']}: {(s['output'] or '').strip()[:240]}")
+    return "\n".join(lines)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "list_workflows",
+        "description": "List the user's saved workflows (name, description, step count) so you "
+                       "know which ones can be run with run_workflow.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+})
+def list_workflows():
+    from oceano import workflows
+    wfs = workflows.list_all()
+    if not wfs:
+        return "(no workflows defined yet — the user can create them in the Workflows window)"
+    def _nodes(w):
+        return len([n for n in w.get("graph", {}).get("nodes", []) if n.get("type") not in ("start", "end")])
+    return "\n".join(f"- {w['name']} ({_nodes(w)} nodes)"
+                     + (f": {w['description']}" if w.get("description") else "") for w in wfs)
+
+
+@tool({
+    "type": "function",
+    "function": {
         "name": "notify",
         "description": "Send a push notification to the user's phone (ntfy). "
                        "Use to report when a long task is finished.",
@@ -734,26 +785,32 @@ def learn_skill(name, description, body):
 @tool({
     "type": "function",
     "function": {
-        "name": "delegate_to_claude",
+        "name": "delegate",
         "description": "Hand a self-contained subtask to the configured delegate — a stronger "
-                       "assistant running headless in the workspace (Claude Code by default, or the "
-                       "user's configured cloud model run as a full agent). Either way it can read, "
-                       "write, and run things to complete the task. Give precise, complete "
-                       "instructions — the relevant file paths and exactly what it must produce — "
-                       "because it cannot ask you questions. Returns its final report. CALL THIS "
-                       "whenever the user asks you to 'use Claude' / 'delegate' / 'have Claude do it', "
-                       "or for a heavy subtask beyond you. The capability is available — don't claim you can't.",
+                       "assistant running headless in the workspace. WHO that is, is set by the user "
+                       "in Settings → Delegation (Claude Code by default, or a cloud model run as a "
+                       "full agent); you don't choose — just delegate. Either way it can read, write, "
+                       "and run things to complete the task. Give precise, complete instructions — "
+                       "the relevant file paths and exactly what it must produce — because it cannot "
+                       "ask you questions. Returns its final report. CALL THIS whenever the user asks "
+                       "you to 'delegate' or 'have the strong model do it', or for a heavy subtask "
+                       "beyond you. The capability is available — don't claim you can't.",
         "parameters": {"type": "object", "properties": {
             "instructions": {"type": "string"},
         }, "required": ["instructions"]},
     },
 })
-def delegate_to_claude(instructions):
+def delegate_tool(instructions):
     from oceano import delegate
-    r = delegate.run(instructions, cwd=config.WORKSPACE)   # honours Settings → Delegation
+    r = delegate.run(instructions, cwd=config.WORKSPACE)   # honours Settings → Delegation (default role)
     if not r["ok"]:
         return f"delegation failed: {r['error']}"
     return r["output"][:8000] or "(the delegate finished but returned no text)"
+
+
+# back-compat: the tool was once 'delegate_to_claude'. Keep the old name callable (not shown
+# to the model) so any saved reference still routes to the generalized delegate.
+_TOOLS["delegate_to_claude"] = delegate_tool
 
 
 # --- calendar (local copy, synced from Google Calendar / any ICS feed) -------

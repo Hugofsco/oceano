@@ -14,7 +14,7 @@ Use delegate.run(...) to honour the configured provider. to_claude(...) forces t
 
 ROLES — delegation is configured separately per role, so the user can point different
 work at different models:
-  • 'default' — the agent's delegate_to_claude tool (interactive "use Claude / delegate").
+  • 'default' — the agent's `delegate` tool (interactive "use Claude / delegate").
   • 'improve' — the SELF-IMPROVING jobs: skills review, eval judging, memory maintenance.
 'improve' may be set to 'inherit', meaning "use whatever 'default' is set to".
 
@@ -189,9 +189,10 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         from oceano.agent import Agent
         from oceano import tools as _tools
         # learn=False + inject_context=False: a delegate gets a self-contained task, not the
-        # user's persona/memories; exclude delegate_to_claude so it can't delegate to itself.
+        # user's persona/memories; exclude the delegate tool (both names) so it can't delegate
+        # to itself in an infinite loop.
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
-                   inject_context=False, exclude_tools={"delegate_to_claude"},
+                   inject_context=False, exclude_tools={"delegate", "delegate_to_claude"},
                    only_tools=_api_only_tools(tools))
         deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()

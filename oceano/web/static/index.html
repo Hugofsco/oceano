@@ -11,6 +11,7 @@
 <link rel="stylesheet" href="/static/vendor/codemirror/codemirror.min.css">
 <link rel="stylesheet" href="/static/vendor/codemirror/material-darker.css">
 <link rel="stylesheet" href="/static/vendor/codemirror/addon/dialog/dialog.css">
+<link rel="stylesheet" href="/static/vendor/drawflow.min.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -26,18 +27,33 @@
       <div class="brand-text"><h1>Oceano</h1><span>local agent · deep waters</span></div>
     </div>
 
-    <nav class="nav" id="nav">
-      <button class="nav-item active" data-view="chat"><span class="ni">◈</span> Chat</button>
-      <button class="nav-item" data-view="files"><span class="ni">▤</span> Files</button>
-      <button class="nav-item" data-view="brain"><span class="ni">✶</span> Brain</button>
-      <button class="nav-item" data-view="scheduler"><span class="ni">⏱</span> Scheduler</button>
-      <button class="nav-item" data-view="calendar"><span class="ni">◷</span> Calendar</button>
-      <button class="nav-item" data-view="researcher"><span class="ni">⌖</span> Researcher</button>
-    </nav>
-
-    <div class="chat-nav" id="chatNav">
-      <button class="new-voyage" id="newVoyage"><span class="nv-icon">⊹</span> New voyage</button>
-      <div class="sessions" id="sessions"></div>
+    <div class="side-deck">
+      <div class="side-track" id="sideTrack">
+        <!-- pane 1: the app menu -->
+        <div class="side-pane">
+          <nav class="nav" id="nav">
+            <button class="nav-item active" data-view="chat"><span class="ni">◈</span> Chats</button>
+            <button class="nav-item" data-view="files"><span class="ni">▤</span> Files</button>
+            <button class="nav-item" data-view="brain"><span class="ni">✶</span> Brain</button>
+            <button class="nav-item" data-view="scheduler"><span class="ni">⏱</span> Scheduler</button>
+            <button class="nav-item" data-view="calendar"><span class="ni">◷</span> Calendar</button>
+            <button class="nav-item" data-view="researcher"><span class="ni">⌖</span> Researcher</button>
+            <button class="nav-item" data-view="workflows"><span class="ni">⚙</span> Workflows</button>
+            <button class="nav-item" data-view="search"><span class="ni">⌕</span> Search</button>
+            <button class="nav-item" data-view="notes"><span class="ni">❏</span> Notes</button>
+            <button class="nav-item" data-view="health"><span class="ni">◉</span> Health</button>
+          </nav>
+        </div>
+        <!-- pane 2: chat history (slides in from the Chats menu item) -->
+        <div class="side-pane">
+          <div class="chats-head">
+            <button class="chats-back" id="chatsBack" title="back to menu">←</button>
+            <span class="chats-title">Chats</span>
+            <button class="new-voyage sm" id="newVoyage"><span class="nv-icon">⊹</span> New</button>
+          </div>
+          <div class="sessions" id="sessions"></div>
+        </div>
+      </div>
     </div>
 
     <div class="sidebar-foot">
@@ -51,7 +67,12 @@
       <button class="icon-btn ghost" id="toggleSidebar" aria-label="menu">☰</button>
       <div class="depth-readout" id="depthReadout">— · —</div>
       <div class="topbar-right">
+        <div class="jobs-wrap">
+          <button class="icon-btn jobs-badge" id="jobsBadge" title="background jobs" style="display:none"><span class="jb-dot"></span><span id="jbCount">0</span></button>
+          <div class="jobs-pop" id="jobsPop"></div>
+        </div>
         <button class="icon-btn" id="liveBtn" title="Live browser — watch Oceano browse">◫</button>
+        <button class="icon-btn" id="voiceBtn" title="Voice — talk to Oceano">🎙</button>
         <label class="agent-switch" id="agentSwitch" title="Agent mode — give it tools and let it run">
           <input type="checkbox" id="agentToggle">
           <span class="track"><span class="thumb"></span></span>
@@ -207,6 +228,7 @@
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
+<script src="/static/vendor/drawflow.min.js"></script>
 <!-- CodeMirror 5 (vendored): the IDE-grade editor for the Files view -->
 <script src="/static/vendor/codemirror/codemirror.min.js"></script>
 <script src="/static/vendor/codemirror/mode/meta.js"></script>

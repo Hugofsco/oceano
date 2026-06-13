@@ -20,6 +20,7 @@ import json
 import os
 import secrets
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -28,8 +29,9 @@ from pathlib import Path
 
 import requests
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 import config
 from oceano import browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
@@ -150,6 +152,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Oceano", lifespan=lifespan)
+_BOOT_TS = time.time()          # process start, for the health dashboard's uptime readout
 _sessions = {}  # session_id -> Agent
 _cancels = {}   # session_id -> threading.Event (set to abort an in-flight query)
 _locks = {}     # session_id -> threading.Lock serialising turn/compact on one Agent
@@ -393,6 +396,85 @@ def system_status():
             "telegram": telegram_runtime.status()}
 
 
+def _llamaswap_status():
+    """llama-swap reachability + which model it currently has loaded. The model list
+    comes from /v1/models; the live-loaded model from llama-swap's /running admin route
+    (best-effort — tolerant of shape/version differences, never raises)."""
+    base = config.LLM_BASE_URL.rstrip("/")
+    root = base[:-3].rstrip("/") if base.endswith("/v1") else base   # admin routes live off /v1
+    out = {"ok": False, "loaded": None, "models": []}
+    try:
+        r = requests.get(base + "/models", timeout=2)
+        out["ok"] = r.ok
+        out["models"] = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+    except (requests.RequestException, ValueError):
+        return out
+    try:                                            # llama-swap: GET /running -> currently-up upstream(s)
+        rr = requests.get(root + "/running", timeout=2)
+        if rr.ok:
+            data = rr.json()
+            running = data.get("running") if isinstance(data, dict) else data
+            if isinstance(running, list) and running and isinstance(running[0], dict):
+                out["loaded"] = running[0].get("model") or running[0].get("id")
+    except (requests.RequestException, ValueError):
+        pass
+    return out
+
+
+@app.get("/api/health")
+def health_dashboard():
+    """Aggregated live health of the whole self-hosted stack, for the Health window:
+    uptime, the inference + embedding servers, scheduler heartbeat, Telegram, the
+    knowledge stores, and GPU/VRAM. Each piece degrades independently."""
+    beat = scheduler.last_beat()
+    try:
+        tasks = len(scheduler.all_tasks())
+    except Exception:
+        tasks = None
+    try:
+        docs = rag.stats()
+    except Exception:
+        docs = {}
+    try:
+        hw = rivers.hw()
+    except Exception:
+        hw = {}
+    return {
+        "uptime_s": time.time() - _BOOT_TS,
+        "model": config.MODEL,
+        "llamaswap": _llamaswap_status(),
+        "embed": {"ok": _embed_reachable(), "model": embeddings.EMBED_MODEL, "url": embeddings.EMBED_URL},
+        "scheduler": {"beat_ago_s": (time.time() - beat) if beat else None, "tasks": tasks},
+        "telegram": telegram_runtime.status(),
+        "memory": {"count": memory.count()},
+        "rag": docs,
+        "hw": hw,
+    }
+
+
+# ---------------- background jobs: live registry + serialization (queue) toggle ----------
+@app.get("/api/jobs")
+def jobs_snapshot():
+    """What background work is in flight right now + the serialize setting (for the
+    running indicators and the Settings toggle)."""
+    from oceano import jobs
+    return jobs.snapshot()
+
+
+@app.post("/api/jobs/serialize")
+async def jobs_set_serialize(req: Request):
+    """Turn the queue on/off. `enabled` → background jobs; `chat` → chat turns. Both run
+    one-at-a-time through one shared gate instead of hitting the local model in parallel."""
+    from oceano import jobs
+    b = await req.json()
+    if "enabled" in b:
+        jobs.set_serialize(bool(b["enabled"]))
+    if "chat" in b:
+        jobs.set_serialize_chat(bool(b["chat"]))
+    s = jobs.snapshot()
+    return {"ok": True, "serialize": s["serialize"], "serialize_chat": s["serialize_chat"]}
+
+
 # ---------------- agent tools (read-only list for Settings → Tools) ----------
 _TOOL_CATEGORY = {
     "list_files": "workspace", "read_file": "workspace", "write_file": "workspace",
@@ -404,8 +486,9 @@ _TOOL_CATEGORY = {
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
     "index_docs": "documents", "search_docs": "documents",
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills",
-    "delegate_to_claude": "delegate",
+    "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
+    "run_workflow": "workflow", "list_workflows": "workflow",
     "calendar_events": "calendar",
 }
 
@@ -650,28 +733,36 @@ async def chat(req: Request):
     def worker():
         stream = None
         try:
-            # One turn at a time per session: another tab's turn or a /compact must not
-            # mutate ag.messages while this stream is appending to it.
-            with _session_lock(sid):
-                cap = _ctx_cap.get(sid)              # /context <n> → auto-compact before the turn
-                if cap and len(ag.messages) > cap:
-                    dropped = ag.compact()
-                    if dropped:
-                        _compactions[sid] = _compactions.get(sid, 0) + 1
-                        put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
-                                                        f"(context passed {cap})."})
-                # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
-                # manage what it knows about you without full agent mode; agent mode → all tools.
-                from oceano import tools as _tools
-                stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
-                for ev in stream:
-                    if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
-                        _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
-                    if cancel.is_set():
-                        break           # stop feeding — query was aborted
-                    put(ev)
-            if not cancel.is_set():
-                put({"type": "done"})
+            # When the user adds chat to the queue (Settings → Execution), this turn waits on
+            # the same global gate the background jobs use — so it won't hit the model in
+            # parallel with running work. gate=False (default) → chat stays fully responsive.
+            from oceano import jobs
+            chat_gate = jobs.serialize_chat_enabled()
+            if chat_gate and jobs.snapshot()["running"] > 0:
+                put({"type": "notice", "text": "⏳ Queued — waiting for current work to finish (chat queue is on)."})
+            with jobs.job("chat", (message or "chat")[:60], gate=chat_gate):
+                # One turn at a time per session: another tab's turn or a /compact must not
+                # mutate ag.messages while this stream is appending to it.
+                with _session_lock(sid):
+                    cap = _ctx_cap.get(sid)              # /context <n> → auto-compact before the turn
+                    if cap and len(ag.messages) > cap:
+                        dropped = ag.compact()
+                        if dropped:
+                            _compactions[sid] = _compactions.get(sid, 0) + 1
+                            put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
+                                                            f"(context passed {cap})."})
+                    # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
+                    # manage what it knows about you without full agent mode; agent mode → all tools.
+                    from oceano import tools as _tools
+                    stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
+                    for ev in stream:
+                        if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
+                            _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
+                        if cancel.is_set():
+                            break           # stop feeding — query was aborted
+                        put(ev)
+                if not cancel.is_set():
+                    put({"type": "done"})
         except Exception as ex:
             traceback.print_exc()   # so it actually lands in the journal, not just the UI
             put({"type": "error", "message": f"{type(ex).__name__}: {ex}"})
@@ -1010,6 +1101,15 @@ def remove_memory(mid: int):
     return {"ok": memory.forget(mid)}
 
 
+# ---------------- memory graph (Memory Graph window) ----------------
+@app.get("/api/memory/graph")
+async def memory_graph(threshold: float = 0.62):
+    """Memories as a similarity graph for the Memory Graph window. The cosine scan runs
+    off the event loop so a large store can't stall the request."""
+    th = min(max(threshold, 0.3), 0.95)
+    return await asyncio.to_thread(memory.graph, th)
+
+
 # ---------------- memory injection policy (Settings → Memory) ----------------
 @app.get("/api/memory/policy")
 def get_memory_policy():
@@ -1019,6 +1119,163 @@ def get_memory_policy():
 @app.post("/api/memory/policy")
 async def set_memory_policy(req: Request):
     return {"ok": True, "policy": memory.set_policy(await req.json())}
+
+
+# ---------------- notes / kanban scratchpad ----------------
+@app.get("/api/notes")
+def notes_get():
+    from oceano import notes
+    return notes.board()
+
+
+@app.post("/api/notes")
+async def notes_add(req: Request):
+    from oceano import notes
+    b = await req.json()
+    return {"ok": True, "card": notes.add(b.get("text", ""), b.get("col", "todo"))}
+
+
+@app.patch("/api/notes/{cid}")
+async def notes_update(cid: int, req: Request):
+    from oceano import notes
+    b = await req.json()
+    return {"ok": notes.update(cid, b.get("text"), b.get("col"))}
+
+
+@app.delete("/api/notes/{cid}")
+def notes_delete(cid: int):
+    from oceano import notes
+    return {"ok": notes.remove(cid)}
+
+
+# ---------------- voice console (web) — reuses the Telegram speech stack ----------------
+@app.get("/api/voice/status")
+def voice_status():
+    from oceano import voice
+    return voice.status()
+
+
+@app.post("/api/voice/stt")
+async def voice_stt(req: Request):
+    """Transcribe an uploaded audio blob (the browser's MediaRecorder gives webm/opus;
+    faster-whisper decodes it via ffmpeg). Body is the raw audio bytes."""
+    from oceano import voice
+    data = await req.body()
+    if not data:
+        return {"text": ""}
+    fd, tmp = tempfile.mkstemp(suffix=".webm")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        text = await asyncio.to_thread(voice.transcribe, tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return {"text": text}
+
+
+@app.post("/api/voice/tts")
+async def voice_tts(req: Request):
+    """Render text to an OGG/Opus clip the browser can play. The temp file is unlinked
+    after the response is sent (BackgroundTask)."""
+    from oceano import voice
+    text = ((await req.json()).get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "no text")
+    path = await asyncio.to_thread(voice.synthesize, text)
+    if not path:
+        raise HTTPException(503, "TTS unavailable on this machine")
+
+    def _cleanup():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return FileResponse(path, media_type="audio/ogg", background=BackgroundTask(_cleanup))
+
+
+# ---------------- workflows (named, schedulable multi-step recipes) ----------------
+@app.get("/api/workflows")
+def workflows_list():
+    from oceano import workflows
+    return [{**w, "schedule": workflows.schedule_info(w["id"])} for w in workflows.list_all()]
+
+
+@app.post("/api/workflows")
+async def workflows_create(req: Request):
+    from oceano import workflows
+    b = await req.json()
+    return {"ok": True, "workflow": workflows.create(b.get("name", "Untitled"),
+                                                      b.get("description", ""), b.get("graph"))}
+
+
+@app.patch("/api/workflows/{wid}")
+async def workflows_update(wid: int, req: Request):
+    from oceano import workflows
+    b = await req.json()
+    wf = workflows.update(wid, name=b.get("name"), description=b.get("description"), graph=b.get("graph"))
+    return {"ok": wf is not None, "workflow": wf}
+
+
+@app.delete("/api/workflows/{wid}")
+def workflows_delete(wid: int):
+    from oceano import workflows
+    return {"ok": workflows.remove(wid)}
+
+
+@app.post("/api/workflows/{wid}/schedule")
+async def workflows_schedule(wid: int, req: Request):
+    from oceano import workflows
+    workflows.set_schedule(wid, ((await req.json()).get("cron") or "").strip())
+    return {"ok": True, "schedule": workflows.schedule_info(wid)}
+
+
+@app.get("/api/workflows/{wid}/runs")
+def workflows_runs(wid: int):
+    from oceano import workflows
+    return workflows.runs(wid)
+
+
+@app.post("/api/workflows/{wid}/run")
+async def workflows_run(wid: int):
+    """Run a workflow now, streaming step-by-step progress as SSE. The engine runs in a
+    worker thread (it blocks on the local model + tools); events feed through a queue so
+    the response can keep-alive during quiet steps — same shape as /api/chat."""
+    from oceano import workflows
+    wf = workflows.get(wid)
+    if not wf:
+        raise HTTPException(404, "no such workflow")
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    def worker():
+        try:
+            workflows.run(wf, trigger="manual", on_step=put)
+        except Exception as ex:
+            traceback.print_exc()
+            put({"event": "error", "message": f"{type(ex).__name__}: {ex}"})
+        finally:
+            put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def gen():
+        while True:
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=10)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            if ev is None:
+                break
+            yield _sse(ev)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
 
 # ---------------- workspace files (fenced) ----------------
@@ -1044,6 +1301,27 @@ def list_dir(path: str = ""):
                for c in sorted(base.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))]
     rel = str(base.relative_to(config.WORKSPACE))
     return {"path": "" if rel == "." else rel, "entries": entries}
+
+
+@app.get("/api/files/all")
+def list_all_files():
+    """Flat, recursive list of workspace files + dirs (relative posix paths), for the
+    searchable file/folder pickers in the Workflows editor. Skips heavy/hidden dirs and
+    caps the walk so a huge workspace can't stall the request."""
+    base = config.WORKSPACE
+    files, dirs, n = [], [], 0
+    for root, ds, fs in os.walk(base):
+        ds[:] = [d for d in ds if d not in _MTIME_SKIP_DIRS and not d.startswith(".")]
+        relp = os.path.relpath(root, base)
+        rel = "" if relp == "." else relp.replace(os.sep, "/")
+        if rel:
+            dirs.append(rel)
+        for f in fs:
+            files.append(f if not rel else rel + "/" + f)
+            n += 1
+            if n >= 4000:
+                return {"files": sorted(files), "dirs": sorted(dirs), "capped": True}
+    return {"files": sorted(files), "dirs": sorted(dirs)}
 
 
 @app.get("/api/raw")
@@ -1094,6 +1372,116 @@ def preview_mtime(path: str):
 _PREVIEW_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"
 
 
+# ---------------- artifact rendering (markdown / mermaid / chart / slides) ----------------
+# The Preview iframe can render a handful of *source* artifact types — not just finished
+# .html. We wrap the file in a self-contained page that pulls the renderer from /static/vendor
+# (loads fine in the opaque sandbox — the CSP sandbox restricts the document's origin, not
+# resource fetches) and decodes the file content from base64 (so nothing in it can break out
+# of the HTML/JS context). Same security headers as a plain preview apply.
+def _artifact_kind(name):
+    n = (name or "").lower()
+    if n.endswith(".slides.md") or n.endswith(".slides"):
+        return "slides"
+    if n.endswith(".chart.json"):
+        return "chart"
+    if n.endswith((".mmd", ".mermaid")):
+        return "mermaid"
+    if n.endswith((".md", ".markdown")):
+        return "markdown"
+    return None
+
+
+_ARTIFACT_BASE_CSS = """
+  :root{color-scheme:dark}*{box-sizing:border-box}
+  body{margin:0;background:#0b1620;color:#e6edf3;font:15px/1.65 'Hanken Grotesk',-apple-system,system-ui,sans-serif}
+  ::selection{background:#1f6feb55}a{color:#58a6ff}
+  .wrap{max-width:860px;margin:0 auto;padding:30px 28px 80px}
+  pre{background:#0d1117;border:1px solid #1c2733;border-radius:10px;padding:14px 16px;overflow:auto}
+  code{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:.92em}
+  :not(pre)>code{background:#1c2733;padding:.1em .4em;border-radius:5px}
+  table{border-collapse:collapse;width:100%;margin:1em 0}
+  th,td{border:1px solid #1c2733;padding:7px 11px;text-align:left}
+  th{background:#101c27}
+  blockquote{border-left:3px solid #2b7a78;margin:1em 0;padding:.2em 1em;color:#9fb3c8}
+  img{max-width:100%;border-radius:8px}
+  h1,h2,h3{font-family:'Fraunces',Georgia,serif;line-height:1.2}
+  h1{font-size:2em}h2{font-size:1.5em;border-bottom:1px solid #1c2733;padding-bottom:.2em}
+  hr{border:none;border-top:1px solid #1c2733;margin:2em 0}
+  .art-err{color:#ff7b72;padding:22px;font-family:'JetBrains Mono',monospace;white-space:pre-wrap}
+"""
+
+_TPL_MARKDOWN = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/vendor/atom-one-dark.min.css">
+<style>__CSS__</style>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script src="/static/vendor/highlight.min.js"></script></head>
+<body><article class="wrap" id="doc"></article><script>
+const RAW=new TextDecoder().decode(Uint8Array.from(atob("__B64__"),c=>c.charCodeAt(0)));
+try{marked.setOptions({gfm:true,breaks:false});
+  document.getElementById('doc').innerHTML=DOMPurify.sanitize(marked.parse(RAW));
+  document.querySelectorAll('pre code').forEach(b=>{try{hljs.highlightElement(b)}catch(e){}});
+}catch(e){document.getElementById('doc').innerHTML='<div class="art-err">'+e+'</div>';}
+</script></body></html>"""
+
+_TPL_MERMAID = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>__CSS__ .wrap{text-align:center}.mermaid{visibility:hidden}</style>
+<script src="/static/vendor/mermaid.min.js"></script></head>
+<body><div class="wrap"><pre class="mermaid" id="m"></pre></div><script>
+const RAW=new TextDecoder().decode(Uint8Array.from(atob("__B64__"),c=>c.charCodeAt(0)));
+const el=document.getElementById('m');el.textContent=RAW;
+try{mermaid.initialize({startOnLoad:false,theme:'dark',securityLevel:'strict'});
+  mermaid.run({nodes:[el]}).then(()=>{el.style.visibility='visible'})
+   .catch(e=>{el.outerHTML='<div class="art-err">'+e+'</div>';});
+}catch(e){el.outerHTML='<div class="art-err">'+e+'</div>';}
+</script></body></html>"""
+
+_TPL_CHART = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>__CSS__ .wrap{max-width:780px;padding-top:40px}</style>
+<script src="/static/vendor/chart.umd.min.js"></script></head>
+<body><div class="wrap"><canvas id="c"></canvas><div class="art-err" id="err"></div></div><script>
+const RAW=new TextDecoder().decode(Uint8Array.from(atob("__B64__"),c=>c.charCodeAt(0)));
+try{const cfg=JSON.parse(RAW);
+  Chart.defaults.color='#9fb3c8';Chart.defaults.borderColor='#1c2733';
+  Chart.defaults.font.family="'Hanken Grotesk',sans-serif";
+  new Chart(document.getElementById('c'),cfg);
+}catch(e){document.getElementById('err').textContent='Invalid chart spec (expects a Chart.js config JSON): '+e;}
+</script></body></html>"""
+
+_TPL_SLIDES = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>__CSS__
+ html,body{height:100%;overflow:hidden;background:#070f17}
+ #deck{height:100vh;display:flex;align-items:center;justify-content:center;padding:6vh 8vw;cursor:pointer}
+ .slide{max-width:920px;width:100%;animation:fade .25s ease}
+ .slide h1{font-size:2.7em;margin-top:0}.slide h2{border:none}
+ #hud{position:fixed;bottom:14px;right:18px;font:13px/1 'JetBrains Mono',monospace;color:#5b7287}
+ #hint{position:fixed;bottom:14px;left:18px;font:12px 'JetBrains Mono',monospace;color:#3d4f5e}
+ @keyframes fade{from{opacity:0;transform:translateY(7px)}to{opacity:1}}</style>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script></head>
+<body><div id="deck"></div><div id="hud"></div><div id="hint">← → / space · click to advance</div><script>
+const RAW=new TextDecoder().decode(Uint8Array.from(atob("__B64__"),c=>c.charCodeAt(0)));
+const slides=RAW.split(/\\n-{3,}\\s*\\n/).map(s=>s.trim()).filter(Boolean);
+let i=0;const deck=document.getElementById('deck'),hud=document.getElementById('hud');
+function render(){deck.innerHTML='<section class="slide">'+DOMPurify.sanitize(marked.parse(slides[i]||'*empty deck*'))+'</section>';hud.textContent=(i+1)+' / '+Math.max(slides.length,1);}
+function go(d){const n=Math.min(Math.max(i+d,0),slides.length-1);if(n!==i){i=n;render();}}
+addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){e.preventDefault();go(1);}else if(e.key==='ArrowLeft'||e.key==='PageUp'){go(-1);}else if(e.key==='Home'){i=0;render();}else if(e.key==='End'){i=slides.length-1;render();}});
+deck.addEventListener('click',e=>go(e.clientX<innerWidth*0.25?-1:1));
+render();</script></body></html>"""
+
+_ARTIFACT_TEMPLATES = {"markdown": _TPL_MARKDOWN, "mermaid": _TPL_MERMAID,
+                       "chart": _TPL_CHART, "slides": _TPL_SLIDES}
+
+
+def _artifact_html(kind, raw):
+    b64 = base64.b64encode(raw.encode("utf-8")).decode()
+    return _ARTIFACT_TEMPLATES[kind].replace("__CSS__", _ARTIFACT_BASE_CSS).replace("__B64__", b64)
+
+
 @app.get("/api/preview/{path:path}")
 def preview_file(path: str):
     """Serve a workspace file for the in-app Preview iframe. PATH-BASED (not ?path=) so an
@@ -1114,11 +1502,19 @@ def preview_file(path: str):
         p = p / "index.html"
     if not p.is_file():
         raise HTTPException(404, "not found")
-    return FileResponse(str(p), headers={
+    headers = {
         "Cache-Control": "no-store",
         "Content-Security-Policy": f"sandbox {_PREVIEW_SANDBOX}",
         "X-Content-Type-Options": "nosniff",
-    })
+    }
+    kind = _artifact_kind(p.name)               # .md/.mmd/.chart.json/.slides → render, not raw
+    if kind:
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise HTTPException(500, str(e))
+        return HTMLResponse(_artifact_html(kind, raw), headers=headers)
+    return FileResponse(str(p), headers=headers)
 
 
 @app.get("/api/file")
@@ -1245,6 +1641,13 @@ async def update_task_api(tid: int, req: Request):
 def delete_task_api(tid: int):
     ok = scheduler.delete_task(tid)
     return {"ok": ok, **({} if ok else {"error": "this entry is managed by the Researcher — delete the topic there"})}
+
+
+@app.post("/api/tasks/{tid}/run")
+async def run_task_api(tid: int):
+    """Run a scheduled task right now, on demand. Off the event loop — a task can block
+    (it may call the model, delegate, or run a workflow)."""
+    return await asyncio.to_thread(scheduler.run_task, tid)
 
 
 # ---------------- calendar (local copy, synced from ICS feeds) ----------------

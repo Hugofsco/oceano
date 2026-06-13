@@ -230,6 +230,64 @@ def search(query, k=8):
              "pinned": bool(r[5]), "score": round(max(s, 0.0), 3)} for s, r in scored[:k]]
 
 
+def _split_tags(tags):
+    """Free-text tag string -> a set of normalized tag tokens (comma/space separated)."""
+    if not tags:
+        return set()
+    raw = tags.replace(",", " ").split()
+    return {t.strip().lower() for t in raw if t.strip()}
+
+
+def graph(threshold=0.62, max_nodes=140, max_edges=500):
+    """The memory store as a graph, for the Memory Graph window. Nodes are memories
+    (colored by category in the UI); edges connect memories that are either strongly
+    semantically similar (cosine >= threshold, using the stored embeddings) or share a
+    tag. Returns {nodes, edges, threshold}. Edges are capped, strongest first."""
+    con = _db()
+    rows = con.execute("SELECT id, text, tags, category, pinned, embedding FROM memories "
+                       "ORDER BY pinned DESC, id DESC LIMIT ?", (max_nodes,)).fetchall()
+    con.close()
+    nodes, vecs, tagmap = [], {}, {}
+    for r in rows:
+        mid = r[0]
+        nodes.append({"id": mid, "text": r[1], "tags": r[2] or "",
+                      "category": r[3] or "fact", "pinned": bool(r[4])})
+        if r[5]:
+            try:
+                vecs[mid] = json.loads(r[5])
+            except ValueError:
+                pass
+        for t in _split_tags(r[2]):
+            tagmap.setdefault(t, []).append(mid)
+
+    ids = [n["id"] for n in nodes]
+    edges, seen = [], set()
+    for i in range(len(ids)):                         # semantic edges (strongest signal)
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            if a in vecs and b in vecs:
+                s = _cosine(vecs[a], vecs[b])
+                if s >= threshold:
+                    edges.append({"a": a, "b": b, "w": round(s, 3), "kind": "semantic"})
+                    seen.add((a, b))
+    # Tag edges, but ONLY for *rare* tags. A tag shared by many memories is a hub: it
+    # links everything to everything (O(n^2) edges) and says nothing — skip it, or the
+    # graph becomes a hairball. Co-tagging is only a meaningful link when the tag is rare.
+    tag_cap = max(3, int(len(nodes) * 0.25))
+    for tag, members in tagmap.items():
+        if len(members) > tag_cap:
+            continue
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = sorted((members[i], members[j]))
+                if a != b and (a, b) not in seen:
+                    edges.append({"a": a, "b": b, "w": 0.5, "kind": "tag", "tag": tag})
+                    seen.add((a, b))
+    edges.sort(key=lambda e: e["w"], reverse=True)
+    return {"nodes": nodes, "edges": edges[:max_edges],
+            "threshold": threshold, "categories": CATEGORIES}
+
+
 def add_if_new(text, tags="", category="fact", threshold=0.86):
     """Save a memory only if it isn't a near-duplicate of an existing one (semantic
     when the embed server is up, exact-text otherwise). Used by auto-learning so
@@ -327,6 +385,13 @@ def _parse_plan(output):
 
 
 def maintain():
+    """Memory-hygiene run, registered as a background job so the UI can show it running."""
+    from oceano import jobs
+    with jobs.job("memory", "memory maintenance", ref="memory:maintain"):
+        return _maintain()
+
+
+def _maintain():
     """One maintenance run: hand the whole memory store to Claude Code, apply its plan.
     Pinned memories are never deleted; a plan that would wipe most of the store is refused
     as a safety net. Returns a short summary. Called by the scheduler's locked job."""

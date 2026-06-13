@@ -127,13 +127,26 @@ function _fmtChatDate(d) {
   if (diff === 0) return "Today"; if (diff === 1) return "Yesterday";
   return new Date(d + "T00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 }
+// the sidebar's two panes slide: menu ⇄ chat history
+function sideShowChats() { const t = $("#sideTrack"); if (t) t.classList.add("show-chats"); renderSessions(); }
+function sideShowMain() { const t = $("#sideTrack"); if (t) t.classList.remove("show-chats"); }
+let _foldClosed = new Set();                        // collapsed date-folders (by date key)
 function renderSessions() {
   const box = $("#sessions"); if (!box) return; box.innerHTML = "";
-  const groups = {};                               // group by date → dated folders
+  if (state.session && !_chats.some(s => s.id === state.session)) {   // brand-new chat, not yet saved
+    const el = document.createElement("div"); el.className = "session active";
+    el.innerHTML = `<span class="s-title"></span>`; $(".s-title", el).textContent = _curTitle || "New voyage";
+    box.appendChild(el);
+  }
+  const groups = {};                               // group by date → dated "folders"
   _chats.forEach(s => (groups[s.date || "—"] ||= []).push(s));
   Object.keys(groups).sort().reverse().forEach(date => {
-    const h = document.createElement("div"); h.className = "s-date"; h.textContent = _fmtChatDate(date);
-    box.appendChild(h);
+    const fold = document.createElement("div"); fold.className = "s-folder" + (_foldClosed.has(date) ? "" : " open");
+    const h = document.createElement("div"); h.className = "s-folder-h";
+    h.innerHTML = `<span class="s-fold-ic">▾</span><span class="s-fold-date"></span><span class="s-fold-n">${groups[date].length}</span>`;
+    $(".s-fold-date", h).textContent = _fmtChatDate(date);
+    h.onclick = () => { _foldClosed.has(date) ? _foldClosed.delete(date) : _foldClosed.add(date); fold.classList.toggle("open"); };
+    const inner = document.createElement("div"); inner.className = "s-folder-body";
     groups[date].forEach(s => {
       const el = document.createElement("div");
       el.className = "session" + (s.id === state.session ? " active" : "");
@@ -141,14 +154,10 @@ function renderSessions() {
       $(".s-title", el).textContent = s.title;
       el.onclick = () => openVoyage(s.id);
       $(".s-del", el).onclick = e => { e.stopPropagation(); deleteVoyage(s.id); };
-      box.appendChild(el);
+      inner.appendChild(el);
     });
+    fold.appendChild(h); fold.appendChild(inner); box.appendChild(fold);
   });
-  if (state.session && !_chats.some(s => s.id === state.session)) {   // brand-new chat, not yet saved
-    const el = document.createElement("div"); el.className = "session active";
-    el.innerHTML = `<span class="s-title"></span>`; $(".s-title", el).textContent = _curTitle;
-    box.insertBefore(el, box.firstChild);
-  }
 }
 async function deleteVoyage(id) {
   const s = _chats.find(x => x.id === id);
@@ -891,6 +900,12 @@ const SETTINGS_PAGES = {
     </div>`,
   tools: `
     <div class="drawer-section">
+      <h3>Execution</h3>
+      <p class="sub">When on, Oceano runs background jobs — scheduled tasks, workflows, research, memory upkeep — <b>one at a time</b>. A job that starts while another is working waits in a queue instead of hitting the local model in parallel. The eval suite paces itself and isn't gated.</p>
+      <label class="set-toggle"><input type="checkbox" id="serializeToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Queue background jobs (serialize model work)</span></label>
+      <label class="set-toggle"><input type="checkbox" id="serializeChatToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Queue chat messages too <span class="st-note">— a chat turn also waits behind running work (share the gate; enable the option above for full serialization)</span></span></label>
+    </div>
+    <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
       <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
       <div class="chat-tools">
@@ -991,7 +1006,15 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); }
+async function loadJobsSetting() {
+  const t = $("#serializeToggle"), tc = $("#serializeChatToggle"); if (!t) return;
+  let d; try { d = await api("/api/jobs"); } catch { return; }
+  t.checked = !!d.serialize;
+  if (tc) tc.checked = !!d.serialize_chat;
+  t.onchange = () => _postJ("/api/jobs/serialize", { enabled: t.checked }).then(r => toast(r.serialize ? "Background jobs will queue" : "Background jobs run in parallel", "info")).catch(() => {});
+  if (tc) tc.onchange = () => _postJ("/api/jobs/serialize", { chat: tc.checked }).then(r => toast(r.serialize_chat ? "Chat messages will queue" : "Chat messages run immediately", "info")).catch(() => {});
+}
 
 const POLICY_OPTS = [["always", "Always inject"], ["relevant", "When relevant"], ["off", "Off"]];
 async function loadMemoryPolicy() {
@@ -1553,7 +1576,7 @@ async function expLoad(path) {
       $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
       const items = e.dir
         ? [{ label: "Open", action: () => expLoad(e.path) }]
-        : [...(isWebPage(e.name) ? [{ label: "▶ Preview", action: () => openPreview(e.path) }] : []),
+        : [...(isPreviewable(e.name) ? [{ label: previewLabel(e.name), action: () => openPreview(e.path) }] : []),
            { label: "Open here", action: () => expOpenFile(e.path) },
            { label: "Open in new window", action: () => openFileWindow(e.path) },
            { label: "Download", action: () => window.open("/api/raw?path=" + encodeURIComponent(e.path), "_blank") }];
@@ -1617,7 +1640,7 @@ async function _mountEditor(container, path, opts = {}) {
       <select class="fe-lang fw-lang" title="syntax mode">${langs}</select>
       <button class="ed-btn fw-find" title="Find / replace (Ctrl-F)">⌕</button>
       <button class="ed-btn fw-wrap" title="Toggle line wrap">⏎</button>
-      ${isWebPage(path) ? '<button class="ed-btn fw-preview" title="Preview in a sandboxed window">▶ Preview</button>' : ""}
+      ${isPreviewable(path) ? `<button class="ed-btn fw-preview" title="Preview in a sandboxed window">${previewLabel(path)}</button>` : ""}
       <button class="ed-btn fw-saveas" title="Save as a new file">Save as…</button>
       <button class="primary sm fw-save">Save</button>
     </div>
@@ -1668,6 +1691,20 @@ async function openFileWindow(path) {                          // standalone pop
 
 /* ---------- Preview: render a workspace web app in a sandboxed iframe (device simulator + live reload) ---------- */
 const isWebPage = p => /\.html?$/i.test(p || "");
+// previewable artifacts: finished web pages + source types the backend renders in the sandbox
+// (markdown docs, mermaid diagrams, Chart.js specs, slide decks).
+function isPreviewable(p) {
+  const n = (p || "").toLowerCase();
+  return /\.(html?|md|markdown|mmd|mermaid|slides)$/.test(n) || n.endsWith(".chart.json");
+}
+function previewLabel(p) {
+  const n = (p || "").toLowerCase();
+  if (n.endsWith(".slides.md") || n.endsWith(".slides")) return "▶ Slides";
+  if (n.endsWith(".chart.json")) return "▶ Chart";
+  if (n.endsWith(".mmd") || n.endsWith(".mermaid")) return "▶ Diagram";
+  if (n.endsWith(".md") || n.endsWith(".markdown")) return "▶ View";
+  return "▶ Preview";
+}
 const _previewURL = p => "/api/preview/" + p.split("/").map(encodeURIComponent).join("/");
 let _previewTimer = null;
 function openPreview(path) {
@@ -1707,14 +1744,15 @@ function openPreview(path) {
   };
   poll(); _previewTimer = setInterval(poll, 1500);
 }
-// artifact-style chip: when the agent writes an .html file, offer a Preview on that tool card
+// artifact-style chip: when the agent writes a renderable file (.html/.md/.mmd/.chart.json/
+// .slides), offer to open it in the Preview window straight from that tool card.
 function maybePreviewChip(card, name, argsJson) {
   if (!card || name !== "write_file") return;
   let path; try { path = JSON.parse(argsJson).path; } catch { return; }
-  if (!isWebPage(path)) return;
+  if (!isPreviewable(path)) return;
   const th = $(".th", card); if (!th || $(".tool-preview", th)) return;
   const b = document.createElement("button");
-  b.className = "tool-preview"; b.textContent = "▶ Preview";
+  b.className = "tool-preview"; b.textContent = previewLabel(path);
   b.onclick = e => { e.stopPropagation(); openPreview(path); };
   th.appendChild(b);
 }
@@ -1750,9 +1788,10 @@ function brainTab(which) {
   if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; }
   if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; }
   if (which === "mem") {
-    c.innerHTML = `<div class="mem-add"><input id="bMemText" placeholder="Teach Oceano a durable fact…"><input id="bMemTags" class="mem-tags" placeholder="tags"><button class="primary sm" id="bMemAdd">Remember</button></div><div class="mem-list" id="bMemList"></div>`;
+    c.innerHTML = `<div class="mem-add"><input id="bMemText" placeholder="Teach Oceano a durable fact…"><input id="bMemTags" class="mem-tags" placeholder="tags"><button class="primary sm" id="bMemAdd">Remember</button><button class="ghost-btn sm" id="bMemGraph" title="Explore the memory store as a graph">❄ Graph</button></div><div class="mem-list" id="bMemList"></div>`;
     const add = async () => { const t = $("#bMemText").value.trim(); if (!t) return; await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t, tags: $("#bMemTags").value.trim() }) }); $("#bMemText").value = ""; $("#bMemTags").value = ""; loadBrainMem(); };
     $("#bMemAdd").onclick = add;
+    $("#bMemGraph").onclick = openMemoryGraph;
     $("#bMemText").addEventListener("keydown", e => { if (e.key === "Enter") add(); });
     loadBrainMem();
   } else if (which === "kn") {
@@ -2160,6 +2199,7 @@ async function loadScheduler() {
   if (!d.tasks.length) { list.innerHTML = `<div class="empty-note">No scheduled tasks. Pick a preset and add one above.</div>`; return; }
   d.tasks.forEach(t => {
     const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
+    row.dataset.tid = t.id; row.dataset.src = t.source || "";
     const nxt = t.next_run ? t.next_run.slice(0, 16).replace("T", " ") : "—";
     const isSkills = (t.source || "").startsWith("skills");
     const mgrName = isSkills ? "Skills" : "Researcher";
@@ -2168,10 +2208,21 @@ async function loadScheduler() {
     const lock = t.managed ? ` · <span class="sr-lock" title="created by ${mgrName} — schedule & on/off are editable here; managed there">🔒 ${mgrName}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
       <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${lock}</div></div>` +
+      `<button class="sr-btn sr-run" title="run now, ignoring the schedule">▶ Run</button>` +
       `<button class="sr-btn sr-edit">${t.managed ? "schedule" : "edit"}</button>` +
       (t.managed ? `<button class="sr-btn sr-res" title="manage in ${mgrName}">${mgrName.toLowerCase()}</button>`
                  : `<button class="sr-btn sr-del">✕</button>`);
     $("input", row).onchange = async e => { await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadScheduler(); };
+    $(".sr-run", row).onclick = async ev => {
+      const b = ev.currentTarget; if (b.disabled) return;
+      b.disabled = true; b.textContent = "running…"; row.classList.add("running");
+      try {
+        const r = await _postJ("/api/tasks/" + t.id + "/run", {});
+        if (r.ok) toast("Ran ✓ " + ((r.result || "done").trim().slice(0, 140)), "info");
+        else toast("Run failed: " + (r.error || "unknown"), "err");
+      } catch { toast("Run failed", "err"); }
+      row.classList.remove("running"); loadScheduler();
+    };
     $(".sr-edit", row).onclick = () => t.managed ? editTaskSchedule(t) : editTask(t);
     if (t.managed) {
       $(".sr-res", row).onclick = isSkills ? () => openBrain("skills") : openResearcher;
@@ -2566,6 +2617,658 @@ async function editResearch(t) {
   fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) }).then(() => loadResearch());
 }
 
+/* ====================================================================
+   Memory graph — a force-directed map of the memory store.
+   Nodes are memories (colored by category); edges link memories that are
+   strongly semantically similar or share a tag. Pure-canvas, no libs.
+   ==================================================================== */
+const MEM_CAT_COLORS = { identity: "#e0a86b", preference: "#7ec8a9", project: "#6ba3e0", fact: "#9b8fd6", task: "#d67f9b" };
+let _mgRaf = null;
+function openMemoryGraph() {
+  const { body, reused } = createWindow({ id: "win-memgraph", title: "Memory graph", icon: "❄", width: 780, height: 600,
+    onClose: () => { if (_mgRaf) { cancelAnimationFrame(_mgRaf); _mgRaf = null; } } });
+  if (reused) return;
+  body.classList.add("mg-win");
+  body.innerHTML = `
+    <div class="mg-bar">
+      <label class="mg-th">link strength <input type="range" id="mgTh" min="0.45" max="0.9" step="0.01" value="0.62"><span id="mgThVal">0.62</span></label>
+      <span class="fe-spacer"></span>
+      <span class="mg-legend">${Object.entries(MEM_CAT_COLORS).map(([k, v]) => `<span class="mg-lg"><i style="background:${v}"></i>${k}</span>`).join("")}</span>
+      <button class="ed-btn" id="mgReload" title="reload">↻</button>
+    </div>
+    <div class="mg-stage"><canvas id="mgCanvas"></canvas><div class="mg-inspect" id="mgInspect" style="display:none"></div><div class="mg-empty empty-note" id="mgEmpty" style="display:none"></div></div>`;
+  const canvas = $("#mgCanvas", body), th = $("#mgTh", body), thVal = $("#mgThVal", body);
+  const inspect = $("#mgInspect", body), empty = $("#mgEmpty", body), ctx = canvas.getContext("2d");
+  let nodes = [], edges = [], byId = {}, dragging = null, hover = null;
+
+  function fit() {
+    const r = canvas.parentElement.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+    canvas.style.width = r.width + "px"; canvas.style.height = r.height + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { w: r.width, h: r.height };
+  }
+  async function loadGraph() {
+    let g; try { g = await api("/api/memory/graph?threshold=" + th.value); } catch { return; }
+    const { w, h } = fit();
+    byId = {};
+    nodes = (g.nodes || []).map((n, idx) => {
+      const ang = (idx / Math.max((g.nodes || []).length, 1)) * Math.PI * 2;
+      const o = { ...n, x: w / 2 + Math.cos(ang) * 130 + (idx % 5), y: h / 2 + Math.sin(ang) * 130, vx: 0, vy: 0, r: n.pinned ? 9 : 6, deg: 0 };
+      byId[n.id] = o; return o;
+    });
+    edges = (g.edges || []).filter(e => byId[e.a] && byId[e.b]);
+    edges.forEach(e => { byId[e.a].deg++; byId[e.b].deg++; });
+    empty.style.display = nodes.length ? "none" : "block";
+    if (!nodes.length) empty.textContent = "No memories yet — teach Oceano something in Brain → Memory.";
+    inspect.style.display = "none";
+    if (!_mgRaf) tick();
+  }
+  function tick() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    for (let i = 0; i < nodes.length; i++) {                 // repulsion (Coulomb-ish)
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy || 0.01, d = Math.sqrt(d2);
+        const f = 950 / d2, ux = dx / d, uy = dy / d;
+        a.vx += ux * f; a.vy += uy * f; b.vx -= ux * f; b.vy -= uy * f;
+      }
+    }
+    edges.forEach(e => {                                     // springs along links
+      const a = byId[e.a], b = byId[e.b];
+      let dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const target = e.kind === "semantic" ? 64 : 120, f = (d - target) * 0.01 * e.w, ux = dx / d, uy = dy / d;
+      a.vx += ux * f; a.vy += uy * f; b.vx -= ux * f; b.vy -= uy * f;
+    });
+    nodes.forEach(n => {
+      if (n === dragging) { n.vx = n.vy = 0; return; }
+      n.vx += (w / 2 - n.x) * 0.002; n.vy += (h / 2 - n.y) * 0.002;   // gentle gravity to center
+      n.vx *= 0.86; n.vy *= 0.86; n.x += n.vx; n.y += n.vy;
+      n.x = Math.max(12, Math.min(w - 12, n.x)); n.y = Math.max(12, Math.min(h - 12, n.y));
+    });
+    draw();
+    _mgRaf = requestAnimationFrame(tick);
+  }
+  function draw() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+    edges.forEach(e => {
+      const a = byId[e.a], b = byId[e.b];
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      if (e.kind === "semantic") { ctx.strokeStyle = `rgba(120,170,220,${0.1 + e.w * 0.4})`; ctx.lineWidth = 0.6 + e.w; ctx.setLineDash([]); }
+      else { ctx.strokeStyle = "rgba(150,150,175,0.18)"; ctx.lineWidth = 0.8; ctx.setLineDash([3, 3]); }
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+    nodes.forEach(n => {
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r + (n === hover ? 2 : 0), 0, Math.PI * 2);
+      ctx.fillStyle = MEM_CAT_COLORS[n.category] || "#888"; ctx.fill();
+      if (n.pinned || n === hover) { ctx.lineWidth = n.pinned ? 2 : 1; ctx.strokeStyle = "#fff"; ctx.stroke(); }
+    });
+  }
+  function nodeAt(mx, my) {
+    for (let i = nodes.length - 1; i >= 0; i--) { const n = nodes[i], dx = mx - n.x, dy = my - n.y; if (dx * dx + dy * dy <= (n.r + 4) * (n.r + 4)) return n; }
+    return null;
+  }
+  const relpos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  canvas.onmousedown = e => { const [x, y] = relpos(e); const n = nodeAt(x, y); if (n) { dragging = n; showInspect(n); } };
+  canvas.onmousemove = e => { const [x, y] = relpos(e); if (dragging) { dragging.x = x; dragging.y = y; } else { hover = nodeAt(x, y); canvas.style.cursor = hover ? "pointer" : "default"; } };
+  window.addEventListener("mouseup", () => { dragging = null; });
+  function showInspect(n) {
+    inspect.style.display = "block";
+    inspect.innerHTML = `<div class="mgi-cat" style="color:${MEM_CAT_COLORS[n.category] || "#888"}">${n.pinned ? "📌 " : ""}${escapeHtml(n.category)}</div><div class="mgi-text">${escapeHtml(n.text)}</div>${n.tags ? `<div class="mgi-tags">${escapeHtml(n.tags)}</div>` : ""}<div class="mgi-deg">${n.deg} link${n.deg === 1 ? "" : "s"}</div>`;
+  }
+  th.oninput = () => { thVal.textContent = (+th.value).toFixed(2); };
+  th.onchange = loadGraph;
+  $("#mgReload", body).onclick = loadGraph;
+  loadGraph();
+}
+
+/* ====================================================================
+   System health dashboard — live state of the self-hosted stack.
+   ==================================================================== */
+let _healthTimer = null;
+function openHealth() {
+  const { body, reused } = createWindow({ id: "win-health", title: "Health — system", icon: "◉", width: 560, height: 600,
+    onClose: () => { if (_healthTimer) { clearInterval(_healthTimer); _healthTimer = null; } } });
+  if (reused) return;
+  body.classList.add("hd-win");
+  body.innerHTML = `<div class="hd-grid" id="hdGrid"></div><div class="hd-foot"><span id="hdUptime">—</span><button class="ed-btn" id="hdReload" title="refresh">↻</button></div>`;
+  const grid = $("#hdGrid", body);
+  const dot = ok => `<span class="hd-dot ${ok ? "ok" : "bad"}"></span>`;
+  const fmtBytes = b => b == null ? "—" : (b >= 1e9 ? (b / 1073741824).toFixed(1) + " GB" : (b / 1048576).toFixed(0) + " MB");
+  const fmtDur = s => { if (s == null) return "—"; s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + (h ? h + "h " : "") + m + "m"; };
+  const card = (title, ok, rows) => `<div class="hd-card"><div class="hd-h">${dot(ok)}${escapeHtml(title)}</div>${rows.map(r => `<div class="hd-row"><span>${escapeHtml(r[0])}</span><b>${r[1]}</b></div>`).join("")}</div>`;
+  async function load() {
+    let d; try { d = await api("/api/health"); } catch { grid.innerHTML = `<div class="empty-note">health unavailable</div>`; return; }
+    const ls = d.llamaswap || {}, em = d.embed || {}, sc = d.scheduler || {}, tg = d.telegram || {}, hw = d.hw || {}, rg = d.rag || {};
+    grid.innerHTML = [
+      card("Inference · llama-swap", ls.ok, [["loaded model", escapeHtml(ls.loaded || d.model || "—")], ["available", (ls.models || []).length || "—"]]),
+      card("Embeddings · :8082", em.ok, [["model", escapeHtml(em.model || "—")]]),
+      card("GPU", !!(hw.gpu || hw.backend), [["device", escapeHtml(hw.gpu || hw.backend || "—")], ["VRAM free", fmtBytes(hw.vram_free) + (hw.vram_total ? " / " + fmtBytes(hw.vram_total) : "")]]),
+      card("Scheduler", sc.beat_ago_s != null && sc.beat_ago_s < 180, [["last beat", sc.beat_ago_s != null ? Math.round(sc.beat_ago_s) + "s ago" : "—"], ["tasks", sc.tasks ?? "—"]]),
+      card("Telegram", !!tg.running, [["bot", tg.running ? "@" + escapeHtml(tg.username || "on") : "off"]]),
+      card("Knowledge", true, [["memories", d.memory ? d.memory.count : "—"], ["doc chunks", rg.chunks ?? "—"], ["files indexed", rg.files ?? "—"]]),
+    ].join("");
+    $("#hdUptime", body).textContent = "uptime " + fmtDur(d.uptime_s);
+  }
+  $("#hdReload", body).onclick = load;
+  load(); _healthTimer = setInterval(load, 5000);
+}
+
+/* ====================================================================
+   Semantic search — ask the corpus (memories + indexed docs), with scores
+   and jump-to-source.
+   ==================================================================== */
+function openSearch() {
+  const { body, reused } = createWindow({ id: "win-search", title: "Search — semantic", icon: "⌕", width: 600, height: 560 });
+  if (reused) return;
+  body.classList.add("ks-win");
+  body.innerHTML = `
+    <div class="ks-bar">
+      <div class="ks-scope"><button data-scope="memory" class="on">Memories</button><button data-scope="docs">Documents</button></div>
+      <input id="ksQ" placeholder="search by meaning, not keywords…" autocomplete="off">
+      <button class="primary sm" id="ksGo">Search</button>
+    </div>
+    <div class="ks-note" id="ksNote"></div>
+    <div class="ks-results" id="ksRes"></div>`;
+  let scope = "memory";
+  $$(".ks-scope button", body).forEach(b => b.onclick = () => { scope = b.dataset.scope; $$(".ks-scope button", body).forEach(x => x.classList.toggle("on", x === b)); });
+  const res = $("#ksRes", body), note = $("#ksNote", body);
+  async function go() {
+    const q = $("#ksQ", body).value.trim(); if (!q) return;
+    note.textContent = "searching…"; res.innerHTML = "";
+    let r; try { r = await api("/api/brain/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope, query: q }) }); } catch { note.textContent = "search failed"; return; }
+    const items = r.results || [];
+    note.textContent = items.length ? `${items.length} result${items.length === 1 ? "" : "s"}` : "nothing close enough — try different words";
+    items.forEach(it => {
+      const card = document.createElement("div"); card.className = "ks-card";
+      const score = typeof it.score === "number" ? it.score : 0;
+      if (scope === "memory") {
+        card.innerHTML = `<div class="ks-score">${score.toFixed(2)}</div><div class="ks-bd"><div class="ks-txt">${escapeHtml(it.text || "")}</div><div class="ks-meta">${escapeHtml(it.category || "")}${it.tags ? " · " + escapeHtml(it.tags) : ""}</div></div>`;
+        card.onclick = () => openBrain("mem");
+      } else {
+        card.innerHTML = `<div class="ks-score">${score.toFixed(2)}</div><div class="ks-bd"><div class="ks-src">${escapeHtml(it.name || "")}</div><div class="ks-txt">${escapeHtml((it.chunk || "").slice(0, 320))}</div></div>`;
+        if (it.path) { card.title = "open " + escapeHtml(it.name || ""); card.onclick = () => openDocSource(it.path); }
+      }
+      res.appendChild(card);
+    });
+  }
+  $("#ksGo", body).onclick = go;
+  $("#ksQ", body).addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  setTimeout(() => $("#ksQ", body).focus(), 50);
+}
+// indexed docs carry absolute paths; open in the editor when they live under the workspace fence
+function openDocSource(absPath) {
+  const i = (absPath || "").indexOf("/workspace/");
+  if (i >= 0) openFileWindow(absPath.slice(i + "/workspace/".length));
+  else toast(absPath, "info");
+}
+
+/* ====================================================================
+   Notes — a tiny Kanban scratchpad (todo / doing / done), drag to move.
+   ==================================================================== */
+const NOTE_COLS = [["todo", "To do"], ["doing", "Doing"], ["done", "Done"]];
+function openNotes() {
+  const { body, reused } = createWindow({ id: "win-notes", title: "Notes — board", icon: "❏", width: 720, height: 540 });
+  if (reused) return;
+  body.classList.add("kb-win");
+  body.innerHTML = `<div class="kb-board" id="kbBoard"></div>`;
+  loadNotes();
+}
+async function loadNotes() {
+  const board = $("#kbBoard"); if (!board) return;
+  let data; try { data = await api("/api/notes"); } catch { return; }
+  board.innerHTML = "";
+  NOTE_COLS.forEach(([key, label]) => {
+    const col = document.createElement("div"); col.className = "kb-col"; col.dataset.col = key;
+    const cards = data[key] || [];
+    col.innerHTML = `<div class="kb-col-h">${label}<span class="kb-count">${cards.length}</span></div><button class="kb-add">+ add</button><div class="kb-cards"></div>`;
+    const cardsEl = $(".kb-cards", col);
+    cards.forEach(c => cardsEl.appendChild(noteCard(c)));
+    $(".kb-add", col).onclick = async () => {
+      const t = await promptDialog("New card", { placeholder: "what needs doing?", okLabel: "Add" });
+      if (!t) return;
+      await _postJ("/api/notes", { text: t, col: key }); loadNotes();
+    };
+    col.addEventListener("dragover", e => { e.preventDefault(); col.classList.add("drop"); });
+    col.addEventListener("dragleave", () => col.classList.remove("drop"));
+    col.addEventListener("drop", async e => {
+      e.preventDefault(); col.classList.remove("drop");
+      const id = +e.dataTransfer.getData("text/plain");
+      if (id) { await fetch("/api/notes/" + id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ col: key }) }); loadNotes(); }
+    });
+    board.appendChild(col);
+  });
+}
+function noteCard(c) {
+  const el = document.createElement("div"); el.className = "kb-card"; el.draggable = true;
+  el.innerHTML = `<div class="kb-txt">${escapeHtml(c.text)}</div><button class="kb-del" title="delete">✕</button>`;
+  el.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", c.id); el.classList.add("dragging"); });
+  el.addEventListener("dragend", () => el.classList.remove("dragging"));
+  $(".kb-txt", el).onclick = async () => {
+    const t = await promptDialog("Edit card", { value: c.text, okLabel: "Save" });
+    if (t === null) return;
+    await fetch("/api/notes/" + c.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t }) }); loadNotes();
+  };
+  $(".kb-del", el).onclick = async e => { e.stopPropagation(); await fetch("/api/notes/" + c.id, { method: "DELETE" }); loadNotes(); };
+  return el;
+}
+
+/* ====================================================================
+   Voice console — push-to-talk (MediaRecorder → STT) + speak text (TTS).
+   Reuses the same faster-whisper / Piper stack as the Telegram channel.
+   ==================================================================== */
+let _vcRec = null, _vcChunks = [];
+async function openVoice() {
+  const { body, reused } = createWindow({ id: "win-voice", title: "Voice", icon: "🎙", width: 420, height: 460,
+    onClose: () => { try { if (_vcRec && _vcRec.state === "recording") _vcRec.stop(); } catch {} _vcRec = null; } });
+  if (reused) return;
+  body.classList.add("vc-win");
+  body.innerHTML = `
+    <div class="vc-status" id="vcStatus">checking voice engines…</div>
+    <button class="vc-mic" id="vcMic" disabled><span class="vc-mic-ic">🎙</span><span id="vcMicLabel">…</span></button>
+    <div class="vc-transcript" id="vcTx" contenteditable="true" data-ph="your words appear here — editable"></div>
+    <div class="vc-actions">
+      <button class="ghost-btn sm" id="vcSpeak">🔊 Speak this</button>
+      <button class="primary sm" id="vcSend">↪ Send to chat</button>
+    </div>
+    <audio id="vcAudio" style="display:none"></audio>`;
+  const st = $("#vcStatus", body), mic = $("#vcMic", body), micLabel = $("#vcMicLabel", body), tx = $("#vcTx", body), audio = $("#vcAudio", body);
+  let s; try { s = await api("/api/voice/status"); } catch { s = {}; }
+  st.innerHTML = `${s.stt ? "🎙 STT: " + escapeHtml(s.stt_model || "ready") : "🎙 STT: not installed"} · ${s.tts ? "🔊 TTS: " + escapeHtml(s.tts_voice || "ready") : "🔊 TTS: not installed"}`;
+  mic.disabled = !s.stt;
+  micLabel.textContent = s.stt ? "click to talk" : "speech-to-text unavailable";
+  const startRec = async () => {
+    if (!navigator.mediaDevices) { toast("microphone unavailable", "err"); return; }
+    let stream; try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch { toast("mic permission denied", "err"); return; }
+    _vcChunks = [];
+    _vcRec = new MediaRecorder(stream);
+    _vcRec.ondataavailable = e => { if (e.data.size) _vcChunks.push(e.data); };
+    _vcRec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      mic.classList.remove("rec"); micLabel.textContent = "transcribing…";
+      try {
+        const r = await fetch("/api/voice/stt", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: new Blob(_vcChunks, { type: "audio/webm" }) });
+        const j = await r.json();
+        if (j.text) tx.textContent = (tx.textContent ? tx.textContent.trim() + " " : "") + j.text;
+        else toast("nothing heard", "info");
+      } catch { toast("transcription failed", "err"); }
+      micLabel.textContent = "click to talk";
+    };
+    _vcRec.start(); mic.classList.add("rec"); micLabel.textContent = "● recording — click to stop";
+  };
+  mic.onclick = () => { if (_vcRec && _vcRec.state === "recording") _vcRec.stop(); else startRec(); };
+  $("#vcSpeak", body).onclick = async () => {
+    const text = (tx.textContent || "").trim(); if (!text) return;
+    if (!s.tts) { toast("TTS not available", "err"); return; }
+    try {
+      const r = await fetch("/api/voice/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      if (!r.ok) { toast("TTS failed", "err"); return; }
+      audio.src = URL.createObjectURL(await r.blob()); audio.play();
+    } catch { toast("TTS failed", "err"); }
+  };
+  $("#vcSend", body).onclick = () => {
+    const text = (tx.textContent || "").trim(); if (!text) return;
+    const input = $("#input"); input.value = text; input.dispatchEvent(new Event("input")); input.focus();
+    tx.textContent = ""; toast("dropped into the composer", "info");
+  };
+}
+
+/* ====================================================================
+   Workflows — visual, branching recipes drawn on a Drawflow canvas.
+   Nodes: start · tool · instruction · delegate · decision · end.
+   Decision nodes route execution down a "yes"/"no" edge (rule | model | delegate).
+   The clean graph model {nodes,edges} is the source of truth; we build the canvas
+   from it on open and read it back from Drawflow's export on save.
+   ==================================================================== */
+let _wfTools = null;                          // cached enabled-tool list for tool nodes
+async function wfLoadTools() {
+  if (_wfTools) return _wfTools;
+  try { _wfTools = (await api("/api/tools")).filter(t => t.enabled && !t.name.startsWith("mcp__")); } catch { _wfTools = []; }
+  return _wfTools;
+}
+const WF_PORTS = { start: [0, 1], end: [1, 0], decision: [1, 2], tool: [1, 1], instruction: [1, 1], delegate: [1, 1] };
+function wfToolOptions(sel) {
+  return (_wfTools || []).map(t => `<option value="${t.name}"${t.name === sel ? " selected" : ""}>${t.name}</option>`).join("");
+}
+function wfNodeData(n) {
+  if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
+  if (n.type === "instruction") return { text: n.text || "" };
+  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default" };
+  if (n.type === "decision") return { mode: n.mode || "model", question: n.question || "", ruleOp: n.ruleOp || "contains", ruleValue: n.ruleValue || "", role: n.role || "default" };
+  return {};
+}
+function wfNodeHtml(type, data) {
+  if (type === "start") return `<div class="wfn wfn-start"><b>▶ Start</b></div>`;
+  if (type === "end") return `<div class="wfn wfn-end"><b>■ End</b></div>`;
+  if (type === "tool") return `<div class="wfn wfn-tool"><b>🔧 Tool</b><select class="wfn-f wfn-tool-sel">${wfToolOptions(data.tool)}</select><div class="wfn-form"></div></div>`;
+  if (type === "instruction") return `<div class="wfn wfn-instruction"><b>✎ Instruction</b><textarea df-text class="wfn-f" placeholder="what should the agent do? (it may use any tool)"></textarea></div>`;
+  if (type === "delegate") return `<div class="wfn wfn-delegate"><b>↗ Delegate</b><textarea df-text class="wfn-f" placeholder="task for Claude / cloud"></textarea><select df-role class="wfn-f"><option value="default">default</option><option value="improve">improve</option></select></div>`;
+  if (type === "decision") return `<div class="wfn wfn-decision"><b>◆ Decision</b><select df-mode class="wfn-f"><option value="model">model judges</option><option value="rule">rule on prev output</option><option value="delegate">delegate judges</option></select><textarea df-question class="wfn-f" placeholder="yes/no question (model & delegate)"></textarea><div class="wfn-rule"><select df-ruleOp class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-ruleValue class="wfn-f" placeholder="value"></div><div class="wfn-branches"><span>▸ yes</span><span>▸ no</span></div></div>`;
+  return `<div class="wfn"><b>${type}</b></div>`;
+}
+// ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
+const _WF_LONG_STR = /content|text|body|code|message|prompt|command|instruction/i;
+// params that should be a searchable PICKER, keyed "tool.param" → which option source to search
+const WF_PICKERS = {
+  "load_skill.name": "skills", "run_workflow.name": "workflows",
+  "read_file.path": "files", "write_file.path": "files", "edit_file.path": "files",
+  "list_files.path": "dirs", "index_docs.folder": "dirs", "make_folder.path": "dirs",
+};
+let _wfEnumCache = {}, _wfFilesCache = null;
+async function wfFiles() {
+  if (!_wfFilesCache) { try { _wfFilesCache = await api("/api/files/all"); } catch { _wfFilesCache = { files: [], dirs: [] }; } }
+  return _wfFilesCache;
+}
+async function wfEnumOptions(src) {                 // src: skills | workflows | files | dirs
+  if (_wfEnumCache[src]) return _wfEnumCache[src];
+  let opts = [];
+  try {
+    if (src === "skills") opts = (await api("/api/skills")).map(s => s.name);
+    else if (src === "workflows") opts = (await api("/api/workflows")).map(w => w.name);
+    else if (src === "files") opts = (await wfFiles()).files || [];
+    else if (src === "dirs") opts = (await wfFiles()).dirs || [];
+  } catch { opts = []; }
+  _wfEnumCache[src] = opts;
+  return opts;
+}
+// turn each .wfn-combo input into a type-to-search autocomplete (still accepts free text)
+function wfWireCombos(form) {
+  form.querySelectorAll(".wfn-combo").forEach(async inp => {
+    const box = inp.parentElement.querySelector(".wfn-acx");
+    const opts = await wfEnumOptions(inp.dataset.enum);
+    let hi = -1, shown = [];
+    const render = () => {
+      const q = inp.value.trim().toLowerCase();
+      shown = (q ? opts.filter(o => o.toLowerCase().includes(q)) : opts).slice(0, 8);
+      if (!shown.length) { box.style.display = "none"; return; }
+      box.innerHTML = shown.map((o, i) => `<div class="wfn-ac${i === hi ? " hi" : ""}" data-i="${i}">${escapeHtml(o)}</div>`).join("");
+      box.style.display = "block";
+    };
+    const pick = o => { inp.value = o; box.style.display = "none"; inp.dispatchEvent(new Event("change", { bubbles: true })); };
+    inp.addEventListener("focus", () => { hi = -1; render(); });
+    inp.addEventListener("input", () => { hi = -1; render(); });
+    inp.addEventListener("blur", () => setTimeout(() => { box.style.display = "none"; }, 150));
+    inp.addEventListener("keydown", e => {
+      if (box.style.display === "none") return;
+      if (e.key === "ArrowDown") { e.preventDefault(); hi = Math.min(hi + 1, shown.length - 1); render(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(hi - 1, 0); render(); }
+      else if (e.key === "Enter" && hi >= 0) { e.preventDefault(); pick(shown[hi]); }
+      else if (e.key === "Escape") box.style.display = "none";
+    });
+    box.addEventListener("mousedown", e => { const it = e.target.closest(".wfn-ac"); if (it) { e.preventDefault(); pick(shown[+it.dataset.i]); } });
+  });
+}
+function wfBuildToolForm(form, toolName, args) {
+  const tool = (_wfTools || []).find(t => t.name === toolName);
+  const params = (tool && tool.params) || [];
+  if (!params.length) { form.innerHTML = `<div class="wfn-noargs">no arguments</div>`; return; }
+  form.innerHTML = params.map(p => {
+    const v = args[p.name], dt = p.type || "string";
+    const lab = `<label class="wfn-lab" title="${escapeHtml(p.description || "")}">${escapeHtml(p.name)}${p.required ? '<i class="wfn-req">*</i>' : ""}</label>`;
+    const picker = WF_PICKERS[toolName + "." + p.name];
+    let field;
+    if (picker)                   // searchable combo over existing skills/workflows/files/dirs (free text ok too)
+      field = `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-arg="${escapeHtml(p.name)}" data-type="string" data-enum="${picker}" autocomplete="off" placeholder="type to search…" value="${v != null ? escapeHtml(String(v)) : ""}"><div class="wfn-acx" style="display:none"></div></div>`;
+    else if (dt === "boolean")
+      field = `<select class="wfn-fld" data-arg="${escapeHtml(p.name)}" data-type="boolean"><option value="">—</option><option value="true"${v === true ? " selected" : ""}>true</option><option value="false"${v === false ? " selected" : ""}>false</option></select>`;
+    else if (dt === "integer" || dt === "number")
+      field = `<input class="wfn-fld" type="number" data-arg="${escapeHtml(p.name)}" data-type="${dt}" value="${v != null ? escapeHtml(String(v)) : ""}">`;
+    else if (dt === "array" || dt === "object")
+      field = `<textarea class="wfn-fld wfn-json" data-arg="${escapeHtml(p.name)}" data-type="${dt}" placeholder="JSON">${v != null ? escapeHtml(JSON.stringify(v)) : ""}</textarea>`;
+    else if (_WF_LONG_STR.test(p.name))
+      field = `<textarea class="wfn-fld" data-arg="${escapeHtml(p.name)}" data-type="string">${v != null ? escapeHtml(String(v)) : ""}</textarea>`;
+    else
+      field = `<input class="wfn-fld" data-arg="${escapeHtml(p.name)}" data-type="string" value="${v != null ? escapeHtml(String(v)) : ""}">`;
+    return `<div class="wfn-row">${lab}${field}</div>`;
+  }).join("");
+}
+function wfReadToolForm(form) {
+  const args = {};
+  form.querySelectorAll("[data-arg]").forEach(f => {
+    const name = f.dataset.arg, type = f.dataset.type, raw = (f.value != null ? f.value : "").trim();
+    f.classList.remove("wfn-bad");
+    if (type === "boolean") { if (raw === "true") args[name] = true; else if (raw === "false") args[name] = false; }
+    else if (type === "integer") { if (raw !== "") { const n = parseInt(raw, 10); if (!isNaN(n)) args[name] = n; } }
+    else if (type === "number") { if (raw !== "") { const n = parseFloat(raw); if (!isNaN(n)) args[name] = n; } }
+    else if (type === "array" || type === "object") { if (raw !== "") { try { args[name] = JSON.parse(raw); } catch { f.classList.add("wfn-bad"); } } }
+    else if (raw !== "") args[name] = raw;
+  });
+  return args;
+}
+// wire a tool node's DOM: populate the form for the chosen tool, sync edits into Drawflow's node data
+function wfWireTool(editor, dfId, toolName, argsObj) {
+  const el = document.getElementById("node-" + dfId); if (!el) return;
+  const sel = el.querySelector(".wfn-tool-sel"), form = el.querySelector(".wfn-form");
+  if (!sel || !form) return;
+  const state = { tool: sel.value || toolName, args: { ...(argsObj || {}) } };
+  const sync = () => editor.updateNodeDataFromId(dfId, { tool: state.tool, args: JSON.stringify(state.args) });
+  const bindFields = () => form.querySelectorAll("[data-arg]").forEach(f => {
+    const handler = () => { state.args = wfReadToolForm(form); sync(); };
+    f.addEventListener("change", handler);                       // selects + combo picks (synthetic) + commit
+    if (f.tagName !== "SELECT") f.addEventListener("input", handler);   // live typing
+  });
+  const build = () => { wfBuildToolForm(form, state.tool, state.args); bindFields(); wfWireCombos(form); sync(); };
+  build();
+  sel.onchange = () => { state.tool = sel.value; state.args = {}; build(); };
+}
+const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
+  : n.type === "instruction" ? (n.text || "instruction").slice(0, 54)
+  : n.type === "delegate" ? "↗ " + (n.text || "delegate").slice(0, 48)
+  : n.type === "decision" ? "◆ " + (n.question || n.mode || "decision").slice(0, 48)
+  : n.type;
+
+function openWorkflows() {
+  const { body, reused } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 940, height: 660 });
+  if (reused) return;
+  body.classList.add("wf-win");
+  wfRenderList(body);
+}
+async function wfRenderList(body) {
+  body.innerHTML = `
+    <div class="wf-head"><h3>Workflows</h3><span class="fe-spacer"></span><button class="primary sm" id="wfNew">+ New workflow</button></div>
+    <div class="wf-list" id="wfList"><div class="empty-note">loading…</div></div>`;
+  $("#wfNew", body).onclick = () => wfRenderEditor(body, null);
+  let wfs; try { wfs = await api("/api/workflows"); } catch { return; }
+  const list = $("#wfList", body);
+  if (!wfs.length) { list.innerHTML = `<div class="empty-note">No workflows yet. Build one on the canvas — wire up tool, instruction, delegate and decision nodes, then run it on demand or on a schedule.</div>`; return; }
+  list.innerHTML = "";
+  wfs.forEach(w => {
+    const nodes = (w.graph && w.graph.nodes) || [];
+    const acts = nodes.filter(n => n.type !== "start" && n.type !== "end");
+    const hasDec = nodes.some(n => n.type === "decision");
+    const sched = w.schedule ? `<span class="wf-sched" title="scheduled">⏱ ${escapeHtml(w.schedule.cron)}${w.schedule.enabled ? "" : " · off"}</span>` : "";
+    const el = document.createElement("div"); el.className = "wf-card"; el.dataset.wid = w.id;
+    el.innerHTML = `
+      <div class="wf-card-main">
+        <div class="wf-card-name">${escapeHtml(w.name)} ${sched}</div>
+        ${w.description ? `<div class="wf-card-desc">${escapeHtml(w.description)}</div>` : ""}
+        <div class="wf-card-meta">${acts.length} node${acts.length === 1 ? "" : "s"}${hasDec ? " · ◆ branching" : ""}</div>
+      </div>
+      <div class="wf-card-actions">
+        <button class="primary sm wf-run">▶ Run</button>
+        <button class="ed-btn wf-edit">Edit</button>
+        <button class="ed-btn wf-sched-btn" title="schedule">⏱</button>
+        <button class="ed-btn wf-runs" title="run history">⟲</button>
+        <button class="ed-btn wf-del" title="delete">✕</button>
+      </div>`;
+    $(".wf-run", el).onclick = () => wfRenderRun(body, w);
+    $(".wf-edit", el).onclick = () => wfRenderEditor(body, w);
+    $(".wf-sched-btn", el).onclick = () => wfSchedule(body, w);
+    $(".wf-runs", el).onclick = () => wfRenderRuns(body, w);
+    $(".wf-del", el).onclick = async () => { if (!await confirmAction("Delete workflow?", `“${w.name}” and its schedule will be removed.`)) return; await fetch("/api/workflows/" + w.id, { method: "DELETE" }); wfRenderList(body); };
+    list.appendChild(el);
+  });
+}
+async function wfSchedule(body, w) {
+  const cron = await promptDialog("Schedule workflow", { value: w.schedule ? w.schedule.cron : "",
+    message: "Cron · min hr day mon wkday — leave blank to unschedule", okLabel: "Save" });
+  if (cron === null) return;
+  await _postJ("/api/workflows/" + w.id + "/schedule", { cron });
+  wfRenderList(body);
+}
+async function wfRenderEditor(body, w) {
+  await wfLoadTools();
+  _wfEnumCache = {}; _wfFilesCache = null;        // refresh skill/workflow/file pickers each time the editor opens
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button>
+      <input id="wfName" class="wf-name-in" placeholder="workflow name" value="${w ? escapeHtml(w.name) : ""}">
+      <input id="wfDesc" class="wf-desc-in" placeholder="description (optional)" value="${w ? escapeHtml(w.description || "") : ""}">
+      <span class="fe-spacer"></span>
+      <button class="primary sm" id="wfSave">${w ? "Save" : "Create"}</button></div>
+    <div class="wf-palette">
+      <span class="wf-pal-lbl">add:</span>
+      <button class="ed-btn" data-add="tool">🔧 Tool</button>
+      <button class="ed-btn" data-add="instruction">✎ Instruction</button>
+      <button class="ed-btn" data-add="delegate">↗ Delegate</button>
+      <button class="ed-btn" data-add="decision">◆ Decision</button>
+      <button class="ed-btn" data-add="end">■ End</button>
+      <span class="fe-spacer"></span>
+      <button class="ed-btn" id="wfZoomOut">−</button><button class="ed-btn" id="wfZoomIn">+</button>
+      <span class="wf-hint">drag from a node's right dot to another's left dot to connect</span>
+    </div>
+    <div class="wf-canvas" id="wfCanvas"></div>`;
+  $("#wfBack", body).onclick = () => wfRenderList(body);
+  const editor = new Drawflow($("#wfCanvas", body));
+  editor.reroute = true;
+  editor.start();
+  let addN = 0;
+  const place = n => { addN++; return [80 + (addN % 6) * 46, 70 + (addN % 6) * 40]; };
+  const addNode = (type, x, y, n) => {
+    const [px, py] = (x != null) ? [x, y] : place();
+    const [ins, outs] = WF_PORTS[type];
+    const cfg = n || { type };
+    const data = wfNodeData(cfg);
+    const dfId = editor.addNode(type, ins, outs, px, py, "wf-dfn wf-dfn-" + type, data, wfNodeHtml(type, data));
+    if (type === "tool") wfWireTool(editor, dfId, data.tool, cfg.args || {});
+    return dfId;
+  };
+  // build from the saved graph, or seed a fresh start node
+  if (w && w.graph && w.graph.nodes && w.graph.nodes.length) {
+    const map = {};
+    w.graph.nodes.forEach(n => { map[n.id] = addNode(n.type, n.x || 60, n.y || 60, n); });
+    (w.graph.edges || []).forEach(e => {
+      const from = map[e.from], to = map[e.to]; if (from == null || to == null) return;
+      const src = w.graph.nodes.find(x => x.id === e.from) || {};
+      const port = src.type === "decision" ? (e.branch === "no" ? "output_2" : "output_1") : "output_1";
+      try { editor.addConnection(from, to, port, "input_1"); } catch {}
+    });
+  } else {
+    addNode("start", 40, 80, { type: "start" });
+  }
+  $$(".wf-palette [data-add]", body).forEach(b => b.onclick = () => addNode(b.dataset.add));
+  $("#wfZoomIn", body).onclick = () => editor.zoom_in();
+  $("#wfZoomOut", body).onclick = () => editor.zoom_out();
+  $("#wfSave", body).onclick = async () => {
+    const name = $("#wfName").value.trim(); if (!name) { toast("name is required", "err"); return; }
+    const { graph, error } = wfReadCanvas(editor);
+    if (error) { toast(error, "err"); return; }
+    const payload = { name, description: $("#wfDesc").value.trim(), graph };
+    if (w) await fetch("/api/workflows/" + w.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    else await _postJ("/api/workflows", payload);
+    wfRenderList(body);
+  };
+}
+function wfReadCanvas(editor) {
+  const data = editor.export().drawflow.Home.data;
+  const nodes = [], edges = [];
+  let error = null;
+  for (const k in data) {
+    const nd = data[k], id = +k, d = nd.data || {};
+    const node = { id, type: nd.name, x: Math.round(nd.pos_x), y: Math.round(nd.pos_y) };
+    if (nd.name === "tool") {
+      node.tool = d.tool || "";
+      try { node.args = (d.args || "").trim() ? JSON.parse(d.args) : {}; }
+      catch { error = `invalid JSON in tool node “${node.tool || id}”`; node.args = {}; }
+    } else if (nd.name === "instruction") node.text = d.text || "";
+    else if (nd.name === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; }
+    else if (nd.name === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleOp || "contains"; node.ruleValue = d.ruleValue || ""; node.role = d.role || "default"; }
+    nodes.push(node);
+    const outs = nd.outputs || {};
+    for (const oname in outs) (outs[oname].connections || []).forEach(c =>
+      edges.push({ from: id, to: +c.node, branch: nd.name === "decision" ? (oname === "output_2" ? "no" : "yes") : null }));
+  }
+  return { graph: { nodes, edges }, error };
+}
+async function wfRenderRun(body, w) {
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
+    <div class="wf-run-steps" id="wfRunSteps"></div>`;
+  $("#wfBack", body).onclick = () => wfRenderList(body);
+  const host = $("#wfRunSteps", body), status = $("#wfRunStatus", body), rows = {};
+  const addRow = (id, label) => {
+    const r = document.createElement("div"); r.className = "wf-run-step running";
+    r.innerHTML = `<div class="wf-rs-h"><span class="wf-rs-ic">◌</span><span class="wf-rs-label">${escapeHtml(label || "")}</span><span class="wf-rs-branch"></span></div><div class="wf-rs-tools"></div><div class="wf-rs-out"></div>`;
+    host.appendChild(r); host.scrollTop = host.scrollHeight; rows[id] = r; return r;
+  };
+  try {
+    const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST" });
+    const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = "";
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true }); let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line.startsWith("data: ")) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+        if (ev.event === "node_start") addRow(ev.id, ev.label);
+        else if (ev.event === "tool" && rows[ev.id] && ev.text) { const t = document.createElement("div"); t.className = "wf-rs-tool"; t.textContent = ev.text; $(".wf-rs-tools", rows[ev.id]).appendChild(t); }
+        else if (ev.event === "node_end" && rows[ev.id]) {
+          const r = rows[ev.id]; r.className = "wf-run-step " + (ev.ok ? "ok" : "fail");
+          $(".wf-rs-ic", r).textContent = ev.ok ? "✓" : "✗";
+          if (ev.branch) $(".wf-rs-branch", r).textContent = "→ " + ev.branch;
+          $(".wf-rs-out", r).textContent = (ev.output || "").trim();
+        } else if (ev.event === "done") { status.textContent = ev.run ? ev.run.summary : "done"; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail"); }
+        else if (ev.event === "error") { status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail"; }
+      }
+      host.scrollTop = host.scrollHeight;
+    }
+  } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; }
+}
+async function wfRenderRuns(body, w) {
+  body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>History · ${escapeHtml(w.name)}</h3></div><div class="wf-runs-list" id="wfRunsList"><div class="empty-note">loading…</div></div>`;
+  $("#wfBack", body).onclick = () => wfRenderList(body);
+  let runs; try { runs = await api("/api/workflows/" + w.id + "/runs"); } catch { return; }
+  const list = $("#wfRunsList", body);
+  if (!runs.length) { list.innerHTML = `<div class="empty-note">No runs yet — hit ▶ Run.</div>`; return; }
+  list.innerHTML = "";
+  runs.forEach(r => {
+    const el = document.createElement("div"); el.className = "wf-run-rec " + (r.status === "ok" ? "ok" : "fail");
+    el.innerHTML = `<div class="wf-rr-h"><span class="wf-rr-status">${r.status === "ok" ? "✓" : "✗"}</span><span class="wf-rr-sum">${escapeHtml(r.summary || "")}</span><span class="fe-spacer"></span><span class="wf-rr-meta">${escapeHtml((r.ts || "").slice(0, 16).replace("T", " "))} · ${escapeHtml(r.trigger || "")}</span></div><div class="wf-rr-steps"></div>`;
+    const det = $(".wf-rr-steps", el);
+    (r.steps || []).forEach(s => { const d = document.createElement("div"); d.className = "wf-rr-step"; d.innerHTML = `<div class="wf-rr-sl">${s.ok ? "✓" : "✗"} ${escapeHtml(s.label || "")}${s.branch ? ` <span class="wf-rr-br">→ ${escapeHtml(s.branch)}</span>` : ""}</div><div class="wf-rr-out">${escapeHtml((s.output || "").trim().slice(0, 400))}</div>`; det.appendChild(d); });
+    el.querySelector(".wf-rr-h").onclick = () => el.classList.toggle("open");
+    list.appendChild(el);
+  });
+}
+
+/* ---------------- background-jobs running indicator (global, polled) ---------------- */
+let _jobsLast = [], _jobsTimer = null;
+function renderJobsPop(pop) {
+  if (!_jobsLast.length) { pop.innerHTML = `<div class="jb-empty">No background jobs running.</div>`; return; }
+  pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j =>
+    `<div class="jb-item jb-${j.state}"><span class="jb-k">${escapeHtml(j.kind)}</span><span class="jb-l">${escapeHtml(j.label)}</span><span class="jb-m">${j.state === "queued" ? "queued" : Math.round(j.elapsed) + "s"}</span></div>`).join("");
+}
+async function pollJobs() {
+  let d; try { d = await api("/api/jobs"); } catch { return; }
+  _jobsLast = d.jobs || [];
+  const n = (d.running || 0) + (d.queued || 0), badge = $("#jobsBadge");
+  if (badge) {
+    badge.style.display = n ? "flex" : "none";
+    $("#jbCount").textContent = n;
+    badge.classList.toggle("active", (d.running || 0) > 0);
+    badge.classList.toggle("only-queued", (d.running || 0) === 0 && (d.queued || 0) > 0);
+    badge.title = n ? `${d.running || 0} running${d.queued ? ", " + d.queued + " queued" : ""}` : "";
+  }
+  const pop = $("#jobsPop"); if (pop && pop.classList.contains("open")) renderJobsPop(pop);
+  // highlight the exact workflow cards / scheduler rows whose job is running (match by ref)
+  const running = new Set(_jobsLast.filter(j => j.state === "running" && j.ref).map(j => j.ref));
+  $$(".wf-card[data-wid]").forEach(c => c.classList.toggle("job-running", running.has("workflow:" + c.dataset.wid)));
+  $$(".sched-row[data-tid]").forEach(r => r.classList.toggle("job-running", running.has(r.dataset.src) || running.has("task:" + r.dataset.tid)));
+}
+
 /* ---------------- wiring ---------------- */
 const autosize = t => { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; };
 function wire() {
@@ -2585,11 +3288,16 @@ function wire() {
 
   $$(".nav-item").forEach(n => n.onclick = () => {
     const v = n.dataset.view;
-    if (v === "files") openExplorer();
+    if (v === "chat") { setView("chat"); sideShowChats(); }
+    else if (v === "files") openExplorer();
     else if (v === "brain") openBrain();
     else if (v === "scheduler") openScheduler();
     else if (v === "calendar") openCalendar();
     else if (v === "researcher") openResearcher();
+    else if (v === "workflows") openWorkflows();
+    else if (v === "search") openSearch();
+    else if (v === "notes") openNotes();
+    else if (v === "health") openHealth();
     else setView(v);
   });
 
@@ -2600,6 +3308,11 @@ function wire() {
   $("#openSettings").onclick = openSettings;
   $("#toggleSidebar").onclick = () => $("#sidebar").classList.toggle("open");
   $("#liveBtn").onclick = openLiveView;
+  { const vb = $("#voiceBtn"); if (vb) vb.onclick = openVoice; }
+  { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
+  { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
+  document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
+  pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);
 
   // files
   $("#fRefresh").onclick = () => loadFiles(state.cwd);

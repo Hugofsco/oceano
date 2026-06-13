@@ -162,8 +162,15 @@ Finish with a 2-3 line summary of what you added or changed this run."""
 
 
 def run_topic(rid):
-    """One research run: drive the agent, then re-index the docs into RAG.
-    Called by the scheduler when its [ RESEARCH ] task is due, or by Run-now."""
+    """One research run, registered as a background job so the UI can show it running."""
+    from oceano import jobs
+    with jobs.job("research", f"research #{rid}", ref=f"research:{rid}"):
+        return _run_topic(rid)
+
+
+def _run_topic(rid):
+    """Drive the agent, then re-index the docs into RAG. Called by the scheduler when its
+    [ RESEARCH ] task is due, or by Run-now."""
     con = _db()
     row = con.execute("SELECT topic, focus, doc FROM topics WHERE id=?", (rid,)).fetchone()
     con.close()

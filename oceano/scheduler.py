@@ -191,14 +191,43 @@ def is_due(cron, last_run, now=None):
     return croniter(cron, base).get_next(datetime) <= now
 
 
+def _dispatch(source, instruction, ref=None):
+    """Run one task's action by its source tag and return the result string. Shared by
+    the scheduled loop and the on-demand 'run now'. Always runs in the background channel —
+    everything here is unattended, so it must never drive the user's shared live browser.
+
+    The specialized jobs (research/skills/evals/memory/workflow) register themselves in the
+    jobs registry (so 'run now' from their own panels is tracked too); only the plain agent
+    task is wrapped here."""
+    from oceano.agent import Agent
+    from oceano import tools, jobs
+    with tools.background():
+        if source and source.startswith("research:"):        # Researcher-owned entry
+            from oceano import researcher
+            return researcher.run_topic(int(source.split(":", 1)[1]))
+        if source == "skills:eval":                          # locked skills-evaluation entry
+            from oceano import skills
+            return skills.evaluate_all()
+        if source == "evals:run":                            # locked model-eval suite
+            from oceano import evals
+            evals.run_all_bg()                               # long → background, don't wedge the caller
+            return "model eval suite started in the background"
+        if source == "memory:maintain":                      # locked memory-hygiene job
+            from oceano import memory
+            return memory.maintain()                         # delegates to Claude Code, applies the plan
+        if source and source.startswith("workflow:"):        # a user-defined workflow
+            from oceano import workflows
+            return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule").get("summary", "workflow ran")
+        with jobs.job("task", instruction, ref=ref):
+            return Agent().run(instruction)
+
+
 def run_due_once():
     """Stamp the heartbeat, run every task that's due, push each result. Blocking.
 
     Returns the number of tasks run. A failing task is logged + skipped (its
     last_run still advances) so one bad task can't wedge the whole loop.
     """
-    from oceano.agent import Agent
-    from oceano import tools
     beat()                                  # tell the UI we're alive
     con = _db()
     rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source FROM tasks").fetchall()
@@ -209,24 +238,7 @@ def run_due_once():
             continue
         print(f"[scheduler] running #{tid}: {instruction}")
         try:
-            # everything the scheduler runs is unattended → never drive the user's
-            # shared live browser (applies uniformly to research, skills-eval, tasks)
-            with tools.background():
-                if source and source.startswith("research:"):    # Researcher-owned entry
-                    from oceano import researcher
-                    answer = researcher.run_topic(int(source.split(":", 1)[1]))
-                elif source == "skills:eval":                    # locked skills-evaluation entry
-                    from oceano import skills
-                    answer = skills.evaluate_all()
-                elif source == "evals:run":                      # locked model-eval suite
-                    from oceano import evals
-                    evals.run_all_bg()                           # long → background, don't wedge the loop
-                    answer = "model eval suite started in the background"
-                elif source == "memory:maintain":                # locked memory-hygiene job
-                    from oceano import memory
-                    answer = memory.maintain()                   # delegates to Claude Code, applies the plan
-                else:
-                    answer = Agent().run(instruction)
+            answer = _dispatch(source, instruction, ref=source or f"task:{tid}")
             notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task")
         except Exception as e:
             print(f"[scheduler] task #{tid} failed: {e}")
@@ -235,3 +247,28 @@ def run_due_once():
     con.commit()
     con.close()
     return ran
+
+
+def run_task(tid, advance=True):
+    """Run a scheduled task right now, on demand — ignores the cron. Returns
+    {ok, result} or {ok: False, error}. advance=True stamps last_run so the heartbeat
+    won't immediately re-fire a task that happened to be due. Blocking (call off the
+    event loop); long jobs (evals) already detach themselves."""
+    con = _db()
+    row = con.execute("SELECT instruction, source FROM tasks WHERE id=?", (tid,)).fetchone()
+    con.close()
+    if not row:
+        return {"ok": False, "error": "no such task"}
+    instruction, source = row
+    print(f"[scheduler] manual run #{tid}: {instruction}")
+    try:
+        answer = _dispatch(source, instruction, ref=source or f"task:{tid}") or ""
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if advance:
+        con = _db()
+        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), tid))
+        con.commit()
+        con.close()
+    notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task (manual)")
+    return {"ok": True, "result": answer}

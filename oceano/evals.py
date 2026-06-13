@@ -330,6 +330,15 @@ def state():
 
 
 def run_all(models=None):
+    """Run the eval suite, registered as a (non-gated) background job so the UI shows it.
+    serialize=False: the suite is long and paces its own model calls, so it shouldn't hold
+    the global queue gate for every other background job."""
+    from oceano import jobs
+    with jobs.job("eval", "model eval suite", ref="evals:run", gate=False):
+        return _run_all(models)
+
+
+def _run_all(models=None):
     """Run every enabled case against each target model (default: served local
     models), grouped by model so llama-swap swaps once per model. Stores a run +
     its results, returns a short summary string. Blocking — call in a thread."""

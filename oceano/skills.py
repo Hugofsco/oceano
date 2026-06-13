@@ -220,6 +220,13 @@ def eval_state():
 
 
 def evaluate_all():
+    """Run the skills pipeline once, registered as a background job so the UI shows it."""
+    from oceano import jobs
+    with jobs.job("skills", "skills evaluation", ref="skills:eval"):
+        return _evaluate_all()
+
+
+def _evaluate_all():
     """Run the full pipeline once. Returns a human-readable summary (also stored
     in eval_state for the UI). Called by the locked scheduler entry or Evaluate-now."""
     if _EVAL_STATE["running"]:
