@@ -143,6 +143,11 @@ async def lifespan(_app):
         memory.ensure_maintenance_task()   # the locked '[ MEMORY ]' hygiene schedule
     except Exception:
         traceback.print_exc()
+    try:
+        from oceano import reindex
+        reindex.ensure_task()              # the locked '[ INDEX ]' reindex schedule
+    except Exception:
+        traceback.print_exc()
     yield
     await telegram_runtime.stop()
     try:

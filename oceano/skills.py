@@ -96,6 +96,33 @@ def catalog():
     return "\n".join(f"- {s['name']}: {s['description']}" for s in _published())
 
 
+def reindex():
+    """Warm the skill-relevance embedding cache for present published skills, and drop cache
+    entries for skills that no longer exist. Returns a short summary. Only present skills kept."""
+    pubs = _published()
+    dirs = {s["dir"] for s in pubs}
+    warmed = failed = 0
+    for s in pubs:
+        path = SKILLS_DIR / s["dir"] / "SKILL.md"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        hit = _VEC_CACHE.get(s["dir"])
+        if hit and hit[0] == mtime:
+            continue                                 # already cached at this version
+        vec = embeddings.embed(f"{s['name']}: {s['description']}")
+        if vec:
+            _VEC_CACHE[s["dir"]] = (mtime, vec); warmed += 1
+        else:
+            failed += 1
+    stale = [d for d in list(_VEC_CACHE) if d not in dirs]
+    for d in stale:
+        _VEC_CACHE.pop(d, None)
+    return (f"{len(pubs)} published, {warmed} (re)embedded, {len(stale)} stale dropped"
+            + (f", {failed} embed-failed" if failed else ""))
+
+
 def relevant(query, k=6):
     """The published skills most relevant to this prompt, as catalog lines.
     Semantic top-k when the embed server is up; the full catalog otherwise

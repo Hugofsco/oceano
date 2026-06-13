@@ -215,6 +215,9 @@ def _dispatch(source, instruction, ref=None):
         if source == "memory:maintain":                      # locked memory-hygiene job
             from oceano import memory
             return memory.maintain()                         # delegates to Claude Code, applies the plan
+        if source == "reindex:all":                          # locked index re-sync (docs/memories/skills/chats)
+            from oceano import reindex
+            return reindex.reindex_all()
         if source and source.startswith("workflow:"):        # a user-defined workflow
             from oceano import workflows
             return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule").get("summary", "workflow ran")

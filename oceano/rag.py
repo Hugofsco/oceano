@@ -185,3 +185,39 @@ def search(query, k=6):
     scored.sort(key=lambda x: x[0], reverse=True)
     return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
             for s, p, c in scored[:k]]
+
+
+def reindex():
+    """Re-sync the doc index to disk: drop chunks for indexed files that no longer exist,
+    and re-embed files whose content changed since they were indexed. (Brand-new files are
+    added via index_docs.) Returns a short summary. Only what's present is kept."""
+    con = _db()
+    rows = con.execute("SELECT path, hash FROM docmeta").fetchall()
+    present = refreshed = pruned = 0
+    for path, oldh in rows:
+        p = Path(path)
+        if not p.is_file():                          # file gone → prune its chunks + meta
+            con.execute("DELETE FROM chunks WHERE path=?", (path,))
+            con.execute("DELETE FROM docmeta WHERE path=?", (path,))
+            con.commit()
+            pruned += 1
+            continue
+        present += 1
+        text = _read(p)
+        h = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+        if h == oldh:
+            continue                                 # unchanged
+        con.execute("DELETE FROM chunks WHERE path=?", (path,))
+        ok = True
+        for ch in _chunks(text):
+            vec = embeddings.embed(ch)
+            if not vec:                              # embed server down → leave this file for next run
+                ok = False
+                break
+            con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)", (path, ch, json.dumps(vec)))
+        if ok:
+            con.execute("INSERT OR REPLACE INTO docmeta (path, hash) VALUES (?,?)", (path, h))
+            refreshed += 1
+        con.commit()
+    con.close()
+    return f"{present} present, {refreshed} refreshed, {pruned} pruned"
