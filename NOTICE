@@ -28,6 +28,21 @@ distributed under its own license:
   Copyright (c) Ivan Sagalaev and other contributors.
   License: BSD-3-Clause — https://github.com/highlightjs/highlight.js/blob/main/LICENSE
 
+- Mermaid (oceano/web/static/vendor/mermaid.min.js)
+  Diagram rendering for the Preview artifact view.
+  Copyright (c) Knut Sveidqvist and contributors.
+  License: MIT — https://github.com/mermaid-js/mermaid/blob/develop/LICENSE
+
+- Chart.js (oceano/web/static/vendor/chart.umd.min.js)
+  Charts for the Preview artifact view.
+  Copyright (c) Chart.js Contributors.
+  License: MIT — https://github.com/chartjs/Chart.js/blob/master/LICENSE.md
+
+- Drawflow (oceano/web/static/vendor/drawflow.min.js and drawflow.min.css)
+  Node-based canvas for the Workflows editor.
+  Copyright (c) Jero Soler.
+  License: MIT — https://github.com/jerosoler/Drawflow/blob/master/LICENSE
+
 Runtime model engines (faster-whisper, Piper, plus the GGUF/ONNX model files
 themselves) are installed via pip and downloaded at install/first-run — they are
 NOT bundled in this repository. See assets/README.md and requirements.txt; each

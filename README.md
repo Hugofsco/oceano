@@ -24,18 +24,31 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **24 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
-  headless browser, long-term memory, document RAG, skills, and scheduling; plus any
-  tools from MCP servers you connect.
+- **29 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
+  headless browser, long-term memory, document RAG, skills, scheduling, workflows, and
+  delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
-  memory is used (pin / always / when-relevant / off).
+  memory is used (pin / always / when-relevant / off). A weekly, Claude-reviewed
+  maintenance job keeps the store deduped — and a graph view maps how memories relate.
+- **Visual workflows.** Draw branching, multi-step recipes on a node canvas
+  (tool · instruction · delegate · decision), run them on demand or on a schedule, and
+  watch each node execute live. See [Workflows](#workflows).
+- **Configurable delegation.** Hand a heavy subtask to a stronger assistant — Claude
+  Code (no API key, via the `claude` CLI) or a cloud model run as a full agent — with
+  *who* chosen in Settings, and a separate target for the self-improving jobs.
 - **Watch it browse.** A multi-tab live browser streams what the agent sees; a web
   search spins up a tab per source so you can see exactly what it read.
+- **Run-aware + optional queue.** A live indicator shows every background job
+  (workflows, scheduled tasks, research, …); an optional setting serializes them — and,
+  if you want, chat — so the single local model isn't hit in parallel.
 - **Rivers** — browse Hugging Face GGUF models, see which fit your GPU (auto-scored),
   download them, and one-click "serve" them into `llama-swap`.
-- **Web UI** — floating windows, auth (login required), agent mode, live tool-call
-  cards, streamed reasoning, file explorer, and a "Brain" for memory/skills/knowledge.
+- **A desktop of apps.** Floating windows: chat with dated history folders, a "Brain"
+  (memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
+  Scheduler, Calendar, Researcher, semantic Search, a Kanban Notes board, a
+  System-health dashboard, a Memory graph, a Voice console, and a sandboxed Preview that
+  renders web apps, markdown, Mermaid, charts, and slide decks.
 
 ---
 
@@ -76,7 +89,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (24)
+## The agent's tools (29)
 
 | Group | Tools |
 |-------|-------|
@@ -85,8 +98,11 @@ from a web UI or Telegram.
 | **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget_memory` |
 | **Documents (RAG)** | `index_docs`, `search_docs` |
-| **Skills** | `list_skills`, `load_skill` |
+| **Skills** | `list_skills`, `load_skill`, `learn_skill` |
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
+| **Workflows** | `run_workflow`, `list_workflows` (trigger saved workflows; authored in the UI) |
+| **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
+| **Calendar** | `calendar_events` (read the synced local copy) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
 
 File/shell operations are fenced to `workspace/` by default (`OCEANO_CONFINE=1`).
@@ -109,6 +125,10 @@ fallback. It's designed to feel like the agent actually *remembers* you:
   the model: **Always**, **When relevant**, or **Off**. Pinned memories override.
 - **Self-correction** — the agent can `update_memory` / `forget_memory` when something
   becomes wrong or outdated.
+- **Maintenance + graph** — a locked weekly job hands the whole store to Claude Code to
+  dedupe, merge, and re-file (pinned memories are never deleted, and a run that would gut
+  the store is refused). A **graph view** (Brain → Memory → ❄ Graph) maps memories by
+  semantic similarity and shared tags, colored by category.
 
 ---
 
@@ -119,6 +139,45 @@ body). The catalog (names + descriptions) is surfaced to the agent every turn, a
 pulls the full body in with `load_skill` when a task matches. Ships with a starter
 library: `research-report`, `summarize-document`, `code-review`, `daily-digest`,
 `extract-to-csv`. Create/edit them in the UI (Brain → Skills) or by adding files.
+
+---
+
+## Workflows
+
+Named, **branching** recipes you draw on a node canvas (the Workflows window). A workflow
+is a directed graph; execution walks it from a **start** node, following edges:
+
+- **tool** — a chosen tool fired with preset arguments (a real form per tool, with
+  searchable pickers for skills / saved workflows / workspace files — no JSON to hand-write)
+- **instruction** — a free-form step run through the agent loop (it may use any tool)
+- **delegate** — hand the step to the configured delegate (Claude Code / a cloud model)
+- **decision** — routes **yes / no** down different edges, judged by a **rule** over the
+  previous step's output, the **local model**, or a **delegate**
+- **start / end**
+
+All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
+runaway loops. Run a workflow on demand (live, node-by-node progress over SSE) or on a
+cron (managed in the Scheduler); every run is recorded. The agent can *trigger* saved
+workflows with `run_workflow`, but you author them in the UI. Stored in
+`data/workflows.json`; the canvas is a vendored [Drawflow](https://github.com/jerosoler/Drawflow).
+
+---
+
+## Delegation
+
+Oceano can hand a self-contained subtask to a stronger assistant via the `delegate` tool.
+**Who** that is, is set in **Settings → Delegation** — and the default path needs no
+Anthropic API key:
+
+- **Claude Code** (default) — runs headless via the `claude` CLI inside the workspace,
+  with its own tools (uses your existing CLI login, no key passed by Oceano).
+- **A cloud model** — any configured OpenAI-compatible endpoint, run through Oceano's
+  *own* agent loop with *our* tools, so it can read, write, and run things — not just reason.
+
+Two independent **roles** let you point different work at different models: **default**
+(the agent's `delegate` tool) and **improve** (the self-improving jobs — skills review,
+eval judging, memory maintenance). The local model never grades its own work; that's
+what the `improve` delegate is for. Live readiness + a one-click test sit in the panel.
 
 ---
 
@@ -143,11 +202,19 @@ it in Settings → Account). It's a single-page app with:
 - **Auth** — cookie session, password hashed (PBKDF2) in `data/web.json`; all `/api`
   routes gated.
 - **Chat** — SSE streaming, streamed reasoning (collapsible, auto-scrolling), inline
-  tool-call cards, a **Stop** button that aborts an in-flight query, and an **Agent**
-  toggle (persists) that hands the model its tools.
-- **Floating windows** — Settings, Brain (Memory / Knowledge / Skills / Rivers), Files
-  explorer, Scheduler, and the **Live browser** (multi-tab; click to switch, watch the
-  agent research source-by-source). Drag, resize, snap, minimize.
+  tool-call cards, a **Stop** button that aborts an in-flight query, an **Agent** toggle
+  (persists) that hands the model its tools, and Telegram-style **slash commands**
+  (`/context`, `/compact`, `/status`, …) with autocomplete. The sidebar slides between
+  the app menu and dated **chat-history folders**.
+- **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
+  Evals), **Workflows** (node canvas), Files explorer + editor, Scheduler, Calendar,
+  Researcher, semantic **Search**, **Notes** (Kanban), **Health** (live system
+  dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out), the
+  **Live browser** (multi-tab — watch the agent research source-by-source), and a
+  sandboxed **Preview**. Drag, resize, snap, minimize.
+- **Preview / artifacts** — when the agent writes an `.html` app, markdown, a Mermaid
+  diagram, a Chart.js spec, or a `.slides` deck, a chip opens it rendered in an
+  origin-isolated sandbox iframe (device presets + live reload).
 - **Multiple endpoints** — local `llama.cpp` plus remote providers; models from all of
   them appear in the composer's picker.
 
@@ -161,8 +228,13 @@ it in Settings → Account). It's a single-page app with:
 - **Telegram bot** — chat with Oceano from your phone. Enable it and set the token +
   allowed user IDs in **Settings → Telegram** (it runs inside the engine, no separate
   service). Only allow-listed user IDs are answered (the agent can run shell).
-- **Scheduler** — cron tasks run by the agent autonomously; results pushed to your
-  phone via [ntfy](https://ntfy.sh). Manage in the Scheduler window.
+- **Scheduler** — cron tasks run by the agent autonomously; results pushed to your phone
+  via [ntfy](https://ntfy.sh). Manage in the Scheduler window, or hit **▶ Run** to fire
+  any job on demand (locked jobs and workflows included).
+- **Background jobs & the queue** — every unattended job (workflows, scheduled tasks,
+  research, evals, memory upkeep) registers in a live registry shown by a topbar
+  indicator. **Settings → Tools → Execution** can *serialize* them through one gate —
+  optionally including chat — so the single local model isn't hit in parallel.
 
 ---
 
@@ -262,15 +334,24 @@ oceano/
   llm.py             OpenAI-compatible client (streaming, tools)
   tools.py           the tool registry + built-in tools
   safety.py          shell/SSRF guards + untrusted-content fencing
-  memory.py          long-term memory (SQLite + embeddings, policy, pinning)
-  rag.py             document indexing + semantic search
-  skills.py          skill loading + catalog
-  scheduler.py       cron tasks + ntfy + heartbeat
+  memory.py          long-term memory (SQLite + embeddings, policy, pinning, graph, maintenance)
+  rag.py             document indexing + semantic search (incremental)
+  skills.py          skill loading + catalog + Claude-judged evaluation
+  scheduler.py       cron tasks + on-demand run + ntfy + heartbeat
+  workflows.py       visual branching workflows (graph engine + run history)
+  jobs.py            background-job registry + optional serialization gate (queue)
+  delegate.py        delegation to Claude Code / a cloud model (per-role config)
+  notes.py           Kanban scratchpad (JSON-persisted)
+  evals.py           model eval suite (cases, leaderboard, scheduled runs)
+  researcher.py      scheduled deep-dives → living docs → RAG
+  calsync.py         read-only calendar sync (ICS feeds)
+  voice.py           speech-in (faster-whisper) / speech-out (Piper) for web + Telegram
   rivers.py          Hugging Face model catalog + hardware-fit + serve
   mcp_client.py      optional MCP server connections
   browser.py         agent browser surface (SSRF-guarded)
   livebrowser.py     persistent multi-tab headless Chromium (CDP screencast)
   embeddings.py      shared embedding client (:8082)
+  atomicio.py        atomic writes for the small JSON stores
   telegram_bot.py    Telegram frontend
   web/
     server.py        FastAPI backend + all /api routes + auth
@@ -290,7 +371,8 @@ Runtime data (`data/`, `workspace/`), the virtualenv, and `oceano.env` are gitig
 ## License
 
 MIT — see [LICENSE](LICENSE). Bundled third-party libraries (CodeMirror, marked,
-DOMPurify, highlight.js) are credited with their own licenses in [NOTICE](NOTICE).
+DOMPurify, highlight.js, Mermaid, Chart.js, Drawflow) are credited with their own
+licenses in [NOTICE](NOTICE).
 
 ---
 
