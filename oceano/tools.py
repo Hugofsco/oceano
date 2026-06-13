@@ -584,6 +584,28 @@ def search_docs(query):
     return safety.wrap_untrusted("documents", rag.search_docs(query))
 
 
+@tool({
+    "type": "function",
+    "function": {
+        "name": "search_chats",
+        "description": "Search the user's PAST conversations by meaning, to recall what was "
+                       "discussed or decided before. Use this when the user refers to an earlier "
+                       "chat ('what did we decide about…', 'the conversation where we…') or you "
+                       "need context from prior sessions. Returns the closest conversations with a "
+                       "title, date, and snippet.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}
+        }, "required": ["query"]},
+    },
+})
+def search_chats(query):
+    from oceano import chats
+    res = chats.search(query, k=5)
+    if not res:
+        return "(no matching past conversations)"
+    return "\n".join(f"- [{r['date']}] {r['title']}: {r['snippet'][:160]}" for r in res)
+
+
 # --- headless browser ------------------------------------------------------
 _BG_BROWSER_NOTE = ("(the interactive/visual browser is only available in the web UI — the "
                     "user on this channel can't see it. Use fetch_url to read pages instead.)")

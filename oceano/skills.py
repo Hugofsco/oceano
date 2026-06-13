@@ -161,6 +161,51 @@ def learn_skill(name, description, body):
             f"model before being published into your active skills.")
 
 
+_DISTILL_PROMPT = """You are reviewing a conversation between a user and a local AI agent, to
+extract a REUSABLE SKILL the agent could follow next time a similar task comes up.
+
+A good skill is a GENERAL, repeatable procedure — not a one-off answer, not chit-chat, not
+facts about this particular user, not anything tied to one-time specifics. If the conversation
+contains no reusable procedure, say so honestly.
+
+Output ONLY a JSON object, nothing else:
+  {{"skill": true, "name": "<short-kebab-case>", "description": "<one line: when to use it>",
+    "body": "<the procedure as short, imperative steps>"}}
+or, when there's nothing worth saving:
+  {{"skill": false, "reason": "<one short line>"}}
+
+CONVERSATION:
+{transcript}"""
+
+
+def from_conversation(transcript):
+    """Distill a reusable skill from a chat transcript using the (improve-role) delegate — the
+    strong model writes it; the local model must never author or judge its own skills. Saved as
+    LEARNING so it enters the normal independent-review pipeline. Returns a result dict."""
+    from oceano import delegate
+    transcript = (transcript or "").strip()
+    if not transcript:
+        return {"ok": False, "error": "empty conversation — have a chat first"}
+    r = delegate.run(_DISTILL_PROMPT.format(transcript=transcript[:12000]),
+                     cwd=SKILLS_DIR, tools="Read", timeout=400, role="improve")
+    if not r.get("ok"):
+        return {"ok": False, "error": f"delegate unavailable: {r.get('error')}"}
+    m = re.search(r"\{.*\}", r.get("output", ""), re.DOTALL)
+    if not m:
+        return {"ok": False, "error": "no parsable result from the reviewer"}
+    try:
+        plan = json.loads(m.group(0))
+    except ValueError:
+        return {"ok": False, "error": "unparsable JSON from the reviewer"}
+    if not plan.get("skill"):
+        return {"ok": True, "saved": False, "reason": str(plan.get("reason", "nothing reusable found"))}
+    name, desc, body = str(plan.get("name", "")), str(plan.get("description", "")), str(plan.get("body", ""))
+    if not name.strip() or not body.strip():
+        return {"ok": True, "saved": False, "reason": "the reviewer didn't return a usable skill"}
+    learn_skill(name, desc, body)            # saved as LEARNING → independent review promotes it
+    return {"ok": True, "saved": True, "name": name, "description": desc}
+
+
 def set_status(dir, status, notes=None):
     path = SKILLS_DIR / dir / "SKILL.md"
     if not path.exists() or status not in STATUSES:

@@ -380,6 +380,7 @@ const CHAT_COMMANDS = [
   { name: "compact", args: "", desc: "summarize & shrink the context now" },
   { name: "tools", args: "", desc: "list the tools the agent can call" },
   { name: "agent", args: "[on|off]", desc: "toggle agent mode (tools)" },
+  { name: "skill", args: "", desc: "distill this conversation into a reusable skill" },
   { name: "reset", args: "", desc: "start a fresh conversation" },
   { name: "help", args: "", desc: "show this list" },
 ];
@@ -461,6 +462,14 @@ async function runSlash(cmd, text) {
     return;
   }
   if (cmd === "reset" || cmd === "clear") { fetch("/api/session/" + encodeURIComponent(sid), { method: "DELETE" }).catch(() => {}); newVoyage(); return; }
+  if (cmd === "skill") {
+    const note = addSysNote("⚗ distilling this conversation into a skill… (a stronger model is reviewing it)");
+    let d; try { d = await _postJ("/api/chats/" + encodeURIComponent(sid) + "/to-skill", {}); } catch { setSysNote(note, "⚗ skill distillation failed"); return; }
+    if (!d.ok) setSysNote(note, "⚗ " + escapeHtml(d.error || "couldn't distill a skill"));
+    else if (!d.saved) setSysNote(note, "⚗ Nothing reusable to save here — " + escapeHtml(d.reason || ""));
+    else setSysNote(note, `⚗ Saved <b>${escapeHtml(d.name)}</b> as a <i>learning</i> skill — it goes live after an independent review (Brain → Skills).<br><span class="sys-hint">${escapeHtml(d.description || "")}</span>`);
+    return;
+  }
   if (cmd === "agent") {
     const on = /^(on|off)$/i.test(arg) ? /on/i.test(arg) : !state.agent;
     state.agent = on; const t = $("#agentToggle"); if (t) t.checked = on;
@@ -2767,7 +2776,7 @@ function openSearch() {
   body.classList.add("ks-win");
   body.innerHTML = `
     <div class="ks-bar">
-      <div class="ks-scope"><button data-scope="memory" class="on">Memories</button><button data-scope="docs">Documents</button></div>
+      <div class="ks-scope"><button data-scope="memory" class="on">Memories</button><button data-scope="docs">Documents</button><button data-scope="chats">Conversations</button></div>
       <input id="ksQ" placeholder="search by meaning, not keywords…" autocomplete="off">
       <button class="primary sm" id="ksGo">Search</button>
     </div>
@@ -2788,6 +2797,10 @@ function openSearch() {
       if (scope === "memory") {
         card.innerHTML = `<div class="ks-score">${score.toFixed(2)}</div><div class="ks-bd"><div class="ks-txt">${escapeHtml(it.text || "")}</div><div class="ks-meta">${escapeHtml(it.category || "")}${it.tags ? " · " + escapeHtml(it.tags) : ""}</div></div>`;
         card.onclick = () => openBrain("mem");
+      } else if (scope === "chats") {
+        card.innerHTML = `<div class="ks-score">${score.toFixed(2)}</div><div class="ks-bd"><div class="ks-src">${escapeHtml(it.title || "Untitled")} · ${escapeHtml(it.date || "")}</div><div class="ks-txt">${escapeHtml((it.snippet || "").slice(0, 320))}</div></div>`;
+        card.title = "open this conversation";
+        card.onclick = () => { openVoyage(it.id); sideShowChats(); };
       } else {
         card.innerHTML = `<div class="ks-score">${score.toFixed(2)}</div><div class="ks-bd"><div class="ks-src">${escapeHtml(it.name || "")}</div><div class="ks-txt">${escapeHtml((it.chunk || "").slice(0, 320))}</div></div>`;
         if (it.path) { card.title = "open " + escapeHtml(it.name || ""); card.onclick = () => openDocSource(it.path); }

@@ -484,7 +484,7 @@ _TOOL_CATEGORY = {
     "browser_open": "browser", "browser_screenshot": "browser",
     "browser_click": "browser", "browser_scroll": "browser",
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
-    "index_docs": "documents", "search_docs": "documents",
+    "index_docs": "documents", "search_docs": "documents", "search_chats": "memory",
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills",
     "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
@@ -599,13 +599,13 @@ def brain_stats():
 
 @app.post("/api/brain/search")
 async def brain_search(request: Request):
-    """Semantic search over memories or indexed docs (uses the embedding engine)."""
+    """Semantic search over memories, indexed docs, or past conversations."""
     b = await request.json()
     query = (b.get("query") or "").strip()
     scope = b.get("scope", "memory")
     if not query:
         return {"results": []}
-    fn = memory.search if scope == "memory" else rag.search
+    fn = {"memory": memory.search, "docs": rag.search, "chats": chats.search}.get(scope, memory.search)
     return {"results": await asyncio.to_thread(fn, query)}   # cosine scan off the event loop
 
 
@@ -917,6 +917,16 @@ async def chats_save(cid: str, req: Request):
 def chats_delete(cid: str):
     _drop_session_state(cid)        # also free the in-memory Agent
     return {"ok": chats.delete(cid)}
+
+
+@app.post("/api/chats/{cid}/to-skill")
+async def chat_to_skill(cid: str):
+    """Distill this conversation into a reusable skill (delegated to Claude / the improve
+    model; saved as a LEARNING skill that enters the independent-review pipeline)."""
+    text = chats.transcript(cid)
+    if not text.strip():
+        return {"ok": False, "error": "no conversation yet — chat a bit first"}
+    return await asyncio.to_thread(skills.from_conversation, text)
 
 
 # ---------------- wipe (Settings → destructive, per-target) ----------------
