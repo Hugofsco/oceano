@@ -36,7 +36,9 @@ from oceano import atomicio
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 _CONFIG_PATH = config.WORKSPACE.parent / "data" / "delegation.json"
-ROLES = ("default", "improve")
+# 'default' = the agent's delegate tool · 'improve' = self-improving jobs · 'vision' = image
+# recognition (the local chat model is text-only, so images are routed to this target).
+ROLES = ("default", "improve", "vision")
 
 
 # --- provider config, per role (Settings → Delegation) ---------------------
@@ -238,6 +240,54 @@ def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30, 
     return to_claude(instructions, cwd=cwd, tools=tools, timeout=timeout, max_turns=max_turns)
 
 
+# --- vision: analyze an image via the configured target (the local chat model is text-only) ---
+def _vision_api(image_path, question, cfg):
+    """Direct multimodal completion (image_url) to a configured cloud vision model."""
+    import base64
+    import mimetypes
+    if not (cfg["base_url"] and cfg["model"]):
+        return {"ok": False, "output": "", "error": "no vision model configured (Settings → Delegation)"}
+    try:
+        data = Path(image_path).read_bytes()
+    except OSError as e:
+        return {"ok": False, "output": "", "error": f"can't read image: {e}"}
+    mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    url = f"data:{mime};base64," + base64.b64encode(data).decode()
+    try:
+        from oceano.web import server
+        key = server.endpoint_key(cfg["base_url"]) or "sk-no-key-needed"
+    except Exception:
+        key = "sk-no-key-needed"
+    try:
+        from openai import OpenAI
+        c = OpenAI(base_url=cfg["base_url"], api_key=key, timeout=120)
+        r = c.chat.completions.create(model=cfg["model"], messages=[{"role": "user", "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": url}}]}])
+        return {"ok": True, "output": (r.choices[0].message.content or "").strip(), "error": ""}
+    except Exception as e:
+        return {"ok": False, "output": "", "error": f"vision model error: {type(e).__name__}: {e}"}
+
+
+def describe_image(image_path, question="", role="vision"):
+    """Analyze an image with the configured vision target and return {ok, output, error}.
+      claude_cli → Claude Code reads the image file directly (it's multimodal);
+      api        → a direct image_url completion to the configured vision model.
+    The text result is fed back to the (text-only) local chat model as context."""
+    cfg = resolve(role)
+    q = (question or "").strip() or "Describe this image in detail."
+    q = (f"{q}\n\nDescribe only what is actually visible, concisely and factually.")
+    if cfg["provider"] == "api":
+        return _vision_api(image_path, q, cfg)
+    if not find_claude():
+        return {"ok": False, "output": "",
+                "error": "claude CLI not found — install Claude Code or configure a cloud vision model in Settings → Delegation"}
+    # Claude Code can open and 'see' image files via its Read tool (needs a few turns:
+    # read the file, then answer — keep a little headroom).
+    return to_claude(f"Open and look at the image file `{image_path}`. {q}",
+                     cwd=config.WORKSPACE, tools="Read", timeout=300, max_turns=10)
+
+
 # --- readiness (Settings → Delegation) -------------------------------------
 def status_all():
     """Claude Code readiness (shared) plus per-role provider + readiness, for the UI.
@@ -253,7 +303,8 @@ def status_all():
         return {"provider": raw["provider"], "base_url": raw["base_url"], "model": raw["model"],
                 "effective_provider": eff["provider"], "inherits": inherits, "ready": ready}
 
-    return {"claude": claude, "default": role_status("default"), "improve": role_status("improve")}
+    return {"claude": claude, "default": role_status("default"),
+            "improve": role_status("improve"), "vision": role_status("vision")}
 
 
 def probe(role="default"):

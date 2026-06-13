@@ -283,9 +283,60 @@ function appendThink(card, text) {
 }
 function finalizeThink(card) { if (!card) return; const st = $(".tk-stat", card); st.classList.remove("run"); st.textContent = ""; }
 
+/* ---------- chat attachments (drag & drop · paste · 📎) ---------- */
+let _pendingAttachments = [];
+const _rawURL = p => "/api/raw?path=" + encodeURIComponent(p);
+async function uploadFile(file) {
+  if (!file) return;
+  const fd = new FormData(); fd.append("file", file, file.name || "file");
+  let r; try { r = await fetch("/api/upload", { method: "POST", body: fd }).then(x => x.json()); }
+  catch { toast("upload failed", "err"); return; }
+  if (!r || !r.ok) { toast((r && r.error) || "upload failed", "err"); return; }
+  _pendingAttachments.push(r); renderAttachTray();
+}
+function clearAttachments() { _pendingAttachments = []; renderAttachTray(); }
+function _attChipHTML(a, removable) {
+  return (a.kind === "image" ? `<img class="att-thumb" src="${_rawURL(a.path)}" alt="">` : `<span class="att-ic">📄</span>`)
+    + `<span class="att-name">${escapeHtml(a.name)}</span>` + (removable ? `<button class="att-x" title="remove">✕</button>` : "");
+}
+function renderAttachTray() {
+  const tray = $("#attachTray"); if (!tray) return;
+  tray.innerHTML = ""; tray.style.display = _pendingAttachments.length ? "flex" : "none";
+  _pendingAttachments.forEach((a, i) => {
+    const chip = document.createElement("div"); chip.className = "att-chip att-" + a.kind; chip.innerHTML = _attChipHTML(a, true);
+    $(".att-x", chip).onclick = () => { _pendingAttachments.splice(i, 1); renderAttachTray(); };
+    tray.appendChild(chip);
+  });
+}
+function renderMsgAttachments(el, atts) {
+  if (!el || !atts.length) return;
+  const box = document.createElement("div"); box.className = "msg-atts";
+  atts.forEach(a => {
+    const c = document.createElement("div"); c.className = "att-chip att-" + a.kind; c.innerHTML = _attChipHTML(a, false);
+    if (a.kind === "image") c.onclick = () => openFileWindow(a.path);
+    box.appendChild(c);
+  });
+  el.appendChild(box);
+}
+function wireAttach() {
+  const btn = $("#attachBtn"), inp = $("#attachInput"); if (!btn || !inp) return;
+  btn.onclick = () => inp.click();
+  inp.onchange = () => { [...inp.files].forEach(uploadFile); inp.value = ""; };
+  const composer = $(".composer");
+  if (composer) {
+    ["dragover", "dragenter"].forEach(ev => composer.addEventListener(ev, e => { e.preventDefault(); composer.classList.add("drop"); }));
+    ["dragleave", "dragend"].forEach(ev => composer.addEventListener(ev, () => composer.classList.remove("drop")));
+    composer.addEventListener("drop", e => { e.preventDefault(); composer.classList.remove("drop"); [...(e.dataTransfer.files || [])].forEach(uploadFile); });
+  }
+  $("#input").addEventListener("paste", e => {
+    const imgs = [...(e.clipboardData.items || [])].filter(it => it.type.startsWith("image/"));
+    if (imgs.length) { e.preventDefault(); imgs.forEach(it => uploadFile(it.getAsFile())); }
+  });
+}
+
 async function send() {
   const input = $("#input"), text = input.value.trim();
-  if (!text || state.busy) return;
+  if ((!text && !_pendingAttachments.length) || state.busy) return;
   const sc = slashName(text);                       // composer command (/status, /compact, …)?
   if (sc) {
     input.value = ""; autosize(input); state.busy = true;
@@ -296,9 +347,12 @@ async function send() {
   state.busy = true; setSendMode(true);
   $("#send").classList.add("ping"); setTimeout(() => $("#send").classList.remove("ping"), 600);
   input.value = ""; autosize(input);
-  addUser(text); touchTitle(text); appendT({ role: "user", content: text });
+  const atts = _pendingAttachments.slice(); clearAttachments();   // capture + reset the tray
+  const ue = addUser(text); if (atts.length) renderMsgAttachments(ue, atts);
+  touchTitle(text || (atts[0] && atts[0].name) || "attachment"); appendT({ role: "user", content: text });
 
-  const payload = { session: state.session, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent };
+  const payload = { session: state.session, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
+                    attachments: atts.map(a => ({ path: a.path, name: a.name, kind: a.kind })) };
   let sounding = addThinking(), bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, rafP = false, stats = null, livePopped = false;
   const killSounding = () => { if (sounding) { sounding.remove(); sounding = null; } };
   const draw = () => { rafP = false; if (bubble) renderMD(bubble, acc + " ▌"); };
@@ -952,6 +1006,17 @@ const SETTINGS_PAGES = {
         <div class="dg-row"><button class="exp-btn dg-test" data-role="improve">Test / Re-check</button><span class="dg-probe" id="dgProbe-improve"></span></div>
       </div>
 
+      <div class="dg-role">
+        <div class="dg-h">Image recognition <span class="lbl-sub">— the local chat model is text-only; images go here</span></div>
+        <div class="dg-providers">
+          <label class="dg-prov"><input type="radio" name="dg-vision" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-vision" value="claude_cli"><span><b>Claude Code</b><i>reads the image file directly</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-vision" value="api"><span><b>Cloud model</b><i>a vision-capable endpoint you configured</i></span></label>
+        </div>
+        <select class="dg-model" id="dgModel-vision" style="display:none"></select>
+        <div class="dg-row"><button class="exp-btn dg-test" data-role="vision">Test / Re-check</button><span class="dg-probe" id="dgProbe-vision"></span></div>
+      </div>
+
       <div class="acct-actions"><span class="acct-msg" id="dgMsg"></span><button class="primary sm" id="dgSave">Save</button></div>
     </div>`,
   services: `
@@ -1099,7 +1164,7 @@ async function loadDelegation() {
   let d; try { d = await api("/api/delegate"); } catch { return; }
   dgRenderStatus(d);
   try { _dgModels = (await api("/api/models")).filter(m => !m.error); } catch { _dgModels = []; }
-  ["default", "improve"].forEach(role => dgInitRole(role, d[role] || {}));
+  ["default", "improve", "vision"].forEach(role => dgInitRole(role, d[role] || {}));
 }
 function dgInitRole(role, cfg) {
   $$(`input[name="dg-${role}"]`).forEach(r => { r.checked = (r.value === cfg.provider); r.onchange = () => dgSyncRole(role); });
@@ -1123,19 +1188,20 @@ function dgRenderStatus(d) {
     : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`)
     + `<div class="dg-hint">Authentication is confirmed only when you press <b>Test / Re-check</b> in a section below.</div>`;
 }
+const DG_LABELS = { improve: "self-improvement", vision: "image-recognition" };
 function dgRolePayload(role) {
-  const prov = ($(`input[name="dg-${role}"]:checked`) || {}).value || (role === "improve" ? "inherit" : "claude_cli");
+  const prov = ($(`input[name="dg-${role}"]:checked`) || {}).value || (role === "default" ? "claude_cli" : "inherit");
   let base_url = "", model = "";
   if (prov === "api") {
     const opt = $(`#dgModel-${role}`) && $(`#dgModel-${role}`).selectedOptions[0];
-    if (!opt || !opt.value) return { error: "pick a model for the " + (role === "improve" ? "self-improvement" : "general") + " delegate" };
+    if (!opt || !opt.value) return { error: "pick a model for the " + (DG_LABELS[role] || "general") + " delegate" };
     model = opt.value; base_url = opt.dataset.base || "";
   }
   return { role, provider: prov, base_url, model };
 }
 async function saveDelegation() {
   const msg = $("#dgMsg");
-  const payloads = ["default", "improve"].map(dgRolePayload);
+  const payloads = ["default", "improve", "vision"].map(dgRolePayload);
   const bad = payloads.find(p => p.error);
   if (bad) { if (msg) { msg.textContent = bad.error; msg.className = "acct-msg err"; } return; }
   try {
@@ -3323,6 +3389,7 @@ function wire() {
   $("#liveBtn").onclick = openLiveView;
   { const vb = $("#voiceBtn"); if (vb) vb.onclick = openVoice; }
   { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
+  wireAttach();
   { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
   document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
   pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);

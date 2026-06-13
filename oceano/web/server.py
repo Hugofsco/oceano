@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -715,6 +715,7 @@ async def chat(req: Request):
     ag.base_url = base_url
     ag.api_key = api_key
     agent_mode = bool(body.get("agent_mode"))
+    attachments = body.get("attachments") or []      # [{path, name, kind}] from /api/upload
     # so it's verifiable in the journal which mode a message actually ran in (tools
     # are only attached in agent mode) — settles "the toggle was on but it didn't use tools".
     print(f"[chat] model={ag.model!r} agent_mode={agent_mode}", flush=True)
@@ -751,10 +752,17 @@ async def chat(req: Request):
                             _compactions[sid] = _compactions.get(sid, 0) + 1
                             put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
                                                             f"(context passed {cap})."})
+                    # dropped files become context for the (text-only) local model: text is
+                    # extracted inline; images are described by the configured vision target.
+                    turn_msg = message
+                    if attachments:
+                        ctx = _attachment_context(attachments, message, put)
+                        if ctx:
+                            turn_msg = ctx + message
                     # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
                     # manage what it knows about you without full agent mode; agent mode → all tools.
                     from oceano import tools as _tools
-                    stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
+                    stream = ag.run_stream(turn_msg) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools())
                     for ev in stream:
                         if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
                             _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
@@ -1296,6 +1304,57 @@ def _wresolve(path):
     if not p.is_relative_to(config.WORKSPACE):
         raise HTTPException(400, "path escapes workspace")
     return p
+
+
+# ---------------- chat file/image drop ----------------
+_UPLOAD_DIR = config.WORKSPACE / "uploads"
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    """Save a dropped file into workspace/uploads and classify it (image / text / other)."""
+    data = await file.read()
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(413, "file too large (25 MB max)")
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    raw = (file.filename or "file").replace("\\", "/").rsplit("/", 1)[-1]
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw)[:80] or "file"
+    dest = _UPLOAD_DIR / safe
+    base, suf, n = dest.stem, dest.suffix, 1
+    while dest.exists():                                  # don't clobber an existing upload
+        dest = _UPLOAD_DIR / f"{base}_{n}{suf}"
+        n += 1
+    dest.write_bytes(data)
+    ext = dest.suffix.lower()
+    kind = "image" if ext in _IMG_EXT else ("text" if (ext in rag.TEXT_EXT or ext == ".pdf") else "other")
+    return {"ok": True, "name": dest.name, "path": str(dest.relative_to(config.WORKSPACE)), "kind": kind}
+
+
+def _attachment_context(attachments, question, put=None):
+    """Turn dropped files into text context for the (text-only) local model: text files inline,
+    images described by the configured vision target. Returns a prefix string ('' if nothing)."""
+    from oceano import rag, delegate
+    parts = []
+    for att in attachments or []:
+        try:
+            p = _wresolve(att.get("path", ""))
+        except Exception:
+            continue
+        if not p.is_file():
+            continue
+        name = att.get("name") or p.name
+        if att.get("kind") == "image":
+            if put:
+                put({"type": "notice", "text": f"🖼 analyzing {name} with the vision model…"})
+            r = delegate.describe_image(str(p), question, role="vision")
+            desc = (r.get("output") or "").strip() if r.get("ok") else f"(couldn't analyze: {r.get('error')})"
+            parts.append(f"[Attached image “{name}” — what the vision model sees:]\n{desc}")
+        else:
+            text = rag._read(p)
+            if text.strip():
+                parts.append(f"[Attached file “{name}”:]\n{text[:6000]}")
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
 
 
 @app.get("/api/files")

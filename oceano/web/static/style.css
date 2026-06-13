@@ -1219,3 +1219,17 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .wf-card.job-running{border-color:var(--biolum);box-shadow:0 0 0 1px rgba(55,227,198,.25)}
 .wf-card.job-running .wf-card-name::after{content:" · running";color:var(--biolum);font-family:var(--font-mono);font-size:10px}
 .sched-row.job-running{border-color:var(--biolum);box-shadow:0 0 0 1px rgba(55,227,198,.25)}
+
+/* chat attachments (file/image drop) */
+.attach-btn{font-size:16px;line-height:1}
+.composer.drop{outline:2px dashed var(--biolum);outline-offset:3px;border-radius:14px}
+.attach-tray{display:none;flex-wrap:wrap;gap:7px;margin-bottom:8px}
+.att-chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px 8px;max-width:240px;font-size:12px;color:var(--foam)}
+.att-chip.att-image{cursor:pointer}
+.att-thumb{width:30px;height:30px;object-fit:cover;border-radius:6px;flex:none;background:var(--abyss-0)}
+.att-ic{flex:none}
+.att-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-x{background:none;border:none;color:var(--faint);cursor:pointer;font-size:12px;padding:0 2px;flex:none}
+.att-x:hover{color:var(--coral)}
+.msg-atts{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px;justify-content:flex-end}
+.msg.user .msg-atts .att-chip{background:rgba(55,227,198,.08)}
