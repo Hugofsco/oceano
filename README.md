@@ -24,13 +24,17 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **29 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
+- **30 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
   headless browser, long-term memory, document RAG, skills, scheduling, workflows, and
   delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
-  memory is used (pin / always / when-relevant / off). A weekly, Claude-reviewed
-  maintenance job keeps the store deduped — and a graph view maps how memories relate.
+  memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
+  the configured delegate) keeps the store deduped, a graph view maps how memories relate,
+  and you can semantically search your **past conversations** too.
+- **Drop in files & images.** Attach files to a chat message (drag · paste · 📎):
+  documents are read inline, and images are understood by a configurable vision target
+  (Claude Code or a cloud vision model) since the local chat model is text-only.
 - **Visual workflows.** Draw branching, multi-step recipes on a node canvas
   (tool · instruction · delegate · decision), run them on demand or on a schedule, and
   watch each node execute live. See [Workflows](#workflows).
@@ -89,14 +93,14 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (29)
+## The agent's tools (30)
 
 | Group | Tools |
 |-------|-------|
 | **Workspace / shell** | `list_files`, `read_file`, `write_file`, `edit_file` (surgical patch), `make_folder`, `run_shell`, `python_exec` |
 | **Web** | `web_search` (SearXNG), `fetch_url` (renders in the live browser) |
 | **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
-| **Memory** | `remember`, `recall`, `update_memory`, `forget_memory` |
+| **Memory** | `remember`, `recall`, `update_memory`, `forget_memory`, `search_chats` (recall past conversations) |
 | **Documents (RAG)** | `index_docs`, `search_docs` |
 | **Skills** | `list_skills`, `load_skill`, `learn_skill` |
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
@@ -125,10 +129,13 @@ fallback. It's designed to feel like the agent actually *remembers* you:
   the model: **Always**, **When relevant**, or **Off**. Pinned memories override.
 - **Self-correction** — the agent can `update_memory` / `forget_memory` when something
   becomes wrong or outdated.
-- **Maintenance + graph** — a locked weekly job hands the whole store to Claude Code to
-  dedupe, merge, and re-file (pinned memories are never deleted, and a run that would gut
-  the store is refused). A **graph view** (Brain → Memory → ❄ Graph) maps memories by
-  semantic similarity and shared tags, colored by category.
+- **Maintenance + graph** — a locked weekly job hands the whole store to the configured
+  delegate to dedupe, merge, and re-file (pinned memories are never deleted, and a run that
+  would gut the store is refused). A **graph view** (Brain → Memory → ❄ Graph) maps memories
+  by semantic similarity and shared tags, colored by category.
+- **Conversation recall** — past chats are embedded incrementally, so semantic
+  **Search → Conversations** and the agent's `search_chats` tool can surface what you
+  discussed in earlier sessions, not just stored facts.
 
 ---
 
@@ -136,9 +143,16 @@ fallback. It's designed to feel like the agent actually *remembers* you:
 
 A skill is a reusable instruction packet at `skills/<name>/SKILL.md` (front-matter +
 body). The catalog (names + descriptions) is surfaced to the agent every turn, and it
-pulls the full body in with `load_skill` when a task matches. Ships with a starter
-library: `research-report`, `summarize-document`, `code-review`, `daily-digest`,
-`extract-to-csv`. Create/edit them in the UI (Brain → Skills) or by adding files.
+pulls the full body in with `load_skill` when a task matches. Ships with a starter library
+(`research-report`, `code-review`, `daily-digest`, `debug-systematically`,
+`read-large-files`, `verify-by-running`, …). Create/edit them in the UI (Brain → Skills),
+add files directly, or let the agent **learn** them:
+
+- **`learn_skill`** — the agent distills a reusable procedure it just worked out. **`/skill`**
+  in the chat box does the same for the *current conversation*.
+- A learned skill enters as `learning` and is reviewed by an **independent** model (the
+  `improve` delegate) before it goes live: `learning` → `staged` → `published`. Only
+  published skills ever reach the agent — the model that wrote a skill never validates it.
 
 ---
 
@@ -174,10 +188,12 @@ Anthropic API key:
 - **A cloud model** — any configured OpenAI-compatible endpoint, run through Oceano's
   *own* agent loop with *our* tools, so it can read, write, and run things — not just reason.
 
-Two independent **roles** let you point different work at different models: **default**
-(the agent's `delegate` tool) and **improve** (the self-improving jobs — skills review,
-eval judging, memory maintenance). The local model never grades its own work; that's
-what the `improve` delegate is for. Live readiness + a one-click test sit in the panel.
+Three independent **roles** let you point different work at different models: **default**
+(the agent's `delegate` tool), **improve** (the self-improving jobs — skills review, eval
+judging, memory maintenance), and **vision** (image recognition — the local chat model is
+text-only, so files dropped into chat get routed here; Claude Code reads the image file
+directly, or point it at a cloud vision model). The local model never grades its own work,
+nor sees images itself. Live readiness + a one-click test sit in each section.
 
 ---
 
@@ -202,13 +218,14 @@ it in Settings → Account). It's a single-page app with:
 - **Auth** — cookie session, password hashed (PBKDF2) in `data/web.json`; all `/api`
   routes gated.
 - **Chat** — SSE streaming, streamed reasoning (collapsible, auto-scrolling), inline
-  tool-call cards, a **Stop** button that aborts an in-flight query, an **Agent** toggle
-  (persists) that hands the model its tools, and Telegram-style **slash commands**
-  (`/context`, `/compact`, `/status`, …) with autocomplete. The sidebar slides between
-  the app menu and dated **chat-history folders**.
+  tool-call cards, a **Stop** button, an **Agent** toggle (persists) that hands the model
+  its tools, Telegram-style **slash commands** (`/context`, `/compact`, `/status`,
+  `/skill`, …) with autocomplete, and **file/image attachments** (drag · paste · 📎). The
+  sidebar slides between the app menu and dated **chat-history folders**.
 - **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
   Evals), **Workflows** (node canvas), Files explorer + editor, Scheduler, Calendar,
-  Researcher, semantic **Search**, **Notes** (Kanban), **Health** (live system
+  Researcher, semantic **Search** (memories · documents · conversations), **Notes**
+  (Kanban), **Health** (live system
   dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out), the
   **Live browser** (multi-tab — watch the agent research source-by-source), and a
   sandboxed **Preview**. Drag, resize, snap, minimize.
@@ -231,8 +248,13 @@ it in Settings → Account). It's a single-page app with:
 - **Scheduler** — cron tasks run by the agent autonomously; results pushed to your phone
   via [ntfy](https://ntfy.sh). Manage in the Scheduler window, or hit **▶ Run** to fire
   any job on demand (locked jobs and workflows included).
+- **Locked maintenance jobs** — schedulable/toggleable (but not deletable) entries keep
+  Oceano healthy: a skills review, the eval suite, memory hygiene, and a nightly
+  **`[ INDEX ]` reindex** that re-syncs the doc / memory / skill / chat embeddings to disk
+  (pruning what's gone, re-embedding what changed). The self-improving jobs are judged by
+  the configured `improve` delegate, never the local model.
 - **Background jobs & the queue** — every unattended job (workflows, scheduled tasks,
-  research, evals, memory upkeep) registers in a live registry shown by a topbar
+  research, evals, memory & index upkeep) registers in a live registry shown by a topbar
   indicator. **Settings → Tools → Execution** can *serialize* them through one gate —
   optionally including chat — so the single local model isn't hit in parallel.
 
@@ -313,8 +335,9 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
 
 - **`oceano/safety.py`** — `check_shell` (refuses catastrophic commands), `check_url`
   (SSRF guard: blocks loopback/private/link-local/metadata so injections can't reach
-  your DBs/LLM/cloud metadata), and `wrap_untrusted` (fences web/doc/email text as
-  data so the model never obeys instructions hidden inside it).
+  your DBs/LLM/cloud metadata), and `wrap_untrusted` (fences web / doc / email text — and
+  the passive research-note auto-injection — as data so the model never obeys instructions
+  hidden inside it).
 - **Workspace confinement** — file tools resolve relative to `workspace/` and refuse
   to escape it.
 - **systemd hardening** — `NoNewPrivileges`, `ProtectHome=read-only` with
@@ -335,9 +358,11 @@ oceano/
   tools.py           the tool registry + built-in tools
   safety.py          shell/SSRF guards + untrusted-content fencing
   memory.py          long-term memory (SQLite + embeddings, policy, pinning, graph, maintenance)
-  rag.py             document indexing + semantic search (incremental)
-  skills.py          skill loading + catalog + Claude-judged evaluation
+  rag.py             document indexing + semantic search (incremental, self-pruning)
+  chats.py           chat persistence (dated folders) + conversation search (embeddings)
+  skills.py          skill loading + catalog + independent review + learn-from-chat
   scheduler.py       cron tasks + on-demand run + ntfy + heartbeat
+  reindex.py         locked job: re-sync doc / memory / skill / chat indexes to disk
   workflows.py       visual branching workflows (graph engine + run history)
   jobs.py            background-job registry + optional serialization gate (queue)
   delegate.py        delegation to Claude Code / a cloud model (per-role config)
