@@ -1,0 +1,69 @@
+# Oceano — full stack in containers. CPU-safe by itself; add a GPU override for
+# acceleration (scripts/install.sh --docker picks the right one from GPU detection):
+#
+#   NVIDIA:  docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+#   AMD/Intel (Vulkan): … -f docker-compose.vulkan.yml …
+#   AMD (ROCm):         … -f docker-compose.rocm.yml …
+#
+# The image (oceano:local) is built once by the installer with the matching backend and
+# shared by the three compute services. Models live in a host-mounted ../../models (kept
+# out of the image); secrets in ../../oceano.env. Everything is reachable only via the
+# oceano service's localhost-published :8800 — the rest is an internal network.
+name: oceano
+
+services:
+  oceano:                         # the engine: web UI + Telegram + scheduler
+    image: oceano:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    pull_policy: never
+    container_name: oceano
+    env_file:
+      - ../../oceano.env
+    environment:
+      OCEANO_WEB_HOST: "0.0.0.0"
+      OCEANO_LLM_URL: "http://llama-swap:8081/v1"
+      OCEANO_EMBED_URL: "http://embeddings:8082/v1"
+      OCEANO_EMBED_MANAGED: "0"
+      OCEANO_SEARXNG: "http://searxng:8080"
+    ports:
+      - "127.0.0.1:8800:8800"     # localhost only — same posture as baremetal
+    volumes:
+      - ../../data:/app/data
+      - ../../workspace:/app/workspace
+    depends_on: [embeddings, llama-swap, searxng]
+    restart: unless-stopped
+
+  embeddings:                     # nomic-embed on :8082 — CPU (-ngl 0), never touches the GPU
+    image: oceano:local
+    pull_policy: never
+    container_name: oceano-embeddings
+    command: >
+      /opt/llama.cpp/build/bin/llama-server
+      -m /models/nomic-embed-text-v1.5.Q8_0.gguf
+      --embedding --pooling mean -ngl 0 -c 8192
+      --host 0.0.0.0 --port 8082
+    volumes:
+      - ../../models:/models:ro
+    expose: ["8082"]
+    restart: unless-stopped
+
+  llama-swap:                     # chat models on :8081 — the GPU consumer (see overrides)
+    image: oceano:local
+    pull_policy: never
+    container_name: oceano-llama-swap
+    command: ["/usr/local/bin/llama-swap", "-config", "/config/llama-swap.yaml", "-listen", "0.0.0.0:8081", "-watch-config"]
+    volumes:
+      - ../../models:/models
+      - ./llama-swap.docker.yaml:/config/llama-swap.yaml
+    expose: ["8081"]
+    restart: unless-stopped
+
+  searxng:                        # web_search / fetch_url backend on :8080 (internal)
+    image: searxng/searxng:latest
+    container_name: oceano-searxng
+    volumes:
+      - ../searxng/settings.yml:/etc/searxng/settings.yml
+    expose: ["8080"]
+    restart: unless-stopped

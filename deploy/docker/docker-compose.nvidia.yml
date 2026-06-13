@@ -1,0 +1,13 @@
+# GPU override — NVIDIA (CUDA). Requires the NVIDIA Container Toolkit on the host
+# (scripts/install.sh --docker installs it for a CUDA build). Only llama-swap (the chat
+# models) gets the GPU; embeddings stay CPU.
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+services:
+  llama-swap:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

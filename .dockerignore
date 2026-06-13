@@ -1,0 +1,19 @@
+# Keep the build context small and free of host state / secrets / data.
+.git
+venv
+.venv
+llama.cpp
+models
+data
+workspace
+assets
+.claude
+node_modules
+__pycache__
+**/__pycache__
+*.pyc
+*.log
+oceano.env
+# build artifacts / editor cruft
+*.tmp
+.DS_Store

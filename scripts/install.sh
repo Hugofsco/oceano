@@ -15,11 +15,16 @@
 #  10. health summary
 #
 # Usage:
-#   scripts/install.sh            # full install (idempotent; safe to re-run)
-#   scripts/install.sh --check    # detect + probe only, change NOTHING
-#   scripts/install.sh --rebuild-llama   # force a clean llama.cpp rebuild
-#   scripts/install.sh --with-models     # also download the chat models (several GB)
+#   scripts/install.sh            # full BAREMETAL install (default; idempotent, safe to re-run)
+#   scripts/install.sh --docker   # CONTAINERIZED stack instead (docker compose; GPU auto-detected)
+#   scripts/install.sh --check    # detect + probe only, change NOTHING (either mode)
+#   scripts/install.sh --rebuild-llama   # force a clean llama.cpp rebuild (baremetal)
+#   scripts/install.sh --with-models     # also download the chat model (several GB)
 #   scripts/install.sh --yes      # don't prompt before the heavy steps
+#
+# Docker mode builds ONE image (oceano:local) with the GPU backend detect_gpu picks
+# (CUDA/Vulkan/ROCm/CPU) and brings up 4 services via deploy/docker/ — oceano (:8800),
+# embeddings (:8082, CPU), llama-swap (:8081, GPU), searxng. Models live in ./models.
 #
 # Override paths via env (same names config.py uses): OCEANO_LLAMA_DIR,
 # OCEANO_MODELS_DIR, OCEANO_LLAMA_SWAP_BIN, OCEANO_LLAMA_SWAP_CFG, EMBED_MODEL, SEARXNG_COMPOSE.
@@ -41,6 +46,8 @@ LLAMA_SWAP_BIN="${OCEANO_LLAMA_SWAP_BIN:-/usr/local/bin/llama-swap}"
 LLAMA_SWAP_CFG="${OCEANO_LLAMA_SWAP_CFG:-$LLAMA_DIR/llama-swap.yaml}"
 SEARXNG_COMPOSE="${SEARXNG_COMPOSE:-$ROOT/deploy/searxng/docker-compose.yml}"
 VENV="$ROOT/venv"
+DOCKER_DIR="$ROOT/deploy/docker"        # containerized stack (--docker)
+DOCKER_MODELS="$ROOT/models"            # host-mounted models dir for the containers
 
 # chat models llama-swap serves (only fetched with --with-models)
 declare -A CHAT_MODELS=(
@@ -48,13 +55,15 @@ declare -A CHAT_MODELS=(
 )
 
 # ---- flags -----------------------------------------------------------------
-CHECK=0; REBUILD=0; WITH_MODELS=0; ASSUME_YES=0
+CHECK=0; REBUILD=0; WITH_MODELS=0; ASSUME_YES=0; MODE=baremetal
 for a in "$@"; do case "$a" in
   --check) CHECK=1 ;;
+  --docker|--container) MODE=docker ;;
+  --baremetal|--host) MODE=baremetal ;;
   --rebuild-llama) REBUILD=1 ;;
   --with-models) WITH_MODELS=1 ;;
   --yes|-y) ASSUME_YES=1 ;;
-  -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
   *) echo "unknown flag: $a" >&2; exit 2 ;;
 esac; done
 
@@ -311,17 +320,78 @@ summary() {
 }
 
 # ============================================================================
-main() {
+# docker mode: containerized stack (compose) — GPU via a per-vendor override
+# ============================================================================
+DOCKER="docker"
+ensure_nvidia_toolkit() {   # GPU-in-Docker for CUDA needs NVIDIA's Container Toolkit on the host
+  [ "$BACKEND" = cuda ] || return 0
+  command -v nvidia-ctk >/dev/null && { ok "NVIDIA Container Toolkit present"; return 0; }
+  say "NVIDIA Container Toolkit (GPU passthrough for Docker)"
+  warn "installing nvidia-container-toolkit (adds NVIDIA's apt repo) — required for GPU in containers"
+  confirm || { skip "skipped — containers will run CPU-only"; BACKEND=cpu; CMAKE_GPU=""; return 0; }
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+  sudo apt-get update -qq && sudo apt-get install -y nvidia-container-toolkit \
+    && sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker \
+    && ok "toolkit installed + Docker configured for GPUs" \
+    || { warn "toolkit install failed — falling back to CPU containers"; BACKEND=cpu; CMAKE_GPU=""; }
+}
+docker_searxng_secret() {   # bake a real SearXNG secret_key once (same as the baremetal path)
+  local s="$ROOT/deploy/searxng/settings.yml"
+  [ -f "$s" ] && grep -q REPLACE_ME "$s" \
+    && sed -i "s/REPLACE_ME/$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48)/" "$s" || true
+}
+docker_models() {           # models live OUTSIDE the image, in a host-mounted ./models
+  say "Models (host-mounted ./models)"
+  mkdir -p "$DOCKER_MODELS"
+  fetch_model "$DOCKER_MODELS/nomic-embed-text-v1.5.Q8_0.gguf" "$EMBED_MODEL_URL"
+  if [ "$WITH_MODELS" = 1 ]; then
+    fetch_model "$DOCKER_MODELS/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
+      "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+  else skip "chat models: pass --with-models to fetch (several GB), or add one via Rivers later"; fi
+}
+docker_main() {
+  printf '%s\n' "${B}╔══ Oceano installer · docker ══╗${NC}  root=$ROOT"
+  detect_gpu
+  ensure_docker || die "Docker is required for --docker (install it, or run the baremetal default)"
+  docker info >/dev/null 2>&1 || DOCKER="sudo docker"   # use sudo only if the daemon needs it
+  ensure_nvidia_toolkit
+  oceano_env
+  docker_searxng_secret
+  docker_models
+  local BUILDER RUNTIME OVERRIDE=""
+  case "$BACKEND" in
+    cuda)   BUILDER=nvidia/cuda:12.4.1-devel-ubuntu22.04; RUNTIME=nvidia/cuda:12.4.1-runtime-ubuntu22.04; OVERRIDE=docker-compose.nvidia.yml ;;
+    vulkan) BUILDER=ubuntu:22.04;                          RUNTIME=ubuntu:22.04;                          OVERRIDE=docker-compose.vulkan.yml ;;
+    rocm)   BUILDER=rocm/dev-ubuntu-22.04:6.1.2;           RUNTIME=rocm/dev-ubuntu-22.04:6.1.2;           OVERRIDE=docker-compose.rocm.yml ;;
+    *)      BUILDER=ubuntu:22.04;                          RUNTIME=ubuntu:22.04 ;;
+  esac
+  say "Build image oceano:local ($BACKEND) — llama.cpp + python + chromium (several minutes, GBs)"
+  if confirm; then
+    $DOCKER build -f "$ROOT/Dockerfile" \
+      --build-arg BUILDER_IMAGE="$BUILDER" --build-arg RUNTIME_IMAGE="$RUNTIME" \
+      --build-arg OCEANO_BACKEND="$BACKEND" --build-arg CMAKE_GPU="$CMAKE_GPU" \
+      -t oceano:local "$ROOT" || die "image build failed"
+    ok "built oceano:local"
+  else skip "skipped build (compose needs the image — build it before 'up')"; fi
+  local files=(-f "$DOCKER_DIR/docker-compose.yml"); [ -n "$OVERRIDE" ] && files+=(-f "$DOCKER_DIR/$OVERRIDE")
+  say "Start the stack: docker compose ${files[*]} up -d"
+  confirm || { skip "skipped 'compose up' — run it yourself when ready"; return 0; }
+  $DOCKER compose "${files[@]}" up -d || die "compose up failed"
+  sleep 4
+  say "Health"
+  port_up 8800 && ok "web UI :8800 up" \
+    || warn ":8800 not answering yet — give it a moment ($DOCKER compose ${files[*]} logs -f oceano)"
+  say "Open the web UI at http://127.0.0.1:8800  (default login: admin / admin)"
+}
+
+# ============================================================================
+baremetal_main() {
   printf '%s\n' "${B}╔══ Oceano installer ══╗${NC}  root=$ROOT  llama=$LLAMA_DIR"
   detect_gpu
-  if [ "$CHECK" = 1 ]; then
-    say "Probing services (--check: no changes will be made)"
-    for pp in "8800 web" "8082 embeddings" "8081 llama-swap" "8080 searxng"; do
-      set -- $pp; port_up "$1" "/v1/models" || port_up "$1" && ok "$2 (:$1) up" || warn "$2 (:$1) down"
-    done
-    say "Would build llama.cpp with: ${CMAKE_GPU:-CPU-only}; apt: ${APT_GPU[*]:-none extra}"
-    exit 0
-  fi
   apt_deps
   gpu_driver
   build_llama
@@ -332,5 +402,18 @@ main() {
   install_llama_swap
   install_service
   summary
+}
+
+main() {
+  if [ "$CHECK" = 1 ]; then
+    detect_gpu
+    say "Probing services (--check: no changes will be made; mode=$MODE)"
+    for pp in "8800 web" "8082 embeddings" "8081 llama-swap" "8080 searxng"; do
+      set -- $pp; port_up "$1" "/v1/models" || port_up "$1" && ok "$2 (:$1) up" || warn "$2 (:$1) down"
+    done
+    say "Would build llama.cpp with: ${CMAKE_GPU:-CPU-only}; apt: ${APT_GPU[*]:-none extra}"
+    exit 0
+  fi
+  if [ "$MODE" = docker ]; then docker_main; else baremetal_main; fi
 }
 main

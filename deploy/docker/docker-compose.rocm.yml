@@ -1,0 +1,14 @@
+# GPU override — AMD ROCm/HIP. Passes the KFD compute node + DRI render nodes through.
+# ROCm-in-Docker is the least-trodden path: it needs the host ROCm kernel driver, and the
+# image must be built on a ROCm base (the installer does this for a ROCm build). If the GPU
+# isn't seen, check your `render`/`video` GIDs (getent group render video) and add them.
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+services:
+  llama-swap:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    security_opt:
+      - seccomp:unconfined

@@ -1,0 +1,11 @@
+# GPU override — Vulkan (AMD/Intel, RADV/Mesa or a vendor ICD). Passes the DRI render
+# nodes through; the image already carries libvulkan1 + mesa-vulkan-drivers for a Vulkan
+# build. Group ids vary by host — if Vulkan can't see the GPU, add your `render`/`video`
+# GIDs under group_add (find them with `getent group render video`).
+#   docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+services:
+  llama-swap:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video

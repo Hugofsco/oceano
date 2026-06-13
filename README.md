@@ -278,10 +278,15 @@ alongside the built-ins. Graceful no-op when none are configured.
 
 ## Install
 
-Designed for a fresh Ubuntu host. The installer detects the GPU and builds `llama.cpp`
-with the right backend, installs dependencies, fetches the embedding model, sets up the
-Python venv + Playwright, brings up SearXNG + `llama-swap`, and installs the systemd
-unit templated to your user/path.
+One script, two modes — **baremetal** (default, systemd) or **Docker** (containerized).
+Both auto-detect the GPU and pick the matching `llama.cpp` backend
+(**NVIDIA → CUDA**, **AMD/Intel → Vulkan**, **ROCm**, or **CPU**).
+
+### Baremetal (default)
+
+The installer detects the GPU and builds `llama.cpp` with the right backend, installs
+dependencies, fetches the embedding model, sets up the Python venv + Playwright, brings
+up SearXNG + `llama-swap`, and installs the systemd unit templated to your user/path.
 
 ```bash
 git clone https://github.com/Hugofsco/oceano.git ~/Oceano
@@ -305,6 +310,34 @@ sudo systemctl restart oceano  # restart everything
 ```
 
 Then open `http://127.0.0.1:8800` and log in with **admin / admin**.
+
+### Docker (containerized)
+
+`--docker` builds **one image** (`oceano:local`) with the detected GPU backend and brings
+up the whole stack via `docker compose` — four services: `oceano` (engine, :8800),
+`embeddings` (:8082, CPU), `llama-swap` (:8081, **GPU**), and `searxng`. Everything the
+build needs is in the repo's `Dockerfile` (llama.cpp, llama-swap, Python deps, Chromium,
+ffmpeg, espeak-ng); only the GPU models live outside it, in a host-mounted `./models`.
+
+```bash
+cp oceano.env.example oceano.env             # secrets (mounted at runtime, never baked in)
+scripts/install.sh --docker                  # detect GPU → build image → compose up
+scripts/install.sh --docker --with-models    # …and fetch the chat model into ./models
+```
+
+For an **NVIDIA** GPU it installs the NVIDIA Container Toolkit and applies
+`deploy/docker/docker-compose.nvidia.yml`; for **Vulkan/ROCm** it passes the DRI/KFD
+device nodes through (`docker-compose.vulkan.yml` / `.rocm.yml`); **CPU** needs no
+override. The compose lives in `deploy/docker/`; manage it the usual way:
+
+```bash
+cd deploy/docker
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml ps      # status
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml logs -f # logs
+```
+
+Either way, open `http://127.0.0.1:8800` (published localhost-only — same posture as
+baremetal; the other services stay on the internal network).
 
 ---
 

@@ -1,0 +1,17 @@
+# llama-swap config for the containerized stack — chat models on :8081, one resident at a
+# time. Paths are container paths (the image's llama-server + the mounted /models). Oceano's
+# Rivers "Serve" appends models here and -watch-config hot-reloads. -ngl 99 offloads to the
+# GPU when the image was built with a GPU backend (it's a no-op on a CPU build).
+#
+# The qwen3-4b entry below works once the model is present in ../../models (the installer's
+# --with-models fetches it; otherwise add a model via Rivers).
+healthCheckTimeout: 300
+logLevel: info
+models:
+  "qwen3-4b":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      -m /models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+      -ngl 99 -fa 1 --parallel 1 -c 65536 -ctk q8_0 -ctv q4_0 --jinja
+      --host 127.0.0.1 --port ${PORT}
+    ttl: 600
