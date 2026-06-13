@@ -341,10 +341,11 @@ def update(mid, text):
     return True
 
 
-# ============================ scheduled maintenance (locked, Claude-judged) ============================
-# A locked scheduler job that delegates memory hygiene to Claude Code (no API key → the
-# `claude -p` CLI), mirroring the locked eval + skills-evaluation jobs. The local model never
-# judges its own memory; Claude reviews the whole store and returns a plan, which we apply.
+# ============================ scheduled maintenance (locked, independently reviewed) ============================
+# A locked scheduler job that delegates memory hygiene to the configured 'improve' delegate
+# (Settings → Delegation; Claude Code by default — no API key needed — or a cloud model),
+# mirroring the locked eval + skills-evaluation jobs. The local model never judges its own
+# memory; the delegate reviews the whole store and returns a plan, which we apply.
 MAINT_SOURCE = "memory:maintain"
 MAINT_PREFIX = "[ MEMORY ] "
 
@@ -392,8 +393,8 @@ def maintain():
 
 
 def _maintain():
-    """One maintenance run: hand the whole memory store to Claude Code, apply its plan.
-    Pinned memories are never deleted; a plan that would wipe most of the store is refused
+    """One maintenance run: hand the whole memory store to the configured delegate, apply its
+    plan. Pinned memories are never deleted; a plan that would wipe most of the store is refused
     as a safety net. Returns a short summary. Called by the scheduler's locked job."""
     from oceano import delegate
     items = list_all(limit=1000)
@@ -402,10 +403,10 @@ def _maintain():
     listing = "\n".join(
         f'#{m["id"]} [{m["category"]}]{" 📌" if m["pinned"] else ""}: {m["text"]}' for m in items)
     prompt = _MAINT_PROMPT.format(count=len(items), listing=listing[:14000])
-    # role="improve": memory maintenance is a self-improvement job with its own delegate.
+    # role="improve": memory maintenance is a self-improvement job with its own configurable delegate.
     r = delegate.run(prompt, cwd=config.WORKSPACE, tools="Read", timeout=600, role="improve")
     if not r["ok"]:
-        return f"maintenance skipped — Claude unavailable: {r['error']}"
+        return f"maintenance skipped — delegate unavailable: {r['error']}"
     plan = _parse_plan(r["output"])
     if plan is None:
         return "maintenance skipped — no parsable plan from the reviewer"
@@ -437,8 +438,10 @@ def ensure_maintenance_task():
     """Make sure the locked '[ MEMORY ]' schedule exists (visible + retimable + toggleable
     in the Scheduler, but not deletable). Weekly, Mondays 06:00."""
     from oceano import scheduler
-    if any(t.get("source") == MAINT_SOURCE for t in scheduler.all_tasks()):
+    label = MAINT_PREFIX + "Evaluate & maintain long-term memory (dedupe, optimize) — independently reviewed via the configured delegate"
+    existing = next((t for t in scheduler.all_tasks() if t.get("source") == MAINT_SOURCE), None)
+    if existing:
+        if existing.get("instruction") != label:      # refresh stale wording on an existing entry
+            scheduler.update_task(existing["id"], instruction=label, allow_managed=True)
         return
-    scheduler.add_task("0 6 * * 1",
-                       MAINT_PREFIX + "Evaluate & maintain long-term memory (dedupe, optimize) — reviewed by Claude Code",
-                       source=MAINT_SOURCE)
+    scheduler.add_task("0 6 * * 1", label, source=MAINT_SOURCE)

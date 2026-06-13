@@ -214,7 +214,7 @@ def _dispatch(source, instruction, ref=None):
             return "model eval suite started in the background"
         if source == "memory:maintain":                      # locked memory-hygiene job
             from oceano import memory
-            return memory.maintain()                         # delegates to Claude Code, applies the plan
+            return memory.maintain()                         # delegates to the configured reviewer, applies the plan
         if source == "reindex:all":                          # locked index re-sync (docs/memories/skills/chats)
             from oceano import reindex
             return reindex.reindex_all()

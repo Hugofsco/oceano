@@ -3,8 +3,9 @@
 A CASE is a task plus graders. A RUN executes every enabled case against one or
 more target models, producing one RESULT per (case × model). Cheap deterministic
 graders (file exists / answer contains / tool was called) run in code; quality is
-scored by an INDEPENDENT judge — Claude Code via oceano.delegate — never the model
-under test. Aggregates feed the leaderboard (and, later, model routing).
+scored by an INDEPENDENT judge — the configured 'improve' delegate (oceano.delegate;
+Claude Code by default, or a cloud model) — never the model under test. Aggregates feed
+the leaderboard (and, later, model routing).
 
 Each case runs in a throwaway workspace (tools.background_workspace) so cases can't
 pollute each other or the real workspace, and so file checks are deterministic.
@@ -284,7 +285,7 @@ Score how well the agent accomplished the task. Output ONLY a JSON object:
 
 
 def _judge(case, run):
-    """Independent quality score from Claude Code. Returns a verdict dict or None."""
+    """Independent quality score from the configured 'improve' delegate. Returns a verdict dict or None."""
     from oceano import delegate
     from pathlib import Path
     prompt = _JUDGE_PROMPT.format(
@@ -509,11 +510,13 @@ def ensure_eval_task():
     """Make sure the locked '[ EVAL ]' schedule exists (visible in the Scheduler;
     its schedule + on/off are user-editable there, but it can't be deleted). Weekly."""
     from oceano import scheduler
-    if any(t.get("source") == EVAL_SOURCE for t in scheduler.all_tasks()):
+    label = "[ EVAL ] Run the model eval suite (independently judged via the configured delegate)"
+    existing = next((t for t in scheduler.all_tasks() if t.get("source") == EVAL_SOURCE), None)
+    if existing:
+        if existing.get("instruction") != label:      # refresh stale wording on an existing entry
+            scheduler.update_task(existing["id"], instruction=label, allow_managed=True)
         return
-    scheduler.add_task("0 4 * * 1",          # Mondays 04:00
-                       "[ EVAL ] Run the model eval suite (judged by Claude Code)",
-                       source=EVAL_SOURCE)
+    scheduler.add_task("0 4 * * 1", label, source=EVAL_SOURCE)   # Mondays 04:00
 
 
 _SEED_CASES = [
