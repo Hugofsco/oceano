@@ -187,20 +187,37 @@ def search(query, k=6):
             for s, p, c in scored[:k]]
 
 
+def prune_orphans():
+    """Drop every chunk whose source file no longer exists on disk — iterating the CHUNKS
+    table directly, so it also catches chunks with no docmeta row (a pre-docmeta DB or a
+    partially-written index), not just docmeta-tracked files. Stale docmeta rows are cleared
+    too. Returns the number of source files pruned. Cheap: one stat per distinct path."""
+    con = _db()
+    paths = {r[0] for r in con.execute("SELECT DISTINCT path FROM chunks").fetchall()}
+    paths |= {r[0] for r in con.execute("SELECT path FROM docmeta").fetchall()}
+    pruned = 0
+    for p in paths:
+        if not Path(p).is_file():
+            con.execute("DELETE FROM chunks WHERE path=?", (p,))
+            con.execute("DELETE FROM docmeta WHERE path=?", (p,))
+            pruned += 1
+    con.commit()
+    con.close()
+    return pruned
+
+
 def reindex():
-    """Re-sync the doc index to disk: drop chunks for indexed files that no longer exist,
-    and re-embed files whose content changed since they were indexed. (Brand-new files are
-    added via index_docs.) Returns a short summary. Only what's present is kept."""
+    """Re-sync the doc index to disk: prune chunks for files that no longer exist (incl.
+    orphan chunks with no docmeta row, via prune_orphans), then re-embed files whose content
+    changed since they were indexed. (Brand-new files are added via index_docs.) Returns a
+    short summary. Only what's present is kept."""
+    pruned = prune_orphans()                         # chunks-driven sweep (catches the docmeta-empty case)
     con = _db()
     rows = con.execute("SELECT path, hash FROM docmeta").fetchall()
-    present = refreshed = pruned = 0
+    present = refreshed = 0
     for path, oldh in rows:
         p = Path(path)
-        if not p.is_file():                          # file gone → prune its chunks + meta
-            con.execute("DELETE FROM chunks WHERE path=?", (path,))
-            con.execute("DELETE FROM docmeta WHERE path=?", (path,))
-            con.commit()
-            pruned += 1
+        if not p.is_file():                          # already handled by prune_orphans(); skip defensively
             continue
         present += 1
         text = _read(p)
