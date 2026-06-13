@@ -2395,13 +2395,17 @@ async function loadEvalHistory() {
       <button class="sr-btn ev-view">results</button><button class="sr-btn ev-del">✕</button></div>`).join("");
   $("#evClear", body).onclick = async () => {
     if (!await confirmAction("Clear eval history?", "Deletes all runs and their results. Cases and model selection are kept.")) return;
-    await fetch("/api/evals/runs/clear", { method: "POST" }); loadEvalHistory();
+    const r = await (await fetch("/api/evals/runs/clear", { method: "POST" })).json().catch(() => ({}));
+    if (r && r.error) toast(r.error, "err");
+    loadEvalHistory();
   };
   $$(".ev-run", body).forEach(el => {
     $(".ev-view", el).onclick = () => openEvalResults(+el.dataset.id);
     $(".ev-del", el).onclick = async () => {
       if (!await confirmAction("Delete this run?", "Run #" + el.dataset.id)) return;
-      await fetch("/api/evals/runs/" + el.dataset.id, { method: "DELETE" }); loadEvalHistory();
+      const r = await (await fetch("/api/evals/runs/" + el.dataset.id, { method: "DELETE" })).json().catch(() => ({}));
+      if (r && r.error) toast(r.error, "err");
+      loadEvalHistory();
     };
   });
 }

@@ -7,6 +7,7 @@ import json
 import re
 from functools import lru_cache
 
+import httpx
 from openai import OpenAI
 
 import config
@@ -14,7 +15,10 @@ import config
 
 @lru_cache(maxsize=32)
 def client(base_url, api_key):
-    return OpenAI(base_url=base_url, api_key=api_key or "sk-no-key-needed")
+    # connect timeout fails fast on a down endpoint; read/write/pool default to LLM_TIMEOUT
+    # (the per-chunk idle ceiling when streaming) so a hung socket can't stall a turn forever.
+    return OpenAI(base_url=base_url, api_key=api_key or "sk-no-key-needed",
+                  timeout=httpx.Timeout(config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT))
 
 
 # Some llama.cpp builds don't extract tool calls from certain models (e.g. Qwen3.5
@@ -106,7 +110,10 @@ def stream(messages, tools=None, model=None, temperature=0.2, base_url=None, api
                 slot["args"] += tc.function.arguments
     if calls:
         yield {"tool_calls": [calls[i] for i in sorted(calls)]}
-    elif "<tool_call>" in buf:                    # streaming parser missed them → recover
+    elif tools and "<tool_call>" in buf:          # streaming parser missed them → recover.
+        # Only when tools were actually offered: with tools=None a <tool_call> block in
+        # the text is just text, and reconstructing it would hand a tool-less turn
+        # executable calls it was never given.
         leaked = _parse_leaked_tool_calls(buf)
         if leaked:
             yield {"tool_calls": leaked}

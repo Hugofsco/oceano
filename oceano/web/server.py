@@ -152,6 +152,7 @@ async def lifespan(_app):
 app = FastAPI(title="Oceano", lifespan=lifespan)
 _sessions = {}  # session_id -> Agent
 _cancels = {}   # session_id -> threading.Event (set to abort an in-flight query)
+_locks = {}     # session_id -> threading.Lock serialising turn/compact on one Agent
 # per-session chat state for the composer's slash-commands (/context, /compact, /status)
 _ctx_cap = {}      # session_id -> auto-compact threshold (messages), or absent
 _compactions = {}  # session_id -> how many times the context was compacted this session
@@ -259,6 +260,20 @@ def _agent(sid):
     if sid not in _sessions:
         _sessions[sid] = Agent()
     return _sessions[sid]
+
+
+def _session_lock(sid):
+    """One lock per session: anything that mutates that session's Agent.messages
+    (a streaming turn, /compact, auto-compact) must hold it — two tabs can share a
+    session id, so client-side guards don't cover this."""
+    return _locks.setdefault(sid, threading.Lock())
+
+
+def _drop_session_state(sid):
+    """Forget ALL per-session state. Every session-removal path goes through here —
+    a dict missed in one path leaks stale state into a reused session id."""
+    for d in (_sessions, _cancels, _ctx_cap, _compactions, _last_ctx, _locks):
+        d.pop(sid, None)
 
 
 def _sse(obj):
@@ -635,23 +650,26 @@ async def chat(req: Request):
     def worker():
         stream = None
         try:
-            cap = _ctx_cap.get(sid)                  # /context <n> → auto-compact before the turn
-            if cap and len(ag.messages) > cap:
-                dropped = ag.compact()
-                if dropped:
-                    _compactions[sid] = _compactions.get(sid, 0) + 1
-                    put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
-                                                    f"(context passed {cap})."})
-            # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
-            # manage what it knows about you without full agent mode; agent mode → all tools.
-            from oceano import tools as _tools
-            stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
-            for ev in stream:
-                if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
-                    _last_ctx[sid] = ev["ctx"]       # remember real prompt tokens for /status
-                if cancel.is_set():
-                    break               # stop feeding — query was aborted
-                put(ev)
+            # One turn at a time per session: another tab's turn or a /compact must not
+            # mutate ag.messages while this stream is appending to it.
+            with _session_lock(sid):
+                cap = _ctx_cap.get(sid)              # /context <n> → auto-compact before the turn
+                if cap and len(ag.messages) > cap:
+                    dropped = ag.compact()
+                    if dropped:
+                        _compactions[sid] = _compactions.get(sid, 0) + 1
+                        put({"type": "notice", "text": f"🗜 Auto-compacted {dropped} messages "
+                                                        f"(context passed {cap})."})
+                # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
+                # manage what it knows about you without full agent mode; agent mode → all tools.
+                from oceano import tools as _tools
+                stream = ag.run_stream(message) if agent_mode else ag.run_stream(message, only_tools=_tools.chat_tools())
+                for ev in stream:
+                    if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
+                        _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
+                    if cancel.is_set():
+                        break           # stop feeding — query was aborted
+                    put(ev)
             if not cancel.is_set():
                 put({"type": "done"})
         except Exception as ex:
@@ -710,8 +728,7 @@ async def chat_stop(request: Request):
 
 @app.delete("/api/session/{sid}")
 def end_session(sid: str):
-    _sessions.pop(sid, None)
-    _ctx_cap.pop(sid, None); _compactions.pop(sid, None); _last_ctx.pop(sid, None)
+    _drop_session_state(sid)
     return {"ok": True}
 
 
@@ -753,7 +770,15 @@ async def chat_compact(req: Request):
     if len(ag.messages) <= 2:
         return {"ok": False, "error": "nothing to compact yet — the context is already small",
                 **_ctx_payload(sid)}
-    dropped = ag.compact()
+    lock = _session_lock(sid)
+    if not lock.acquire(blocking=False):   # a turn is streaming — compacting now would corrupt it
+        return {"ok": False, "error": "busy — wait for the current reply to finish (or Stop it) first",
+                **_ctx_payload(sid)}
+    try:
+        # summarising is a blocking LLM call — keep it off the event loop
+        dropped = await asyncio.to_thread(ag.compact)
+    finally:
+        lock.release()
     if dropped:
         _compactions[sid] = _compactions.get(sid, 0) + 1
     return {"ok": True, "dropped": dropped, **_ctx_payload(sid)}
@@ -799,8 +824,7 @@ async def chats_save(cid: str, req: Request):
 
 @app.delete("/api/chats/{cid}")
 def chats_delete(cid: str):
-    _sessions.pop(cid, None)        # also free the in-memory Agent
-    _cancels.pop(cid, None)
+    _drop_session_state(cid)        # also free the in-memory Agent
     return {"ok": chats.delete(cid)}
 
 
@@ -940,12 +964,17 @@ def evals_runs():
 
 @app.delete("/api/evals/runs/{run_id}")
 def evals_delete_run(run_id: int):
-    return {"ok": evals.delete_run(run_id)}
+    if not evals.delete_run(run_id):
+        return {"ok": False, "error": "that run is still executing — cancel it first"}
+    return {"ok": True}
 
 
 @app.post("/api/evals/runs/clear")
 def evals_clear_runs():
-    return {"ok": True, "removed": evals.clear_runs()}
+    removed = evals.clear_runs()
+    if removed is None:
+        return {"ok": False, "error": "an eval run is in progress — cancel it or let it finish first"}
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/api/evals/results")
@@ -1026,23 +1055,36 @@ def raw_file(path: str):
     return FileResponse(str(p))
 
 
+# Folders never worth statting for app auto-reload — they're what blows a preview
+# folder past the walk cap and hides the actual app files behind it.
+_MTIME_SKIP_DIRS = {"node_modules", "__pycache__", "venv", "dist", "build"}
+
+
 @app.get("/api/preview-mtime")
 def preview_mtime(path: str):
     """Latest mtime among the files in the previewed app's folder. The Preview window
     polls this to auto-reload when the agent (or you) edits the app. Defined BEFORE the
     /api/preview/{path} catch-all so it isn't swallowed by it."""
     p = _wresolve(path)
-    base = p.parent if p.is_file() else (p if p.is_dir() else config.WORKSPACE)
+    if not p.exists():
+        return {"mtime": 0}         # deleted/renamed — never walk the whole workspace for it
+    base = p.parent if p.is_file() else p
     latest, n = 0.0, 0
-    for f in base.rglob("*"):
-        if f.is_file():
+    if p.is_file():
+        try:                        # the previewed file itself ALWAYS counts, cap or not —
+            latest = p.stat().st_mtime   # edits to it must fire a reload even in a huge folder
+        except OSError:
+            pass
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in _MTIME_SKIP_DIRS and not d.startswith(".")]
+        for name in files:
             try:
-                latest = max(latest, f.stat().st_mtime)
+                latest = max(latest, (Path(root) / name).stat().st_mtime)
             except OSError:
                 pass
             n += 1
             if n >= 1000:           # cap the walk so a huge folder can't stall the poll
-                break
+                return {"mtime": latest}
     return {"mtime": latest}
 
 

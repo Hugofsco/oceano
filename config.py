@@ -10,6 +10,13 @@ LLM_API_KEY  = os.environ.get("OCEANO_LLM_KEY", "sk-no-key-needed")  # llama.cpp
 # For harder multi-step jobs: OCEANO_MODEL=gpt-oss-20b (stronger, but triggers a ~10-15s swap).
 MODEL = os.environ.get("OCEANO_MODEL", "qwen3-4b")
 
+# How long to wait on the LLM endpoint. CONNECT is short so a down llama-swap fails fast
+# instead of wedging a turn (esp. Telegram's single event loop); READ is the max idle gap
+# while a response is in flight — per-chunk when streaming — so it trips on a half-open
+# connection but never cuts off a slow-but-live generation or a cold model swap.
+LLM_CONNECT_TIMEOUT = float(os.environ.get("OCEANO_LLM_CONNECT_TIMEOUT", "10"))
+LLM_TIMEOUT = float(os.environ.get("OCEANO_LLM_TIMEOUT", "300"))
+
 # --- Workspace: the folder the agent actually works in ---
 WORKSPACE = Path(os.environ.get("OCEANO_WORKSPACE", Path(__file__).parent / "workspace")).resolve()
 

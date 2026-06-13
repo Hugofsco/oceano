@@ -29,6 +29,8 @@ _LOCAL_TZ = datetime.now().astimezone().tzinfo
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
+    con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS feeds ("
                 "id INTEGER PRIMARY KEY, name TEXT, url TEXT, "
                 "last_sync TEXT, last_error TEXT, event_count INTEGER DEFAULT 0)")

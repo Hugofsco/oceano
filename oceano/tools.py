@@ -15,7 +15,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import config
-from oceano import memory, skills, rag, browser, scheduler, safety, livebrowser
+from oceano import memory, skills, rag, browser, scheduler, safety, livebrowser, atomicio
 
 # --- channels --------------------------------------------------------------
 # Oceano is driven from several places, and they don't share a screen. The live
@@ -140,8 +140,7 @@ def _load_state():
 
 def _save_state():
     try:
-        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_PATH.write_text(json.dumps({"disabled": sorted(_DISABLED), "chat_off": sorted(_CHAT_OFF)}))
+        atomicio.write_text(_STATE_PATH, json.dumps({"disabled": sorted(_DISABLED), "chat_off": sorted(_CHAT_OFF)}))
     except OSError:
         pass
 

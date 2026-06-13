@@ -18,17 +18,21 @@ work at different models:
   • 'improve' — the SELF-IMPROVING jobs: skills review, eval judging, memory maintenance.
 'improve' may be set to 'inherit', meaning "use whatever 'default' is set to".
 
-Containment (CLI): the subprocess runs with cwd inside the workspace (or a caller-chosen
-folder) and ONLY the tools listed in `tools` are allowed — no Bash unless a caller
-explicitly grants it. Claude Code itself blocks edits outside its working directory.
+Containment (BOTH providers): the caller's `tools` spec and `timeout` are honoured
+whichever provider runs. CLI → cwd inside the workspace, --allowedTools, subprocess
+timeout. api → the spec is translated to the equivalent local tools and enforced by
+the Agent at execution time, with a wall-clock deadline on the loop. No Bash/shell
+unless a caller explicitly grants it.
 """
 import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import config
+from oceano import atomicio
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 _CONFIG_PATH = config.WORKSPACE.parent / "data" / "delegation.json"
@@ -78,8 +82,7 @@ def set_config(d, role="default"):
                     "base_url": (d.get("base_url", cur.get("base_url", "")) or "").strip(),
                     "model": (d.get("model", cur.get("model", "")) or "").strip()}
     try:
-        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_PATH.write_text(json.dumps(allcfg))
+        atomicio.write_text(_CONFIG_PATH, json.dumps(allcfg))
     except OSError:
         pass
     return allcfg[role]
@@ -140,11 +143,38 @@ def claude_version():
 
 
 # --- cloud API provider ----------------------------------------------------
-def to_api(instructions, cwd=None, role="default"):
+# How a Claude-CLI --allowedTools spec maps onto OUR tool names, so the api provider
+# honours the same containment callers ask of the CLI. Grep has no local tool —
+# read_file/list_files cover that ground. Unknown CLI names grant nothing.
+_API_TOOL_MAP = {
+    "Read": ("read_file", "list_files"),
+    "Glob": ("list_files",),
+    "Grep": ("read_file", "list_files"),
+    "Write": ("write_file", "make_folder"),
+    "Edit": ("edit_file",),
+    "Bash": ("run_shell", "python_exec"),
+}
+
+
+def _api_only_tools(tools_spec):
+    """Translate a CLI tools spec into an allowlist of our tool names.
+    None → no narrowing (the full enabled surface)."""
+    if tools_spec is None:
+        return None
+    names = set()
+    for t in (x.strip() for x in tools_spec.split(",")):
+        if t:
+            names.update(_API_TOOL_MAP.get(t, ()))
+    return names
+
+
+def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600):
     """Delegate to the configured cloud model by running it through OUR agent loop — the
-    SAME machinery local models use, so it has the full (enabled) tool surface: it can read,
-    write, run shell, browse, etc. Scoped to `cwd` (a throwaway/working folder) when given.
-    Returns {ok, output, error}. (learn=False so the task prompt is never mined into memory.)"""
+    SAME machinery local models use. `tools` (a Claude-CLI-style spec) is translated to
+    the equivalent local tools and enforced, and `timeout` puts a wall-clock deadline on
+    the loop, so this provider honours the same containment as the CLI. Scoped to `cwd`
+    (a throwaway/working folder) when given. Returns {ok, output, error}.
+    (learn=False so the task prompt is never mined into memory.)"""
     cfg = resolve(role)
     base_url, model = cfg["base_url"], cfg["model"]
     if not (base_url and model):
@@ -161,11 +191,15 @@ def to_api(instructions, cwd=None, role="default"):
         # learn=False + inject_context=False: a delegate gets a self-contained task, not the
         # user's persona/memories; exclude delegate_to_claude so it can't delegate to itself.
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
-                   inject_context=False, exclude_tools={"delegate_to_claude"})
+                   inject_context=False, exclude_tools={"delegate_to_claude"},
+                   only_tools=_api_only_tools(tools))
+        deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()
         with ctx:
-            out = ag.run(instructions)
+            out = ag.run(instructions, deadline=deadline)
         return {"ok": True, "output": (out or "").strip(), "error": ""}
+    except TimeoutError:
+        return {"ok": False, "output": "", "error": f"delegate (cloud agent) timed out after {timeout}s"}
     except Exception as e:
         return {"ok": False, "output": "", "error": f"delegate (cloud agent) error: {type(e).__name__}: {e}"}
 
@@ -199,7 +233,7 @@ def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30, 
       api        → the cloud model run through OUR agent loop with OUR tools.
     `cwd` scopes the working folder for both. role='improve' for self-improving jobs."""
     if resolve(role)["provider"] == "api":
-        return to_api(instructions, cwd=cwd, role=role)
+        return to_api(instructions, cwd=cwd, role=role, tools=tools, timeout=timeout)
     return to_claude(instructions, cwd=cwd, tools=tools, timeout=timeout, max_turns=max_turns)
 
 

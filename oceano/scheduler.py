@@ -25,6 +25,8 @@ NTFY_TOPIC = os.environ.get("OCEANO_NTFY_TOPIC", "")
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
+    con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS tasks ("
                 "id INTEGER PRIMARY KEY, cron TEXT, instruction TEXT, "
                 "last_run TEXT, enabled INTEGER DEFAULT 1, source TEXT)")

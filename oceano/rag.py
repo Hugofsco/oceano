@@ -17,6 +17,8 @@ RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes i
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
+    con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS chunks ("
                 "id INTEGER PRIMARY KEY, path TEXT, chunk TEXT, embedding TEXT)")
     # per-file content hash so re-indexing skips unchanged docs (incremental)
@@ -87,13 +89,16 @@ def index_docs(folder, only=None):
         for ch in _chunks(text):
             vec = embeddings.embed(ch)
             if not vec:
-                con.close()               # uncommitted → the DELETE above rolls back
+                con.close()               # uncommitted → only THIS file's DELETE rolls back;
+                                          # files committed earlier this run stay indexed, and a
+                                          # retry skips them (hash match) and resumes here
                 return "ERROR: embed server down — start scripts/serve-embeddings.sh"
             con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)",
                         (sp, ch, json.dumps(vec)))
             n_chunks += 1
             added = True
         con.execute("INSERT OR REPLACE INTO docmeta (path, hash) VALUES (?,?)", (sp, h))
+        con.commit()                      # per file: a later file's embed failure can't undo this one
         n_files += added
     if prune:                             # drop chunks for files removed from disk
         bp = str(base)

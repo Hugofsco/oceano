@@ -26,13 +26,16 @@ CASE_TIMEOUT = 240                                 # default per-case wall-clock
 GRADER_TYPES = ("judge", "contains", "file_exists", "tool_called")
 CATEGORIES = ("qa", "research", "code", "file", "reasoning", "tool-use")
 
-_STATE = {"running": False, "phase": "", "done": 0, "total": 0, "last": None, "cancelling": False}
+_STATE = {"running": False, "phase": "", "done": 0, "total": 0, "last": None, "cancelling": False,
+          "run_id": None}                          # id of the run row being written, while running
 _CANCEL = threading.Event()                        # set by cancel() to stop an in-progress run
 
 
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
+    con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS cases ("
                 "id INTEGER PRIMARY KEY, name TEXT, category TEXT, prompt TEXT, rubric TEXT, "
                 "graders TEXT, seed TEXT, timeout INTEGER, weight REAL DEFAULT 1.0, enabled INTEGER DEFAULT 1)")
@@ -138,11 +141,15 @@ def available_models():
 
 
 def set_selected_models(models):
-    """Persist the user's eval target selection (Brain → Evals → Models). Stored as the
-    subset of model names to run; [] means 'no explicit choice → run all available'.
+    """Persist the user's eval target selection (Brain → Evals → Models). Stored as
+    sent — NOT filtered against what's currently served, so a transient model-listing
+    failure can't silently wipe the choice; selected_models() intersects with
+    availability at run time. [] means 'no explicit choice → run all available'.
     This selection drives BOTH the manual 'Run now' and the scheduled [ EVAL ] run."""
-    avail = set(available_models())
-    chosen = [m for m in (models or []) if isinstance(m, str) and m in avail]
+    chosen = []
+    for m in models or []:
+        if isinstance(m, str) and m.strip() and m not in chosen:
+            chosen.append(m)
     _set_setting("models", chosen)
     return chosen
 
@@ -159,12 +166,13 @@ def selected_models():
 
 def models_config():
     """For the Models tab: every available model and whether it's currently a target.
-    With no saved selection yet, all models count as selected (default = run all)."""
+    'selected' comes from selected_models() — the SAME rule a run uses — so what the
+    UI shows checked is exactly what a run targets (including the run-all fallback
+    when nothing, or nothing still served, is saved)."""
     avail = available_models()
-    saved = _get_setting("models")
-    chosen = set(saved) if saved else set(avail)
+    sel = set(selected_models())
     return {"available": avail,
-            "selected": [m for m in avail if m in chosen],
+            "selected": [m for m in avail if m in sel],
             "scheduled": _scheduled_note()}
 
 
@@ -344,6 +352,7 @@ def run_all(models=None):
     run_id = cur.lastrowid
     con.commit()
     con.close()
+    _STATE["run_id"] = run_id                      # lets the delete endpoints protect this row
 
     per_model = {m: [] for m in models}
     cancelled = False
@@ -385,7 +394,8 @@ def run_all(models=None):
         con.execute("UPDATE runs SET status=?, summary=? WHERE id=?", (status, summary, run_id))
         con.commit()
         con.close()
-        _STATE.update({"running": False, "phase": "", "last": summary, "cancelling": False})
+        _STATE.update({"running": False, "phase": "", "last": summary, "cancelling": False,
+                       "run_id": None})
         _CANCEL.clear()
         _cleanup_scratch()
     return summary
@@ -427,7 +437,11 @@ def runs(limit=20):
 
 
 def delete_run(run_id):
-    """Remove one run from history along with its per-case results."""
+    """Remove one run from history along with its per-case results. Refused (False)
+    for the run currently executing — its worker is still writing rows for it, and
+    deleting the row would leave the run burning GPU invisibly with orphaned results."""
+    if _STATE["running"] and _STATE.get("run_id") == run_id:
+        return False
     con = _db()
     con.execute("DELETE FROM results WHERE run_id=?", (run_id,))
     con.execute("DELETE FROM runs WHERE id=?", (run_id,))
@@ -438,7 +452,10 @@ def delete_run(run_id):
 
 def clear_runs():
     """Wipe ALL run history + results (cases and the model selection are kept).
-    Returns the number of runs removed."""
+    Refused (None) while a run is in progress — cancel it first. Returns the
+    number of runs removed otherwise."""
+    if _STATE["running"]:
+        return None
     con = _db()
     n = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
     con.execute("DELETE FROM results")

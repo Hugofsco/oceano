@@ -10,6 +10,7 @@ import shutil
 from datetime import datetime
 
 import config
+from oceano import atomicio
 
 CHATS_DIR = config.WORKSPACE.parent / "data" / "chats"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")          # session ids come from the client → validate
@@ -55,7 +56,7 @@ def save(sid, title, messages, created=None):
         path = folder / f"{sid}.json"
     rec = {"id": sid, "title": (title or "New voyage")[:120], "created": created,
            "updated": _now(), "messages": messages or []}
-    path.write_text(json.dumps(rec))
+    atomicio.write_text(path, json.dumps(rec))   # atomic: a torn write can't lose the conversation
     return True
 
 

@@ -22,6 +22,7 @@ import requests
 import yaml
 
 import config
+from oceano import atomicio
 
 HF_API = "https://huggingface.co/api"
 HF_RESOLVE = "https://huggingface.co"
@@ -369,5 +370,5 @@ def serve(filename, name=None, ngl=99, ctx=8192, fa=True, kv="f16", ttl=600):
             raise ValueError("append did not register the model (indentation?)")
     except (yaml.YAMLError, ValueError) as e:
         return {"ok": False, "error": f"refused to write — would corrupt config: {e}"}
-    cfg.write_text(updated)
+    atomicio.write_text(cfg, updated)          # atomic: a crash can't truncate llama-swap.yaml
     return {"ok": True, "name": name, "ngl": ngl, "ctx": ctx, "fa": fa, "kv": kv, "ttl": ttl}

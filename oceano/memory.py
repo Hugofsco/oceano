@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import config
-from oceano import embeddings
+from oceano import embeddings, atomicio
 
 DB_PATH = config.WORKSPACE.parent / "data" / "memory.db"
 POLICY_PATH = config.WORKSPACE.parent / "data" / "memory_policy.json"
@@ -30,6 +30,8 @@ _DEFAULT_POLICY = {"identity": "always", "preference": "always",
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
+    con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute(
         "CREATE TABLE IF NOT EXISTS memories ("
         "id INTEGER PRIMARY KEY, ts TEXT, text TEXT, tags TEXT, embedding TEXT, "
@@ -79,8 +81,7 @@ def get_policy():
 def set_policy(policy):
     full = {c: (policy.get(c) if (policy or {}).get(c) in ("always", "relevant", "off")
                 else _DEFAULT_POLICY[c]) for c in CATEGORIES}
-    POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    POLICY_PATH.write_text(json.dumps(full, indent=2))
+    atomicio.write_text(POLICY_PATH, json.dumps(full, indent=2))
     return full
 
 
