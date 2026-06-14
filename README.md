@@ -311,6 +311,12 @@ sudo systemctl restart oceano  # restart everything
 
 Then open `http://127.0.0.1:8800` and log in with **admin / admin**.
 
+The install also drops an **`oceano`** terminal client on your PATH — the rich, streamed
+`cli.py` whose sessions persist to the same chat store as the web UI (`/chats` to resume).
+Just run `oceano`. Install/remove it on its own with `scripts/install-cli.sh`
+(`--system` for `/usr/local/bin`, `--uninstall` to remove). In Docker, get the same client
+with `docker compose exec oceano /app/venv/bin/python cli.py`.
+
 ### Docker (containerized)
 
 `--docker` builds **one image** (`oceano:local`) with the detected GPU backend and brings
@@ -416,12 +422,13 @@ oceano/
     static/          the SPA (index.html, app.js, style.css)
 config.py            central, env-overridable config
 scripts/
-  install.sh         host bootstrapper (GPU detect → build → services)
+  install.sh         host bootstrapper (GPU detect → build → services; --docker for containers)
+  install-cli.sh     installs the `oceano` terminal command (a cli.py launcher)
   serve-embeddings.sh  the embedding server launcher
 systemd/             oceano.service + oceano-llama-swap.service
 deploy/searxng/      bundled SearXNG compose + settings
 skills/              skill library (one folder per skill)
-cli.py               run the agent from the terminal
+cli.py               rich terminal client (streamed; sessions persist to data/chats/; installed as `oceano`)
 ```
 
 Runtime data (`data/`, `workspace/`), the virtualenv, and `oceano.env` are gitignored.

@@ -307,6 +307,14 @@ install_service() {
 }
 
 # ============================================================================
+# 9. the `oceano` terminal command (the rich cli.py launcher)
+# ============================================================================
+install_cli() {
+  say "oceano CLI command"
+  bash "$ROOT/scripts/install-cli.sh" 2>/dev/null || warn "CLI launcher install skipped (scripts/install-cli.sh)"
+}
+
+# ============================================================================
 # health summary
 # ============================================================================
 summary() {
@@ -317,6 +325,8 @@ summary() {
   port_up 8080        && ok "SearXNG       :8080  up" || warn "SearXNG       :8080  DOWN"
   echo
   say "Open the web UI at http://127.0.0.1:8800  (default login: admin / admin)"
+  command -v oceano >/dev/null && say "Or chat from the terminal:  oceano" \
+    || say "Terminal client: scripts/install-cli.sh  →  then run 'oceano'"
 }
 
 # ============================================================================
@@ -401,6 +411,7 @@ baremetal_main() {
   ensure_searxng
   install_llama_swap
   install_service
+  install_cli
   summary
 }
 
