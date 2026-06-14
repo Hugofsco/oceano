@@ -426,6 +426,46 @@ function stopChat() {
   fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: state.session }) }).catch(() => {});
   if (_chatAbort) _chatAbort.abort();   // stops the client read; server cancels too
 }
+// After a reload, re-attach to a reply that was still being generated server-side (the turn keeps
+// running even though the SSE dropped). Renders what was buffered, polls for the rest, then saves.
+async function maybeReconnectChat() {
+  const sid = state.session; if (!sid) return;
+  let live; try { live = await api("/api/chat/live/" + encodeURIComponent(sid)); } catch { return; }
+  if (!live || (!live.running && !(live.events || []).length)) return;
+  const lastUser = [..._curT].reverse().find(m => m.role === "user");
+  if (!live.running && lastUser && lastUser.content === live.message) return;   // already saved — skip
+  reconnectChat(sid, live);
+}
+async function reconnectChat(sid, live) {
+  if (state.busy) return;
+  state.busy = true; setSendMode(true);
+  addUser(live.message); appendT({ role: "user", content: live.message });
+  addSysNote("↻ reconnected to a reply that was still being generated…");
+  let bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null;
+  const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
+  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
+  const apply = ev => {
+    if (ev.type === "reasoning") { flushBubble(); if (!thinkCard) thinkCard = addThinkCard(); thinkText += ev.text; appendThink(thinkCard, ev.text); }
+    else if (ev.type === "token") { flushThink(); if (!bubble) bubble = addAssistant(""); acc += ev.text; renderMD(bubble, acc + " ▌"); toBottom(); }
+    else if (ev.type === "tool_call") { flushThink(); flushBubble(); lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args }; maybePreviewChip(lastCard, ev.name, ev.args); }
+    else if (ev.type === "tool_result") { fillTool(lastCard, ev.result); if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; } }
+    else if (ev.type === "answer_done") { flushThink(); if (bubble) renderMD(bubble, acc, true); }
+    else if (ev.type === "answer") { flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom(); }
+    else if (ev.type === "notice") { flushThink(); flushBubble(); addSysNote(escapeHtml(ev.text)); }
+    else if (ev.type === "error") { flushThink(); if (!bubble) bubble = addAssistant(""); acc = "⚠️ " + (ev.message || "error"); renderMD(bubble, acc); }
+  };
+  (live.events || []).forEach(apply);
+  let since = live.total != null ? live.total : (live.events || []).length, running = live.running;
+  while (running) {
+    await new Promise(r => setTimeout(r, 800));
+    let d; try { d = await api("/api/chat/live/" + encodeURIComponent(sid) + "?since=" + since); } catch { break; }
+    (d.events || []).forEach(apply);
+    since = d.total != null ? d.total : since; running = d.running;
+  }
+  flushThink(); flushBubble();
+  persistChat();
+  state.busy = false; setSendMode(false);
+}
 
 /* ---------------- composer slash-commands (mirror Telegram, minus model selection) ---------------- */
 // single source of truth — drives autocomplete, /help, and recognition
@@ -1060,7 +1100,7 @@ const SETTINGS_PAGES = {
     </div>`,
 };
 function openSettings() {
-  const { body, reused } = createWindow({ id: "win-settings", title: "Settings", icon: "⚙", width: 660, height: 560 });
+  const { body, reused } = createWindow({ id: "win-settings", title: "Settings", icon: "⚙", width: 660, height: 560, restoreKey: "settings" });
   if (reused) { loadSettingsAll(); return; }
   body.classList.add("set-win");
   body.innerHTML = `
@@ -1309,7 +1349,18 @@ async function logout() {
 
 /* ================= FLOATING WINDOWS ================= */
 let _winZ = 60;
+// --- window-session persistence: remember which app windows are open, restore them on reload ---
+function _winOpen() { try { return JSON.parse(localStorage.getItem("oceano.openwins") || "[]"); } catch { return []; } }
+function _winSet(a) { try { localStorage.setItem("oceano.openwins", JSON.stringify(a)); } catch {} }
+function _trackWin(id, key, arg) { const a = _winOpen().filter(w => w.id !== id); a.push({ id, key, arg }); _winSet(a); }
+function _untrackWin(id) { _winSet(_winOpen().filter(w => w.id !== id)); }
+function restoreWindows() {
+  const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
+                      brain: openBrain, workflows: openWorkflows, preview: openPreview, file: openFileWindow };
+  _winOpen().forEach(w => { const fn = RESTORERS[w.key]; if (fn) { try { fn(w.arg); } catch {} } });
+}
 function createWindow(opts) {
+  if (opts.restoreKey) _trackWin(opts.id, opts.restoreKey, opts.restoreArg);   // remember it's open
   const existing = opts.id && document.getElementById(opts.id);
   if (existing) { existing.style.display = "flex"; existing.style.zIndex = ++_winZ; if (existing._chip) existing._chip.remove(); return { body: $(".win-body", existing), reused: true }; }
   const win = document.createElement("div");
@@ -1341,6 +1392,7 @@ function createWindow(opts) {
   $(".win-close", win).onclick = async () => {
     if (opts.onClose && (await opts.onClose()) === false) return;   // onClose may veto the close
     if (win._chip) win._chip.remove();
+    if (opts.id) _untrackWin(opts.id);                              // forget it (don't restore next load)
     win.remove();
   };
   _dragify($(".win-bar", win), win, "move");
@@ -1486,7 +1538,7 @@ function _mapToPage(img, clientX, clientY) {           // displayed frame coords
 }
 function openLiveView() {
   const { body, reused } = createWindow({ id: "win-live", title: "Live browser — drive it, or watch Oceano", icon: "◫", width: 720, height: 600,
-    onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } } });
+    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } } });
   if (reused) return;
   body.innerHTML = `
     <div class="live-addr"><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button></div>
@@ -1553,6 +1605,7 @@ function renderLiveTabs(tabs) {
 let _expCwd = "";
 function openExplorer() {
   const { body, reused } = createWindow({ id: "win-explorer", title: "Files — workspace", icon: "▤", width: 880, height: 580,
+    restoreKey: "explorer",
     onClose: async () => {                          // warn before discarding unsaved (dirty) tabs
       const dirty = _edTabs.filter(t => t.dirty);
       if (!dirty.length) return;
@@ -1864,7 +1917,7 @@ async function _mountEditor(container, path, opts = {}) {
 async function openFileWindow(path) {                          // standalone pop-out editor window
   const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
   const name = path.split("/").pop();
-  const { body, reused } = createWindow({ id: "fw-" + path.replace(/[^a-z0-9]/gi, "_"), title: name, icon: isImg ? "▦" : "ℜ", width: 640, height: 520 });
+  const { body, reused } = createWindow({ id: "fw-" + path.replace(/[^a-z0-9]/gi, "_"), title: name, icon: isImg ? "▦" : "ℜ", width: 640, height: 520, restoreKey: "file", restoreArg: path });
   if (reused) return;
   await _mountEditor(body, path, { onSaved: () => { if (typeof _expCwd === "string") expLoad(_expCwd); } });
 }
@@ -1890,6 +1943,7 @@ let _previewTimer = null;
 function openPreview(path) {
   const name = path.split("/").pop() || path, id = "win-preview";
   const { body } = createWindow({ id, title: "Preview — " + name, icon: "▶", width: 920, height: 660,
+    restoreKey: "preview", restoreArg: path,
     onClose: () => { if (_previewTimer) { clearInterval(_previewTimer); _previewTimer = null; } } });
   body.classList.add("pv-win");
   body.innerHTML = `
@@ -1941,6 +1995,7 @@ function maybePreviewChip(card, name, argsJson) {
 const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
 function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
+    restoreKey: "brain", restoreArg: tab,
     onClose: () => { if (_riverTimer) { clearInterval(_riverTimer); _riverTimer = null; } if (_skillEvalTimer) { clearTimeout(_skillEvalTimer); _skillEvalTimer = null; } if (_evalTimer) { clearTimeout(_evalTimer); _evalTimer = null; } if (_brainEvalDotTimer) { clearInterval(_brainEvalDotTimer); _brainEvalDotTimer = null; } } });
   if (!reused) {
     body.classList.add("set-win");
@@ -3300,7 +3355,7 @@ const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
   : n.type;
 
 function openWorkflows() {
-  const { body, reused } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 940, height: 660 });
+  const { body, reused } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 940, height: 660, restoreKey: "workflows" });
   if (reused) return;
   body.classList.add("wf-win");
   wfRenderList(body);
@@ -3738,9 +3793,11 @@ async function initApp() {
   await loadChats();              // chats now live on Oceano (dated folders), not the browser
   await migrateLocalChats();      // lift any pre-existing browser chats over, once
   const active = localStorage.getItem("oceano.active");
-  if (active && _chats.some(s => s.id === active)) openVoyage(active);
-  else if (_chats.length) openVoyage(_chats[0].id);
+  if (active && _chats.some(s => s.id === active)) await openVoyage(active);
+  else if (_chats.length) await openVoyage(_chats[0].id);
   else newVoyage();
+  await maybeReconnectChat();       // re-attach to a reply that was still generating before the reload
+  restoreWindows();                // re-open the app windows that were open before a reload
   setInterval(loadModels, 30000);
 }
 async function boot() {

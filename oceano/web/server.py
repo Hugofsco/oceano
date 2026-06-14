@@ -165,6 +165,9 @@ _locks = {}     # session_id -> threading.Lock serialising turn/compact on one A
 _ctx_cap = {}      # session_id -> auto-compact threshold (messages), or absent
 _compactions = {}  # session_id -> how many times the context was compacted this session
 _last_ctx = {}     # session_id -> real prompt-token count from the last turn's stats
+_chat_live = {}    # session_id -> {running, message, events:[...]} — buffers the in-flight turn so a
+                   # browser refresh can RECONNECT to it (the agent keeps running server-side)
+_CHAT_LIVE_KEEP = 600   # seconds a finished turn stays reconnectable
 
 SESSION_COOKIE = "oceano_sess"
 SESSION_TTL = 30 * 24 * 3600        # 30 days
@@ -787,9 +790,21 @@ async def chat(req: Request):
     # idle proxy / VS Code port-forward / Tailscale hop drops the stream.
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
-    put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)
+    now = time.time()
+    for _s in [k for k, v in _chat_live.items() if not v.get("running") and now - v.get("ts", now) > _CHAT_LIVE_KEEP]:
+        _chat_live.pop(_s, None)                          # prune old finished turns
+    _chat_live[sid] = {"running": True, "message": message, "events": [], "ts": now}
 
-    cancel = threading.Event()      # set by /api/chat/stop OR a client disconnect
+    def put(ev):
+        if ev is not None:                                # buffer every event so a refresh can reconnect
+            b = _chat_live.get(sid)
+            if b is not None:
+                b["events"].append(ev)
+                if isinstance(ev, dict) and ev.get("type") in ("done", "error"):
+                    b["running"] = False
+        loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    cancel = threading.Event()      # set ONLY by /api/chat/stop (a disconnect no longer cancels)
     _cancels[sid] = cancel
 
     def worker():
@@ -843,6 +858,9 @@ async def chat(req: Request):
                     stream.close()
                 except Exception:
                     pass
+            b = _chat_live.get(sid)
+            if b is not None:
+                b["running"] = False                      # turn is over — reconnection stops polling
             put(None)  # sentinel: stream finished
 
     threading.Thread(target=worker, daemon=True).start()
@@ -859,8 +877,7 @@ async def chat(req: Request):
                     break
                 yield _sse(ev)
         except (asyncio.CancelledError, GeneratorExit):
-            cancel.set()                # client went away (aborted/closed) → stop the agent
-            raise
+            raise                       # client went away — let the turn finish server-side (reconnectable)
         except Exception:
             # never let the response generator die silently — log it and try to
             # send a clean error frame so the client shows a real message.
@@ -884,6 +901,17 @@ async def chat_stop(request: Request):
     if ev:
         ev.set()
     return {"ok": bool(ev)}
+
+
+@app.get("/api/chat/live/{sid}")
+def chat_live(sid: str, since: int = 0):
+    """The in-flight (or just-finished) turn for a session, so a reloaded page can reconnect to it
+    and replay what it missed. `since` = how many events the client already has."""
+    b = _chat_live.get(sid)
+    if not b:
+        return {"running": False, "message": "", "events": [], "total": 0}
+    evs = b["events"]
+    return {"running": b["running"], "message": b["message"], "events": evs[since:], "total": len(evs)}
 
 
 @app.delete("/api/session/{sid}")

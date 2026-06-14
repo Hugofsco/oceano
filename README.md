@@ -24,7 +24,7 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **30 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
+- **31 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
   headless browser, long-term memory, document RAG, skills, scheduling, workflows, and
   delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
@@ -34,13 +34,19 @@ from a web UI or Telegram.
   and you can semantically search your **past conversations** too.
 - **Drop in files & images.** Attach files to a chat message (drag · paste · 📎):
   documents are read inline, and images are understood by a configurable vision target
-  (Claude Code or a cloud vision model) since the local chat model is text-only.
-- **Visual workflows.** Draw branching, multi-step recipes on a node canvas
-  (tool · instruction · delegate · decision), run them on demand or on a schedule, and
-  watch each node execute live. See [Workflows](#workflows).
-- **Configurable delegation.** Hand a heavy subtask to a stronger assistant — Claude
-  Code (no API key, via the `claude` CLI) or a cloud model run as a full agent — with
-  *who* chosen in Settings, and a separate target for the self-improving jobs.
+  (Claude Code or a cloud vision model) since the local chat model is text-only. Or bulk-load
+  data: the Files explorer takes **drag-and-drop (or pick) of whole files and folders**
+  straight into the workspace.
+- **Visual workflows + triggers.** Draw branching, multi-step recipes on a node canvas
+  (tool · instruction · delegate · decision); fire them manually, on a cron, or on an
+  **event** — a watched folder changing, a webhook, a chat keyword, or another workflow
+  finishing. Watch each node execute live. See [Workflows](#workflows).
+- **Survives a refresh.** Open app windows reopen where you left them, and a chat reply
+  (or workflow) still generating when you reload **reconnects** instead of being lost.
+- **Configurable delegation + any model as primary.** Hand a heavy subtask to a stronger
+  assistant — Claude Code (no API key) or a cloud model run as a full agent — *who* chosen
+  in Settings, with separate targets for the self-improving jobs. Pick **any model from any
+  endpoint** as Oceano's primary (local-first is opt-in), or turn delegation **fully off**.
 - **Watch it browse.** A multi-tab live browser streams what the agent sees; a web
   search spins up a tab per source so you can see exactly what it read.
 - **Run-aware + optional queue.** A live indicator shows every background job
@@ -93,7 +99,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (30)
+## The agent's tools (31)
 
 | Group | Tools |
 |-------|-------|
@@ -102,9 +108,9 @@ from a web UI or Telegram.
 | **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget_memory`, `search_chats` (recall past conversations) |
 | **Documents (RAG)** | `index_docs`, `search_docs` |
-| **Skills** | `list_skills`, `load_skill`, `learn_skill` |
+| **Skills** | `list_skills`, `load_skill` (one or several), `learn_skill`, `evaluate_skill` (independent review → staging) |
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
-| **Workflows** | `run_workflow`, `list_workflows` (trigger saved workflows; authored in the UI) |
+| **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
 | **Calendar** | `calendar_events` (read the synced local copy) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
@@ -153,6 +159,11 @@ add files directly, or let the agent **learn** them:
 - A learned skill enters as `learning` and is reviewed by an **independent** model (the
   `improve` delegate) before it goes live: `learning` → `staged` → `published`. Only
   published skills ever reach the agent — the model that wrote a skill never validates it.
+- The reviewer doesn't just approve/reject — it can **edit a salvageable skill to fix it** and
+  **conflict-checks** it against the published library before promoting it to `staged`. Brain →
+  Skills has **Published / Staged / Learning** tabs so you can see what's queued and **publish a
+  staged skill yourself**. A workflow can close the loop with the `evaluate_skill` tool
+  (research → `learn_skill` → `evaluate_skill` → staged).
 
 ---
 
@@ -162,7 +173,9 @@ Named, **branching** recipes you draw on a node canvas (the Workflows window). A
 is a directed graph; execution walks it from a **start** node, following edges:
 
 - **tool** — a chosen tool fired with preset arguments (a real form per tool, with
-  searchable pickers for skills / saved workflows / workspace files — no JSON to hand-write)
+  searchable pickers for skills / saved workflows / workspace files — and **multi-select**
+  on the capability pickers, e.g. load several skills or run several workflows at once — no
+  JSON to hand-write)
 - **instruction** — a free-form step run through the agent loop (it may use any tool)
 - **delegate** — hand the step to the configured delegate (Claude Code / a cloud model)
 - **decision** — routes **yes / no** down different edges, judged by a **rule** over the
@@ -170,10 +183,14 @@ is a directed graph; execution walks it from a **start** node, following edges:
 - **start / end**
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
-runaway loops. Run a workflow on demand (live, node-by-node progress over SSE) or on a
-cron (managed in the Scheduler); every run is recorded. The agent can *trigger* saved
-workflows with `run_workflow`, but you author them in the UI. Stored in
-`data/workflows.json`; the canvas is a vendored [Drawflow](https://github.com/jerosoler/Drawflow).
+runaway loops. **Triggers** (the ⚡ panel) decide *when* a workflow fires: manually (▶ Run),
+on a **cron** (managed in the Scheduler), or on an **event** — a watched workspace folder
+changing, an incoming **webhook** (a secret-token URL), a **chat keyword** (web / Telegram),
+or **another workflow finishing** (chaining, loop-guarded). Every run is recorded (live,
+node-by-node over SSE), and a run still in progress when you **refresh the browser reconnects**
+to its live state. The agent can also trigger saved workflows with `run_workflow`, but you
+author them in the UI. Stored in `data/workflows.json`; the canvas is a vendored
+[Drawflow](https://github.com/jerosoler/Drawflow).
 
 ---
 
@@ -194,6 +211,11 @@ judging, memory maintenance), and **vision** (image recognition — the local ch
 text-only, so files dropped into chat get routed here; Claude Code reads the image file
 directly, or point it at a cloud vision model). The local model never grades its own work,
 nor sees images itself. Live readiness + a one-click test sit in each section.
+
+The same panel also sets Oceano's **primary model** — **any model from any configured
+endpoint** (local-first is opt-in; a cloud model can be your default, and it's carried to
+chat, Telegram, the CLI, and background jobs). A master toggle turns **delegation fully off**
+(withholding the `delegate` tool and stopping the delegated jobs) for a purely local setup.
 
 ---
 
@@ -220,15 +242,17 @@ it in Settings → Account). It's a single-page app with:
 - **Chat** — SSE streaming, streamed reasoning (collapsible, auto-scrolling), inline
   tool-call cards, a **Stop** button, an **Agent** toggle (persists) that hands the model
   its tools, Telegram-style **slash commands** (`/context`, `/compact`, `/status`,
-  `/skill`, …) with autocomplete, and **file/image attachments** (drag · paste · 📎). The
-  sidebar slides between the app menu and dated **chat-history folders**.
+  `/skill`, …) with autocomplete, and **file/image attachments** (drag · paste · 📎). A reply
+  still being generated when you reload **reconnects** to it (the turn keeps running
+  server-side). The sidebar slides between the app menu and dated **chat-history folders**.
 - **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
-  Evals), **Workflows** (node canvas), Files explorer + editor, Scheduler, Calendar,
-  Researcher, semantic **Search** (memories · documents · conversations), **Notes**
-  (Kanban), **Health** (live system
+  Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
+  upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
+  (memories · documents · conversations), **Notes** (Kanban), **Health** (live system
   dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out), the
   **Live browser** (multi-tab — watch the agent research source-by-source), and a
-  sandboxed **Preview**. Drag, resize, snap, minimize.
+  sandboxed **Preview**. Drag, resize, snap, minimize — and the set of open windows
+  **reopens after a reload**.
 - **Preview / artifacts** — when the agent writes an `.html` app, markdown, a Mermaid
   diagram, a Chart.js spec, or a `.slides` deck, a chip opens it rendered in an
   origin-isolated sandbox iframe (device presets + live reload).
@@ -312,8 +336,9 @@ sudo systemctl restart oceano  # restart everything
 Then open `http://127.0.0.1:8800` and log in with **admin / admin**.
 
 The install also drops an **`oceano`** terminal client on your PATH — the rich, streamed
-`cli.py` whose sessions persist to the same chat store as the web UI (`/chats` to resume).
-Just run `oceano`. Install/remove it on its own with `scripts/install-cli.sh`
+`cli.py` with rendered markdown + colored diffs, a slash-command **palette** (type `/`),
+themes, and a tool-confirmation gate (on by default for OS-reaching tools); its sessions
+persist to the same chat store as the web UI (`/chats` to resume). Just run `oceano`. Install/remove it on its own with `scripts/install-cli.sh`
 (`--system` for `/usr/local/bin`, `--uninstall` to remove). In Docker, get the same client
 with `docker compose exec oceano /app/venv/bin/python cli.py`.
 
@@ -380,7 +405,8 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
 - **Workspace confinement** — file tools resolve relative to `workspace/` and refuse
   to escape it.
 - **systemd hardening** — `NoNewPrivileges`, `ProtectHome=read-only` with
-  `ReadWritePaths` limited to `workspace/`, `data/`, `skills/`, `PrivateTmp`.
+  `ReadWritePaths` limited to `workspace/`, `data/`, `skills/`, the `llama.cpp/` model dir,
+  and `PrivateTmp`.
 - **Localhost binding** + **login auth** on the web UI.
 
 For true isolation, run it in a container or under bubblewrap/firejail.
