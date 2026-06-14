@@ -12,6 +12,7 @@ stay thin. No external deps: just ANSI + stdlib readline for line editing/histor
 """
 import re
 import secrets
+import shutil
 import sys
 import time
 
@@ -29,8 +30,41 @@ R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"; IT = "\033[3m"
 CYAN = "\033[36m"; GREEN = "\033[32m"; BLUE = "\033[34m"; GREY = "\033[90m"; CORAL = "\033[38;5;210m"; BUOY = "\033[38;5;215m"
 def _wrap(s):  # mark non-printing runs so readline measures the prompt width correctly
     return re.sub(r"(\033\[[0-9;]*m)", "\001\\1\002", s)
-YOU = _wrap(f"{GREEN}{B}you ›{R} ")
+YOU = _wrap(f"{GREEN}{B} › {R}")            # the prompt INSIDE the input box
 OCEANO = f"{CYAN}{B}oceano ›{R} "
+
+# block-letter wordmark (opencode-style banner), shown once at startup
+LOGO = (
+    "█████ █████ █████ █████ █   █ █████\n"
+    "█   █ █     █     █   █ ██  █ █   █\n"
+    "█   █ █     ████  █████ █ █ █ █   █\n"
+    "█   █ █     █     █   █ █  ██ █   █\n"
+    "█████ █████ █████ █   █ █   █ █████"
+)
+
+
+def _termw():
+    return max(36, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
+def banner():
+    if _termw() >= 38:
+        for ln in LOGO.splitlines():
+            print(f"{CYAN}{B}{ln}{R}")
+    else:
+        print(f"{CYAN}{B}≈ Oceano{R}")
+    print(f"{GREY}≈ a local agent in deep waters · model {config.MODEL}{R}")
+    print(f"{GREY}  /help · /chats to resume · Ctrl-C interrupts a reply{R}")
+
+
+# Claude-Code-style input box: a labelled rule on top, your line, a rule on the bottom.
+def _box_top(label="you"):
+    w = _termw(); head = f"─ {label} "
+    print(f"\n{GREY}╭{head}{'─' * max(0, w - 2 - len(head))}╮{R}")
+
+
+def _box_bottom():
+    print(f"{GREY}╰{'─' * (_termw() - 2)}╯{R}")
 
 
 def _uid():
@@ -289,17 +323,18 @@ def _handle(line, s):
 
 # ============================ main loop ============================
 def main():
-    print(f"\n{CYAN}{B}≈ Oceano{R} {GREY}— terminal{R}")
-    print(f"  {GREY}model{R} {config.MODEL}   {GREY}workspace{R} {config.WORKSPACE}")
-    print(f"  {GREY}/help for commands · /chats to resume · Ctrl-C to interrupt a reply{R}\n")
+    print()
+    banner()
     s = Session()
     while True:
+        _box_top("you")
         try:
             line = input(YOU).strip()
         except EOFError:
-            s.save(); print(f"\n{CYAN}≈ bye{R}"); break
+            _box_bottom(); s.save(); print(f"{CYAN}≈ bye{R}"); break
         except KeyboardInterrupt:
-            print(f"\n{GREY}(use /quit to leave){R}"); continue
+            print(); _box_bottom(); print(f"{GREY}(/quit to leave){R}"); continue
+        _box_bottom()
         if not line:
             continue
         if line.startswith("/"):
