@@ -20,6 +20,9 @@ the scheduler as a managed task tagged `workflow:<id>`.
 """
 import json
 import re
+import secrets
+import threading
+import time
 from datetime import datetime, timezone
 
 import config
@@ -32,6 +35,13 @@ NODE_TYPES = ("start", "tool", "instruction", "delegate", "decision", "end")
 _MAX_RUNS = 60
 _OUT_CAP = 4000
 _VISIT_CAP = 60                      # max node executions per run — loop backstop
+
+# Live run state so the GUI can RECONNECT to an in-progress run after a browser refresh
+# (works for manual AND scheduled runs). Keyed by workflow id; finished runs linger briefly.
+_LIVE = {}
+_LIVE_LOCK = threading.Lock()
+_LIVE_KEEP = 180                     # seconds a finished run stays visible for reconnection
+_LIVE_STALE = 1800                   # drop a 'running' entry with no node activity for this long
 
 
 def _now():
@@ -62,6 +72,7 @@ def _next_id(items):
 
 def _migrate(wf):
     """An older linear workflow ({steps:[...]}) -> a straight-line graph, so nothing breaks."""
+    wf.setdefault("triggers", [])
     if "graph" in wf and isinstance(wf["graph"], dict):
         return wf
     steps = wf.pop("steps", []) or []
@@ -139,7 +150,8 @@ def get_by_name(name):
 def create(name, description="", graph=None):
     data = _load()
     wf = {"id": _next_id(data["workflows"]), "name": (name or "Untitled").strip(),
-          "description": (description or "").strip(), "graph": _norm_graph(graph or {}), "created": _now()}
+          "description": (description or "").strip(), "graph": _norm_graph(graph or {}),
+          "triggers": [], "created": _now()}
     data["workflows"].append(wf)
     _save(data)
     return wf
@@ -214,6 +226,155 @@ def runs(workflow_id=None, limit=40):
     if workflow_id is not None:
         rs = [r for r in rs if r.get("workflow_id") == workflow_id]
     return list(reversed(rs[-limit:]))
+
+
+def _prune_live():
+    now = time.time()
+    for k in [k for k, v in _LIVE.items()
+              if (v.get("finished") and now - v["finished"] > _LIVE_KEEP)
+              or (v.get("status") == "running" and now - v.get("beat", now) > _LIVE_STALE)]:
+        _LIVE.pop(k, None)
+
+
+def live(workflow_id=None):
+    """In-progress (and just-finished) runs so the GUI can reconnect after a refresh.
+    Returns a list (or the single entry for workflow_id, or None)."""
+    with _LIVE_LOCK:
+        _prune_live()
+        vals = [{**v, "steps": list(v.get("steps") or [])} for v in _LIVE.values()]
+    if workflow_id is not None:
+        return next((v for v in vals if v["workflow_id"] == workflow_id), None)
+    return vals
+
+
+# ---------------- triggers (event-based runs: watch · webhook · keyword · chain) ----------------
+_TRIGGER_TYPES = ("watch", "webhook", "keyword", "chain")
+_WATCH_SIG = {}                      # (wid, folder) -> last signature; baseline on first sight
+
+
+def _norm_triggers(items):
+    out = []
+    for t in items or []:
+        if not isinstance(t, dict) or t.get("type") not in _TRIGGER_TYPES:
+            continue
+        ty = t["type"]
+        n = {"type": ty, "enabled": bool(t.get("enabled", True))}
+        if ty == "watch":
+            n["folder"] = str(t.get("folder", "")).strip().strip("/")
+            if not n["folder"]:
+                continue
+        elif ty == "webhook":
+            n["token"] = str(t.get("token") or "").strip() or secrets.token_urlsafe(18)
+        elif ty == "keyword":
+            n["pattern"] = str(t.get("pattern", "")).strip()
+            n["channel"] = t.get("channel") if t.get("channel") in ("any", "web", "telegram") else "any"
+            if not n["pattern"]:
+                continue
+        elif ty == "chain":
+            try:
+                n["after"] = int(t.get("after"))
+            except (TypeError, ValueError):
+                continue
+            n["on"] = t.get("on") if t.get("on") in ("success", "any") else "success"
+        out.append(n)
+    return out
+
+
+def get_triggers(wid):
+    wf = get(wid)
+    return wf.get("triggers", []) if wf else []
+
+
+def set_triggers(wid, items):
+    data = _load()
+    wf = next((w for w in data["workflows"] if w["id"] == wid), None)
+    if not wf:
+        return None
+    wf["triggers"] = _norm_triggers(items)
+    _save(data)
+    return wf["triggers"]
+
+
+def run_async(wf, trigger="trigger", chain_seen=frozenset()):
+    """Fire-and-forget a run in a daemon thread (used by every event trigger)."""
+    threading.Thread(target=lambda: run(wf, trigger=trigger, _chain_seen=chain_seen), daemon=True).start()
+
+
+def _folder_sig(folder):
+    base = (config.WORKSPACE / folder).resolve()
+    if not str(base).startswith(str(config.WORKSPACE.resolve())):   # stay inside the workspace
+        return None
+    if not base.exists():
+        return 0
+    items = []
+    for p in sorted(base.rglob("*"))[:5000]:
+        if p.is_file():
+            try:
+                st = p.stat()
+                items.append((str(p), int(st.st_mtime), st.st_size))
+            except OSError:
+                pass
+    return hash(tuple(items))
+
+
+def poll_watch_triggers():
+    """Run workflows whose watched folder changed since the last tick (called by the engine).
+    First sight of a folder records a baseline only, so a restart can't spuriously fire."""
+    fired = 0
+    for wf in list_all():
+        for tr in wf.get("triggers", []):
+            if tr.get("type") != "watch" or not tr.get("enabled"):
+                continue
+            sig = _folder_sig(tr["folder"])
+            if sig is None:
+                continue
+            key = (wf["id"], tr["folder"])
+            prev = _WATCH_SIG.get(key, "__new__")
+            _WATCH_SIG[key] = sig
+            if prev != "__new__" and sig != prev:
+                run_async(wf, trigger="watch"); fired += 1
+    return fired
+
+
+def fire_keyword(message, channel="web"):
+    """Run workflows whose keyword trigger matches a chat message. Returns the names fired."""
+    msg = (message or "").strip().lower()
+    fired = []
+    if not msg:
+        return fired
+    for wf in list_all():
+        for tr in wf.get("triggers", []):
+            if tr.get("type") != "keyword" or not tr.get("enabled") or tr.get("channel") not in ("any", channel):
+                continue
+            pat = (tr.get("pattern") or "").strip().lower()
+            if pat and pat in msg:
+                run_async(wf, trigger="keyword"); fired.append(wf["name"]); break
+    return fired
+
+
+def fire_chain(after_wid, status, seen=frozenset()):
+    """When a workflow finishes, run any workflow chained after it (loop-guarded by `seen`)."""
+    for wf in list_all():
+        if wf["id"] in seen:
+            continue
+        for tr in wf.get("triggers", []):
+            if (tr.get("type") == "chain" and tr.get("enabled") and tr.get("after") == after_wid
+                    and (tr.get("on") == "any" or status == "ok")):
+                run_async(wf, trigger="chain", chain_seen=seen)
+                break
+
+
+def webhook_run(wid, token):
+    """Run a workflow if `token` matches one of its enabled webhook triggers."""
+    wf = get(wid)
+    if not wf:
+        return None
+    for tr in wf.get("triggers", []):
+        if (tr.get("type") == "webhook" and tr.get("enabled")
+                and secrets.compare_digest(str(tr.get("token", "")), str(token))):
+            run_async(wf, trigger="webhook")
+            return wf
+    return None
 
 
 def _record_run(workflow_id, trigger, status, steps, summary):
@@ -305,12 +466,27 @@ def _compact_event(kind, data):
     return ""
 
 
-def run(wf, trigger="manual", on_step=None):
+def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
     """Walk the workflow graph from its start node, executing nodes and branching at
     decision nodes. Shares one Agent so context accumulates. Returns the run record."""
     from oceano.agent import Agent
+    wf_id = wf["id"]
 
     def emit(ev):
+        e = ev.get("event")
+        with _LIVE_LOCK:                                # mirror progress into the live registry
+            st = _LIVE.get(wf_id)
+            if st is not None:
+                st["beat"] = time.time()
+                if e == "node_start":
+                    st["current"] = {"id": ev.get("id"), "label": ev.get("label")}
+                elif e == "node_end":
+                    st["steps"].append({"id": ev.get("id"), "label": (st.get("current") or {}).get("label", ""),
+                                        "ok": ev.get("ok"), "branch": ev.get("branch"), "output": ev.get("output", "")})
+                elif e == "done":
+                    r = ev.get("run") or {}
+                    st.update(status=ev.get("status", "ok"), current=None, finished=time.time(),
+                              summary=r.get("summary", ""), run_id=r.get("id"))
         if on_step:
             try:
                 on_step(ev)
@@ -332,66 +508,78 @@ def run(wf, trigger="manual", on_step=None):
     ag = Agent(learn=False, exclude_tools={"run_workflow"})
     results, last_output, visits = [], "", 0
     cur = start
+    with _LIVE_LOCK:
+        _prune_live()
+        _LIVE[wf_id] = {"workflow_id": wf_id, "name": wf.get("name", ""), "trigger": trigger,
+                        "started": _now(), "beat": time.time(), "status": "running",
+                        "current": None, "steps": [], "summary": "", "finished": None, "run_id": None}
     from oceano import jobs
-    with jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}"), tools.background():
-        while cur and visits < _VISIT_CAP:
-            visits += 1
-            t = cur["type"]
-            if t == "end":
-                break
-            label = _node_label(cur)
-            emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
-            ok, output, branch = True, "", None
-            try:
-                if t == "start":
-                    output = ""
-                elif t == "tool":
-                    name, args = cur.get("tool", ""), cur.get("args", {})
-                    if not tools.is_enabled(name):
-                        ok, output = False, f"tool '{name}' is disabled or unknown"
-                    else:
-                        output = tools.run(name, json.dumps(args)) or ""
+    try:
+        with jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}"), tools.background():
+            while cur and visits < _VISIT_CAP:
+                visits += 1
+                t = cur["type"]
+                if t == "end":
+                    break
+                label = _node_label(cur)
+                emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
+                ok, output, branch = True, "", None
+                try:
+                    if t == "start":
+                        output = ""
+                    elif t == "tool":
+                        name, args = cur.get("tool", ""), cur.get("args", {})
+                        if not tools.is_enabled(name):
+                            ok, output = False, f"tool '{name}' is disabled or unknown"
+                        else:
+                            output = tools.run(name, json.dumps(args)) or ""
+                            last_output = output
+                            ag.messages.append({"role": "user",
+                                "content": f"(ran tool `{name}` → {output[:1500]})"})
+                    elif t == "instruction":
+                        ag.on_event = lambda kind, d, _i=cur["id"]: (
+                            emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
+                            if kind in ("tool_call", "tool_result") else None)
+                        output = ag.run(cur.get("text", "")) or ""
+                        ag.on_event = lambda kind, d: None
                         last_output = output
-                        ag.messages.append({"role": "user",
-                            "content": f"(ran tool `{name}` → {output[:1500]})"})
-                elif t == "instruction":
-                    ag.on_event = lambda kind, d, _i=cur["id"]: (
-                        emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
-                        if kind in ("tool_call", "tool_result") else None)
-                    output = ag.run(cur.get("text", "")) or ""
-                    ag.on_event = lambda kind, d: None
-                    last_output = output
-                elif t == "delegate":
-                    from oceano import delegate
-                    r = delegate.run(cur.get("text", ""), cwd=config.WORKSPACE,
-                                     tools="Read,Glob,Grep", timeout=600, role=cur.get("role", "default"))
-                    ok = bool(r.get("ok"))
-                    output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
-                    last_output = output
-                    ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
-                elif t == "decision":
-                    verdict, detail = _decide(cur, last_output, ag)
-                    branch = "yes" if verdict else "no"
-                    output = detail
-            except Exception as ex:
-                ok, output = False, f"{type(ex).__name__}: {ex}"
-            results.append({"id": cur["id"], "type": t, "label": label, "ok": ok,
-                            "branch": branch, "output": output[:_OUT_CAP]})
-            emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "output": output[:_OUT_CAP]})
+                    elif t == "delegate":
+                        from oceano import delegate
+                        r = delegate.run(cur.get("text", ""), cwd=config.WORKSPACE,
+                                         tools="Read,Glob,Grep", timeout=600, role=cur.get("role", "default"))
+                        ok = bool(r.get("ok"))
+                        output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
+                        last_output = output
+                        ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
+                    elif t == "decision":
+                        verdict, detail = _decide(cur, last_output, ag)
+                        branch = "yes" if verdict else "no"
+                        output = detail
+                except Exception as ex:
+                    ok, output = False, f"{type(ex).__name__}: {ex}"
+                results.append({"id": cur["id"], "type": t, "label": label, "ok": ok,
+                                "branch": branch, "output": output[:_OUT_CAP]})
+                emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "output": output[:_OUT_CAP]})
 
-            outs = succ.get(cur["id"], [])
-            if t == "decision":
-                nxt = next((to for (br, to) in outs if (br or "yes") == branch), None)
-            else:
-                nxt = outs[0][1] if outs else None
-            cur = nodes.get(nxt) if nxt is not None else None
+                outs = succ.get(cur["id"], [])
+                if t == "decision":
+                    nxt = next((to for (br, to) in outs if (br or "yes") == branch), None)
+                else:
+                    nxt = outs[0][1] if outs else None
+                cur = nodes.get(nxt) if nxt is not None else None
 
-    status = "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error")
-    done = sum(1 for r in results if r["ok"])
-    summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
-    rec = _record_run(wf["id"], trigger, status, results, summary)
-    emit({"event": "done", "status": status, "run": rec})
-    return rec
+        status = "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error")
+        done = sum(1 for r in results if r["ok"])
+        summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
+        rec = _record_run(wf["id"], trigger, status, results, summary)
+        emit({"event": "done", "status": status, "run": rec})
+        fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id})   # chain-trigger any followers
+        return rec
+    finally:
+        with _LIVE_LOCK:                                # never leave a 'running' entry stranded
+            st = _LIVE.get(wf_id)
+            if st and st.get("status") == "running":
+                st.update(status="error", current=None, finished=time.time(), summary="(ended unexpectedly)")
 
 
 def run_by_id(wid, trigger="manual", on_step=None):

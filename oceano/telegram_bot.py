@@ -425,6 +425,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if denied:
         await update.message.reply_text(denied)
         return
+    try:
+        from oceano import workflows
+        workflows.fire_keyword(update.message.text, "telegram")    # keyword-trigger workflows
+    except Exception:
+        pass
     await _respond(update, ctx, update.message.text)
 
 

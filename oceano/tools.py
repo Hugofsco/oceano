@@ -544,9 +544,10 @@ def list_skills():
     "type": "function",
     "function": {
         "name": "load_skill",
-        "description": "Load the full step-by-step instructions for a named skill, then follow them.",
+        "description": "Load the full step-by-step instructions for a skill, then follow them. "
+                       "Load several at once by passing a comma-separated list of names.",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}
+            "name": {"type": "string", "description": "one skill name, or several comma-separated"}
         }, "required": ["name"]},
     },
 })
@@ -717,21 +718,7 @@ def list_tasks():
     return scheduler.list_tasks()
 
 
-@tool({
-    "type": "function",
-    "function": {
-        "name": "run_workflow",
-        "description": "Run one of the user's saved workflows (a named, multi-step recipe) "
-                       "right now, by name or id. Use this when the user asks to run a workflow, "
-                       "or when a task matches a workflow they've defined. You can RUN workflows "
-                       "but not create them — the user authors workflows in the UI. To see what "
-                       "exists, call list_workflows first.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "the workflow's name (or its numeric id)"},
-        }, "required": ["name"]},
-    },
-})
-def run_workflow(name):
+def _run_one_workflow(name):
     from oceano import workflows
     name = str(name or "").strip()
     wf = workflows.get_by_name(name)
@@ -746,6 +733,29 @@ def run_workflow(name):
         mark = "✓" if s["ok"] else "✗"
         lines.append(f"  {mark} {s['label']}: {(s['output'] or '').strip()[:240]}")
     return "\n".join(lines)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "run_workflow",
+        "description": "Run one of the user's saved workflows (a named, multi-step recipe) "
+                       "right now, by name or id. Use this when the user asks to run a workflow, "
+                       "or when a task matches a workflow they've defined. You can RUN workflows "
+                       "but not create them — the user authors workflows in the UI. To see what "
+                       "exists, call list_workflows first. Run several in sequence by passing a "
+                       "comma-separated list.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "a workflow name or numeric id, or several comma-separated"},
+        }, "required": ["name"]},
+    },
+})
+def run_workflow(name):
+    """Run one workflow, or several in sequence: pass a comma-separated list of names."""
+    names = [n.strip() for n in str(name or "").split(",") if n.strip()]
+    if len(names) > 1:
+        return "\n\n".join(_run_one_workflow(n) for n in names)
+    return _run_one_workflow(names[0] if names else str(name or ""))
 
 
 @tool({

@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -206,7 +206,8 @@ def _set_session_cookie(response, user, secret):
 @app.middleware("http")
 async def _require_auth(request: Request, call_next):
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API:
+    webhook = path.startswith("/api/workflows/") and "/webhook/" in path   # gated by its secret token
+    if path.startswith("/api/") and path not in _PUBLIC_API and not webhook:
         if not _current_user(request):
             return JSONResponse({"error": "authentication required"}, status_code=401)
     return await call_next(request)
@@ -760,6 +761,11 @@ async def chat(req: Request):
     body = await req.json()
     sid = body.get("session", "default")
     message = body.get("message", "")
+    try:
+        from oceano import workflows
+        workflows.fire_keyword(message, "web")        # keyword-trigger workflows (runs in background)
+    except Exception:
+        pass
     base_url = body.get("base_url")
     data = load()
     api_key = next((e.get("api_key", "") for e in data["endpoints"]
@@ -1277,6 +1283,38 @@ def workflows_list():
     return [{**w, "schedule": workflows.schedule_info(w["id"])} for w in workflows.list_all()]
 
 
+@app.get("/api/workflows/live")
+def workflows_live():
+    """In-progress (and just-finished) runs — lets the UI reconnect to a running workflow's
+    live state after a browser refresh, and mark which workflows are running."""
+    from oceano import workflows
+    return {"running": workflows.live()}
+
+
+@app.get("/api/workflows/{wid}/triggers")
+def workflows_triggers_get(wid: int):
+    from oceano import workflows
+    return {"triggers": workflows.get_triggers(wid)}
+
+
+@app.put("/api/workflows/{wid}/triggers")
+async def workflows_triggers_set(wid: int, req: Request):
+    from oceano import workflows
+    b = await req.json()
+    return {"ok": True, "triggers": workflows.set_triggers(wid, b.get("triggers", []))}
+
+
+@app.post("/api/workflows/{wid}/webhook/{token}")
+async def workflows_webhook(wid: int, token: str):
+    """Fire a workflow from an external POST. Auth-exempt — the secret token IS the auth.
+    The server is localhost-bound by default; only reachable remotely if you tunnel it."""
+    from oceano import workflows
+    wf = workflows.webhook_run(wid, token)
+    if not wf:
+        raise HTTPException(404, "no matching/enabled webhook trigger")
+    return JSONResponse({"ok": True, "started": wf["name"]}, status_code=202)
+
+
 @app.post("/api/workflows")
 async def workflows_create(req: Request):
     from oceano import workflows
@@ -1384,6 +1422,32 @@ async def upload(file: UploadFile = File(...)):
     ext = dest.suffix.lower()
     kind = "image" if ext in _IMG_EXT else ("text" if (ext in rag.TEXT_EXT or ext == ".pdf") else "other")
     return {"ok": True, "name": dest.name, "path": str(dest.relative_to(config.WORKSPACE)), "kind": kind}
+
+
+@app.post("/api/upload-to")
+async def upload_to(dir: str = Form(""), paths: list[str] = Form([]),
+                    files: list[UploadFile] = File(...)):
+    """Upload many files — or a whole folder (the browser sends each file with its relative path) —
+    straight into the workspace. `dir` is the target subfolder (the explorer's current dir); each
+    `paths[i]` recreates the picked folder's structure. Everything is confined to the workspace."""
+    saved, skipped = [], []
+    for i, f in enumerate(files):
+        rel = (paths[i] if i < len(paths) else "") or (f.filename or "file")
+        parts = [p for p in str(rel).replace("\\", "/").split("/") if p and p not in (".", "..")]
+        if not parts:
+            skipped.append(str(rel)); continue
+        safe = "/".join("".join(c if (c.isalnum() or c in "._- ()") else "_" for c in p)[:120] for p in parts)
+        try:
+            dest = _wresolve((dir.rstrip("/") + "/" + safe) if dir else safe)
+        except HTTPException:
+            skipped.append(safe); continue
+        data = await f.read()
+        if len(data) > 100 * 1024 * 1024:                    # 100 MB per-file cap
+            skipped.append(f"{safe} (>100 MB)"); continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        saved.append(str(dest.relative_to(config.WORKSPACE)))
+    return {"ok": True, "saved": len(saved), "skipped": skipped, "files": saved[:50]}
 
 
 def _attachment_context(attachments, question, put=None):

@@ -1574,8 +1574,13 @@ function openExplorer() {
           <div class="exp-crumbs" id="expCrumbs"></div>
           <button class="exp-btn" id="expNewDir" title="new folder">＋▱</button>
           <button class="exp-btn" id="expNewFile" title="new file">＋▤</button>
+          <button class="exp-btn" id="expUpFilesBtn" title="upload files here">📤</button>
+          <button class="exp-btn" id="expUpDirBtn" title="upload a folder here">📁↑</button>
           <button class="exp-btn" id="expRefresh" title="refresh">↻</button>
+          <span class="exp-upmsg" id="expUpMsg"></span>
         </div>
+        <input type="file" id="expUpFiles" multiple style="display:none">
+        <input type="file" id="expUpDir" webkitdirectory directory multiple style="display:none">
         <div class="exp-list" id="expList"></div>
       </div>
       <div class="exp-divider" id="expDivider" title="drag to resize"></div>
@@ -1589,6 +1594,25 @@ function openExplorer() {
   $("#expNewDir", body).onclick = expNewFolder;
   $("#expNewFile", body).onclick = expNewFile;
   $("#expRefresh", body).onclick = () => expLoad(_expCwd);
+  const upFiles = $("#expUpFiles", body), upDir = $("#expUpDir", body);
+  $("#expUpFilesBtn", body).onclick = () => upFiles.click();
+  $("#expUpDirBtn", body).onclick = () => upDir.click();
+  upFiles.onchange = () => { expUpload([...upFiles.files].map(f => ({ file: f, rel: f.name })), body); upFiles.value = ""; };
+  upDir.onchange = () => { expUpload([...upDir.files].map(f => ({ file: f, rel: f.webkitRelativePath || f.name })), body); upDir.value = ""; };
+  const list = $("#expList", body);
+  ["dragover", "dragenter"].forEach(ev => list.addEventListener(ev, e => { e.preventDefault(); list.classList.add("exp-drop"); }));
+  ["dragleave", "dragend", "drop"].forEach(ev => list.addEventListener(ev, () => list.classList.remove("exp-drop")));
+  list.addEventListener("drop", async e => {
+    e.preventDefault();
+    const items = e.dataTransfer.items, picked = [];
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      const entries = [...items].map(it => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+      for (const ent of entries) picked.push(...await _walkEntry(ent, ""));
+    } else {
+      [...(e.dataTransfer.files || [])].forEach(f => picked.push({ file: f, rel: f.name }));
+    }
+    if (picked.length) expUpload(picked, body);
+  });
   $("#expList", body).addEventListener("contextmenu", e => {
     if (e.target.closest(".exp-row")) return;
     e.preventDefault();
@@ -1597,6 +1621,32 @@ function openExplorer() {
   _wireExpDivider(body);
   expLoad("");
   _edRestore();                                    // reopen the tabs from last time
+}
+function _walkEntry(entry, prefix) {                 // recurse a dropped file/folder into {file, rel}
+  return new Promise(resolve => {
+    if (entry.isFile) entry.file(f => resolve([{ file: f, rel: prefix + entry.name }]), () => resolve([]));
+    else if (entry.isDirectory) {
+      const rd = entry.createReader(), all = [];
+      const read = () => rd.readEntries(async ents => {
+        if (!ents.length) { const nested = await Promise.all(all.map(en => _walkEntry(en, prefix + entry.name + "/"))); resolve(nested.flat()); }
+        else { all.push(...ents); read(); }            // readEntries returns in batches — keep reading
+      }, () => resolve([]));
+      read();
+    } else resolve([]);
+  });
+}
+async function expUpload(items, body) {
+  if (!items || !items.length) return;
+  const msg = body && $("#expUpMsg", body); if (msg) msg.textContent = `uploading ${items.length}…`;
+  const fd = new FormData();
+  fd.append("dir", _expCwd || "");
+  items.forEach(({ file, rel }) => { fd.append("files", file, file.name); fd.append("paths", rel || file.name); });
+  let r = null; try { r = await fetch("/api/upload-to", { method: "POST", body: fd }).then(x => x.json()); } catch {}
+  expLoad(_expCwd);
+  if (msg) {
+    msg.textContent = r ? `✓ ${r.saved} uploaded${r.skipped && r.skipped.length ? ` · ${r.skipped.length} skipped` : ""}` : "upload failed";
+    setTimeout(() => { if (msg) msg.textContent = ""; }, 4000);
+  }
 }
 function _wireExpDivider(body) {
   const div = $("#expDivider", body), left = $("#expLeft", body), split = $(".exp-split", body);
@@ -3098,6 +3148,8 @@ const WF_PICKERS = {
   "read_file.path": "files", "write_file.path": "files", "edit_file.path": "files",
   "list_files.path": "dirs", "index_docs.folder": "dirs", "make_folder.path": "dirs",
 };
+// picker params that allow choosing SEVERAL at once (stored comma-joined; the tool accepts a list)
+const WF_MULTI = new Set(["load_skill.name", "run_workflow.name"]);
 let _wfEnumCache = {}, _wfFilesCache = null;
 async function wfFiles() {
   if (!_wfFilesCache) { try { _wfFilesCache = await api("/api/files/all"); } catch { _wfFilesCache = { files: [], dirs: [] }; } }
@@ -3142,6 +3194,50 @@ function wfWireCombos(form) {
     box.addEventListener("mousedown", e => { const it = e.target.closest(".wfn-ac"); if (it) { e.preventDefault(); pick(shown[+it.dataset.i]); } });
   });
 }
+// multi-select chips combo: choose several skills/workflows; value is kept comma-joined in a hidden field
+function wfWireMulti(form) {
+  form.querySelectorAll(".wfn-multi").forEach(async wrap => {
+    const hidden = wrap.querySelector("input[data-arg]"), chipsEl = wrap.querySelector(".wfn-chips");
+    const inp = wrap.querySelector(".wfn-msearch"), box = wrap.querySelector(".wfn-acx");
+    const opts = await wfEnumOptions(wrap.dataset.enum);
+    const get = () => hidden.value.split(",").map(s => s.trim()).filter(Boolean);
+    let hi = -1, shown = [];
+    const renderChips = arr => {
+      chipsEl.innerHTML = "";
+      arr.forEach(name => {
+        const c = document.createElement("span"); c.className = "wfn-chip"; c.textContent = name;
+        const x = document.createElement("button"); x.type = "button"; x.className = "wfn-chip-x"; x.textContent = "✕";
+        x.onclick = () => set(get().filter(n => n !== name));
+        c.appendChild(x); chipsEl.appendChild(c);
+      });
+    };
+    const set = arr => {
+      hidden.value = [...new Set(arr)].join(", ");
+      renderChips(get());
+      hidden.dispatchEvent(new Event("change", { bubbles: true }));   // sync into the node's data
+    };
+    const render = () => {
+      const cur = get(), q = inp.value.trim().toLowerCase();
+      shown = opts.filter(o => !cur.includes(o) && (!q || o.toLowerCase().includes(q))).slice(0, 8);
+      if (!shown.length) { box.style.display = "none"; return; }
+      box.innerHTML = shown.map((o, i) => `<div class="wfn-ac${i === hi ? " hi" : ""}" data-i="${i}">${escapeHtml(o)}</div>`).join("");
+      box.style.display = "block";
+    };
+    const add = o => { o = o.trim(); if (o) set([...get(), o]); inp.value = ""; hi = -1; render(); };
+    renderChips(get());
+    inp.addEventListener("focus", () => { hi = -1; render(); });
+    inp.addEventListener("input", () => { hi = -1; render(); });
+    inp.addEventListener("blur", () => setTimeout(() => { box.style.display = "none"; }, 150));
+    inp.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); add(hi >= 0 ? shown[hi] : inp.value); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); hi = Math.min(hi + 1, shown.length - 1); render(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(hi - 1, 0); render(); }
+      else if (e.key === "Escape") box.style.display = "none";
+      else if (e.key === "Backspace" && !inp.value) { const c = get(); if (c.length) set(c.slice(0, -1)); }
+    });
+    box.addEventListener("mousedown", e => { const it = e.target.closest(".wfn-ac"); if (it) { e.preventDefault(); add(shown[+it.dataset.i]); } });
+  });
+}
 function wfBuildToolForm(form, toolName, args) {
   const tool = (_wfTools || []).find(t => t.name === toolName);
   const params = (tool && tool.params) || [];
@@ -3151,7 +3247,9 @@ function wfBuildToolForm(form, toolName, args) {
     const lab = `<label class="wfn-lab" title="${escapeHtml(p.description || "")}">${escapeHtml(p.name)}${p.required ? '<i class="wfn-req">*</i>' : ""}</label>`;
     const picker = WF_PICKERS[toolName + "." + p.name];
     let field;
-    if (picker)                   // searchable combo over existing skills/workflows/files/dirs (free text ok too)
+    if (picker && WF_MULTI.has(toolName + "." + p.name))   // pick SEVERAL (chips); stored comma-joined
+      field = `<div class="wfn-multi" data-enum="${picker}"><input type="hidden" class="wfn-fld" data-arg="${escapeHtml(p.name)}" data-type="string" value="${v != null ? escapeHtml(String(v)) : ""}"><div class="wfn-chips"></div><div class="wfn-combo-wrap"><input class="wfn-msearch" autocomplete="off" placeholder="add… (choose several)"><div class="wfn-acx" style="display:none"></div></div></div>`;
+    else if (picker)              // single searchable combo (free text ok too)
       field = `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-arg="${escapeHtml(p.name)}" data-type="string" data-enum="${picker}" autocomplete="off" placeholder="type to search…" value="${v != null ? escapeHtml(String(v)) : ""}"><div class="wfn-acx" style="display:none"></div></div>`;
     else if (dt === "boolean")
       field = `<select class="wfn-fld" data-arg="${escapeHtml(p.name)}" data-type="boolean"><option value="">—</option><option value="true"${v === true ? " selected" : ""}>true</option><option value="false"${v === false ? " selected" : ""}>false</option></select>`;
@@ -3191,7 +3289,7 @@ function wfWireTool(editor, dfId, toolName, argsObj) {
     f.addEventListener("change", handler);                       // selects + combo picks (synthetic) + commit
     if (f.tagName !== "SELECT") f.addEventListener("input", handler);   // live typing
   });
-  const build = () => { wfBuildToolForm(form, state.tool, state.args); bindFields(); wfWireCombos(form); sync(); };
+  const build = () => { wfBuildToolForm(form, state.tool, state.args); bindFields(); wfWireCombos(form); wfWireMulti(form); sync(); };
   build();
   sel.onchange = () => { state.tool = sel.value; state.args = {}; build(); };
 }
@@ -3232,15 +3330,32 @@ async function wfRenderList(body) {
         <button class="primary sm wf-run">▶ Run</button>
         <button class="ed-btn wf-edit">Edit</button>
         <button class="ed-btn wf-sched-btn" title="schedule">⏱</button>
+        <button class="ed-btn wf-trig-btn" title="triggers">⚡</button>
         <button class="ed-btn wf-runs" title="run history">⟲</button>
         <button class="ed-btn wf-del" title="delete">✕</button>
       </div>`;
     $(".wf-run", el).onclick = () => wfRenderRun(body, w);
     $(".wf-edit", el).onclick = () => wfRenderEditor(body, w);
     $(".wf-sched-btn", el).onclick = () => wfSchedule(body, w);
+    $(".wf-trig-btn", el).onclick = () => wfTriggers(body, w);
     $(".wf-runs", el).onclick = () => wfRenderRuns(body, w);
     $(".wf-del", el).onclick = async () => { if (!await confirmAction("Delete workflow?", `“${w.name}” and its schedule will be removed.`)) return; await fetch("/api/workflows/" + w.id, { method: "DELETE" }); wfRenderList(body); };
     list.appendChild(el);
+  });
+  wfMarkLive(body);
+}
+async function wfMarkLive(body) {
+  let live; try { live = (await api("/api/workflows/live")).running || []; } catch { return; }
+  live.filter(r => r.status === "running").forEach(r => {
+    const card = body.querySelector(`.wf-card[data-wid="${r.workflow_id}"]`);
+    if (!card) return;
+    const name = $(".wf-card-name", card);
+    if (name && !$(".wf-running", name)) {
+      const b = document.createElement("span");
+      b.className = "wf-running"; b.title = "running now — open Run to reconnect to its live state";
+      b.textContent = " ● running"; name.appendChild(b);
+    }
+    const btn = $(".wf-run", card); if (btn) btn.textContent = "⊙ View run";
   });
 }
 async function wfSchedule(body, w) {
@@ -3249,6 +3364,54 @@ async function wfSchedule(body, w) {
   if (cron === null) return;
   await _postJ("/api/workflows/" + w.id + "/schedule", { cron });
   wfRenderList(body);
+}
+async function wfTriggers(body, w) {
+  body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Triggers · ${escapeHtml(w.name)}</h3></div>
+    <div class="wf-trig-wrap"><div class="wf-trig" id="wfTrig"></div>
+      <div class="wf-trig-add">
+        <select id="wfTrigType" class="wfn-fld"><option value="watch">File / folder watch</option><option value="webhook">Webhook (HTTP)</option><option value="keyword">Chat keyword</option><option value="chain">After another workflow</option></select>
+        <button class="ed-btn" id="wfTrigAdd">+ Add</button><span class="fe-spacer"></span>
+        <span class="acct-msg" id="wfTrigMsg"></span><button class="primary sm" id="wfTrigSave">Save</button>
+      </div></div>`;
+  $("#wfBack", body).onclick = () => wfRenderList(body);
+  let trg; try { trg = (await api("/api/workflows/" + w.id + "/triggers")).triggers || []; } catch { trg = []; }
+  let allwf = []; try { allwf = await api("/api/workflows"); } catch {}
+  const host = $("#wfTrig", body), TYPES = { watch: "File / folder watch", webhook: "Webhook", keyword: "Chat keyword", chain: "After another workflow" };
+  const render = () => {
+    if (!trg.length) { host.innerHTML = `<div class="empty-note">No event triggers yet. Manual ▶ Run and the schedule (⏱) always work — add event triggers below.</div>`; return; }
+    host.innerHTML = "";
+    trg.forEach((t, i) => {
+      const row = document.createElement("div"); row.className = "wf-trig-row";
+      let fields = "";
+      if (t.type === "watch") fields = `<label class="tf-lab">Folder <input class="wfn-fld tf" data-k="folder" value="${escapeHtml(t.folder || "")}" placeholder="brain/inbox"></label><div class="tf-hint">runs when files are added/changed under workspace/&lt;folder&gt;</div>`;
+      else if (t.type === "webhook") { const url = t.token ? `${location.origin}/api/workflows/${w.id}/webhook/${t.token}` : "(Save to generate the URL)"; fields = `<div class="tf-url">POST <code>${escapeHtml(url)}</code>${t.token ? ` <button class="ed-btn tf-copy" type="button">copy</button>` : ""}</div>`; }
+      else if (t.type === "keyword") fields = `<label class="tf-lab">Phrase <input class="wfn-fld tf" data-k="pattern" value="${escapeHtml(t.pattern || "")}" placeholder="daily brief"></label><label class="tf-lab">Channel <select class="wfn-fld tf" data-k="channel">${["any", "web", "telegram"].map(c => `<option value="${c}"${t.channel === c ? " selected" : ""}>${c}</option>`).join("")}</select></label>`;
+      else if (t.type === "chain") fields = `<label class="tf-lab">After <select class="wfn-fld tf" data-k="after">${allwf.filter(x => x.id !== w.id).map(x => `<option value="${x.id}"${t.after === x.id ? " selected" : ""}>${escapeHtml(x.name)}</option>`).join("") || `<option value="">(no other workflows)</option>`}</select></label><label class="tf-lab">When <select class="wfn-fld tf" data-k="on"><option value="success"${t.on === "success" ? " selected" : ""}>it succeeds</option><option value="any"${t.on === "any" ? " selected" : ""}>it finishes</option></select></label>`;
+      row.innerHTML = `<div class="wf-trig-h"><label class="tf-en"><input type="checkbox" class="tf" data-k="enabled"${t.enabled !== false ? " checked" : ""}> <b>${TYPES[t.type]}</b></label><span class="fe-spacer"></span><button class="ed-btn tf-del" type="button">✕</button></div><div class="wf-trig-f">${fields}</div>`;
+      $$(".tf", row).forEach(f => {
+        const k = f.dataset.k, upd = () => { t[k] = f.type === "checkbox" ? f.checked : (k === "after" ? parseInt(f.value, 10) : f.value); };
+        f.addEventListener("change", upd); if (f.tagName === "INPUT" && f.type !== "checkbox") f.addEventListener("input", upd);
+      });
+      const del = $(".tf-del", row); if (del) del.onclick = () => { trg.splice(i, 1); render(); };
+      const cp = $(".tf-copy", row); if (cp) cp.onclick = () => { try { navigator.clipboard.writeText(`${location.origin}/api/workflows/${w.id}/webhook/${t.token}`); cp.textContent = "copied ✓"; } catch {} };
+      host.appendChild(row);
+    });
+  };
+  $("#wfTrigAdd", body).onclick = () => {
+    const defs = { watch: { type: "watch", enabled: true, folder: "" }, webhook: { type: "webhook", enabled: true },
+      keyword: { type: "keyword", enabled: true, pattern: "", channel: "any" },
+      chain: { type: "chain", enabled: true, after: (allwf.find(x => x.id !== w.id) || {}).id, on: "success" } };
+    trg.push(defs[$("#wfTrigType", body).value]); render();
+  };
+  $("#wfTrigSave", body).onclick = async () => {
+    const msg = $("#wfTrigMsg", body); if (msg) { msg.textContent = "saving…"; msg.className = "acct-msg"; }
+    try {
+      const r = await (await fetch("/api/workflows/" + w.id + "/triggers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ triggers: trg }) })).json();
+      trg = r.triggers || []; render();
+      if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+    } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+  };
+  render();
 }
 async function wfRenderEditor(body, w) {
   await wfLoadTools();
@@ -3344,6 +3507,10 @@ async function wfRenderRun(body, w) {
     r.innerHTML = `<div class="wf-rs-h"><span class="wf-rs-ic">◌</span><span class="wf-rs-label">${escapeHtml(label || "")}</span><span class="wf-rs-branch"></span></div><div class="wf-rs-tools"></div><div class="wf-rs-out"></div>`;
     host.appendChild(r); host.scrollTop = host.scrollHeight; rows[id] = r; return r;
   };
+  // Reconnect to an already-running run (e.g. after a browser refresh) rather than starting a new one.
+  let liveState = null;
+  try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id); } catch {}
+  if (liveState) return wfReconnectRun(body, w, host, status, rows, addRow, liveState);
   try {
     const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST" });
     const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = "";
@@ -3367,6 +3534,39 @@ async function wfRenderRun(body, w) {
       host.scrollTop = host.scrollHeight;
     }
   } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; }
+}
+async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
+  // Re-attach to a run already in progress on the server: render its accumulated steps and poll
+  // the live registry until it finishes. Survives browser refreshes and works for scheduled runs.
+  status.textContent = "reconnected · running…"; status.className = "wf-run-status running";
+  let stop = false;
+  const back = $("#wfBack", body), orig = back.onclick;
+  back.onclick = () => { stop = true; if (orig) orig(); };
+  const paint = (st) => {
+    (st.steps || []).forEach(s => {
+      const r = rows[s.id] || addRow(s.id, s.label);
+      r.className = "wf-run-step " + (s.ok ? "ok" : "fail");
+      $(".wf-rs-ic", r).textContent = s.ok ? "✓" : "✗";
+      if (s.branch) $(".wf-rs-branch", r).textContent = "→ " + s.branch;
+      $(".wf-rs-out", r).textContent = (s.output || "").trim();
+    });
+    if (st.current && !rows[st.current.id]) addRow(st.current.id, st.current.label);  // node in flight
+    host.scrollTop = host.scrollHeight;
+  };
+  let st = initial;
+  while (!stop) {
+    paint(st);
+    if (st.status !== "running") {
+      status.textContent = st.summary || st.status;
+      status.className = "wf-run-status " + (st.status === "ok" ? "ok" : "fail");
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1500));
+    let arr; try { arr = (await api("/api/workflows/live")).running || []; } catch { return; }
+    const next = arr.find(x => x.workflow_id === w.id);
+    if (!next) { status.textContent = "finished"; status.className = "wf-run-status ok"; return; }
+    st = next;
+  }
 }
 async function wfRenderRuns(body, w) {
   body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>History · ${escapeHtml(w.name)}</h3></div><div class="wf-runs-list" id="wfRunsList"><div class="empty-note">loading…</div></div>`;

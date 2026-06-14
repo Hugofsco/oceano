@@ -151,7 +151,7 @@ def relevant(query, k=6):
     return "\n".join(f"- {s['name']}: {s['description']}" for _, s in scored[:k])
 
 
-def load_skill(name):
+def _load_one(name):
     for s in all_skills():
         if s["name"] == name or s["dir"] == name:
             if s["status"] != "published":
@@ -159,6 +159,15 @@ def load_skill(name):
                         f"passed review yet, so it can't be loaded)")
             return s["body"]
     return f"(no such skill: {name}). Use list_skills to see what's available."
+
+
+def load_skill(name):
+    """Load one skill, or several at once: pass a comma-separated list of names and their
+    bodies come back concatenated (each under a `## <name>` header)."""
+    names = [n.strip() for n in str(name or "").split(",") if n.strip()]
+    if len(names) > 1:
+        return "\n\n".join(f"## {n}\n{_load_one(n)}" for n in names)
+    return _load_one(names[0] if names else str(name or ""))
 
 
 def _free_slug(name):
