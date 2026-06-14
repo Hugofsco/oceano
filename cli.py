@@ -62,9 +62,10 @@ THEME = "abyss"
 PREFS = {}                          # loaded in main(): theme · confirm_tools · bell
 _HIST = []                          # input history (shared by the raw editor + readline fallback)
 
-# side-effecting tools gated behind a y/n prompt when confirm_tools is on
-RISKY_TOOLS = {"run_shell", "python_exec", "write_file", "edit_file", "make_folder",
-               "forget_memory", "delegate", "schedule_task", "run_workflow"}
+# Tools that can reach the OS OUTSIDE the workspace fence — gated behind a y/N prompt when
+# confirm_tools is on (the default). File tools are already workspace-confined, so they're not
+# gated (no value, just friction); these three are the real escape hatches.
+RISKY_TOOLS = {"run_shell", "python_exec", "delegate"}
 
 # block-letter wordmark (opencode-style banner), shown once at startup
 LOGO = (
@@ -679,7 +680,7 @@ def _load_prefs():
     except Exception:
         PREFS = {}
     PREFS.setdefault("theme", "abyss")
-    PREFS.setdefault("confirm_tools", False)
+    PREFS.setdefault("confirm_tools", True)          # default ON: confirm OS-reaching tools (CLI has no OS sandbox)
     PREFS.setdefault("bell", True)
     return PREFS
 
