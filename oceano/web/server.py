@@ -290,7 +290,16 @@ def _sse(obj):
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    # Cache-bust our own app.js/style.css by file mtime so a browser never serves a stale
+    # build after an update; the HTML itself is no-cache so the version tokens are re-read.
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    for asset in ("app.js", "style.css"):
+        try:
+            v = int((STATIC / asset).stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f"/static/{asset}", f"/static/{asset}?v={v}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/providers")
@@ -446,7 +455,7 @@ def health_dashboard():
         hw = {}
     return {
         "uptime_s": time.time() - _BOOT_TS,
-        "model": config.MODEL,
+        "model": _effective_model(),
         "llamaswap": _llamaswap_status(),
         "embed": {"ok": _embed_reachable(), "model": embeddings.EMBED_MODEL, "url": embeddings.EMBED_URL},
         "scheduler": {"beat_ago_s": (time.time() - beat) if beat else None, "tasks": tasks},
@@ -490,7 +499,7 @@ _TOOL_CATEGORY = {
     "browser_click": "browser", "browser_scroll": "browser",
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
     "index_docs": "documents", "search_docs": "documents", "search_chats": "memory",
-    "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills",
+    "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills", "evaluate_skill": "skills",
     "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
     "run_workflow": "workflow", "list_workflows": "workflow",
@@ -559,7 +568,7 @@ def delegate_status():
     """Claude readiness (shared) + per-role config/readiness: 'default' (agent delegate tool)
     and 'improve' (self-improving jobs: skills, evals, memory)."""
     from oceano import delegate
-    return delegate.status_all()
+    return {**delegate.status_all(), "enabled": delegate.enabled()}
 
 
 @app.post("/api/delegate")
@@ -585,6 +594,47 @@ async def delegate_test(req: Request):
     role = b.get("role", "default")
     role = role if role in delegate.ROLES else "default"
     return await asyncio.to_thread(delegate.probe, role)
+
+
+def _effective_model():
+    """The model Oceano actually defaults to: the user-set primary, else config.MODEL."""
+    from oceano import delegate
+    return delegate.get_default_model() or config.MODEL
+
+
+@app.get("/api/default-model")
+def get_default_model_api():
+    """The primary model + endpoint the agent uses everywhere. The picker lists ALL models
+    (/api/models, any endpoint) — local-first is opt-in, so any model can be primary."""
+    from oceano import delegate
+    p = delegate.get_primary()
+    return {"model": p["model"], "base_url": p["base_url"],
+            "current": p["model"] or config.MODEL, "fallback": config.MODEL}
+
+
+@app.post("/api/default-model")
+async def set_default_model_api(req: Request):
+    """Set the primary model. base_url empty = the default local endpoint; otherwise resolve and
+    store that endpoint's api key so the agent can reach it from Telegram/CLI/jobs too."""
+    from oceano import delegate
+    b = await req.json()
+    model = (b.get("model") or "").strip()
+    base_url = (b.get("base_url") or "").strip()
+    api_key = endpoint_key(base_url) if base_url else ""
+    delegate.set_primary(model, base_url, api_key)
+    return {"ok": True, "current": delegate.get_default_model() or config.MODEL}
+
+
+@app.post("/api/delegate/enabled")
+async def set_delegation_enabled(req: Request):
+    """Master delegation switch. Off → run() refuses (background jobs + the tool) and the
+    delegate tool is withheld from the agent. (Also toggleable per-tool under Settings → Tools.)"""
+    from oceano import delegate
+    b = await req.json()
+    on = bool(b.get("enabled", True))
+    delegate.set_enabled(on)
+    tools.set_enabled("delegate", on)                # keep the agent's delegate tool in sync
+    return {"ok": True, "enabled": on, **delegate.status_all()}
 
 
 @app.get("/api/mcp")

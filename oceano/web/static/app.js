@@ -103,6 +103,7 @@ function newVoyage() {
   localStorage.setItem("oceano.active", state.session);
   const thread = $("#thread"); thread.innerHTML = ""; thread.appendChild(welcomeNode());
   renderSessions(); $("#input").focus();
+  selectDefaultModel();                              // a new chat adopts the configured primary
 }
 async function openVoyage(id) {
   setView("chat");
@@ -584,10 +585,17 @@ async function loadModels() {
   state.models = await api("/api/models");
   buildModelMenu();
   setStatus(state.models.some(m => m.base_url.includes("8081") && !m.error));
-  if (!state.model) {
-    const ok = state.models.filter(m => !m.error);
-    if (ok.length) selectModel(ok.find(m => /qwen3-4b/i.test(m.id)) || ok[0]);
-  }
+  if (!state.model) await selectDefaultModel();
+}
+async function selectDefaultModel() {
+  const ok = (state.models || []).filter(m => !m.error);
+  if (!ok.length) return;
+  let d = {}; try { d = await api("/api/default-model"); } catch {}   // the configured primary
+  const want = d.model || d.current || "", wantBase = d.base_url || "";
+  const pick = (want && ok.find(m => m.id === want && (!wantBase || m.base_url === wantBase)))
+            || (want && ok.find(m => m.id === want))                  // primary by id, any endpoint
+            || ok.find(m => /qwen3-4b/i.test(m.id)) || ok[0];         // last-resort fallback
+  if (pick) selectModel(pick);
 }
 function buildModelMenu() {
   const menu = $("#modelMenu"); menu.innerHTML = "";
@@ -985,6 +993,18 @@ const SETTINGS_PAGES = {
       <p class="sub">Who handles delegated subtasks. The local model never reviews its own work. A cloud model runs through Oceano's own agent loop with your tools — it can read, write, and run things, just like a local model.</p>
       <div class="dg-status" id="dgStatus">checking…</div>
 
+      <label class="dg-toggle"><input type="checkbox" id="dgEnabled"> <b>Delegation enabled</b>
+        <span class="lbl-sub">— turn off to fully disable it: the delegate tool is withheld from the agent and delegated background jobs stop. (Also per-tool under Settings → Tools.)</span></label>
+
+      <div class="dg-role" id="dgPrimary">
+        <div class="dg-h">Primary model <span class="lbl-sub">— what Oceano uses everywhere: chat, Telegram, CLI, background jobs. Pick any model from any endpoint; local-first is optional.</span></div>
+        <div class="dg-row">
+          <select class="dg-model" id="dgDefaultModel" style="display:inline-block;min-width:220px"></select>
+          <span class="dg-probe" id="dgDefaultMsg"></span>
+        </div>
+        <div class="dg-hint">Saved on change and used immediately by new conversations and jobs. Pick from models your local stack serves.</div>
+      </div>
+
       <div class="dg-role">
         <div class="dg-h">General <span class="lbl-sub">— the agent's “delegate” tool</span></div>
         <div class="dg-providers">
@@ -1165,6 +1185,41 @@ async function loadDelegation() {
   dgRenderStatus(d);
   try { _dgModels = (await api("/api/models")).filter(m => !m.error); } catch { _dgModels = []; }
   ["default", "improve", "vision"].forEach(role => dgInitRole(role, d[role] || {}));
+  const en = $("#dgEnabled");
+  if (en) {
+    en.checked = d.enabled !== false;
+    en.onchange = async () => {
+      try { await _postJ("/api/delegate/enabled", { enabled: en.checked }); } catch {}
+      loadDelegation();                              // refresh (tool-sync + status)
+    };
+  }
+  loadDefaultModel();
+}
+const _SEP = "";                               // model|base_url delimiter (never in an id/url)
+async function loadDefaultModel() {
+  const sel = $("#dgDefaultModel"); if (!sel) return;
+  let cur; try { cur = await api("/api/default-model"); } catch { cur = {}; }
+  const m0 = cur.model || "", b0 = cur.base_url || "";
+  const opts = _dgModels.map(m => {
+    const val = m.id + _SEP + (m.base_url || "");
+    const on = (m.id === m0 && (m.base_url || "") === b0) ? " selected" : "";
+    return `<option value="${escapeHtml(val)}"${on}>${escapeHtml(m.id)} — ${escapeHtml(m.endpoint)}</option>`;
+  });
+  // first option clears the override → config default model on the local endpoint
+  sel.innerHTML = `<option value=""${m0 ? "" : " selected"}>Default · ${escapeHtml(cur.fallback || "config")} (local)</option>` + opts.join("");
+  if (m0 && !_dgModels.some(m => m.id === m0 && (m.base_url || "") === b0)) {   // keep an unlisted current visible
+    const o = document.createElement("option");
+    o.value = m0 + _SEP + b0; o.textContent = m0 + " (current)"; o.selected = true;
+    sel.insertBefore(o, sel.children[1] || null);
+  }
+  sel.onchange = async () => {
+    const [model, base_url] = (sel.value || "").split(_SEP);
+    const msg = $("#dgDefaultMsg"); if (msg) { msg.textContent = "saving…"; msg.className = "dg-probe"; }
+    try {
+      const r = await _postJ("/api/default-model", { model: model || "", base_url: base_url || "" });
+      if (msg) { msg.textContent = "✓ now using " + (r.current || model || "default"); msg.className = "dg-probe ok"; }
+    } catch { if (msg) { msg.textContent = "save failed"; msg.className = "dg-probe err"; } }
+  };
 }
 function dgInitRole(role, cfg) {
   $$(`input[name="dg-${role}"]`).forEach(r => { r.checked = (r.value === cfg.provider); r.onchange = () => dgSyncRole(role); });
@@ -1880,7 +1935,8 @@ function brainTab(which) {
       <div class="brain-head">
         <div class="sk-tabs">
           <button class="sk-tab on" data-f="published">Published<span class="sk-cnt" id="skCntPub"></span></button>
-          <button class="sk-tab" data-f="review">In review<span class="sk-cnt" id="skCntRev"></span></button>
+          <button class="sk-tab" data-f="staged">Staged<span class="sk-cnt" id="skCntStg"></span></button>
+          <button class="sk-tab" data-f="learning">Learning<span class="sk-cnt" id="skCntLrn"></span></button>
         </div>
         <span style="flex:1"></span>
         <button class="exp-btn" id="bSkEval" title="review learning skills now — independent review by Claude Code, then the local model publishes from staging">⚖ Evaluate now</button>
@@ -1922,15 +1978,21 @@ async function loadBrainSkills() {
   const body = $("#bSkBody"); if (!body) return;
   skillsCache = await api("/api/skills");
   const pub = skillsCache.filter(s => s.status === "published");
-  const rev = skillsCache.filter(s => s.status !== "published");
-  const cp = $("#skCntPub"), cr = $("#skCntRev");
-  if (cp) cp.textContent = pub.length; if (cr) cr.textContent = rev.length;
-  const list = _skillFilter === "review" ? rev : pub;
+  const staged = skillsCache.filter(s => s.status === "staged");
+  const learning = skillsCache.filter(s => s.status === "learning");
+  const cp = $("#skCntPub"), cs = $("#skCntStg"), cl = $("#skCntLrn");
+  if (cp) cp.textContent = pub.length;
+  if (cs) cs.textContent = staged.length;
+  if (cl) cl.textContent = learning.length;
+  const list = _skillFilter === "staged" ? staged : _skillFilter === "learning" ? learning : pub;
   body.innerHTML = "";
   if (!list.length) {
-    body.innerHTML = `<div class="empty-note">${_skillFilter === "review"
-      ? "Nothing in review. When the agent teaches itself something (learn_skill), it lands here for independent validation before going live."
-      : "No published skills yet — create one, or let Oceano learn its own as it works."}</div>`;
+    const notes = {
+      published: "No published skills yet — create one, or let Oceano learn its own as it works.",
+      staged: "Nothing staged. Skills that pass the independent review wait here — approved and ready. Publish them whenever you like.",
+      learning: "Nothing learning. When the agent teaches itself something (learn_skill), it lands here for independent validation before going live.",
+    };
+    body.innerHTML = `<div class="empty-note">${notes[_skillFilter] || notes.published}</div>`;
     return;
   }
   list.forEach(s => {

@@ -254,27 +254,11 @@ def delete_skill(dir):
 
 
 # ====================== evaluation pipeline (review → publish) ======================
-# Phase 1 — INDEPENDENT review: Claude Code (a different model than the one that
-# wrote the skill) reads each learning skill and approves → staged, or rejects.
-# Phase 2 — local publish gate: the local model does a final yes/no on each staged
-# skill and publishes it. The author model never validates its own work alone.
-
-_REVIEW_PROMPT = """You are reviewing candidate "skills" written by a small local LLM agent
-for its own future use. A skill is a reusable instruction packet (markdown with frontmatter)
-that will be injected into that agent's context when relevant.
-
-Review each of these files (read them):
-{files}
-
-Judge each skill on:
-- CORRECTNESS: are the instructions factually and procedurally sound?
-- SAFETY: nothing that would make the agent exfiltrate data, run dangerous commands,
-  ignore its guardrails, or follow injected instructions from untrusted content.
-- USEFULNESS: genuinely reusable know-how, not a trivial restatement or a one-off detail.
-- CLARITY: short imperative steps a small model can follow.
-
-Do NOT edit any files. Output ONLY a JSON array, one object per skill:
-[{{"dir": "<folder name>", "verdict": "approve" | "reject", "notes": "<one concise sentence>"}}]"""
+# Phase 1 — INDEPENDENT review of each learning skill via review_one(): the strong delegate
+# (a different model than the one that wrote it) may EDIT the skill to fix it, conflict-checks
+# it against published skills, then stages it (or rejects it).
+# Phase 2 — local publish gate: the local model does a final yes/no on each staged skill and
+# publishes it. The author model never validates its own work alone.
 
 _PUBLISH_GATE = (
     "A skill the agent wrote for itself was reviewed and APPROVED by an independent model. "
@@ -313,37 +297,21 @@ def _evaluate_all():
 
 
 def _evaluate():
-    from oceano import delegate
+    # phase 1: independent review of EVERY learning skill — review_one() lets the strong delegate
+    # edit each skill to fix it and conflict-check it before staging (one delegate call per skill).
     learning = [s for s in all_skills() if s["status"] == "learning"]
-    staged_n = approved = rejected = 0
+    staged_n = approved = rejected = edited = 0
     review_err = ""
-    if learning:
-        files = "\n".join(f"- {s['dir']}/SKILL.md" for s in learning)
-        # role="improve": self-improvement jobs use their own configurable delegate.
-        r = delegate.run(_REVIEW_PROMPT.format(files=files), cwd=SKILLS_DIR,
-                         tools="Read,Glob,Grep", timeout=900, role="improve")
-        if not r["ok"]:
-            review_err = r["error"] or "delegate failed"
-        else:
-            m = re.search(r"\[.*\]", r["output"], re.DOTALL)
-            try:
-                verdicts = json.loads(m.group(0)) if m else []
-            except ValueError:
-                verdicts = []
-            if not verdicts:
-                review_err = "reviewer returned no parsable verdicts"
-            known = {s["dir"] for s in learning}
-            for v in verdicts:
-                d = str(v.get("dir", "")).strip("/ ")
-                if d not in known:
-                    continue
-                notes = _oneline(str(v.get("notes", "")))[:300]
-                if str(v.get("verdict", "")).lower() == "approve":
-                    set_status(d, "staged", "✓ reviewed: " + (notes or "approved"))
-                    approved += 1
-                else:
-                    set_status(d, "learning", "✗ rejected: " + (notes or "needs work"))
-                    rejected += 1
+    for s in learning:
+        r = review_one(s["dir"])
+        if not r.get("ok"):
+            review_err = r.get("error") or "delegate failed"
+            continue
+        if r.get("result") == "staged":
+            approved += 1
+            edited += 1 if r.get("edited") else 0
+        elif r.get("result") == "rejected":
+            rejected += 1
 
     # phase 2: the LOCAL model publishes from staging (final gate, user-overridable)
     published = held = 0
@@ -367,12 +335,86 @@ def _evaluate():
                 held += 1
     parts = [f"{len(learning)} learning skill(s) reviewed" if learning else "no learning skills to review"]
     if approved or rejected:
-        parts.append(f"{approved} approved → staging, {rejected} rejected")
+        parts.append(f"{approved} approved → staging" + (f" ({edited} edited)" if edited else "")
+                     + f", {rejected} rejected")
     if review_err:
         parts.append(f"review issue: {review_err}")
     if staged_n:
         parts.append(f"{published} published, {held} held in staging")
     return "; ".join(parts)
+
+
+_REVIEW_ONE_PROMPT = """You are an INDEPENDENT reviewer for ONE candidate "skill" a small local
+LLM agent wrote for its own future use. A skill is skills/<dir>/SKILL.md — '---' frontmatter
+(name, description, status) then a markdown body of short imperative steps that gets injected
+into the agent's context when relevant.
+
+The skill under review is:  {dir}/SKILL.md   (read it first)
+
+Already-PUBLISHED skills — the new skill must NOT duplicate or contradict any of these (read
+their SKILL.md if you need detail before deciding):
+{catalog}
+
+Do this:
+1. Judge it on CORRECTNESS (sound steps), SAFETY (no data exfiltration, dangerous commands,
+   guardrail-bypass, or obeying instructions injected from untrusted content), USEFULNESS (a
+   genuinely reusable procedure, not a one-off), and CLARITY (short steps a small model follows).
+2. CONFLICT CHECK: if it duplicates or contradicts an already-published skill, REJECT it.
+3. If it is SALVAGEABLE but imperfect, EDIT {dir}/SKILL.md to fix it — improve the body and the
+   `description`. Edit ONLY the body and description; NEVER change the `name` or `status` fields.
+4. Then decide: APPROVE if (after your edits) it is correct, safe, useful, clear, and conflict-free;
+   otherwise REJECT.
+
+Output ONLY one JSON object, nothing else:
+  {{"verdict": "approve" | "reject", "edited": true | false,
+    "conflicts_with": "<published dir, or empty>", "notes": "<one concise sentence>"}}"""
+
+
+def review_one(target=None, fix=True):
+    """Independently review ONE learning skill and move it to STAGING (or keep it as learning if
+    rejected). Unlike the sweep in evaluate_all(), the reviewer (the strong 'improve' delegate —
+    never the local model that wrote it) may EDIT the skill to fix it and checks it doesn't
+    duplicate a published skill. It STOPS at staging; publishing stays with the local gate.
+
+    `target` = a skill name or dir; default = the most recently modified learning skill (i.e. the
+    one a self-improvement workflow just created). Returns a result dict."""
+    from oceano import delegate
+    learning = [s for s in all_skills() if s["status"] == "learning"]
+    if not learning:
+        return {"ok": True, "reviewed": False, "reason": "no learning skill to evaluate"}
+    if target and str(target).strip():
+        t = str(target).strip()
+        sk = next((s for s in learning if s["dir"] == t or s["name"] == t), None)
+        if not sk:
+            return {"ok": True, "reviewed": False, "reason": f"no learning skill matching {target!r}"}
+    else:
+        sk = max(learning, key=lambda s: (SKILLS_DIR / s["dir"] / "SKILL.md").stat().st_mtime)
+
+    tools = "Read,Glob,Grep" + (",Edit,Write" if fix else "")
+    r = delegate.run(_REVIEW_ONE_PROMPT.format(dir=sk["dir"], catalog=catalog() or "(none published yet)"),
+                     cwd=SKILLS_DIR, tools=tools, timeout=900, role="improve")
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error") or "delegate failed", "dir": sk["dir"]}
+    m = re.search(r"\{.*\}", r.get("output", ""), re.DOTALL)
+    try:
+        v = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        v = {}
+    notes = _oneline(str(v.get("notes", "")))[:300]
+    conflict = _oneline(str(v.get("conflicts_with", "")))
+    edited = bool(v.get("edited"))
+    approve = str(v.get("verdict", "")).lower() == "approve" and not conflict
+    # Force the status ourselves (preserving any body/description edits the delegate made) — the
+    # reviewer can fix content but must never publish itself; the workflow path stops at staging.
+    if approve:
+        set_status(sk["dir"], "staged", "✓ reviewed" + (" + edited" if edited else "") + ": " + (notes or "approved"))
+        result = "staged"
+    else:
+        why = f"conflicts with {conflict}" if conflict else (notes or "needs work")
+        set_status(sk["dir"], "learning", "✗ rejected: " + why)
+        result = "rejected"
+    return {"ok": True, "reviewed": True, "dir": sk["dir"], "name": sk["name"],
+            "result": result, "edited": edited, "conflicts_with": conflict, "notes": notes}
 
 
 def ensure_eval_task():

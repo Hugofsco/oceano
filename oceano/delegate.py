@@ -36,6 +36,11 @@ from oceano import atomicio
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 _CONFIG_PATH = config.WORKSPACE.parent / "data" / "delegation.json"
+_MODEL_KEY = "oceano_default_model"        # primary model id the agent uses everywhere
+_BASE_KEY = "oceano_default_base_url"      # its endpoint (empty = the default local endpoint)
+_KEY_KEY = "oceano_default_api_key"        # api key for that endpoint (empty = config default)
+_ENABLED_KEY = "delegation_enabled"        # master on/off for delegation (run + delegate tool)
+_RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key", "delegation_enabled")
 # 'default' = the agent's delegate tool · 'improve' = self-improving jobs · 'vision' = image
 # recognition (the local chat model is text-only, so images are routed to this target).
 ROLES = ("default", "improve", "vision")
@@ -83,11 +88,68 @@ def set_config(d, role="default"):
     allcfg[role] = {"provider": prov if prov in valid else ("claude_cli" if role == "default" else "inherit"),
                     "base_url": (d.get("base_url", cur.get("base_url", "")) or "").strip(),
                     "model": (d.get("model", cur.get("model", "")) or "").strip()}
+    out = dict(allcfg)
+    raw = _raw()                                     # don't clobber the primary-model / enabled keys
+    for k in _RESERVED:
+        if k in raw:
+            out[k] = raw[k]
     try:
-        atomicio.write_text(_CONFIG_PATH, json.dumps(allcfg))
+        atomicio.write_text(_CONFIG_PATH, json.dumps(out))
     except OSError:
         pass
     return allcfg[role]
+
+
+def _raw():
+    try:
+        d = json.loads(_CONFIG_PATH.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def get_primary():
+    """The user's chosen primary model + endpoint (Settings → Delegation). Any field empty
+    means 'fall back to config': model → config.MODEL, base_url → the default local endpoint."""
+    d = _raw()
+    return {"model": (d.get(_MODEL_KEY) or "").strip(),
+            "base_url": (d.get(_BASE_KEY) or "").strip(),
+            "api_key": (d.get(_KEY_KEY) or "").strip()}
+
+
+def set_primary(model, base_url="", api_key=""):
+    """Persist the primary model + its endpoint. base_url/api_key empty → use the config
+    defaults (local llama.cpp). Preserves the per-role delegation configs in the same file."""
+    d = _raw()
+    d[_MODEL_KEY] = (model or "").strip()
+    d[_BASE_KEY] = (base_url or "").strip()
+    d[_KEY_KEY] = (api_key or "").strip()
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_primary()
+
+
+def get_default_model():                             # back-compat: just the model id
+    return get_primary()["model"]
+
+
+def enabled():
+    """Master delegation switch (default ON). When OFF, run() refuses and the delegate tool
+    is withheld from the agent — so delegation can be fully turned off."""
+    v = _raw().get(_ENABLED_KEY, True)
+    return v if isinstance(v, bool) else str(v).lower() not in ("0", "false", "off", "no", "")
+
+
+def set_enabled(on):
+    d = _raw()
+    d[_ENABLED_KEY] = bool(on)
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return bool(on)
 
 
 def find_claude():
@@ -235,6 +297,8 @@ def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30, 
       claude_cli → the Claude Code CLI (its own tools; `tools=` limits --allowedTools);
       api        → the cloud model run through OUR agent loop with OUR tools.
     `cwd` scopes the working folder for both. role='improve' for self-improving jobs."""
+    if not enabled():
+        return {"ok": False, "output": "", "error": "Delegation is turned off (Settings → Delegation)."}
     if resolve(role)["provider"] == "api":
         return to_api(instructions, cwd=cwd, role=role, tools=tools, timeout=timeout)
     return to_claude(instructions, cwd=cwd, tools=tools, timeout=timeout, max_turns=max_turns)

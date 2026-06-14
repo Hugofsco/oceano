@@ -807,6 +807,38 @@ def learn_skill(name, description, body):
 @tool({
     "type": "function",
     "function": {
+        "name": "evaluate_skill",
+        "description": "Independently review a LEARNING skill and, if it's good, promote it to "
+                       "STAGING. A stronger model (never the one that wrote it) checks it for "
+                       "correctness/safety/usefulness/clarity, EDITS it to fix it if salvageable, "
+                       "and ensures it doesn't duplicate or contradict an already-published skill; "
+                       "conflicts or unfixable skills are rejected. It only stages — publishing "
+                       "stays a separate step. Use right after learn_skill in a self-improvement "
+                       "flow. Leave `name` empty to review the most recently learned skill.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "skill name or dir to review; empty = the most recently learned one"},
+        }},
+    },
+})
+def evaluate_skill(name=""):
+    r = skills.review_one(name or None)
+    if not r.get("ok"):
+        return f"skill review failed: {r.get('error')}"
+    if not r.get("reviewed"):
+        return r.get("reason", "nothing to review")
+    bits = [f"{r['name']} ({r['dir']}) → {r['result']}"]
+    if r.get("edited"):
+        bits.append("edited to fix")
+    if r.get("conflicts_with"):
+        bits.append(f"conflicts with {r['conflicts_with']}")
+    if r.get("notes"):
+        bits.append(r["notes"])
+    return " · ".join(bits)
+
+
+@tool({
+    "type": "function",
+    "function": {
         "name": "delegate",
         "description": "Hand a self-contained subtask to the configured delegate — a stronger "
                        "assistant running headless in the workspace. WHO that is, is set by the user "
