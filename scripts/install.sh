@@ -291,10 +291,12 @@ install_service() {
   local src="$ROOT/systemd/oceano.service" dst=/etc/systemd/system/oceano.service
   [ -f "$src" ] || die "missing $src"
   # Template the unit to THIS install: the __OCEANO_USER__ / __OCEANO_ROOT__ /
-  # __OCEANO_HOME__ tokens (venv, ExecStart, EnvironmentFile, PATH, ReadWritePaths) →
-  # the real user / $ROOT / $HOME. (%h is unusable here — on a system unit it = /root.)
+  # __OCEANO_HOME__ / __OCEANO_LLAMA_DIR__ tokens (venv, ExecStart, EnvironmentFile, PATH,
+  # ReadWritePaths) → the real user / $ROOT / $HOME / $LLAMA_DIR. (%h is unusable here — on
+  # a system unit it = /root.)
   mkdir -p "$HOME/.claude"   # the ReadWritePaths entry below; Claude Code writes its state here
   local rendered; rendered=$(sed -e "s#__OCEANO_ROOT__#$ROOT#g" -e "s#__OCEANO_HOME__#$HOME#g" \
+                                 -e "s#__OCEANO_LLAMA_DIR__#$LLAMA_DIR#g" \
                                  -e "s#^User=__OCEANO_USER__#User=$(id -un)#" "$src")
   if [ -f "$dst" ] && [ "$rendered" = "$(cat "$dst" 2>/dev/null)" ]; then ok "unit already installed + current"
   else

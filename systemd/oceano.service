@@ -29,12 +29,15 @@ RestartSec=10
 # human in the loop (scheduler). Even if the service user has passwordless sudo,
 # neuter privilege escalation and make all of $HOME read-only except the dirs Oceano
 # must write — this confines even run_shell (e.g. blocks writes to ~/.ssh/authorized_keys).
-# <home>/.claude is the one HOME exception: Claude Code (used by delegate_to_claude /
-# the skills + eval reviewers) must write its session/config state there. The leading
-# '-' makes it optional so a box without ~/.claude yet still starts cleanly.
+# Two HOME exceptions: <home>/.claude (Claude Code — used by delegate_to_claude / the
+# skills + eval reviewers — writes its session/config state there) and the llama.cpp dir
+# (Rivers downloads .gguf models into llama.cpp/models and edits llama.cpp/llama-swap.yaml;
+# without write access there, UI model downloads/serve fail with EROFS). The leading '-'
+# makes each optional, so a box without ~/.claude — or one pointed at a remote LLM with no
+# local llama.cpp — still starts cleanly.
 NoNewPrivileges=true
 ProtectHome=read-only
-ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills -__OCEANO_HOME__/.claude
+ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills -__OCEANO_LLAMA_DIR__ -__OCEANO_HOME__/.claude
 PrivateTmp=true
 # SIGTERM the engine first so it can shut the embed child down cleanly, then
 # SIGKILL anything still in the cgroup after the grace period.
