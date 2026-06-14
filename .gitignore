@@ -35,3 +35,19 @@ assets/*
 # --- llama.cpp now lives under the Oceano dir (build tree + GGUF models, ~tens of GB);
 #     never commit it — GitHub caps files at 100MB and these are machine-built binaries.
 llama.cpp/
+
+# --- skills/: ship the built-in skills, ignore the ones the agent learns at runtime.
+#     learn_skill writes new skills to skills/<slug>/ — that generated content shouldn't be
+#     committed. Ignore every skill dir, then whitelist the ones shipped with Oceano. To ship a
+#     NEW built-in skill, add a matching '!' line below (or: git add -f skills/<slug>/).
+skills/*/
+!skills/code-review/
+!skills/daily-digest/
+!skills/debug-systematically/
+!skills/edit-file-precisely/
+!skills/extract-to-csv/
+!skills/read-large-files/
+!skills/research-report/
+!skills/search-the-codebase/
+!skills/summarize-document/
+!skills/verify-by-running/
