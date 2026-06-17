@@ -126,7 +126,8 @@ def delete_case(case_id):
 # ============================ target models ============================
 def available_models():
     """Served local models (llama-swap), newest registration first — the universe a
-    run can target. Falls back to the configured default model."""
+    run can target. No hardcoded default: falls back to an OCEANO_MODEL pin if set, else []
+    (nothing served → nothing to eval)."""
     try:
         from oceano import rivers
         served = [m["served"] for m in rivers.installed() if m.get("served")]
@@ -138,7 +139,7 @@ def available_models():
             return out
     except Exception:
         pass
-    return [config.MODEL]
+    return [config.MODEL] if config.MODEL else []     # '' → no model configured anywhere
 
 
 def set_selected_models(models):

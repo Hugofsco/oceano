@@ -1,5 +1,9 @@
 openai>=1.40
 requests>=2.31
+# CLI frontend (cli.py): prompt_toolkit handles line editing/history/completion, rich
+# handles markdown/spinner/diff rendering — so the terminal UI isn't hand-rolled.
+prompt_toolkit>=3.0
+rich>=13.0
 beautifulsoup4>=4.12
 lxml>=5.0
 croniter>=2.0

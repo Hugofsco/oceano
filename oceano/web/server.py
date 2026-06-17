@@ -507,7 +507,8 @@ _TOOL_CATEGORY = {
     "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
     "run_workflow": "workflow", "list_workflows": "workflow",
-    "calendar_events": "calendar",
+    "calendar_events": "calendar", "add_calendar_event": "calendar",
+    "update_calendar_event": "calendar", "delete_calendar_event": "calendar",
 }
 
 
@@ -601,19 +602,26 @@ async def delegate_test(req: Request):
 
 
 def _effective_model():
-    """The model Oceano actually defaults to: the user-set primary, else config.MODEL."""
+    """The model Oceano actually uses: resolved from the user-set primary, an OCEANO_MODEL
+    pin, or a model served via Rivers (delegate.resolve_primary) — '' if nothing is set up."""
     from oceano import delegate
-    return delegate.get_default_model() or config.MODEL
+    return delegate.get_default_model()
 
 
 @app.get("/api/default-model")
 def get_default_model_api():
     """The primary model + endpoint the agent uses everywhere. The picker lists ALL models
-    (/api/models, any endpoint) — local-first is opt-in, so any model can be primary."""
+    (/api/models, any endpoint) — local-first is opt-in, so any model can be primary.
+      model     the explicit primary the user pinned ('' = none → use the resolved default)
+      current   what Oceano actually resolves to right now (primary > env > served)
+      fallback  what the 'Default' (un-pinned) choice resolves to: env pin or first Rivers model
+      source    where `current` came from: primary | env | served | none"""
     from oceano import delegate
     p = delegate.get_primary()
+    r = delegate.resolve_primary()
+    implicit = config.MODEL or (delegate.served_models()[:1] or [""])[0]
     return {"model": p["model"], "base_url": p["base_url"],
-            "current": p["model"] or config.MODEL, "fallback": config.MODEL}
+            "current": r["model"], "source": r["source"], "fallback": implicit}
 
 
 @app.post("/api/default-model")
@@ -626,7 +634,7 @@ async def set_default_model_api(req: Request):
     base_url = (b.get("base_url") or "").strip()
     api_key = endpoint_key(base_url) if base_url else ""
     delegate.set_primary(model, base_url, api_key)
-    return {"ok": True, "current": delegate.get_default_model() or config.MODEL}
+    return {"ok": True, "current": delegate.get_default_model()}
 
 
 @app.post("/api/delegate/enabled")
@@ -800,6 +808,12 @@ async def chat(req: Request):
             b = _chat_live.get(sid)
             if b is not None:
                 b["events"].append(ev)
+                if isinstance(ev, dict) and ev.get("type") == "tool_progress":
+                    # progress events are ephemeral live updates; keep only the most recent so a
+                    # long delegation (hundreds of them) can't bloat the reconnect buffer.
+                    prog = [e for e in b["events"] if e.get("type") == "tool_progress"]
+                    if len(prog) > 60:
+                        b["events"].remove(prog[0])
                 if isinstance(ev, dict) and ev.get("type") in ("done", "error"):
                     b["running"] = False
         loop.call_soon_threadsafe(q.put_nowait, ev)
@@ -1698,22 +1712,54 @@ def _artifact_html(kind, raw):
     return _ARTIFACT_TEMPLATES[kind].replace("__CSS__", _ARTIFACT_BASE_CSS).replace("__B64__", b64)
 
 
-@app.get("/api/preview/{path:path}")
-def preview_file(path: str):
-    """Serve a workspace file for the in-app Preview iframe. PATH-BASED (not ?path=) so an
-    app's relative assets — ./style.css, ./app.js — resolve correctly against the iframe URL.
-    Auth-gated by the middleware (the iframe navigation carries the same-site cookie).
+# ---------------- preview capability tokens ----------------
+# The Preview iframe is sandboxed WITHOUT allow-same-origin (see _PREVIEW_SANDBOX), so the rendered
+# page sits in an opaque origin and can't send the SameSite=Lax session cookie — that's what stops a
+# previewed page from calling /api/* with your session. The flip side: the page's OWN relative
+# assets (./style.css, ./app.js), if served from the cookie-gated /api/preview/* path, would 401 —
+# the opaque-origin sub-requests carry no cookie. So multi-file previews load through
+# /preview/<token>/… instead: an unguessable, time-boxed, read-only capability minted by a logged-in
+# user (via /api/preview-token) and confined to the previewed file's directory subtree. No cookie is
+# involved, so the /api/* containment is fully preserved.
+_PREVIEW_TOKEN_TTL = 12 * 3600        # long enough to outlast an editing session; re-minted on reload
 
-    SECURITY: this serves agent/user-generated HTML from the app's OWN origin, so we must not
-    let it act with the session. The iframe sandbox attribute alone isn't enough — it's bypassed
-    if the page is opened directly (new tab, window.open, a crafted link). So we ALSO send
-    `Content-Security-Policy: sandbox …` (without allow-same-origin), which forces the browser to
-    treat the response as an opaque origin HOWEVER it's loaded. An opaque-origin document can't
-    send the cookie to /api/* (default fetch creds are dropped cross-origin; Lax cookies aren't
-    sent on cross-site sub-requests), so stored-XSS in a previewed page can't escalate to the API.
-    The sandbox directive doesn't restrict resource loading, so multi-file apps still render their
-    relative assets. nosniff stops MIME confusion; no-store keeps auto-reload fetching fresh."""
-    p = _wresolve(path)
+
+def _preview_root(path):
+    """The directory subtree a token authorizes: the previewed file's parent as a
+    workspace-relative POSIX string ('' = workspace root)."""
+    rel = (path or "").replace("\\", "/").strip("/")
+    return rel.rsplit("/", 1)[0] if "/" in rel else ""
+
+
+def _make_preview_token(root, secret):
+    # "prev:" domain tag (see _make_token) — keeps this capability token distinct from a session
+    # cookie even though both are HMAC'd with the same auth secret in the same base64 envelope.
+    msg = f"{root}:{int(time.time())}"
+    sig = hmac.new(secret.encode(), f"prev:{msg}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}:{sig}".encode()).decode()
+
+
+def _preview_token_root(token, secret):
+    """Authorized root for a valid, unexpired token, else None. HMAC-signed, so root can't be
+    tampered without the secret."""
+    try:
+        root, ts, sig = base64.urlsafe_b64decode(token.encode()).decode().rsplit(":", 2)
+        good = hmac.new(secret.encode(), f"prev:{root}:{ts}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, good):
+            return None
+        if time.time() - int(ts) > _PREVIEW_TOKEN_TTL:
+            return None
+        return root
+    except Exception:
+        return None
+
+
+def _serve_preview(p):
+    """Build the sandboxed response for an already-resolved workspace path. Renders artifact source
+    (.md/.mmd/.chart.json/.slides) to HTML; serves everything else raw. The CSP `sandbox` (no
+    allow-same-origin) forces an opaque origin HOWEVER the response is loaded — so even opened
+    directly (new tab, window.open, a crafted link) it can't act with the session. nosniff stops
+    MIME confusion; no-store keeps auto-reload fetching fresh."""
     if p.is_dir():
         p = p / "index.html"
     if not p.is_file():
@@ -1722,6 +1768,7 @@ def preview_file(path: str):
         "Cache-Control": "no-store",
         "Content-Security-Policy": f"sandbox {_PREVIEW_SANDBOX}",
         "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",       # keep the capability token out of the Referer header
     }
     kind = _artifact_kind(p.name)               # .md/.mmd/.chart.json/.slides → render, not raw
     if kind:
@@ -1731,6 +1778,43 @@ def preview_file(path: str):
             raise HTTPException(500, str(e))
         return HTMLResponse(_artifact_html(kind, raw), headers=headers)
     return FileResponse(str(p), headers=headers)
+
+
+@app.get("/api/preview-token")
+def preview_token(path: str):
+    """Mint a capability token scoped to the previewed file's folder. Cookie-gated by the
+    middleware, so only a logged-in user can mint one; the token then rides in the
+    /preview/<token>/… URL the sandboxed iframe loads."""
+    _wresolve(path)                              # 400s if the path escapes the workspace
+    root = _preview_root(path)
+    secret = load().get("auth", {}).get("secret", "")
+    return {"token": _make_preview_token(root, secret), "root": root}
+
+
+@app.get("/api/preview/{path:path}")
+def preview_file(path: str):
+    """Cookie-gated single-file preview — the iframe's top-level navigation carries the Lax cookie,
+    so this still works for a lone .html/.md/etc. A multi-file app whose relative assets must load
+    goes through /preview/<token>/… instead (see the preview-capability note above)."""
+    return _serve_preview(_wresolve(path))
+
+
+@app.get("/preview/{token}/{path:path}")
+def preview_capability(token: str, path: str):
+    """Token-authed preview — deliberately NOT under /api/, so the middleware doesn't demand the
+    cookie the sandboxed (opaque-origin) iframe can't send. Validates the capability token and
+    confines the request to its authorized directory subtree (read-only). Same sandbox/nosniff/
+    no-store headers as the cookie-gated route. NOTE: a token minted for a workspace-root file
+    authorizes the whole workspace-root subtree — keep multi-file apps in their own folder for a
+    tighter scope."""
+    secret = load().get("auth", {}).get("secret", "")
+    root = _preview_token_root(token, secret)
+    if root is None:
+        raise HTTPException(403, "invalid or expired preview token")
+    p = _wresolve(path)
+    if not p.is_relative_to(_wresolve(root)):    # confine to the token's subtree
+        raise HTTPException(403, "path outside preview scope")
+    return _serve_preview(p)
 
 
 @app.get("/api/file")
@@ -1868,8 +1952,11 @@ async def run_task_api(tid: int):
 
 # ---------------- calendar (local copy, synced from ICS feeds) ----------------
 @app.get("/api/calendar")
-def get_calendar(days: int = 30):
-    return {"feeds": calsync.feeds(), "events": calsync.upcoming(max(1, min(days, 365)))}
+def get_calendar(days: int = 30, start: str = "", end: str = ""):
+    # start+end (YYYY-MM-DD) → the month/week/day grid asks for an explicit range; otherwise
+    # fall back to "next N days from today" (the agenda).
+    events = calsync.range_events(start, end) if (start and end) else calsync.upcoming(max(1, min(days, 365)))
+    return {"feeds": calsync.feeds(), "events": events}
 
 
 @app.post("/api/calendar/feeds")
@@ -1894,6 +1981,31 @@ def delete_calendar_feed(fid: int):
 async def sync_calendar():
     results = await asyncio.to_thread(calsync.sync_all)
     return {"ok": all(r.get("ok") for r in results.values()) if results else True, "results": results}
+
+
+# ---- local events: the editable layer (synced feed events stay read-only) ----
+@app.post("/api/calendar/events")
+async def add_calendar_event_api(req: Request):
+    b = await req.json()
+    return calsync.add_event(b.get("title", ""), b.get("start", ""), end=b.get("end"),
+                             all_day=bool(b.get("all_day")), location=b.get("location", ""),
+                             description=b.get("description", ""), category=b.get("category", ""))
+
+
+@app.put("/api/calendar/events/{eid}")
+async def update_calendar_event_api(eid: int, req: Request):
+    b = await req.json()
+    # only override fields the client actually sent (so omitted ones aren't wiped); `end`
+    # uses calsync's sentinel default so it's only touched when present in the body.
+    kw = {k: b[k] for k in ("title", "start", "all_day", "location", "description", "category") if k in b}
+    if "end" in b:
+        kw["end"] = b["end"]
+    return calsync.update_event(eid, **kw)
+
+
+@app.delete("/api/calendar/events/{eid}")
+def delete_calendar_event_api(eid: int):
+    return calsync.delete_event(eid)
 
 
 # ---------------- researcher (scheduled deep-dives → living docs) -------------

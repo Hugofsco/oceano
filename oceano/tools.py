@@ -56,6 +56,27 @@ def channel(name):
         _local.channel = prev
 
 
+# --- progress sink ---------------------------------------------------------
+# A long-running tool (the streaming delegate) can push live progress to whoever is driving
+# it. The agent sets a sink before running such a tool (on the same thread the tool runs on)
+# and drains it into its event stream; emit_progress is a no-op when nobody's listening.
+def set_progress_sink(fn):
+    _local.progress = fn
+
+
+def clear_progress_sink():
+    _local.progress = None
+
+
+def emit_progress(ev):
+    fn = getattr(_local, "progress", None)
+    if fn:
+        try:
+            fn(ev)
+        except Exception:
+            pass
+
+
 @contextlib.contextmanager
 def background():
     """Run unattended agent work — no shared live browser (Researcher/scheduler/evals)."""
@@ -866,10 +887,25 @@ def evaluate_skill(name=""):
 })
 def delegate_tool(instructions):
     from oceano import delegate
-    r = delegate.run(instructions, cwd=config.WORKSPACE)   # honours Settings → Delegation (default role)
-    if not r["ok"]:
-        return f"delegation failed: {r['error']}"
-    return r["output"][:8000] or "(the delegate finished but returned no text)"
+
+    def on_prog(ev):                         # surface the delegate's live work to the frontend
+        emit_progress({"source": "delegate", **ev})
+
+    r = delegate.run(instructions, cwd=config.WORKSPACE, on_progress=on_prog)  # Settings → Delegation
+    if r["ok"]:
+        return r["output"][:8000] or "(the delegate finished but returned no text)"
+    # Failed/stalled/capped. Hand back any partial work AND tell the local model NOT to attempt
+    # the whole job itself — that's what overflows a small context window and produces garbage.
+    partial = (r.get("output") or "").strip()
+    msg = f"The delegate did not finish: {r.get('error')}."
+    if partial:
+        msg += f"\n\nPartial result it produced before stopping:\n{partial[:6000]}"
+    msg += ("\n\nIMPORTANT: do NOT try to build or write this whole thing yourself — it is a "
+            "large task meant for the delegate and will exceed your context. Tell the user the "
+            "delegation didn't complete, summarize any partial progress above, and suggest they "
+            "retry (delegation now streams and only stops if genuinely stalled, so a retry "
+            "usually gets further) or break the request into smaller pieces.")
+    return msg
 
 
 # back-compat: the tool was once 'delegate_to_claude'. Keep the old name callable (not shown
@@ -877,15 +913,21 @@ def delegate_tool(instructions):
 _TOOLS["delegate_to_claude"] = delegate_tool
 
 
-# --- calendar (local copy, synced from Google Calendar / any ICS feed) -------
+# --- calendar (one local timeline you manage + read-only synced feeds) -------
+# You can fully manage LOCAL events (create/edit/delete). Events synced from an external
+# .ics feed are READ-ONLY (a sync would overwrite them) — schedule AROUND them, never try
+# to change them. In calendar_events output, editable events are marked `[#id]`; that id is
+# what you pass to update_calendar_event / delete_calendar_event.
 @tool({
     "type": "function",
     "function": {
         "name": "calendar_events",
-        "description": "Read the user's calendar: upcoming events for the next N days. "
-                       "This is the local copy, kept in sync from their Google Calendar — "
-                       "use it whenever the user asks about their schedule, availability, "
-                       "appointments, or plans.",
+        "description": "Read the user's schedule: upcoming events for the next N days, across "
+                       "their local Oceano calendar AND any synced external feeds. Use it "
+                       "whenever they ask about their schedule/availability/plans, AND before "
+                       "you add or move anything (to find free slots and the ids of existing "
+                       "events). Editable local events show as `[#id]`; feed events are marked "
+                       "read-only and must not be changed.",
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer", "description": "how many days ahead to look (default 7)"},
         }},
@@ -898,3 +940,81 @@ def calendar_events(days=7):
     except (TypeError, ValueError):
         days = 7
     return calsync.agenda(days)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "add_calendar_event",
+        "description": "Add an event to the user's local calendar (appointments, activities, "
+                       "reminders, blocks of time). Check calendar_events first so you don't "
+                       "clash with an existing event. Times are the user's local time.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "what the event is, e.g. 'Dentist'"},
+            "start": {"type": "string", "description": "start as 'YYYY-MM-DD HH:MM' (timed) or "
+                                                       "'YYYY-MM-DD' (all-day)"},
+            "end": {"type": "string", "description": "optional end as 'YYYY-MM-DD HH:MM'"},
+            "all_day": {"type": "boolean", "description": "true for an all-day event"},
+            "location": {"type": "string", "description": "optional place"},
+            "description": {"type": "string", "description": "optional notes"},
+        }, "required": ["title", "start"]},
+    },
+})
+def add_calendar_event(title, start, end=None, all_day=False, location="", description=""):
+    from oceano import calsync
+    r = calsync.add_event(title, start, end=end, all_day=all_day,
+                          location=location, description=description)
+    if not r.get("ok"):
+        return f"ERROR: {r.get('error')}"
+    e = r["event"]
+    when = e["start"][:10] if e["all_day"] else f"{e['start'][:10]} {e['start'][11:16]}"
+    return f"Added '{e['title']}' on {when} (id {e['id']})."
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "update_calendar_event",
+        "description": "Edit an existing LOCAL calendar event (reschedule, rename, change "
+                       "location, etc.). Pass the event's id (the `[#id]` from calendar_events) "
+                       "and only the fields you want to change. Synced feed events are "
+                       "read-only and cannot be edited.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the event id (from the `[#id]` marker)"},
+            "title": {"type": "string"},
+            "start": {"type": "string", "description": "new start 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'"},
+            "end": {"type": "string", "description": "new end, or empty string to clear it"},
+            "all_day": {"type": "boolean"},
+            "location": {"type": "string"},
+            "description": {"type": "string"},
+        }, "required": ["id"]},
+    },
+})
+def update_calendar_event(id, title=None, start=None, end=..., all_day=None,
+                          location=None, description=None):
+    from oceano import calsync
+    r = calsync.update_event(id, title=title, start=start, end=end, all_day=all_day,
+                             location=location, description=description)
+    if not r.get("ok"):
+        return f"ERROR: {r.get('error')}"
+    e = r["event"]
+    when = e["start"][:10] if e["all_day"] else f"{e['start'][:10]} {e['start'][11:16]}"
+    return f"Updated '{e['title']}' → {when} (id {e['id']})."
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "delete_calendar_event",
+        "description": "Delete a LOCAL calendar event by its id (the `[#id]` from "
+                       "calendar_events). Synced feed events are read-only and cannot be "
+                       "deleted. Confirm with the user before deleting if there's any doubt.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the event id (from the `[#id]` marker)"},
+        }, "required": ["id"]},
+    },
+})
+def delete_calendar_event(id):
+    from oceano import calsync
+    r = calsync.delete_event(id)
+    return "Event deleted." if r.get("ok") else f"ERROR: {r.get('error')}"

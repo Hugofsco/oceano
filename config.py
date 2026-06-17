@@ -6,9 +6,11 @@ from pathlib import Path
 LLM_BASE_URL = os.environ.get("OCEANO_LLM_URL", "http://127.0.0.1:8081/v1")
 LLM_API_KEY  = os.environ.get("OCEANO_LLM_KEY", "sk-no-key-needed")  # llama.cpp ignores it
 
-# Default model. qwen3-4b is already loaded + fast = snappy dev.
-# For harder multi-step jobs: OCEANO_MODEL=gpt-oss-20b (stronger, but triggers a ~10-15s swap).
-MODEL = os.environ.get("OCEANO_MODEL", "qwen3-4b")
+# Model. There is deliberately NO hardcoded default — Oceano resolves the model it uses from
+# what you've actually set up (delegate.resolve_primary): your chosen primary (Settings →
+# Delegation), else a model you've served via Brain → Rivers. OCEANO_MODEL only force-pins one
+# (handy for headless/dev); left unset, an empty string means "ask Rivers what's available".
+MODEL = os.environ.get("OCEANO_MODEL", "")
 
 # How long to wait on the LLM endpoint. CONNECT is short so a down llama-swap fails fast
 # instead of wedging a turn (esp. Telegram's single event loop); READ is the max idle gap

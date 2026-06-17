@@ -24,9 +24,9 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **31 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
-  headless browser, long-term memory, document RAG, skills, scheduling, workflows, and
-  delegation; plus any tools from MCP servers you connect.
+- **34 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
+  headless browser, long-term memory, document RAG, skills, scheduling, workflows, an
+  agent-managed calendar, and delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -99,7 +99,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (31)
+## The agent's tools (34)
 
 | Group | Tools |
 |-------|-------|
@@ -112,7 +112,7 @@ from a web UI or Telegram.
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
-| **Calendar** | `calendar_events` (read the synced local copy) |
+| **Calendar** | `calendar_events` (read schedule), `add_calendar_event`, `update_calendar_event`, `delete_calendar_event` (manage your local calendar; synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
 
 File/shell operations are fenced to `workspace/` by default (`OCEANO_CONFINE=1`).
@@ -211,6 +211,15 @@ judging, memory maintenance), and **vision** (image recognition — the local ch
 text-only, so files dropped into chat get routed here; Claude Code reads the image file
 directly, or point it at a cloud vision model). The local model never grades its own work,
 nor sees images itself. Live readiness + a one-click test sit in each section.
+
+Delegation **streams**: the delegate's live work (its narration and tool uses) surfaces under
+the `delegate` tool card in chat (and dim in the CLI), so a long build shows progress instead
+of a frozen spinner. It uses an **idle** timeout that resets on every event — an actively
+working delegate is never killed for "taking too long", only a genuinely stalled one — with a
+generous absolute cap as a backstop. If a delegation doesn't finish it returns any partial
+work and tells the local model *not* to attempt the whole job itself (which would overflow a
+small context). Tune with `OCEANO_DELEGATE_IDLE` (default 300s), `OCEANO_DELEGATE_MAXTOTAL`
+(3600s), `OCEANO_DELEGATE_MAXTURNS` (60).
 
 The same panel also sets Oceano's **primary model** — **any model from any configured
 endpoint** (local-first is opt-in; a cloud model can be your default, and it's carried to
@@ -380,10 +389,11 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `OCEANO_LLM_URL` | `http://127.0.0.1:8081/v1` | chat model endpoint (llama-swap) |
-| `OCEANO_MODEL` | `qwen3-4b` | default model |
+| `OCEANO_MODEL` | _(unset)_ | pin a model; unset → Oceano uses your primary (Settings → Delegation) or a model served in Brain → Rivers |
 | `OCEANO_WORKSPACE` | `./workspace` | the agent's working folder |
 | `OCEANO_SEARXNG` | `http://127.0.0.1:8080` | web search |
 | `OCEANO_MAX_STEPS` | `25` | tool-call loop cap per turn |
+| `OCEANO_DELEGATE_IDLE` / `_MAXTOTAL` / `_MAXTURNS` | `300` / `3600` / `60` | delegation idle timeout (s), absolute cap (s), max turns |
 | `OCEANO_CONFINE` | `1` | fence file ops to the workspace |
 | `OCEANO_AUTO_LEARN` | `1` | background self-learning memory |
 | `OCEANO_SHELL_GUARD` / `OCEANO_URL_GUARD` | `1` | safety guards |
@@ -434,7 +444,7 @@ oceano/
   notes.py           Kanban scratchpad (JSON-persisted)
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
-  calsync.py         read-only calendar sync (ICS feeds)
+  calsync.py         calendar — agent-managed local events + read-only ICS feed sync
   voice.py           speech-in (faster-whisper) / speech-out (Piper) for web + Telegram
   rivers.py          Hugging Face model catalog + hardware-fit + serve
   mcp_client.py      optional MCP server connections

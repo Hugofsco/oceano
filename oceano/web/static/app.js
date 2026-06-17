@@ -264,6 +264,20 @@ function fillTool(card, result) {
   $(".result", card).textContent = result;
   const st = $(".tstat", card); st.classList.remove("run"); st.textContent = "▾ result";
 }
+// Live progress from a streaming tool (the delegate): append its narration/tool-uses into the
+// card's result area as it works, so a long delegation shows activity instead of freezing.
+function appendToolProgress(card, ev) {
+  if (!card) return;
+  let line = "";
+  if (ev.kind === "text" && ev.text) line = ev.text.trim();
+  else if (ev.kind === "tool") line = "↳ " + (ev.tool || "tool") + (ev.detail ? " · " + ev.detail : "");
+  if (!line) return;
+  card.classList.add("open");                         // auto-expand so the stream is visible
+  const res = $(".result", card);
+  res.textContent += (res.textContent ? "\n" : "") + line;
+  const st = $(".tstat", card); if (st) { st.classList.add("run"); st.textContent = "streaming…"; }
+  toBottom();
+}
 function addThinkCard() {
   clearWelcome();
   const el = document.createElement("div"); el.className = "think";
@@ -385,6 +399,8 @@ async function send() {
           if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
           lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args };
           maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
+        } else if (ev.type === "tool_progress") {
+          killSounding(); appendToolProgress(lastCard, ev);
         } else if (ev.type === "tool_result") {
           fillTool(lastCard, ev.result);
           if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
@@ -448,6 +464,7 @@ async function reconnectChat(sid, live) {
     if (ev.type === "reasoning") { flushBubble(); if (!thinkCard) thinkCard = addThinkCard(); thinkText += ev.text; appendThink(thinkCard, ev.text); }
     else if (ev.type === "token") { flushThink(); if (!bubble) bubble = addAssistant(""); acc += ev.text; renderMD(bubble, acc + " ▌"); toBottom(); }
     else if (ev.type === "tool_call") { flushThink(); flushBubble(); lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args }; maybePreviewChip(lastCard, ev.name, ev.args); }
+    else if (ev.type === "tool_progress") { appendToolProgress(lastCard, ev); }
     else if (ev.type === "tool_result") { fillTool(lastCard, ev.result); if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; } }
     else if (ev.type === "answer_done") { flushThink(); if (bubble) renderMD(bubble, acc, true); }
     else if (ev.type === "answer") { flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom(); }
@@ -634,7 +651,7 @@ async function selectDefaultModel() {
   const want = d.model || d.current || "", wantBase = d.base_url || "";
   const pick = (want && ok.find(m => m.id === want && (!wantBase || m.base_url === wantBase)))
             || (want && ok.find(m => m.id === want))                  // primary by id, any endpoint
-            || ok.find(m => /qwen3-4b/i.test(m.id)) || ok[0];         // last-resort fallback
+            || ok[0];          // nothing configured → first available model (no hardcoded default)
   if (pick) selectModel(pick);
 }
 function buildModelMenu() {
@@ -1354,10 +1371,19 @@ function _winOpen() { try { return JSON.parse(localStorage.getItem("oceano.openw
 function _winSet(a) { try { localStorage.setItem("oceano.openwins", JSON.stringify(a)); } catch {} }
 function _trackWin(id, key, arg) { const a = _winOpen().filter(w => w.id !== id); a.push({ id, key, arg }); _winSet(a); }
 function _untrackWin(id) { _winSet(_winOpen().filter(w => w.id !== id)); }
+function _setWinMin(id, on) { const a = _winOpen(), w = a.find(x => x.id === id); if (w && !!w.min !== on) { w.min = on; _winSet(a); } }
 function restoreWindows() {
   const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
-                      brain: openBrain, workflows: openWorkflows, preview: openPreview, file: openFileWindow };
-  _winOpen().forEach(w => { const fn = RESTORERS[w.key]; if (fn) { try { fn(w.arg); } catch {} } });
+                      brain: openBrain, workflows: openWorkflows, preview: openPreview,
+                      file: openFileWindow, cal: openCalendar };
+  _winOpen().forEach(w => {
+    const fn = RESTORERS[w.key];
+    if (!fn) return;
+    try {
+      fn(w.arg);                                                                   // reopen the window
+      if (w.min) { const el = document.getElementById(w.id); if (el) minimizeWindow(el); }   // …but keep it docked if it was minimized
+    } catch {}
+  });
 }
 function createWindow(opts) {
   if (opts.restoreKey) _trackWin(opts.id, opts.restoreKey, opts.restoreArg);   // remember it's open
@@ -1401,10 +1427,11 @@ function createWindow(opts) {
 }
 function minimizeWindow(win) {
   win.style.display = "none";
+  _setWinMin(win.id, true);                                  // remember it's minimized across reloads
   const chip = document.createElement("button");
   chip.className = "dock-chip";
   chip.innerHTML = `<span class="dc-ic">${escapeHtml(win.dataset.icon || "▢")}</span><span class="dc-t">${escapeHtml(win.dataset.title || "Window")}</span>`;
-  chip.onclick = () => { win.style.display = "flex"; win.style.zIndex = ++_winZ; chip.remove(); win._chip = null; };
+  chip.onclick = () => { win.style.display = "flex"; win.style.zIndex = ++_winZ; chip.remove(); win._chip = null; _setWinMin(win.id, false); };
   $("#winDock").appendChild(chip);
   win._chip = chip;
 }
@@ -1938,7 +1965,7 @@ function previewLabel(p) {
   if (n.endsWith(".md") || n.endsWith(".markdown")) return "▶ View";
   return "▶ Preview";
 }
-const _previewURL = p => "/api/preview/" + p.split("/").map(encodeURIComponent).join("/");
+const _previewURL = (token, p) => "/preview/" + token + "/" + p.split("/").map(encodeURIComponent).join("/");
 let _previewTimer = null;
 function openPreview(path) {
   const name = path.split("/").pop() || path, id = "win-preview";
@@ -1961,7 +1988,12 @@ function openPreview(path) {
     <div class="pv-stage"><div class="pv-frame" style="width:100%"><iframe class="pv-iframe"
         sandbox="allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"></iframe></div></div>`;
   const iframe = $(".pv-iframe", body), frame = $(".pv-frame", body), auto = $(".pv-auto input", body);
-  const load = () => { iframe.src = _previewURL(path) + "?t=" + Date.now(); };   // new URL each time → forces reload
+  // Mint a fresh capability token each load: the iframe is sandboxed without same-origin, so it
+  // can't send the session cookie — it authenticates to /preview/ by the token in the URL instead.
+  const load = async () => {
+    let t; try { t = (await api("/api/preview-token?path=" + encodeURIComponent(path))).token; } catch { return; }
+    iframe.src = _previewURL(t, path) + "?t=" + Date.now();   // new URL each time → forces reload
+  };
   load();
   $(".pv-reload", body).onclick = load;
   $$(".pv-dev", body).forEach(b => b.onclick = () => {
@@ -2723,21 +2755,61 @@ async function openEvalResults(runId) {
   }).join("");
 }
 
-/* ---------- Calendar window (local copy, one-way synced from ICS feeds) ---------- */
+/* ---------- Calendar window — Outlook-style month / week / day grid ----------
+   Local events (yours/the agent's) are editable; synced feed events are read-only (locked). */
+let _calView = "month";              // month | week | day
+let _calAnchor = new Date();         // a day inside the focused period
+let _calCache = [];                  // events for the visible range
+const _CAL_HOURPX = 44;              // px per hour in the week/day time grid
+const _CAL_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];   // Monday-first
+
+const _cal = {
+  ymd: d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
+  parse: s => new Date(s.length <= 10 ? s + "T00:00" : s),
+  addDays: (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; },
+  startOfWeek: d => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; },
+  sameDay: (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(),
+  mins: d => d.getHours() * 60 + d.getMinutes(),
+};
+const calEl = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
+const calHourLabel = h => `${h % 12 || 12} ${h < 12 ? "AM" : "PM"}`;
+const calTimeLabel = d => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
 function openCalendar() {
-  const { body, reused } = createWindow({ id: "win-cal", title: "Calendar — synced, read-only", icon: "◷", width: 680, height: 580 });
-  if (reused) { loadCalendar(); return; }
+  const { body, reused } = createWindow({ id: "win-cal", title: "Calendar", icon: "◷", width: 880, height: 660, restoreKey: "cal" });
+  if (reused) { calRender(); return; }
   body.innerHTML = `
-    <div class="sched-add">
-      <input id="calName" placeholder="name · e.g. Personal" style="flex:0 0 140px">
-      <input id="calUrl" placeholder="secret iCal address (…/basic.ics)" style="flex:1;min-width:160px" spellcheck="false">
-      <button class="primary sm" id="calAdd">Add</button>
-      <button class="exp-btn" id="calSync" title="sync all feeds now">↻ Sync now</button>
+    <div class="cal-toolbar">
+      <div class="cal-nav">
+        <button class="cal-navbtn" id="calPrev" title="previous">‹</button>
+        <button class="cal-navbtn" id="calTodayBtn">Today</button>
+        <button class="cal-navbtn" id="calNext" title="next">›</button>
+      </div>
+      <div class="cal-period" id="calPeriod"></div>
+      <div class="cal-views" id="calViews">
+        <button data-v="month">Month</button><button data-v="week">Week</button><button data-v="day">Day</button>
+      </div>
+      <button class="primary sm" id="calNew">＋ New</button>
+      <button class="exp-btn" id="calSync" title="sync external feeds now">↻</button>
+      <span class="kn-note" id="calMsg"></span>
     </div>
-    <div class="cal-hint">Google Calendar → Settings → your calendar → <b>Integrate calendar</b> → copy the <b>Secret address in iCal format</b> and paste it here. Sync is one-way: Oceano reads your calendar, it never writes to Google.</div>
-    <div class="kn-note" id="calMsg"></div>
-    <div class="cal-feeds" id="calFeeds"></div>
-    <div class="cal-events" id="calEvents"></div>`;
+    <div class="cal-form" id="calForm" hidden></div>
+    <div class="cal-viewport" id="calViewport"></div>
+    <details class="cal-feeds-wrap">
+      <summary>External calendars <span class="lbl-sub">— subscribe to an .ics feed (read-only)</span></summary>
+      <div class="cal-hint">Google Calendar → Settings → your calendar → <b>Integrate calendar</b> → copy the <b>Secret address in iCal format</b>. Sync is one-way: Oceano reads these and never writes back. Synced events show locked — the agent schedules <i>around</i> them.</div>
+      <div class="sched-add">
+        <input id="calName" placeholder="name · e.g. Work" style="flex:0 0 130px">
+        <input id="calUrl" placeholder="secret iCal address (…/basic.ics)" style="flex:1;min-width:150px" spellcheck="false">
+        <button class="primary sm" id="calAdd">Add feed</button>
+      </div>
+      <div class="cal-feeds" id="calFeeds"></div>
+    </details>`;
+  $("#calPrev", body).onclick = () => calNav(-1);
+  $("#calNext", body).onclick = () => calNav(1);
+  $("#calTodayBtn", body).onclick = () => { _calAnchor = new Date(); calRender(); };
+  $("#calNew", body).onclick = () => calOpenForm(null);
+  $$("#calViews button", body).forEach(b => b.onclick = () => { _calView = b.dataset.v; calRender(); });
   $("#calAdd", body).onclick = async () => {
     const name = $("#calName").value.trim(), url = $("#calUrl").value.trim(), msg = $("#calMsg");
     if (!url) return;
@@ -2746,55 +2818,271 @@ function openCalendar() {
       const r = await api("/api/calendar/feeds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, url }) });
       if (!r.ok) { msg.textContent = r.error || "could not add feed"; msg.className = "kn-note err"; return; }
       const s = r.sync || {};
-      msg.textContent = s.ok ? `feed added ✓ · ${s.events} events synced` : `feed added, but first sync failed: ${s.error || "?"}`;
+      msg.textContent = s.ok ? `feed added ✓ · ${s.events} events` : `added, first sync failed: ${s.error || "?"}`;
       msg.className = "kn-note " + (s.ok ? "ok" : "err");
-      $("#calName").value = ""; $("#calUrl").value = "";
-      loadCalendar();
-    } finally { btn.disabled = false; btn.textContent = "Add"; }
+      $("#calName").value = ""; $("#calUrl").value = ""; calRender();
+    } finally { btn.disabled = false; btn.textContent = "Add feed"; }
   };
   $("#calSync", body).onclick = async () => {
-    const btn = $("#calSync"), msg = $("#calMsg");
-    btn.disabled = true; btn.textContent = "syncing…";
+    const btn = $("#calSync"), msg = $("#calMsg"); btn.disabled = true; btn.textContent = "…";
     try {
       const r = await api("/api/calendar/sync", { method: "POST" });
-      msg.textContent = r.ok ? "all feeds synced ✓" : "some feeds failed to sync — see the feed list";
-      msg.className = "kn-note " + (r.ok ? "ok" : "err");
-      loadCalendar();
-    } finally { btn.disabled = false; btn.textContent = "↻ Sync now"; }
+      msg.textContent = r.ok ? "synced ✓" : "some feeds failed"; msg.className = "kn-note " + (r.ok ? "ok" : "err");
+      calRender();
+    } finally { btn.disabled = false; btn.textContent = "↻"; }
   };
-  loadCalendar();
+  calRender();
 }
-function calDayLabel(iso) {
-  const d = new Date(iso + "T00:00"), today = new Date(); today.setHours(0, 0, 0, 0);
-  const diff = Math.round((d - today) / 86400000);
-  const nice = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
-  return diff === 0 ? "Today · " + nice : diff === 1 ? "Tomorrow · " + nice : nice;
+
+function calNav(dir) {
+  if (_calView === "month") _calAnchor = new Date(_calAnchor.getFullYear(), _calAnchor.getMonth() + dir, 1);
+  else _calAnchor = _cal.addDays(_calAnchor, dir * (_calView === "day" ? 1 : 7));
+  calRender();
 }
-async function loadCalendar() {
-  const feedsBox = $("#calFeeds"), evBox = $("#calEvents");
-  if (!feedsBox || !evBox) return;
-  let d; try { d = await api("/api/calendar?days=30"); } catch { return; }
-  feedsBox.innerHTML = "";
-  if (!d.feeds.length) feedsBox.innerHTML = `<div class="empty-note" style="padding:14px">No calendar feeds yet — paste your Google Calendar's secret iCal address above.</div>`;
-  d.feeds.forEach(f => {
-    const row = document.createElement("div"); row.className = "ep";
+
+function calVisibleRange() {
+  if (_calView === "month") {
+    const first = new Date(_calAnchor.getFullYear(), _calAnchor.getMonth(), 1);
+    const last = new Date(_calAnchor.getFullYear(), _calAnchor.getMonth() + 1, 0);
+    return { start: _cal.startOfWeek(first), end: _cal.addDays(_cal.startOfWeek(last), 7) };
+  }
+  if (_calView === "day") {
+    const s = new Date(_calAnchor.getFullYear(), _calAnchor.getMonth(), _calAnchor.getDate());
+    return { start: s, end: _cal.addDays(s, 1) };
+  }
+  const s = _cal.startOfWeek(_calAnchor);
+  return { start: s, end: _cal.addDays(s, 7) };
+}
+
+function calPeriodLabel() {
+  if (_calView === "month") return _calAnchor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  if (_calView === "day") return _calAnchor.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  const s = _cal.startOfWeek(_calAnchor), e = _cal.addDays(s, 6);
+  return `${s.toLocaleDateString(undefined, { month: "short", day: "numeric" })} – ${e.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
+}
+
+async function calRender() {
+  const vp = $("#calViewport"); if (!vp) return;
+  const { start, end } = calVisibleRange();
+  let d; try { d = await api(`/api/calendar?start=${_cal.ymd(start)}&end=${_cal.ymd(end)}`); } catch { return; }
+  _calCache = d.events || [];
+  const pl = $("#calPeriod"); if (pl) pl.textContent = calPeriodLabel();
+  $$("#calViews button").forEach(b => b.classList.toggle("active", b.dataset.v === _calView));
+  vp.innerHTML = "";
+  if (_calView === "month") calRenderMonth(vp, _calCache);
+  else calRenderTimeGrid(vp, _calCache, _calView === "day" ? 1 : 7);
+  calRenderFeeds(d.feeds || []);
+}
+
+function calEventTouchesDay(e, day) {
+  const s = _cal.parse(e.start), en = e.end ? _cal.parse(e.end) : new Date(s.getTime() + 30 * 60000);
+  const sd = new Date(day.getFullYear(), day.getMonth(), day.getDate()), ed = _cal.addDays(sd, 1);
+  return s < ed && en > sd;
+}
+
+function calChip(e) {
+  const chip = calEl("div", "cal-chip " + (e.editable ? "local" : "feed"));
+  const t = e.all_day ? "" : calTimeLabel(_cal.parse(e.start)) + " ";
+  chip.innerHTML = `${e.editable ? "" : '<span class="cal-chip-lock">🔒</span>'}` +
+    `<span class="cal-chip-t">${escapeHtml(t)}</span>${escapeHtml(e.title || "(untitled)")}`;
+  if (e.description || e.location) chip.title = (e.location ? e.location + " — " : "") + (e.description || "");
+  if (e.editable) { chip.classList.add("cal-clickable"); chip.onclick = ev => { ev.stopPropagation(); calOpenForm(e); }; }
+  return chip;
+}
+
+function calRenderMonth(vp, events) {
+  const wrap = calEl("div", "cal-month");
+  const head = calEl("div", "cal-mo-head");
+  _CAL_DOW.forEach(n => head.appendChild(calEl("div", null, n)));
+  wrap.appendChild(head);
+  const { start, end } = calVisibleRange();
+  const grid = calEl("div", "cal-mo-grid");
+  grid.style.gridTemplateRows = `repeat(${Math.round((end - start) / (7 * 864e5))}, minmax(76px, 1fr))`;
+  const today = new Date(), monthIdx = _calAnchor.getMonth();
+  const byDay = {};
+  events.forEach(e => { (byDay[_cal.ymd(_cal.parse(e.start))] ||= []).push(e); });
+  for (let day = new Date(start); day < end; day = _cal.addDays(day, 1)) {
+    const dc = new Date(day);
+    const cell = calEl("div", "cal-mo-cell" + (day.getMonth() !== monthIdx ? " out" : "") + (_cal.sameDay(day, today) ? " today" : ""));
+    cell.appendChild(calEl("div", "cal-mo-num", day.getDate()));
+    const evs = (byDay[_cal.ymd(day)] || []).slice().sort((a, b) => (a.all_day ? 0 : 1) - (b.all_day ? 0 : 1) || a.start.localeCompare(b.start));
+    evs.slice(0, 3).forEach(e => cell.appendChild(calChip(e)));
+    if (evs.length > 3) {
+      const more = calEl("div", "cal-more", `+${evs.length - 3} more`);
+      more.onclick = ev => { ev.stopPropagation(); _calAnchor = dc; _calView = "day"; calRender(); };
+      cell.appendChild(more);
+    }
+    cell.onclick = () => calOpenForm(null, { date: _cal.ymd(dc) });
+    grid.appendChild(cell);
+  }
+  wrap.appendChild(grid); vp.appendChild(wrap);
+}
+
+// greedy interval packing: assign each timed event a column within its overlap cluster
+function calLayoutDay(items) {
+  items.sort((a, b) => a.s - b.s || a.e - b.e);
+  let i = 0;
+  while (i < items.length) {
+    let j = i, maxEnd = items[i].e;
+    while (j + 1 < items.length && items[j + 1].s < maxEnd) { j++; maxEnd = Math.max(maxEnd, items[j].e); }
+    const cluster = items.slice(i, j + 1), colEnds = [];
+    cluster.forEach(o => {
+      let placed = false;
+      for (let k = 0; k < colEnds.length; k++) if (o.s >= colEnds[k]) { o.col = k; colEnds[k] = o.e; placed = true; break; }
+      if (!placed) { o.col = colEnds.length; colEnds.push(o.e); }
+    });
+    cluster.forEach(o => o.cols = colEnds.length);
+    i = j + 1;
+  }
+}
+
+function calRenderTimeGrid(vp, events, ndays) {
+  const gridH = 24 * _CAL_HOURPX;
+  const { start } = calVisibleRange();
+  const days = Array.from({ length: ndays }, (_, i) => _cal.addDays(start, i));
+  const today = new Date();
+  const tg = calEl("div", "cal-tg");
+
+  const headRow = calEl("div", "cal-tg-head");
+  headRow.appendChild(calEl("div", "cal-tg-corner"));
+  days.forEach(d => {
+    const h = calEl("div", "cal-tg-dh" + (_cal.sameDay(d, today) ? " today" : ""));
+    h.innerHTML = `<span class="cal-tg-dn">${_CAL_DOW[(d.getDay() + 6) % 7]}</span> <span class="cal-tg-dd">${d.getDate()}</span>`;
+    headRow.appendChild(h);
+  });
+  tg.appendChild(headRow);
+
+  const adRow = calEl("div", "cal-tg-allday");
+  adRow.appendChild(calEl("div", "cal-tg-adlabel", "all-day"));
+  days.forEach(d => {
+    const dc = new Date(d), cell = calEl("div", "cal-tg-adcell");
+    events.filter(e => e.all_day && calEventTouchesDay(e, d)).forEach(e => cell.appendChild(calChip(e)));
+    cell.onclick = () => calOpenForm(null, { date: _cal.ymd(dc), all_day: true });
+    adRow.appendChild(cell);
+  });
+  tg.appendChild(adRow);
+
+  const scroll = calEl("div", "cal-tg-scroll");
+  const bodyGrid = calEl("div", "cal-tg-body");
+  const gutter = calEl("div", "cal-tg-gutter");
+  for (let h = 0; h < 24; h++) { const cell = calEl("div", "cal-tg-hr", h ? calHourLabel(h) : ""); cell.style.height = _CAL_HOURPX + "px"; gutter.appendChild(cell); }
+  bodyGrid.appendChild(gutter);
+  const cols = calEl("div", "cal-tg-cols");
+  days.forEach(d => {
+    const dc = new Date(d), col = calEl("div", "cal-tg-col"); col.style.height = gridH + "px";
+    col.style.backgroundSize = `100% ${_CAL_HOURPX}px`;
+    const sd = new Date(d.getFullYear(), d.getMonth(), d.getDate()), ed = _cal.addDays(sd, 1);
+    const items = events.filter(e => !e.all_day && calEventTouchesDay(e, d)).map(e => {
+      const s = _cal.parse(e.start), en = e.end ? _cal.parse(e.end) : new Date(s.getTime() + 30 * 60000);
+      const sMin = s < sd ? 0 : _cal.mins(s);
+      const eMin = en >= ed ? 1440 : _cal.mins(en);
+      return { ref: e, s: sMin, e: eMin < sMin + 15 ? sMin + 15 : eMin };   // s/e = minutes; ref = the event
+    });
+    calLayoutDay(items);
+    items.forEach(o => {
+      const e = o.ref;
+      const blk = calEl("div", "cal-tg-ev " + (e.editable ? "local" : "feed ro"));
+      blk.style.top = (o.s / 1440 * gridH) + "px";
+      blk.style.height = Math.max(15, (o.e - o.s) / 1440 * gridH - 2) + "px";
+      blk.style.left = `calc(${o.col / o.cols * 100}% + 2px)`;
+      blk.style.width = `calc(${100 / o.cols}% - 4px)`;
+      blk.innerHTML = `<div class="cal-tg-ev-t">${e.editable ? "" : "🔒 "}${escapeHtml(e.title || "(untitled)")}</div>` +
+        `<div class="cal-tg-ev-time">${escapeHtml(calTimeLabel(_cal.parse(e.start)))}</div>`;
+      if (e.description || e.location) blk.title = (e.location ? e.location + " — " : "") + (e.description || "");
+      if (e.editable) blk.onclick = ev => { ev.stopPropagation(); calOpenForm(e); };
+      col.appendChild(blk);
+    });
+    if (_cal.sameDay(d, today)) { const now = calEl("div", "cal-now"); now.style.top = (_cal.mins(today) / 1440 * gridH) + "px"; col.appendChild(now); }
+    col.onclick = ev => {
+      const y = ev.clientY - col.getBoundingClientRect().top;
+      const hr = Math.max(0, Math.min(23, Math.floor(y / _CAL_HOURPX)));
+      calOpenForm(null, { date: _cal.ymd(dc), start: String(hr).padStart(2, "0") + ":00" });
+    };
+    cols.appendChild(col);
+  });
+  bodyGrid.appendChild(cols);
+  scroll.appendChild(bodyGrid);
+  tg.appendChild(scroll);
+  vp.appendChild(tg);
+  scroll.scrollTop = 7 * _CAL_HOURPX;     // open around the working day
+}
+
+function calRenderFeeds(feeds) {
+  const box = $("#calFeeds"); if (!box) return;
+  box.innerHTML = "";
+  if (!feeds.length) { box.innerHTML = `<div class="empty-note" style="padding:10px">No external calendars subscribed.</div>`; return; }
+  feeds.forEach(f => {
+    const row = calEl("div", "ep");
     const sync = f.last_error ? `⚠ ${f.last_error}` : f.last_sync ? `synced ${f.last_sync.slice(0, 16).replace("T", " ")} UTC` : "never synced";
     row.innerHTML = `<div class="ep-info"><div class="ep-name">${escapeHtml(f.name)}</div><div class="ep-url">${escapeHtml(sync)}</div></div><span class="ep-count ${f.last_error ? "err" : "ok"}">${f.event_count} events</span><button class="ep-del">✕</button>`;
-    $(".ep-del", row).onclick = async () => { if (!await confirmAction("Remove feed?", `“${f.name}” and its local events will be removed. Google is not touched.`, "Remove")) return; await fetch("/api/calendar/feeds/" + f.id, { method: "DELETE" }); loadCalendar(); };
-    feedsBox.appendChild(row);
+    $(".ep-del", row).onclick = async () => { if (!await confirmAction("Remove feed?", `“${f.name}” and its synced events will be removed. The source calendar is not touched.`, "Remove")) return; await fetch("/api/calendar/feeds/" + f.id, { method: "DELETE" }); calRender(); };
+    box.appendChild(row);
   });
-  evBox.innerHTML = "";
-  if (!d.events.length) { if (d.feeds.length) evBox.innerHTML = `<div class="empty-note">No events in the next 30 days.</div>`; return; }
-  let lastDay = null;
-  d.events.forEach(e => {
-    const day = e.start.slice(0, 10);
-    if (day !== lastDay) { const h = document.createElement("div"); h.className = "cal-day"; h.textContent = calDayLabel(day); evBox.appendChild(h); lastDay = day; }
-    const row = document.createElement("div"); row.className = "cal-ev";
-    const when = e.all_day ? "all day" : e.start.slice(11, 16) + (e.end && e.end.slice(0, 10) === day ? "–" + e.end.slice(11, 16) : "");
-    row.innerHTML = `<span class="cal-when">${escapeHtml(when)}</span><span class="cal-title">${escapeHtml(e.title || "(untitled)")}</span>${e.location ? `<span class="cal-loc">${escapeHtml(e.location)}</span>` : ""}`;
-    if (e.description) row.title = e.description;
-    evBox.appendChild(row);
-  });
+}
+
+// Inline create/edit form for a LOCAL event. `ev` → edit; else `prefill` {date,start,end,all_day} for a new one.
+function calOpenForm(ev, prefill) {
+  const box = $("#calForm"); if (!box) return;
+  const isEdit = !!ev; prefill = prefill || {};
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="cal-form-row">
+      <input id="cfTitle" placeholder="Event title" style="flex:1;min-width:140px">
+      <label class="cal-allday"><input type="checkbox" id="cfAllday"> all day</label>
+    </div>
+    <div class="cal-form-row">
+      <input type="date" id="cfDate">
+      <input type="time" id="cfStart" class="cf-time">
+      <span class="cf-dash">–</span>
+      <input type="time" id="cfEnd" class="cf-time">
+      <input id="cfLoc" placeholder="location (optional)" style="flex:1;min-width:110px">
+    </div>
+    <div class="cal-form-row">
+      <button class="primary sm" id="cfSave">${isEdit ? "Save" : "Add event"}</button>
+      <button class="exp-btn" id="cfCancel">Cancel</button>
+      ${isEdit ? `<button class="exp-btn danger" id="cfDelete" style="margin-left:auto">Delete</button>` : ""}
+      <span class="kn-note" id="cfMsg"></span>
+    </div>`;
+  const startHM = prefill.start || "09:00";
+  const endHM = prefill.start ? (String(Math.min(23, +prefill.start.slice(0, 2) + 1)).padStart(2, "0") + ":00") : "";
+  $("#cfTitle").value = ev ? (ev.title || "") : "";
+  $("#cfDate").value = ev ? ev.start.slice(0, 10) : (prefill.date || _cal.ymd(_calAnchor));
+  $("#cfAllday").checked = ev ? !!ev.all_day : !!prefill.all_day;
+  $("#cfStart").value = ev ? (ev.all_day ? "" : ev.start.slice(11, 16)) : startHM;
+  $("#cfEnd").value = ev ? (ev.end ? ev.end.slice(11, 16) : "") : endHM;
+  $("#cfLoc").value = ev ? (ev.location || "") : "";
+  const allday = $("#cfAllday");
+  const toggleTimes = () => {
+    const on = allday.checked;
+    $("#cfStart").style.display = on ? "none" : "";
+    $("#cfEnd").style.display = on ? "none" : "";
+    $(".cf-dash", box).style.display = on ? "none" : "";
+  };
+  allday.onchange = toggleTimes; toggleTimes();
+  const close = () => { box.hidden = true; box.innerHTML = ""; };
+  $("#cfCancel").onclick = close;
+  $("#cfSave").onclick = async () => {
+    const title = $("#cfTitle").value.trim(), date = $("#cfDate").value, on = allday.checked, msg = $("#cfMsg");
+    if (!title) { msg.textContent = "title required"; return; }
+    if (!date) { msg.textContent = "pick a date"; return; }
+    const payload = { title, all_day: on, location: $("#cfLoc").value.trim() };
+    if (on) { payload.start = date; payload.end = ""; }
+    else {
+      const st = $("#cfStart").value, en = $("#cfEnd").value;
+      if (!st) { msg.textContent = "pick a start time (or check all-day)"; return; }
+      payload.start = date + " " + st; payload.end = en ? date + " " + en : "";
+    }
+    const r = await api(isEdit ? "/api/calendar/events/" + ev.id : "/api/calendar/events",
+      { method: isEdit ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (!r.ok) { msg.textContent = r.error || "could not save"; return; }
+    close(); calRender();
+  };
+  if (isEdit) $("#cfDelete").onclick = async () => {
+    if (!await confirmAction("Delete event?", `“${ev.title}” will be removed.`, "Delete")) return;
+    await fetch("/api/calendar/events/" + ev.id, { method: "DELETE" });
+    close(); calRender();
+  };
+  $("#cfTitle").focus();
 }
 
 /* ---------- Researcher window (scheduled deep-dives → living docs) ---------- */

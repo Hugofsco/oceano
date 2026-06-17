@@ -54,12 +54,27 @@ def _c(base_url, api_key):
     return client(base_url or config.LLM_BASE_URL, api_key or config.LLM_API_KEY)
 
 
+def _model(model):
+    """A concrete model id for the call. There is no hardcoded default any more: an explicit
+    `model` wins, else we resolve the configured/served one (delegate.resolve_primary) so
+    model-less callers (the workflow decision gate, the skill publish gate) still work. An
+    empty result means nothing is set up — the endpoint then 400s, the right 'configure a
+    model in Rivers' signal."""
+    if model:
+        return model
+    try:
+        from oceano import delegate
+        return delegate.resolve_primary()["model"] or config.MODEL
+    except Exception:
+        return config.MODEL
+
+
 def chat(messages, tools=None, model=None, temperature=0.2, base_url=None, api_key=None,
          return_usage=False):
     """One completion. Returns the raw `message` (text content OR tool_calls).
     With return_usage=True, returns (message, completion_tokens)."""
     resp = _c(base_url, api_key).chat.completions.create(
-        model=model or config.MODEL,
+        model=_model(model),
         messages=messages,
         tools=tools or None,
         tool_choice="auto" if tools else None,
@@ -80,7 +95,7 @@ def stream(messages, tools=None, model=None, temperature=0.2, base_url=None, api
         {'usage': completion_tokens}
     """
     resp = _c(base_url, api_key).chat.completions.create(
-        model=model or config.MODEL, messages=messages,
+        model=_model(model), messages=messages,
         tools=tools or None, tool_choice="auto" if tools else None,
         temperature=temperature, stream=True, stream_options={"include_usage": True},
     )

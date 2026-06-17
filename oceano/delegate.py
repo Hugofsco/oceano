@@ -35,6 +35,13 @@ import config
 from oceano import atomicio
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
+# Delegation timeouts. The old model used ONE fixed wall-clock that killed long-but-active
+# builds and lost all their output. Now we STREAM the run and use an IDLE timeout (reset on
+# every event) — a productive run is never killed for "taking too long", only a stalled one —
+# with a generous absolute cap as a backstop. All three are env-tunable for big builds.
+_DELEGATE_IDLE = int(os.environ.get("OCEANO_DELEGATE_IDLE", "300"))       # secs with NO output → stalled
+_DELEGATE_MAX = int(os.environ.get("OCEANO_DELEGATE_MAXTOTAL", "3600"))   # absolute cap (1h default)
+_DELEGATE_TURNS = int(os.environ.get("OCEANO_DELEGATE_MAXTURNS", "60"))   # agent turns for a heavy build
 _CONFIG_PATH = config.WORKSPACE.parent / "data" / "delegation.json"
 _MODEL_KEY = "oceano_default_model"        # primary model id the agent uses everywhere
 _BASE_KEY = "oceano_default_base_url"      # its endpoint (empty = the default local endpoint)
@@ -109,8 +116,9 @@ def _raw():
 
 
 def get_primary():
-    """The user's chosen primary model + endpoint (Settings → Delegation). Any field empty
-    means 'fall back to config': model → config.MODEL, base_url → the default local endpoint."""
+    """The user's EXPLICIT primary model + endpoint (Settings → Delegation), as stored —
+    no resolution. An empty model means 'none pinned'; resolve_primary() then decides what
+    Oceano actually uses (env pin or a Rivers-served model). Empty base_url = local endpoint."""
     d = _raw()
     return {"model": (d.get(_MODEL_KEY) or "").strip(),
             "base_url": (d.get(_BASE_KEY) or "").strip(),
@@ -131,8 +139,40 @@ def set_primary(model, base_url="", api_key=""):
     return get_primary()
 
 
-def get_default_model():                             # back-compat: just the model id
-    return get_primary()["model"]
+def served_models():
+    """Model ids currently wired into llama-swap — i.e. what Brain → Rivers has set up to
+    serve on the default local endpoint. An offline read of llama-swap.yaml (insertion order),
+    so it works without the endpoint being up. [] if the config is missing/unreadable."""
+    try:
+        import yaml
+        d = yaml.safe_load(config.LLAMA_SWAP_CFG.read_text()) or {}
+        return list((d.get("models") or {}).keys())
+    except Exception:
+        return []
+
+
+def resolve_primary():
+    """Resolve the model + endpoint Oceano should use, in priority order:
+      1. the user-set primary (Settings → Delegation, or Rivers 'set as default')
+      2. an OCEANO_MODEL env override (config.MODEL), if one is pinned
+      3. a model served locally via Rivers (auto-picked, so Oceano just works once you've
+         served one — no separate "make it primary" step)
+    Returns {model, base_url, api_key, source}. There is NO hardcoded model: model == '' means
+    nothing is configured at all, and the caller should tell the user to download/serve a model
+    in Brain → Rivers (or pick a primary) rather than calling an endpoint with no model."""
+    p = get_primary()
+    if p["model"]:
+        return {**p, "source": "primary"}
+    if config.MODEL:
+        return {"model": config.MODEL, "base_url": "", "api_key": "", "source": "env"}
+    served = served_models()
+    if served:
+        return {"model": served[0], "base_url": "", "api_key": "", "source": "served"}
+    return {"model": "", "base_url": "", "api_key": "", "source": "none"}
+
+
+def get_default_model():                             # back-compat: the RESOLVED model id
+    return resolve_primary()["model"]
 
 
 def enabled():
@@ -195,6 +235,130 @@ def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turn
     return {"ok": True, "output": (r.stdout or "").strip(), "error": ""}
 
 
+def _tool_detail(inp):
+    """A short human label for a Claude tool_use input (a file path / command / pattern)."""
+    if not isinstance(inp, dict):
+        return ""
+    for k in ("file_path", "path", "command", "pattern", "query", "url", "prompt", "description"):
+        v = inp.get(k)
+        if v:
+            return str(v).replace("\n", " ")[:90]
+    return ""
+
+
+def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
+                     max_total=None, max_turns=None, on_progress=None):
+    """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
+
+    Three wins over the old blocking call:
+      1. on_progress(ev) fires live as Claude works — ev is {kind:'text'|'tool', ...} — so a
+         frontend can show what it's doing instead of a frozen spinner.
+      2. an IDLE timeout (reset on every event) replaces the fixed wall-clock: a long build
+         that's actively producing output is never killed; only a genuinely stalled one is.
+      3. the final result is captured incrementally, so even a killed run keeps partial work.
+
+    Returns {ok, output, error, partial, turns, cost}."""
+    import queue
+    import threading
+    idle_timeout = idle_timeout or _DELEGATE_IDLE
+    max_total = max_total or _DELEGATE_MAX
+    max_turns = max_turns or _DELEGATE_TURNS
+    binary = find_claude()
+    if not binary:
+        return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
+                "or set OCEANO_CLAUDE_BIN", "partial": False, "turns": 0, "cost": 0.0}
+    cmd = [binary, "-p", instructions, "--output-format", "stream-json", "--verbose",
+           "--max-turns", str(int(max_turns))]
+    if tools:
+        cmd += ["--allowedTools", tools]
+
+    def emit(ev):
+        if on_progress:
+            try:
+                on_progress(ev)
+            except Exception:
+                pass
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except OSError as e:
+        return {"ok": False, "output": "", "error": f"could not launch claude: {e}",
+                "partial": False, "turns": 0, "cost": 0.0}
+
+    q = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:                 # blocks in this thread, never the main loop
+                q.put(line)
+        finally:
+            q.put(None)                              # EOF sentinel
+    threading.Thread(target=reader, daemon=True).start()
+
+    final, is_error, turns, cost = "", False, 0, 0.0
+    started, stalled, capped = time.monotonic(), False, False
+    while True:
+        if time.monotonic() - started > max_total:
+            capped = True
+            break
+        try:
+            line = q.get(timeout=idle_timeout)
+        except queue.Empty:
+            stalled = True                           # no event for idle_timeout → treat as hung
+            break
+        if line is None:
+            break                                    # process finished, stream closed
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        t = ev.get("type")
+        if t == "assistant":
+            for block in (ev.get("message", {}).get("content") or []):
+                bt = block.get("type")
+                if bt == "text" and block.get("text"):
+                    emit({"kind": "text", "text": block["text"]})
+                elif bt == "tool_use":
+                    emit({"kind": "tool", "tool": block.get("name", "tool"),
+                          "detail": _tool_detail(block.get("input") or {})})
+        elif t == "result":
+            final = ev.get("result") or final
+            is_error = bool(ev.get("is_error"))
+            turns = ev.get("num_turns") or turns
+            cost = ev.get("total_cost_usd") or cost
+        # system / hook_* / rate_limit_event / user(tool_result) → not surfaced
+
+    if stalled or capped:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+    err = ""
+    if stalled:
+        err = f"the delegate produced no output for {idle_timeout}s and was stopped (looked stalled)"
+    elif capped:
+        err = f"the delegate hit the {max_total}s time cap and was stopped"
+    elif is_error:
+        err = "the delegate reported an error"
+    elif not final:
+        try:
+            err = (proc.stderr.read() or "").strip()[:400] or "the delegate returned no output"
+        except Exception:
+            err = "the delegate returned no output"
+    ok = bool(final) and not is_error and not stalled and not capped
+    return {"ok": ok, "output": (final or "").strip(), "error": "" if ok else err,
+            "partial": bool(final) and not ok, "turns": turns, "cost": round(cost, 4)}
+
+
 def claude_version():
     binary = find_claude()
     if not binary:
@@ -232,13 +396,13 @@ def _api_only_tools(tools_spec):
     return names
 
 
-def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600):
+def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600, on_progress=None):
     """Delegate to the configured cloud model by running it through OUR agent loop — the
     SAME machinery local models use. `tools` (a Claude-CLI-style spec) is translated to
     the equivalent local tools and enforced, and `timeout` puts a wall-clock deadline on
     the loop, so this provider honours the same containment as the CLI. Scoped to `cwd`
-    (a throwaway/working folder) when given. Returns {ok, output, error}.
-    (learn=False so the task prompt is never mined into memory.)"""
+    (a throwaway/working folder) when given. on_progress(ev) surfaces its tool calls live.
+    Returns {ok, output, error}. (learn=False so the task prompt is never mined into memory.)"""
     cfg = resolve(role)
     base_url, model = cfg["base_url"], cfg["model"]
     if not (base_url and model):
@@ -249,6 +413,13 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         api_key = server.endpoint_key(base_url) or "sk-no-key-needed"
     except Exception:
         api_key = "sk-no-key-needed"
+
+    def _on_ev(kind, data):                       # map the cloud agent's loop events to progress
+        if not on_progress:
+            return
+        if kind == "tool_call":
+            on_progress({"kind": "tool", "tool": (data or {}).get("name", "tool"), "detail": ""})
+
     try:
         from oceano.agent import Agent
         from oceano import tools as _tools
@@ -257,7 +428,7 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         # to itself in an infinite loop.
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
                    inject_context=False, exclude_tools={"delegate", "delegate_to_claude"},
-                   only_tools=_api_only_tools(tools))
+                   only_tools=_api_only_tools(tools), on_event=_on_ev)
         deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()
         with ctx:
@@ -292,16 +463,21 @@ def _api_ping(role="default", timeout=60):
 
 
 # --- unified entry: honour the configured provider, per role ---------------
-def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30, role="default"):
-    """Delegate per the role's effective provider. Both can read AND act on files:
-      claude_cli → the Claude Code CLI (its own tools; `tools=` limits --allowedTools);
+def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=None, max_turns=None,
+        role="default", on_progress=None):
+    """Delegate per the role's effective provider, STREAMING progress via on_progress(ev).
+      claude_cli → the Claude Code CLI (its own tools; `tools=` limits --allowedTools),
+                   streamed with an idle timeout so long active builds aren't killed;
       api        → the cloud model run through OUR agent loop with OUR tools.
-    `cwd` scopes the working folder for both. role='improve' for self-improving jobs."""
+    `cwd` scopes the working folder for both. role='improve' for self-improving jobs.
+    `timeout` is the absolute cap (None → the generous default); idle is handled internally."""
     if not enabled():
         return {"ok": False, "output": "", "error": "Delegation is turned off (Settings → Delegation)."}
     if resolve(role)["provider"] == "api":
-        return to_api(instructions, cwd=cwd, role=role, tools=tools, timeout=timeout)
-    return to_claude(instructions, cwd=cwd, tools=tools, timeout=timeout, max_turns=max_turns)
+        return to_api(instructions, cwd=cwd, role=role, tools=tools,
+                      timeout=timeout or _DELEGATE_MAX, on_progress=on_progress)
+    return to_claude_stream(instructions, cwd=cwd, tools=tools, max_total=timeout,
+                            max_turns=max_turns, on_progress=on_progress)
 
 
 # --- vision: analyze an image via the configured target (the local chat model is text-only) ---

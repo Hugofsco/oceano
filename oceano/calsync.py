@@ -1,12 +1,16 @@
-"""Local calendar, synced one-way from external feeds.
+"""Oceano's calendar — one local timeline the agent manages, plus read-only synced feeds.
 
-Point it at any .ics URL — for Google Calendar use the calendar's "Secret address
-in iCal format" (Settings → your calendar → Integrate calendar). No OAuth needed.
+Two kinds of event live in the same SQLite db:
 
-The agent only ever reads the local SQLite copy; sync runs in the engine every
-SYNC_INTERVAL seconds (and on demand from the Calendar UI). Recurring events are
-expanded with dateutil's rrule over a rolling window, honouring EXDATE and
-RECURRENCE-ID overrides.
+  • LOCAL events (`local_events`) — created/edited/deleted by you and the agent. This is
+    the real "assistant manages my schedule" surface: appointments, activities, anything.
+  • FEED events (`events`) — mirrored one-way from external .ics URLs (Google Calendar's
+    "Secret address in iCal format", any ICS). READ-ONLY: a sync replaces them wholesale,
+    so the agent must not edit them — it works around them, scheduling in the free slots.
+
+So you get one local place that tracks everything; sync just overlays an immovable layer.
+Sync runs in the engine every SYNC_INTERVAL seconds (and on demand from the Calendar UI);
+recurring feed events are expanded with dateutil's rrule, honouring EXDATE / RECURRENCE-ID.
 """
 import os
 import re
@@ -37,6 +41,12 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS events ("
                 "id INTEGER PRIMARY KEY, feed_id INTEGER, uid TEXT, title TEXT, "
                 "location TEXT, description TEXT, start TEXT, end TEXT, all_day INTEGER)")
+    # Agent/user-managed events — the editable layer. Kept separate from synced feed events
+    # (which a sync replaces wholesale), so local events are never clobbered.
+    con.execute("CREATE TABLE IF NOT EXISTS local_events ("
+                "id INTEGER PRIMARY KEY, title TEXT NOT NULL, location TEXT, description TEXT, "
+                "start TEXT NOT NULL, end TEXT, all_day INTEGER DEFAULT 0, category TEXT, "
+                "created TEXT, updated TEXT)")
     return con
 
 
@@ -216,6 +226,119 @@ def delete_feed(fid):
     return True
 
 
+# ============================ local events (the editable layer) ============================
+def _store_dt(value):
+    """Normalize a user/agent date or date-time to the stored form 'YYYY-MM-DDTHH:MM'
+    (naive local time, matching how feed events are stored). Accepts 'YYYY-MM-DD',
+    'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM[:SS]'. Raises ValueError on anything else."""
+    s = (value or "").strip().replace(" ", "T", 1)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        s += "T00:00"
+    return datetime.fromisoformat(s).strftime("%Y-%m-%dT%H:%M")
+
+
+def _is_date_only(value):
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", (value or "").strip()))
+
+
+def get_local_event(eid):
+    con = _db()
+    r = con.execute("SELECT id, title, location, description, start, end, all_day, category "
+                    "FROM local_events WHERE id=?", (eid,)).fetchone()
+    con.close()
+    if not r:
+        return None
+    return {"id": r[0], "title": r[1], "location": r[2], "description": r[3],
+            "start": r[4], "end": r[5], "all_day": bool(r[6]),
+            "calendar": r[7] or "Oceano", "source": "local", "editable": True}
+
+
+def add_event(title, start, end=None, all_day=False, location="", description="", category=""):
+    """Create a local (agent/user-owned) event. Returns {ok, id, event} or {ok:False, error}."""
+    title = (title or "").strip()
+    if not title:
+        return {"ok": False, "error": "title is required"}
+    try:
+        start_iso = _store_dt(start)
+    except (ValueError, TypeError):
+        return {"ok": False, "error": f"bad start {start!r} — use YYYY-MM-DD or 'YYYY-MM-DD HH:MM'"}
+    if _is_date_only(start):                      # a bare date means an all-day event
+        all_day = True
+    end_iso = None
+    if end:
+        try:
+            end_iso = _store_dt(end)
+        except (ValueError, TypeError):
+            return {"ok": False, "error": f"bad end {end!r} — use YYYY-MM-DD or 'YYYY-MM-DD HH:MM'"}
+        if not all_day and end_iso <= start_iso:
+            return {"ok": False, "error": "end must be after start"}
+    now = datetime.now().isoformat(timespec="seconds")
+    con = _db()
+    cur = con.execute(
+        "INSERT INTO local_events (title, location, description, start, end, all_day, category, created, updated) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (title, (location or "").strip(), (description or "").strip(), start_iso, end_iso,
+         1 if all_day else 0, (category or "").strip(), now, now))
+    con.commit(); eid = cur.lastrowid; con.close()
+    return {"ok": True, "id": eid, "event": get_local_event(eid)}
+
+
+def update_event(eid, title=None, start=None, end=..., all_day=None,
+                 location=None, description=None, category=None):
+    """Edit a LOCAL event in place (only the fields you pass). Synced feed events are
+    read-only and will be rejected. `end` defaults to a sentinel so passing end=None / ''
+    explicitly CLEARS it. Returns {ok, event} or {ok:False, error}."""
+    con = _db()
+    if not con.execute("SELECT id FROM local_events WHERE id=?", (eid,)).fetchone():
+        con.close()
+        return {"ok": False, "error": "no editable event with that id (synced feed events are read-only)"}
+    sets, vals = [], []
+    if title is not None:
+        t = str(title).strip()
+        if not t:
+            con.close(); return {"ok": False, "error": "title cannot be empty"}
+        sets.append("title=?"); vals.append(t)
+    if location is not None:
+        sets.append("location=?"); vals.append(str(location).strip())
+    if description is not None:
+        sets.append("description=?"); vals.append(str(description).strip())
+    if category is not None:
+        sets.append("category=?"); vals.append(str(category).strip())
+    if start is not None:
+        try:
+            sets.append("start=?"); vals.append(_store_dt(start))
+        except (ValueError, TypeError):
+            con.close(); return {"ok": False, "error": f"bad start {start!r}"}
+        if _is_date_only(start) and all_day is None:
+            all_day = True
+    if end is not ...:                            # sentinel → caller didn't touch `end`
+        if end in (None, "", False):
+            sets.append("end=?"); vals.append(None)
+        else:
+            try:
+                sets.append("end=?"); vals.append(_store_dt(end))
+            except (ValueError, TypeError):
+                con.close(); return {"ok": False, "error": f"bad end {end!r}"}
+    if all_day is not None:
+        sets.append("all_day=?"); vals.append(1 if all_day else 0)
+    if not sets:
+        con.close(); return {"ok": False, "error": "nothing to update"}
+    sets.append("updated=?"); vals.append(datetime.now().isoformat(timespec="seconds"))
+    vals.append(eid)
+    con.execute(f"UPDATE local_events SET {', '.join(sets)} WHERE id=?", vals)
+    con.commit(); con.close()
+    return {"ok": True, "event": get_local_event(eid)}
+
+
+def delete_event(eid):
+    """Delete a LOCAL event. Synced feed events can't be deleted (read-only)."""
+    con = _db()
+    cur = con.execute("DELETE FROM local_events WHERE id=?", (eid,))
+    con.commit(); n = cur.rowcount; con.close()
+    return {"ok": n > 0, "error": None if n > 0
+            else "no editable event with that id (synced feed events are read-only)"}
+
+
 # ============================ sync ============================
 def _fetch_ics(url, max_redirects=3):
     """GET a feed with the SSRF guard applied to the URL AND to every redirect hop
@@ -285,28 +408,64 @@ def maybe_sync(max_age=None):
 
 
 # ============================ queries ============================
-def upcoming(days=30):
-    """Events from today through +days, soonest first (for the UI)."""
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    horizon = today + timedelta(days=days + 1)
+def _window(lo, hi):
+    """Both layers (feed + local) merged for the [lo, hi) instant window, soonest first.
+    Each event carries `source` ('local' | 'feed') and `editable` (True only for local)."""
     con = _db()
-    rows = con.execute(
+    feed_rows = con.execute(
         "SELECT e.id, e.title, e.location, e.description, e.start, e.end, e.all_day, f.name "
         "FROM events e LEFT JOIN feeds f ON f.id=e.feed_id "
         "WHERE COALESCE(e.end, e.start) >= ? AND e.start < ? ORDER BY e.start",
-        (today.isoformat(timespec="minutes"), horizon.isoformat(timespec="minutes"))).fetchall()
+        (lo, hi)).fetchall()
+    local_rows = con.execute(
+        "SELECT id, title, location, description, start, end, all_day, category "
+        "FROM local_events WHERE COALESCE(end, start) >= ? AND start < ? ORDER BY start",
+        (lo, hi)).fetchall()
     con.close()
-    return [{"id": r[0], "title": r[1], "location": r[2], "description": r[3],
-             "start": r[4], "end": r[5], "all_day": bool(r[6]), "calendar": r[7]} for r in rows]
+    out = [{"id": r[0], "title": r[1], "location": r[2], "description": r[3],
+            "start": r[4], "end": r[5], "all_day": bool(r[6]),
+            "calendar": r[7] or "Calendar", "source": "feed", "editable": False}
+           for r in feed_rows]
+    out += [{"id": r[0], "title": r[1], "location": r[2], "description": r[3],
+             "start": r[4], "end": r[5], "all_day": bool(r[6]),
+             "calendar": r[7] or "Oceano", "source": "local", "editable": True}
+            for r in local_rows]
+    out.sort(key=lambda e: e["start"])
+    return out
+
+
+def upcoming(days=30):
+    """Merged events from today through +days (for the agenda tool)."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    horizon = today + timedelta(days=days + 1)
+    return _window(today.isoformat(timespec="minutes"), horizon.isoformat(timespec="minutes"))
+
+
+def range_events(start, end):
+    """Merged events overlapping the [start, end) DATE range — what the month/week/day grid
+    asks for. `start`/`end` are 'YYYY-MM-DD' (end exclusive). Bad input → empty list."""
+    if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", start or "") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", end or "")):
+        return []
+    return _window(start + "T00:00", end + "T00:00")
+
+
+def _has_local():
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM local_events").fetchone()[0]
+    con.close()
+    return n > 0
 
 
 def agenda(days=7):
-    """The upcoming agenda as plain text — what the calendar_events tool returns."""
-    if not feeds():
-        return "(no calendar feeds configured — add one in the Calendar section of the web UI)"
+    """The upcoming agenda as plain text — what the calendar_events tool returns. Editable
+    local events are marked `[#id]` (use that id with update/delete_calendar_event); synced
+    feed events are marked read-only so the agent knows it can't touch them."""
     evs = upcoming(days)
     if not evs:
-        return f"(no events in the next {days} days)"
+        if feeds() or _has_local():
+            return f"(no events in the next {days} days — the schedule is clear)"
+        return ("(calendar is empty — add events with add_calendar_event, or subscribe to an "
+                "external .ics feed in the Calendar section of the web UI)")
     lines, last_day = [], None
     for e in evs:
         day = e["start"][:10]
@@ -319,5 +478,6 @@ def agenda(days=7):
         else:
             when = e["start"][11:16] + (f"–{e['end'][11:16]}" if e["end"] and e["end"][:10] == day else "")
         where = f" ({e['location']})" if e["location"] else ""
-        lines.append(f"  - {when}  {e['title']}{where}")
+        tag = f"  [#{e['id']}]" if e["editable"] else f"  (read-only · {e['calendar']})"
+        lines.append(f"  - {when}  {e['title']}{where}{tag}")
     return "\n".join(lines).strip()
