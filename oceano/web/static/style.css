@@ -1010,6 +1010,30 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .serve-grid input:focus,.serve-grid select:focus{border-color:var(--biolum)}
 .serve-fa{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mist);margin:4px 0 8px;cursor:pointer}
 .serve-hint{font-size:11.5px;color:var(--faint);line-height:1.5;margin-bottom:14px}
+/* live VRAM bar in the Rivers header */
+.vram-bar{display:inline-block;width:46px;height:7px;border-radius:4px;background:rgba(84,200,255,.15);margin-left:7px;vertical-align:middle;overflow:hidden}
+.vram-bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--biolum),var(--biolum-2));transition:width .6s}
+.vram-bar.hot>i{background:linear-gradient(90deg,#e8b34a,var(--coral))}
+/* unserve (destructive) mini button */
+.btn-mini.danger{background:rgba(255,111,107,.1);color:var(--coral);border-color:rgba(255,111,107,.35)}
+.btn-mini.danger:hover{background:rgba(255,111,107,.2)}
+/* serve/edit VRAM estimate panel */
+.river-est{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;padding:9px 12px;margin:2px 0 12px;border:1px solid var(--line);border-radius:9px;background:rgba(4,17,26,.4);font-size:12px;color:var(--mist)}
+.river-est b{font-family:var(--font-mono);font-size:13.5px;color:var(--foam)}
+.river-est .est-bd{font-family:var(--font-mono);font-size:11px;color:var(--faint)}
+.river-est .est-free{margin-left:auto;font-family:var(--font-mono);font-size:11px;color:var(--faint);white-space:nowrap}
+.river-est .est-note{flex-basis:100%;font-size:11px;color:var(--faint);line-height:1.45}
+.river-est.ok{border-color:rgba(55,227,198,.4)} .river-est.ok b{color:var(--biolum)}
+.river-est.warn{border-color:rgba(232,179,74,.5)} .river-est.warn b,.river-est.warn .est-free{color:#e8b34a}
+.river-est.err{border-color:rgba(255,111,107,.5)} .river-est.err b,.river-est.err .est-free{color:var(--coral)}
+/* advanced serve params expander */
+.serve-adv{margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:rgba(4,17,26,.3);padding:0 11px}
+.serve-adv summary{cursor:pointer;padding:9px 2px;font-size:12.5px;color:var(--mist);user-select:none}
+.serve-adv summary:hover{color:var(--biolum)}
+.serve-adv[open]{padding-bottom:10px}
+.serve-adv .serve-grid{margin-top:4px}
+.serve-adv>input{width:100%;box-sizing:border-box;padding:8px 10px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12.5px;outline:none}
+.serve-adv>input:focus{border-color:var(--biolum)}
 
 /* ===== Settings → Wipe ===== */
 .wipe-list{display:flex;flex-direction:column;gap:8px;margin:6px 0 10px}

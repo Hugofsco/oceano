@@ -2239,7 +2239,7 @@ function renderKnResults(results, scope, note) {
 }
 
 /* ---------- Brain → Rivers (HF catalog · hwfit · download · serve) ---------- */
-let _riverTimer = null, _riverHw = null;
+let _riverTimer = null, _riverHw = null, _riverHwTimer = null;
 const fmtNum = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : "" + (n || 0);
 const GB = 1073741824;
 function fitClient(size) {                       // mirrors riverbook.fit() for installed models
@@ -2286,12 +2286,32 @@ function renderRivers(c) {
   $("#riverFind").addEventListener("input", riverRenderInstalled);
   riverLoadHw(); riverLoadRecommended(); riverLoadInstalled(); riverPoll();
 }
+function riverPaintHw() {
+  const el = $("#riverHw"); if (!el || !_riverHw) return;
+  const tot = _riverHw.vram_total ? (_riverHw.vram_total / GB).toFixed(1) + " GB" : "—";
+  const free = _riverHw.vram_free != null ? (_riverHw.vram_free / GB).toFixed(1) + " GB free" : "";
+  const used = (_riverHw.vram_total && _riverHw.vram_free != null)
+    ? Math.max(0, _riverHw.vram_total - _riverHw.vram_free) : null;
+  const pct = (used != null && _riverHw.vram_total) ? Math.round(100 * used / _riverHw.vram_total) : 0;
+  el.innerHTML = `<span class="svc-dot ${_riverHw.gpu ? "on" : "off"}"></span>` +
+    `<span>Backend <code>${escapeHtml(_riverHw.backend)}</code> · <code>${escapeHtml(_riverHw.gpu || "CPU only")}</code></span>` +
+    `<span class="vram">VRAM ${tot}${free ? " · " + free : ""}` +
+    (used != null ? `<span class="vram-bar ${pct >= 90 ? "hot" : ""}" title="${pct}% used"><i style="width:${pct}%"></i></span>` : "") +
+    `</span>`;
+}
 async function riverLoadHw() {
   try { _riverHw = await api("/api/rivers/hw"); } catch { return; }
-  const el = $("#riverHw"); if (!el) return;
-  const tot = _riverHw.vram_total ? (_riverHw.vram_total / GB).toFixed(1) + " GB" : "—";
-  const free = _riverHw.vram_free ? " · " + (_riverHw.vram_free / GB).toFixed(1) + " GB free" : "";
-  el.innerHTML = `<span class="svc-dot ${_riverHw.gpu ? "on" : "off"}"></span><span>Backend <code>${escapeHtml(_riverHw.backend)}</code> · <code>${escapeHtml(_riverHw.gpu || "CPU only")}</code></span><span class="vram">VRAM ${tot}${free}</span>`;
+  riverPaintHw();
+  riverMonitor();                          // start the live VRAM readout
+}
+function riverMonitor() {
+  // Poll VRAM every 3s while the Rivers panel is on-screen; self-stops when its element is gone
+  // (tab switched / Brain closed), so no leaked timer — same lifetime idea as the download poll.
+  if (_riverHwTimer) return;
+  _riverHwTimer = setInterval(async () => {
+    if (!document.getElementById("riverHw")) { clearInterval(_riverHwTimer); _riverHwTimer = null; return; }
+    try { _riverHw = await api("/api/rivers/hw"); riverPaintHw(); } catch {}
+  }, 3000);
 }
 let _riverRec = [], _riverRecFilter = "all", _riverRecSort = "score";
 async function riverLoadRecommended() {
@@ -2399,43 +2419,133 @@ function riverRenderInstalled() {
   if (!list.length) { box.innerHTML = `<div class="empty-note">No on-device model matches “${escapeHtml(q)}”.</div>`; return; }
   box.innerHTML = list.map(m =>
     `<div class="river-inst"><span class="in">${escapeHtml(m.filename)}</span><span class="cs">${fmtSize(m.size)}</span>` +
-    (m.served ? `<span class="served">▶ ${escapeHtml(m.served)}</span>`
-              : `<button class="btn-mini cserve" data-f="${escapeHtml(m.filename)}" data-sz="${m.size}">Serve</button>`) +
+    (m.served
+      ? `<span class="served">▶ ${escapeHtml(m.served)}</span>` +
+        `<button class="btn-mini cedit" data-n="${escapeHtml(m.served)}">Edit</button>` +
+        `<button class="btn-mini danger cunserve" data-n="${escapeHtml(m.served)}">Unserve</button>`
+      : `<button class="btn-mini cserve" data-f="${escapeHtml(m.filename)}" data-sz="${m.size}">Serve</button>` +
+        `<button class="btn-mini danger cdelete" data-f="${escapeHtml(m.filename)}" data-sz="${m.size}">Delete</button>`) +
     `</div>`).join("");
   $$(".cserve", box).forEach(b => b.onclick = () => riverServeDialog(b.dataset.f, +b.dataset.sz));
+  $$(".cedit", box).forEach(b => b.onclick = () => riverEditDialog(b.dataset.n));
+  $$(".cunserve", box).forEach(b => b.onclick = () => riverUnserve(b.dataset.n));
+  $$(".cdelete", box).forEach(b => b.onclick = () => riverDelete(b.dataset.f, +b.dataset.sz));
 }
+async function riverDelete(filename, size) {
+  if (!confirm(`Delete "${filename}" from disk? This frees ${fmtSize(size)} and cannot be undone — you'd have to re-download it.`)) return;
+  let r; try { r = await api("/api/rivers/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename }) }); } catch { return; }
+  const note = $("#riverNote");
+  if (note) { note.textContent = r.ok ? `🗑 deleted "${filename}" — freed ${fmtSize(r.freed)}` : (r.error || "delete failed"); note.className = "river-note " + (r.ok ? "ok" : "err"); }
+  riverLoadInstalled();
+}
+async function riverUnserve(name) {
+  if (!confirm(`Stop serving "${name}"? The model file stays on disk — only its llama-swap entry is removed.`)) return;
+  let r; try { r = await api("/api/rivers/unserve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }); } catch { return; }
+  const note = $("#riverNote");
+  if (note) { note.textContent = r.ok ? `✓ unserved "${name}"` : (r.error || "unserve failed"); note.className = "river-note " + (r.ok ? "ok" : "err"); }
+  riverLoadInstalled(); loadModels();
+}
+const _KV_OPTS = `<option value="f16">f16 (fastest)</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0 (smallest)</option>`;
+
 function riverServeDialog(filename, size) {
   const fitc = fitClient(size);
   const defName = filename.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-  const { body } = createWindow({ id: "win-serve", title: "Serve model — parameters", icon: "🌊", width: 470, height: 440 });
+  _riverDialog({ mode: "serve", filename, name: defName,
+    vals: { ngl: fitc.ngl, ctx: 8192, kv: "f16", kv_v: "f16", ttl: 600, fa: true,
+            threads: "", batch: "", ubatch: "", n_cpu_moe: "", parallel: 1, extra: "" } });
+}
+async function riverEditDialog(name) {
+  let d; try { d = await api("/api/rivers/served"); } catch { return; }
+  const m = (d.models || []).find(x => x.name === name);
+  if (!m) { const n = $("#riverNote"); if (n) { n.textContent = `couldn't load "${name}"`; n.className = "river-note err"; } return; }
+  _riverDialog({ mode: "edit", filename: m.filename, name: m.name,
+    vals: { ngl: m.ngl, ctx: m.ctx, kv: m.kv, kv_v: m.kv_v, ttl: m.ttl, fa: m.fa,
+            threads: m.threads || "", batch: m.batch || "", ubatch: m.ubatch || "",
+            n_cpu_moe: m.n_cpu_moe || "", parallel: m.parallel || 1, extra: m.extra || "" } });
+}
+function riverPaintEst(el, e) {
+  const g = x => (x / GB).toFixed(1);
+  const kv = e.kv_bytes != null ? `${g(e.kv_bytes)} GB` : "n/a";
+  const freeTxt = e.vram_free != null ? `${g(e.vram_free)} GB free`
+    : (e.vram_total ? `${g(e.vram_total)} GB total` : "no GPU detected");
+  let cls = "ok", verdict = "fits in VRAM";
+  if (e.vram_total != null) {
+    if (e.vram_free != null && e.total > e.vram_free) { cls = "warn"; verdict = "needs a model swap to fit"; }
+    if (e.total > e.vram_total) { cls = "err"; verdict = "exceeds total VRAM"; }
+  } else { cls = ""; verdict = ""; }
+  el.className = "river-est " + cls;
+  el.innerHTML = `<b>≈ ${g(e.total)} GB</b> <span class="est-bd">weights ${g(e.weights_gpu)} + KV ${kv} + overhead</span>` +
+    `<span class="est-free">${escapeHtml(freeTxt)}${verdict ? " · " + verdict : ""}</span>` +
+    (e.note ? `<span class="est-note">${e.approx ? "⚠ " : "ⓘ "}${escapeHtml(e.note)}</span>` : "");
+}
+function _riverDialog({ mode, filename, name, vals }) {
+  const editing = mode === "edit";
+  const { body } = createWindow({ id: "win-serve", title: (editing ? "Edit served model" : "Serve model") + " — parameters", icon: "🌊", width: 500, height: 640 });
   body.classList.add("set-win");
   body.innerHTML = `<div class="drawer-section">
-    <h3>Serve <code>${escapeHtml(filename)}</code></h3>
-    <label class="field-label">Name <span class="lbl-sub">how it shows in the model picker</span></label>
-    <input id="svName" value="${escapeHtml(defName)}" autocomplete="off">
+    <h3>${editing ? "Edit" : "Serve"} <code>${escapeHtml(filename)}</code></h3>
+    <label class="field-label">Name <span class="lbl-sub">${editing ? "rename isn't supported — unserve & serve again to change it" : "how it shows in the model picker"}</span></label>
+    <input id="svName" value="${escapeHtml(name)}" autocomplete="off" ${editing ? "readonly" : ""}>
     <div class="serve-grid">
-      <div><label class="field-label">Context (tokens)</label><input id="svCtx" type="number" value="8192" min="256" step="1024"></div>
-      <div><label class="field-label">GPU layers (ngl)</label><input id="svNgl" type="number" value="${fitc.ngl}" min="0" max="999"></div>
-      <div><label class="field-label">KV cache</label><select id="svKv"><option value="f16">f16 (fastest)</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0 (smallest)</option></select></div>
-      <div><label class="field-label">TTL (sec resident)</label><input id="svTtl" type="number" value="600" min="0"></div>
+      <div><label class="field-label">Context (tokens)</label><input id="svCtx" type="number" value="${+vals.ctx}" min="256" step="1024"></div>
+      <div><label class="field-label">GPU layers (ngl)</label><input id="svNgl" type="number" value="${+vals.ngl}" min="0" max="999"></div>
+      <div><label class="field-label">K cache</label><select id="svKv">${_KV_OPTS}</select></div>
+      <div><label class="field-label">V cache</label><select id="svKvV">${_KV_OPTS}</select></div>
+      <div><label class="field-label">TTL (sec resident)</label><input id="svTtl" type="number" value="${+vals.ttl}" min="0"></div>
+      <div><label class="field-label">Parallel slots</label><input id="svPar" type="number" value="${+vals.parallel}" min="1" max="64"></div>
     </div>
-    <label class="serve-fa"><input type="checkbox" id="svFa" checked> Flash attention (<code>-fa</code>)</label>
-    <div class="serve-hint">Bigger context needs more VRAM — the KV cache grows with it. On AMD/Vulkan, <b>f16</b> KV is usually fastest; quantize KV only if a huge context won't otherwise fit.</div>
-    <div class="acct-actions"><span class="acct-msg" id="svMsg"></span><button class="primary sm" id="svGo">Serve</button></div>
+    <label class="serve-fa"><input type="checkbox" id="svFa" ${vals.fa ? "checked" : ""}> Flash attention (<code>-fa</code>)</label>
+    <div class="river-est" id="svEst">estimating…</div>
+    <details class="serve-adv"${vals.extra || vals.threads || vals.batch || vals.n_cpu_moe ? " open" : ""}><summary>Advanced</summary>
+      <div class="serve-grid">
+        <div><label class="field-label">Threads (-t)</label><input id="svThreads" type="number" value="${vals.threads}" min="0" placeholder="auto"></div>
+        <div><label class="field-label">MoE→CPU (--n-cpu-moe)</label><input id="svMoe" type="number" value="${vals.n_cpu_moe}" min="0" placeholder="off"></div>
+        <div><label class="field-label">Batch (-b)</label><input id="svBatch" type="number" value="${vals.batch}" min="0" placeholder="default"></div>
+        <div><label class="field-label">U-batch (-ub)</label><input id="svUbatch" type="number" value="${vals.ubatch}" min="0" placeholder="default"></div>
+      </div>
+      <label class="field-label">Extra flags</label>
+      <input id="svExtra" value="${escapeHtml(vals.extra)}" autocomplete="off" placeholder="e.g. --rope-scaling yarn --rope-freq-scale 0.5">
+      <div class="serve-hint">Appended verbatim. Allowed: letters, digits, space and <code>. _ : = + / -</code>.</div>
+    </details>
+    <div class="serve-hint">Bigger context needs more VRAM — the KV cache grows with it. On AMD/Vulkan, <b>f16</b> KV is usually fastest; quantize KV only if a big context won't otherwise fit.</div>
+    <div class="acct-actions"><span class="acct-msg" id="svMsg"></span><button class="primary sm" id="svGo">${editing ? "Save changes" : "Serve"}</button></div>
   </div>`;
+  $("#svKv", body).value = vals.kv; $("#svKvV", body).value = vals.kv_v;
+  const est = $("#svEst", body);
+  let estT = null;
+  const recompute = () => {
+    clearTimeout(estT);
+    estT = setTimeout(async () => {
+      const qs = new URLSearchParams({ filename, ctx: $("#svCtx", body).value || 8192,
+        kv: $("#svKv", body).value, kv_v: $("#svKvV", body).value, ngl: $("#svNgl", body).value || 99 });
+      let e; try { e = await api("/api/rivers/estimate?" + qs.toString()); } catch { return; }
+      if (!est.isConnected) return;
+      if (!e.ok) { est.textContent = e.error || "estimate unavailable"; est.className = "river-est"; return; }
+      riverPaintEst(est, e);
+    }, 250);
+  };
+  ["svCtx", "svNgl", "svKv", "svKvV"].forEach(id => {
+    const el = $("#" + id, body); el.addEventListener("input", recompute); el.addEventListener("change", recompute);
+  });
+  recompute();
   $("#svGo", body).onclick = async () => {
     const msg = $("#svMsg", body), go = $("#svGo", body); go.disabled = true;
-    const payload = { filename, name: $("#svName", body).value.trim(), ctx: +$("#svCtx", body).value,
-      ngl: +$("#svNgl", body).value, kv: $("#svKv", body).value, fa: $("#svFa", body).checked, ttl: +$("#svTtl", body).value };
-    let r; try { r = await api("/api/rivers/serve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); }
+    const payload = { filename, name: $("#svName", body).value.trim(),
+      ctx: +$("#svCtx", body).value, ngl: +$("#svNgl", body).value,
+      kv: $("#svKv", body).value, kv_v: $("#svKvV", body).value, fa: $("#svFa", body).checked,
+      ttl: +$("#svTtl", body).value, parallel: +$("#svPar", body).value,
+      threads: $("#svThreads", body).value, batch: $("#svBatch", body).value,
+      ubatch: $("#svUbatch", body).value, n_cpu_moe: $("#svMoe", body).value,
+      extra: $("#svExtra", body).value.trim() };
+    let r; try { r = await api(editing ? "/api/rivers/update" : "/api/rivers/serve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); }
     catch { go.disabled = false; msg.textContent = "request failed"; msg.className = "acct-msg err"; return; }
     if (!r.ok) { msg.textContent = r.error; msg.className = "acct-msg err"; go.disabled = false; return; }
-    msg.textContent = `✓ serving as "${r.name}"`; msg.className = "acct-msg ok";
-    const note = $("#riverNote"); if (note) { note.textContent = `✓ "${r.name}" — ngl ${r.ngl} · ctx ${r.ctx} · KV ${r.kv} · fa ${r.fa ? "on" : "off"} · on :8081 + the picker`; note.className = "river-note ok"; }
+    msg.textContent = editing ? `✓ updated "${r.name}"` : `✓ serving as "${r.name}"`; msg.className = "acct-msg ok";
+    const note = $("#riverNote"); if (note) { note.textContent = `✓ "${r.name}" — ngl ${r.ngl} · ctx ${r.ctx} · KV ${r.kv}/${r.kv_v} · fa ${r.fa ? "on" : "off"}`; note.className = "river-note ok"; }
     riverLoadInstalled(); loadModels();
     setTimeout(() => { const w = document.getElementById("win-serve"); if (w) w.remove(); }, 800);
   };
-  setTimeout(() => { const e = $("#svName", body); if (e) e.focus(); }, 40);
+  setTimeout(() => { const e = $("#svName", body); if (e && !editing) e.focus(); }, 40);
 }
 
 /* ---------- Scheduler window (heartbeat + tasks) ---------- */

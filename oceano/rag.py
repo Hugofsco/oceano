@@ -121,8 +121,11 @@ def search_docs(query, k=4):
     qvec = embeddings.embed(query)
     if not qvec:
         return "ERROR: embed server down"
-    scored = [(embeddings.cosine(qvec, json.loads(emb)), path, chunk)
-              for path, chunk, emb in rows]
+    scored = []
+    for path, chunk, emb in rows:
+        v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
+        if v:
+            scored.append((embeddings.cosine(qvec, v), path, chunk))
     scored.sort(reverse=True)
     return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in scored[:k])
 
@@ -153,8 +156,11 @@ def research_context(query, k=3, threshold=0.55):
     qvec = embeddings.embed(query)
     if not qvec:
         return []
-    scored = [(embeddings.cosine(qvec, json.loads(emb)), path, chunk)
-              for path, chunk, emb in rows if emb]
+    scored = []
+    for path, chunk, emb in rows:
+        v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
+        if v:
+            scored.append((embeddings.cosine(qvec, v), path, chunk))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(round(s, 3), Path(p).stem, c) for s, p, c in scored[:k] if s >= threshold]
 
@@ -167,7 +173,8 @@ def stats():
     chunks = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     row = con.execute("SELECT embedding FROM chunks WHERE embedding IS NOT NULL LIMIT 1").fetchone()
     con.close()
-    return {"files": files, "chunks": chunks, "dims": len(json.loads(row[0])) if row else None}
+    vec = embeddings.loads_vec(row[0]) if row else None
+    return {"files": files, "chunks": chunks, "dims": len(vec) if vec else None}
 
 
 def search(query, k=6):
@@ -180,8 +187,11 @@ def search(query, k=6):
     qvec = embeddings.embed(query)
     if not qvec:
         return []
-    scored = [(embeddings.cosine(qvec, json.loads(emb)), path, chunk)
-              for path, chunk, emb in rows if emb]
+    scored = []
+    for path, chunk, emb in rows:
+        v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
+        if v:
+            scored.append((embeddings.cosine(qvec, v), path, chunk))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
             for s, p, c in scored[:k]]

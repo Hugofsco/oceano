@@ -14,6 +14,7 @@ against the local llama.cpp/llama-swap stack.
   installed()           -> .gguf already on disk + whether each is wired into llama-swap
 """
 import re
+import struct
 import subprocess
 import threading
 from pathlib import Path
@@ -177,6 +178,147 @@ def _parse_quant(filename):
     return m.group(1).upper() if m else "?"
 
 
+# ============================ VRAM estimate (GGUF-aware) ============================
+# Per-element KV-cache cost in bytes for each dtype the GUI offers (q8_0 = 34 B / 32 elems,
+# q4_0 = 18 B / 32 elems, including the block scale overhead).
+_KV_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}
+_VRAM_OVERHEAD = 350 * 1024 * 1024        # rough compute-buffer / driver allowance
+
+_GGUF_SCALAR_SIZE = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+_GGUF_SCALAR_FMT = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f",
+                    7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+_GGUF_STRING, _GGUF_ARRAY = 8, 9
+
+
+def _gguf_meta(path, window=32 * 1024 * 1024):
+    """Read the architecture fields needed for a KV-cache estimate straight from a GGUF file's
+    metadata header — no `gguf` dependency. Array values (e.g. the tokenizer) are skipped by
+    size, so only the small header region is touched. Returns a dict, or None if the file is
+    unreadable / the metadata exceeds `window` / the layout is unexpected."""
+    try:
+        with open(path, "rb") as fh:
+            buf = fh.read(window)
+    except OSError:
+        return None
+    if len(buf) < 24 or buf[:4] != b"GGUF":
+        return None
+    off = 4
+    try:
+        if struct.unpack_from("<I", buf, off)[0] < 2:      # version
+            return None
+        off += 4 + 8                                        # version + tensor_count (u64)
+        kv_count = struct.unpack_from("<Q", buf, off)[0]; off += 8
+    except struct.error:
+        return None
+
+    def take(n):                                            # bounds-checked cursor advance
+        nonlocal off
+        if off + n > len(buf):
+            raise IndexError
+        off += n
+        return off - n
+
+    def rd_str():
+        ln = struct.unpack_from("<Q", buf, take(8))[0]
+        return buf[take(ln):off].decode("utf-8", "replace")
+
+    def skip(vtype):
+        if vtype in _GGUF_SCALAR_SIZE:
+            take(_GGUF_SCALAR_SIZE[vtype])
+        elif vtype == _GGUF_STRING:
+            rd_str()
+        elif vtype == _GGUF_ARRAY:
+            at = struct.unpack_from("<I", buf, take(4))[0]
+            n = struct.unpack_from("<Q", buf, take(8))[0]
+            if at in _GGUF_SCALAR_SIZE:
+                take(_GGUF_SCALAR_SIZE[at] * n)
+            elif at == _GGUF_STRING:
+                for _ in range(n):
+                    rd_str()
+            else:
+                raise IndexError                            # nested/unknown array → bail
+        else:
+            raise IndexError
+
+    meta = {}
+    try:
+        for _ in range(kv_count):
+            key = rd_str()
+            vtype = struct.unpack_from("<I", buf, take(4))[0]
+            if vtype == _GGUF_STRING:
+                meta[key] = rd_str()
+            elif vtype in _GGUF_SCALAR_FMT:
+                meta[key] = struct.unpack_from(_GGUF_SCALAR_FMT[vtype], buf,
+                                               take(_GGUF_SCALAR_SIZE[vtype]))[0]
+            else:
+                skip(vtype)                                 # arrays — never needed for the estimate
+    except (IndexError, struct.error):
+        return None
+
+    arch = meta.get("general.architecture")
+    if not arch:
+        return None
+    g = lambda s: meta.get(f"{arch}.{s}")
+    n_layers, n_head = g("block_count"), g("attention.head_count")
+    n_head_kv = g("attention.head_count_kv") or n_head
+    n_embd = g("embedding_length")
+    head_dim = g("attention.key_length") or ((n_embd // n_head) if (n_embd and n_head) else None)
+    head_dim_v = g("attention.value_length") or head_dim       # V dim can differ from K
+    if not (n_layers and n_head_kv and head_dim):
+        return None
+    return {"arch": arch, "n_layers": int(n_layers), "n_head_kv": int(n_head_kv),
+            "head_dim": int(head_dim), "head_dim_v": int(head_dim_v), "n_embd": int(n_embd or 0),
+            "sliding_window": int(g("attention.sliding_window") or 0),
+            "n_ctx_train": int(g("context_length") or 0)}
+
+
+def estimate(filename, ctx=8192, kv="f16", ngl=99, kv_v=None):
+    """Estimate VRAM to serve `filename` at the given context / KV dtype / GPU-offload, against
+    this box's VRAM. Accurate when the GGUF metadata parses (KV from the real n_layers/n_head_kv/
+    head_dim — an UPPER bound, since sliding-window layers use less); otherwise a clearly-flagged
+    heuristic (approx=True, KV omitted). All sizes are bytes."""
+    base = Path(filename or "").name
+    if not _safe_gguf(base):
+        return {"ok": False, "error": "invalid filename"}
+    path = config.MODELS_DIR / base
+    if not path.exists():
+        return {"ok": False, "error": "model file not found on disk"}
+    try:
+        ctx = max(256, min(int(ctx), 1_048_576)); ngl = max(0, min(int(ngl), 999))
+    except (TypeError, ValueError):
+        ctx, ngl = 8192, 99
+    k = kv if kv in _KV_BYTES else "f16"
+    v = kv_v if kv_v in _KV_BYTES else k
+    size = path.stat().st_size
+    total_vram, free_vram = _vram_bytes()
+    meta = _gguf_meta(path)
+    note = ""
+    if meta:
+        frac = min(1.0, ngl / meta["n_layers"]) if meta["n_layers"] else 1.0
+        weights = size * frac
+        kv_bytes = (meta["n_layers"] * ctx * meta["n_head_kv"]
+                    * (meta["head_dim"] * _KV_BYTES[k] + meta["head_dim_v"] * _KV_BYTES[v]))
+        approx = False
+        sw = meta.get("sliding_window") or 0
+        if 0 < sw < ctx:                          # real sliding window → full-attn KV is a loose ceiling
+            note = f"sliding-window attention (window {sw:,}) — real KV is likely well below this estimate"
+        elif meta["n_ctx_train"] and ctx > meta["n_ctx_train"]:
+            note = f"context exceeds the model's trained max ({meta['n_ctx_train']:,}) — needs rope-scaling"
+    else:
+        weights, kv_bytes, approx = size, None, True
+        note = "couldn't read model metadata — weights only (KV cache not included)"
+    total = weights + (kv_bytes or 0) + _VRAM_OVERHEAD
+    return {"ok": True, "filename": base, "ctx": ctx, "kv": k, "kv_v": v, "ngl": ngl,
+            "weights_gpu": int(weights),
+            "kv_bytes": (int(kv_bytes) if kv_bytes is not None else None),
+            "overhead": _VRAM_OVERHEAD, "total": int(total),
+            "vram_total": total_vram, "vram_free": free_vram,
+            "fits": (total <= total_vram) if total_vram else None,
+            "approx": approx, "note": note,
+            "n_layers": meta["n_layers"] if meta else None,
+            "n_ctx_train": meta["n_ctx_train"] if meta else None}
+
+
 # ============================ Hugging Face ============================
 def search(query, limit=24):
     """GGUF repos matching the query, most-downloaded first."""
@@ -301,74 +443,303 @@ def _cmd_uses(filename):
 
 
 _KV_TYPES = ("f16", "q8_0", "q4_0")     # KV-cache dtype the GUI may pick
+# Extra-flags escape hatch: this string is spliced into a shell-executed `cmd`, so it is strictly
+# allowlisted (no shell metacharacters, no newlines) and length-capped — same posture as the
+# validated name/filename. Anything outside this set is refused with a clear message.
+_EXTRA_RE = re.compile(r"^[A-Za-z0-9 ._:=+/-]*$")
+# Known llama-server flags Rivers manages as structured fields; these map flag -> integer param.
+_FLAG_INT = {"-ngl": "ngl", "-c": "ctx", "-b": "batch", "-ub": "ubatch", "-t": "threads",
+             "--n-cpu-moe": "n_cpu_moe", "--parallel": "parallel"}
 
 
-def serve(filename, name=None, ngl=99, ctx=8192, fa=True, kv="f16", ttl=600):
-    """Append a model block to llama-swap.yaml (comment-preserving: we append text
-    rather than re-dump). llama-swap's -watch-config hot-reloads it.
+def _norm_params(ngl=99, ctx=8192, fa=True, kv="f16", kv_v=None, ttl=600, threads=None,
+                 batch=None, ubatch=None, n_cpu_moe=None, parallel=1, extra=""):
+    """Clamp/allowlist every serving param to a shell-safe value. Returns (params, error)."""
+    def _opt(x, lo, hi):                       # optional positive int: None/''/0 → omit the flag
+        if x in (None, "", 0, "0"):
+            return None
+        return max(lo, min(int(x), hi))
+    try:
+        ngl = max(0, min(int(ngl), 999)); ctx = max(256, min(int(ctx), 1_048_576))
+        ttl = max(0, min(int(ttl), 86400)); parallel = max(1, min(int(parallel or 1), 64))
+        threads, batch = _opt(threads, 1, 1024), _opt(batch, 1, 1_048_576)
+        ubatch, n_cpu_moe = _opt(ubatch, 1, 1_048_576), _opt(n_cpu_moe, 1, 999)
+    except (TypeError, ValueError):
+        return None, "numeric parameters must be integers"
+    kv = kv if kv in _KV_TYPES else "f16"
+    kv_v = kv_v if kv_v in _KV_TYPES else kv
+    extra = (extra or "").strip()
+    if len(extra) > 400 or not _EXTRA_RE.fullmatch(extra):
+        return None, ("extra flags contain unsupported characters "
+                      "(allowed: letters, digits, space and . _ : = + / -)")
+    return {"ngl": ngl, "ctx": ctx, "fa": bool(fa), "kv": kv, "kv_v": kv_v, "ttl": ttl,
+            "threads": threads, "batch": batch, "ubatch": ubatch, "n_cpu_moe": n_cpu_moe,
+            "parallel": parallel, "extra": extra}, None
+
+
+def _build_flags(p):
+    """The llama-server flag string for a normalized params dict (from _norm_params)."""
+    parts = [f"-ngl {p['ngl']}", f"-fa {'1' if p['fa'] else '0'}"]
+    if p["n_cpu_moe"]:
+        parts.append(f"--n-cpu-moe {p['n_cpu_moe']}")
+    parts.append(f"--parallel {p['parallel']}")
+    parts.append(f"-c {p['ctx']}")
+    if p["batch"]:
+        parts.append(f"-b {p['batch']}")
+    if p["ubatch"]:
+        parts.append(f"-ub {p['ubatch']}")
+    if p["kv"] != "f16" or p["kv_v"] != "f16":        # f16 is the default; emit only when quantized
+        parts.append(f"-ctk {p['kv']} -ctv {p['kv_v']}")
+    if p["threads"]:
+        parts.append(f"-t {p['threads']} --threads-batch {p['threads']}")
+    if p["extra"]:
+        parts.append(p["extra"])
+    parts.append("--jinja")
+    return " ".join(parts)
+
+
+def _block_text(name, model_path, flags, ttl):
+    """One llama-swap model block (the same format serve() has always written)."""
+    return (
+        f'  "{name}":\n'
+        f'    cmd: |\n'
+        f'      {config.LLAMA_SERVER_BIN}\n'
+        f'      -m {model_path}\n'
+        f'      {flags}\n'
+        f'      --host 127.0.0.1 --port ${{PORT}}\n'
+        f'    ttl: {ttl}\n'
+    )
+
+
+def _validate_has(text, name):
+    """The new YAML must still parse AND contain `name` (catches an indentation slip)."""
+    try:
+        check = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        return False, str(e)
+    if name not in (check.get("models") or {}):
+        return False, "the edit did not register the model (indentation?)"
+    return True, ""
+
+
+def _block_span(lines, name):
+    """(start, end) line indices for model `name`'s block: its `  "name":` key line through the
+    last non-blank line before the next sibling (any line indented <= 2 spaces) or EOF. The block's
+    own leading comments sit before `start`, so they survive an edit. None if the key isn't found."""
+    keyre = re.compile(r'^  "?' + re.escape(name) + r'"?\s*:\s*$')
+    start = next((i for i, ln in enumerate(lines) if keyre.match(ln)), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if not ln.strip():
+            continue
+        if len(ln) - len(ln.lstrip(" ")) <= 2:        # a sibling key OR the next block's comment
+            end = j
+            break
+    while end - 1 > start and not lines[end - 1].strip():   # don't swallow trailing blank separators
+        end -= 1
+    return start, end
+
+
+def _model_path_in(cmd):
+    """The `-m <path>` argument from a llama-swap cmd string, or ''."""
+    toks = (cmd or "").split()
+    for i, t in enumerate(toks):
+        if t == "-m" and i + 1 < len(toks):
+            return toks[i + 1]
+    return ""
+
+
+def _parse_flags(cmd):
+    """Decompose a llama-server cmd into structured params; UNKNOWN flags are preserved verbatim
+    in `extra`, so editing a hand-tuned model never drops a flag (known ones like --n-cpu-moe
+    round-trip into their field; anything without a field lands in `extra`)."""
+    toks = (cmd or "").split()
+    p = {"ngl": 99, "ctx": 8192, "fa": True, "kv": "f16", "kv_v": "f16", "threads": None,
+         "batch": None, "ubatch": None, "n_cpu_moe": None, "parallel": 1}
+    extra, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if t.endswith("llama-server") or t == "--jinja":
+            i += 1; continue
+        if t in ("-m", "--host", "--port"):
+            i += 2; continue                            # path/host/port are re-emitted by _block_text
+        if t in _FLAG_INT:
+            try: p[_FLAG_INT[t]] = int(nxt)
+            except (TypeError, ValueError): pass
+            i += 2; continue
+        if t == "-fa":
+            p["fa"] = (nxt != "0"); i += 2; continue
+        if t == "-ctk":
+            p["kv"] = nxt if nxt in _KV_TYPES else p["kv"]; i += 2; continue
+        if t == "-ctv":
+            p["kv_v"] = nxt if nxt in _KV_TYPES else p["kv_v"]; i += 2; continue
+        if t == "--threads-batch":
+            i += 2; continue                            # mirrors -t; rebuilt from `threads`
+        extra.append(t); i += 1                          # unknown flag → keep verbatim
+    p["extra"] = " ".join(extra).strip()
+    return p
+
+
+def serve(filename, name=None, ngl=99, ctx=8192, fa=True, kv="f16", ttl=600, kv_v=None,
+          threads=None, batch=None, ubatch=None, n_cpu_moe=None, parallel=1, extra=""):
+    """Append a model block to llama-swap.yaml (comment-preserving: we append text rather than
+    re-dump). llama-swap's -watch-config hot-reloads it.
 
     Serving params (all settable from the GUI):
-      ngl  GPU layers (0 = CPU)         ctx  context window (tokens)
-      fa   flash attention on/off       kv   KV-cache dtype: f16 | q8_0 | q4_0
-      ttl  seconds llama-swap keeps the model resident after last use
+      ngl  GPU layers (0 = CPU)        ctx  context window (tokens)
+      fa   flash attention on/off      kv/kv_v  K/V cache dtype: f16 | q8_0 | q4_0
+      ttl  seconds resident after use  threads  CPU threads (-t / --threads-batch)
+      batch (-b) · ubatch (-ub) · n_cpu_moe (MoE expert offload) · parallel · extra (extra flags)
 
-    `filename` and `name` end up inside a shell-executed `cmd`, so both are strictly
-    validated — only [A-Za-z0-9._-] survives, which can't break YAML or inject shell.
-    The numeric/enum params are clamped/allowlisted, so they're shell-safe too."""
+    `filename`/`name`/`extra` end up inside a shell-executed `cmd`, so all are strictly validated
+    (allowlist) and the numeric params clamped — none can break YAML or inject shell."""
     base = Path(filename or "").name
     if not _safe_gguf(base):
         return {"ok": False, "error": "invalid filename — must be a plain .gguf name"}
     name = _sanitize_name(name or Path(base).stem)
     if not name:
         return {"ok": False, "error": "invalid model name (use letters, digits, . _ -)"}
-
     path = config.MODELS_DIR / base
     if not path.exists():
         return {"ok": False, "error": "model file not found on disk"}
+    p, err = _norm_params(ngl=ngl, ctx=ctx, fa=fa, kv=kv, kv_v=kv_v, ttl=ttl, threads=threads,
+                          batch=batch, ubatch=ubatch, n_cpu_moe=n_cpu_moe, parallel=parallel, extra=extra)
+    if err:
+        return {"ok": False, "error": err}
 
     cfg = config.LLAMA_SWAP_CFG
     try:
         data = yaml.safe_load(cfg.read_text()) or {}
     except (OSError, yaml.YAMLError) as e:
         return {"ok": False, "error": f"cannot read llama-swap.yaml: {e}"}
-
-    existing = set((data.get("models") or {}).keys())
-    if name in existing:
+    if name in set((data.get("models") or {}).keys()):
         return {"ok": False, "error": f"a model named {name!r} is already in llama-swap.yaml"}
     if _cmd_uses(base):
         return {"ok": False, "error": "this file is already served by llama-swap"}
 
-    try:
-        ngl = int(ngl); ctx = int(ctx); ttl = int(ttl)
-    except (TypeError, ValueError):
-        ngl, ctx, ttl = 99, 8192, 600
-    ngl = max(0, min(ngl, 999)); ctx = max(256, min(ctx, 1_048_576)); ttl = max(0, min(ttl, 86400))
-    kv = kv if kv in _KV_TYPES else "f16"          # allowlist → shell-safe
-    # build the flag string from the chosen params (only allowlisted/clamped values)
-    flags = f"-ngl {ngl} -fa {'1' if fa else '0'} --parallel 1 -c {ctx}"
-    if kv != "f16":                                 # f16 is llama.cpp's default; only emit when quantized
-        flags += f" -ctk {kv} -ctv {kv}"
-    flags += " --jinja"
-
-    block = (
-        f'\n  "{name}":\n'
-        f'    cmd: |\n'
-        f'      {config.LLAMA_SERVER_BIN}\n'
-        f'      -m {path}\n'
-        f'      {flags}\n'
-        f'      --host 127.0.0.1 --port ${{PORT}}\n'
-        f'    ttl: {ttl}\n'
-    )
     original = cfg.read_text()
     if "models:" not in original:
         return {"ok": False, "error": "llama-swap.yaml has no 'models:' section"}
-    updated = original.rstrip("\n") + "\n" + block
-    # validate it still parses AND gained exactly this model before writing
+    updated = original.rstrip("\n") + "\n\n" + _block_text(name, path, _build_flags(p), p["ttl"])
+    ok, verr = _validate_has(updated, name)
+    if not ok:
+        return {"ok": False, "error": f"refused to write — would corrupt config: {verr}"}
+    atomicio.write_text(cfg, updated)          # atomic: a crash can't truncate llama-swap.yaml
+    return {"ok": True, "name": name, "ngl": p["ngl"], "ctx": p["ctx"], "fa": p["fa"],
+            "kv": p["kv"], "kv_v": p["kv_v"], "ttl": p["ttl"]}
+
+
+def served():
+    """Current llama-swap model blocks as structured params (for the UI's edit/unserve list)."""
+    try:
+        data = yaml.safe_load(config.LLAMA_SWAP_CFG.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return {"models": []}
+    out = []
+    for name, spec in (data.get("models") or {}).items():
+        cmd = (spec or {}).get("cmd", "") or ""
+        out.append({"name": name, "filename": Path(_model_path_in(cmd)).name,
+                    "ttl": (spec or {}).get("ttl", 600), **_parse_flags(cmd)})
+    return {"models": out}
+
+
+def update_served(name, ngl=99, ctx=8192, fa=True, kv="f16", ttl=600, kv_v=None, threads=None,
+                  batch=None, ubatch=None, n_cpu_moe=None, parallel=1, extra=""):
+    """Re-tune an already-served model in place. Surgically replaces ONLY that model's block (its
+    leading comments and the rest of the file are untouched), keeping the existing model file
+    path; re-validates before an atomic write."""
+    name = _sanitize_name(name)
+    if not name:
+        return {"ok": False, "error": "invalid model name"}
+    cfg = config.LLAMA_SWAP_CFG
+    try:
+        text = cfg.read_text()
+        data = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return {"ok": False, "error": f"cannot read llama-swap.yaml: {e}"}
+    spec = (data.get("models") or {}).get(name)
+    if spec is None:
+        return {"ok": False, "error": f"no served model named {name!r}"}
+    model_path = _model_path_in(spec.get("cmd", ""))
+    if not model_path:
+        return {"ok": False, "error": "could not find the model path in the current config"}
+    p, err = _norm_params(ngl=ngl, ctx=ctx, fa=fa, kv=kv, kv_v=kv_v, ttl=ttl, threads=threads,
+                          batch=batch, ubatch=ubatch, n_cpu_moe=n_cpu_moe, parallel=parallel, extra=extra)
+    if err:
+        return {"ok": False, "error": err}
+    lines = text.split("\n")
+    span = _block_span(lines, name)
+    if span is None:
+        return {"ok": False, "error": "could not locate the model block to edit"}
+    start, end = span
+    block_lines = _block_text(name, model_path, _build_flags(p), p["ttl"]).rstrip("\n").split("\n")
+    updated = "\n".join(lines[:start] + block_lines + lines[end:])
+    if not updated.endswith("\n"):
+        updated += "\n"
+    ok, verr = _validate_has(updated, name)
+    if not ok:
+        return {"ok": False, "error": f"refused to write — would corrupt config: {verr}"}
+    atomicio.write_text(cfg, updated)
+    return {"ok": True, "name": name, "ngl": p["ngl"], "ctx": p["ctx"], "fa": p["fa"],
+            "kv": p["kv"], "kv_v": p["kv_v"], "ttl": p["ttl"]}
+
+
+def unserve(name):
+    """Remove a model block from llama-swap.yaml (surgical delete; other blocks + comments stay).
+    Re-validates that the model is gone and the file still parses before the atomic write."""
+    name = _sanitize_name(name)
+    if not name:
+        return {"ok": False, "error": "invalid model name"}
+    cfg = config.LLAMA_SWAP_CFG
+    try:
+        text = cfg.read_text()
+        data = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return {"ok": False, "error": f"cannot read llama-swap.yaml: {e}"}
+    if name not in (data.get("models") or {}):
+        return {"ok": False, "error": f"no served model named {name!r}"}
+    lines = text.split("\n")
+    span = _block_span(lines, name)
+    if span is None:
+        return {"ok": False, "error": "could not locate the model block to remove"}
+    start, end = span
+    updated = re.sub(r"\n{3,}", "\n\n", "\n".join(lines[:start] + lines[end:]))
+    if not updated.endswith("\n"):
+        updated += "\n"
     try:
         check = yaml.safe_load(updated) or {}
-        if name not in (check.get("models") or {}):
-            raise ValueError("append did not register the model (indentation?)")
-    except (yaml.YAMLError, ValueError) as e:
+    except yaml.YAMLError as e:
         return {"ok": False, "error": f"refused to write — would corrupt config: {e}"}
-    atomicio.write_text(cfg, updated)          # atomic: a crash can't truncate llama-swap.yaml
-    return {"ok": True, "name": name, "ngl": ngl, "ctx": ctx, "fa": fa, "kv": kv, "ttl": ttl}
+    if name in (check.get("models") or {}) or "models:" not in updated:
+        return {"ok": False, "error": "refused — removal left the config inconsistent"}
+    atomicio.write_text(cfg, updated)
+    return {"ok": True, "name": name}
+
+
+def delete_model(filename):
+    """Delete a model's .gguf from disk to reclaim space. Guarded: refuses a model still wired
+    into llama-swap (unserve it first), the configured embedding model (memory/RAG need it), and
+    anything outside the models dir. Returns {ok, filename, freed} or {ok:False, error}."""
+    base = Path(filename or "").name
+    if not _safe_gguf(base):
+        return {"ok": False, "error": "invalid filename — must be a plain .gguf name"}
+    path = (config.MODELS_DIR / base).resolve()
+    if not path.is_relative_to(config.MODELS_DIR.resolve()):     # defense-in-depth (basename already safe)
+        return {"ok": False, "error": "path escapes the models directory"}
+    if not path.is_file():
+        return {"ok": False, "error": "model file not found on disk"}
+    if path == Path(config.EMBED_MODEL).resolve():
+        return {"ok": False, "error": "that's the embedding model — memory & document search need it"}
+    served_as = _cmd_uses(base)
+    if served_as:
+        return {"ok": False, "error": f"still served as {served_as!r} — unserve it first, then delete"}
+    try:
+        freed = path.stat().st_size
+        path.unlink()
+    except OSError as e:
+        return {"ok": False, "error": f"could not delete: {e}"}
+    return {"ok": True, "filename": base, "freed": freed}

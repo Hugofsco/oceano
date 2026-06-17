@@ -124,7 +124,11 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
     if pool:                                         # 3. semantic top-k from 'relevant'
         qv = _embed(query)
         if qv:
-            scored = [(_cosine(qv, json.loads(r[5])) if r[5] else -1.0, r) for r in pool]
+            scored = []
+            for r in pool:                           # skip rows with a missing/corrupt vector
+                v = embeddings.loads_vec(r[5])
+                if v:
+                    scored.append((_cosine(qv, v), r))
         else:
             words = set(query.lower().split())
             scored = [(float(sum(w in r[1].lower() for w in words)), r) for r in pool]
@@ -161,8 +165,11 @@ def recall(query, k=5):
 
     qvec = _embed(query)
     if qvec:  # semantic path
-        scored = [(_cosine(qvec, json.loads(emb)), text, tags)
-                  for text, tags, emb in rows if emb]
+        scored = []
+        for text, tags, emb in rows:
+            v = embeddings.loads_vec(emb)             # skip a missing/corrupt embedding row
+            if v:
+                scored.append((_cosine(qvec, v), text, tags))
         scored.sort(reverse=True)
         top = scored[:k]
     else:     # keyword fallback
@@ -221,7 +228,10 @@ def search(query, k=8):
         return []
     qvec = _embed(query)
     if qvec:
-        scored = [(_cosine(qvec, json.loads(r[6])) if r[6] else -1.0, r) for r in rows]
+        scored = []
+        for r in rows:                               # corrupt/missing vector → -1.0 (sorts last)
+            v = embeddings.loads_vec(r[6])
+            scored.append((_cosine(qvec, v) if v else -1.0, r))
     else:
         words = set(query.lower().split())
         scored = [(float(sum(w in r[2].lower() for w in words)), r) for r in rows]
@@ -300,7 +310,8 @@ def add_if_new(text, tags="", category="fact", threshold=0.86):
     rows = con.execute("SELECT text, embedding FROM memories").fetchall()
     if vec:
         for t, emb in rows:
-            if emb and _cosine(vec, json.loads(emb)) >= threshold:
+            v = embeddings.loads_vec(emb)             # ignore a corrupt row rather than crash
+            if v and _cosine(vec, v) >= threshold:
                 con.close(); return False
     else:
         low = text.lower()
@@ -322,7 +333,10 @@ def best_match(query):
         return None
     qv = _embed(query)
     if qv:
-        scored = [(_cosine(qv, json.loads(e)) if e else -1.0, i, t) for i, t, e in rows]
+        scored = []
+        for i, t, e in rows:                          # corrupt/missing vector → -1.0 (sorts last)
+            v = embeddings.loads_vec(e)
+            scored.append((_cosine(qv, v) if v else -1.0, i, t))
     else:
         ql = set(query.lower().split())
         scored = [(float(sum(w in t.lower() for w in ql)), i, t) for i, t, e in rows]

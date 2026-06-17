@@ -1,5 +1,6 @@
 """Shared embedding client — talks to the dedicated llama.cpp embed server (:8082).
 Used by BOTH long-term memory and document RAG, so they stay consistent."""
+import json
 import math
 import os
 
@@ -25,3 +26,16 @@ def cosine(a, b):
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     return dot / (na * nb) if na and nb else 0.0
+
+
+def loads_vec(blob):
+    """Decode a stored embedding (JSON text) back into a vector, or None if it's missing
+    or corrupt. Used on the hot read paths (memory + RAG search) so ONE bad/truncated row
+    can't take down the whole query with a JSONDecodeError — the row is simply skipped."""
+    if not blob:
+        return None
+    try:
+        v = json.loads(blob)
+    except (ValueError, TypeError):
+        return None
+    return v if isinstance(v, list) else None

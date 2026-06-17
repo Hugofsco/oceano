@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 import config
-from oceano import browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
+from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -113,7 +113,11 @@ def load():
 
 def save(data):
     STORE.parent.mkdir(parents=True, exist_ok=True)
-    STORE.write_text(json.dumps(data, indent=2))
+    # Atomic write: this file holds the password hash+salt, the cookie-signing secret, and
+    # every endpoint API key — a crash / full disk mid-write must never leave it half-written.
+    # (A corrupt web.json fails json.loads on boot, taking the whole UI down and locking the
+    # user out, since load() only re-seeds when a key is *absent*, not when the file is broken.)
+    atomicio.write_text(STORE, json.dumps(data, indent=2))
     try:
         STORE.chmod(0o600)
     except OSError:
@@ -176,8 +180,11 @@ _PUBLIC_API = {"/api/login", "/api/me"}
 
 
 def _make_token(user, secret):
+    # Domain-separate the HMAC ("sess:") so a session cookie and a preview-capability token
+    # (same secret, same envelope shape) can never be cross-validated as one another — without
+    # this, a preview token minted for a folder named like the user doubles as a login cookie.
     msg = f"{user}:{int(time.time())}"
-    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(secret.encode(), f"sess:{msg}".encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{msg}:{sig}".encode()).decode()
 
 
@@ -185,7 +192,7 @@ def _token_user(token, auth):
     """Return the username a cookie authenticates, or None if invalid/expired."""
     try:
         user, ts, sig = base64.urlsafe_b64decode(token.encode()).decode().rsplit(":", 2)
-        good = hmac.new(auth["secret"].encode(), f"{user}:{ts}".encode(), hashlib.sha256).hexdigest()
+        good = hmac.new(auth["secret"].encode(), f"sess:{user}:{ts}".encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, good):
             return None
         if time.time() - int(ts) > SESSION_TTL:
@@ -732,12 +739,50 @@ def rivers_jobs():
     return {"jobs": rivers.jobs()}
 
 
+def _serve_params(b):
+    """Pull the serving params out of a request body (shared by serve + update)."""
+    return dict(ngl=b.get("ngl", 99), ctx=b.get("ctx", 8192), fa=b.get("fa", True),
+                kv=b.get("kv", "f16"), kv_v=b.get("kv_v"), ttl=b.get("ttl", 600),
+                threads=b.get("threads"), batch=b.get("batch"), ubatch=b.get("ubatch"),
+                n_cpu_moe=b.get("n_cpu_moe"), parallel=b.get("parallel", 1), extra=b.get("extra", ""))
+
+
 @app.post("/api/rivers/serve")
 async def rivers_serve(request: Request):
     b = await request.json()
-    return rivers.serve(b.get("filename", ""), b.get("name"),
-                          b.get("ngl", 99), b.get("ctx", 8192),
-                          fa=b.get("fa", True), kv=b.get("kv", "f16"), ttl=b.get("ttl", 600))
+    return rivers.serve(b.get("filename", ""), b.get("name"), **_serve_params(b))
+
+
+@app.get("/api/rivers/served")
+def rivers_served():
+    """Models currently wired into llama-swap, as structured params (for edit/unserve)."""
+    return rivers.served()
+
+
+@app.get("/api/rivers/estimate")
+async def rivers_estimate(filename: str, ctx: int = 8192, kv: str = "f16",
+                          kv_v: str = "", ngl: int = 99):
+    """VRAM estimate for a serve config (reads the GGUF header off the event loop)."""
+    return await asyncio.to_thread(rivers.estimate, filename, ctx, kv, ngl, kv_v or None)
+
+
+@app.post("/api/rivers/update")
+async def rivers_update(request: Request):
+    """Re-tune an already-served model in place (preserves comments + unknown flags)."""
+    b = await request.json()
+    return rivers.update_served(b.get("name", ""), **_serve_params(b))
+
+
+@app.post("/api/rivers/unserve")
+async def rivers_unserve(request: Request):
+    """Remove a model from llama-swap.yaml."""
+    return rivers.unserve((await request.json()).get("name", ""))
+
+
+@app.post("/api/rivers/delete")
+async def rivers_delete(request: Request):
+    """Delete a model's .gguf from disk (refuses if served, or if it's the embedding model)."""
+    return rivers.delete_model((await request.json()).get("filename", ""))
 
 
 def list_models():
@@ -1840,6 +1885,8 @@ async def write_file_api(req: Request):
 @app.delete("/api/file")
 def delete_file_api(path: str):
     p = _wresolve(path)
+    if p == config.WORKSPACE:        # an empty/'.' path resolves to the root — don't rmtree everything
+        raise HTTPException(400, "refusing to delete the workspace root")
     if p.is_dir():
         shutil.rmtree(p)
     elif p.is_file():
@@ -1858,6 +1905,8 @@ async def make_folder_api(req: Request):
 async def rename_api(req: Request):
     b = await req.json()
     src, dst = _wresolve(b["path"]), _wresolve(b["to"])
+    if config.WORKSPACE in (src, dst):               # never move/clobber the workspace root itself
+        raise HTTPException(400, "refusing to move the workspace root")
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
     return {"ok": True}

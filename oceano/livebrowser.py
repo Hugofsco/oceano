@@ -63,6 +63,37 @@ def _launch(p):
     return p.chromium.launch(headless=True, args=args, ignore_default_args=ignore)
 
 
+def _install_ssrf_guard(ctx):
+    """Re-apply the SSRF guard to every NAVIGATION the browser makes — not just the first URL
+    a tool checked. A fetched page can 3xx / <meta refresh> / JS-redirect to an internal address
+    (llama-swap :8081, embeddings :8082, SearXNG :8080, cloud metadata); without this the
+    live-browser path (fetch_url / browser_open on the web channel) would follow the redirect and
+    feed the internal response back to the model. We gate navigation requests only — each redirect
+    hop is its own navigation request, so hops are re-checked too — and let subresources through
+    (they don't return readable page text to the agent). Only http(s) is checked, so about:/data:
+    navigations still work; a no-op when OCEANO_URL_GUARD is off (check_url returns None)."""
+    from oceano import safety
+
+    def _route(route):
+        try:
+            req = route.request
+            if (req.is_navigation_request() and req.url.startswith(("http://", "https://"))
+                    and safety.check_url(req.url)):
+                route.abort()
+                return
+        except Exception:
+            pass
+        try:
+            route.continue_()
+        except Exception:
+            pass
+
+    try:
+        ctx.route("**/*", _route)
+    except Exception:
+        pass
+
+
 def _new_context(br):
     """A context that looks like a normal desktop browser: real UA (the bundled
     build's UA minus the 'Headless' token), a locale, and an Accept-Language header."""
@@ -83,6 +114,7 @@ def _new_context(br):
             ctx.add_init_script(_STEALTH_JS)
         except Exception:
             pass
+    _install_ssrf_guard(ctx)         # block redirects/JS-navigation to internal addresses
     return ctx
 
 _CMD = queue.Queue()
