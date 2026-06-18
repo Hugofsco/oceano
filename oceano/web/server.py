@@ -73,6 +73,47 @@ def _hash_pw(password, salt):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
 
 
+# ---------------- optional TOTP 2FA (RFC 6238, stdlib) ----------------
+# Standard authenticator-app TOTP: SHA1 · 6 digits · 30s (max app compatibility). The secret lives
+# in data/web.json alongside the password hash (gitignored, chmod 600, atomic-written). 2FA is OFF
+# unless the user enables it in Settings → Account.
+import struct  # noqa: E402  (kept local to the auth block)
+
+
+def _totp_secret():
+    """A fresh base32 TOTP secret (20 random bytes), the form authenticator apps expect."""
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def _totp_at(secret, counter):
+    """The 6-digit code for a given 30s time-step (RFC 6238 / HOTP over SHA1)."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    mac = hmac.new(key, struct.pack(">Q", int(counter)), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    code = (struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+
+def _totp_verify(secret, code, window=1, now=None):
+    """Return the matched time-step if `code` is valid within ±window steps, else None. The step is
+    used for replay protection (a code can't be reused once its step is recorded)."""
+    code = (code or "").strip().replace(" ", "")
+    if not (secret and code.isdigit() and len(code) == 6):
+        return None
+    step = int((now if now is not None else time.time()) // 30)
+    for w in range(-window, window + 1):
+        if hmac.compare_digest(_totp_at(secret, step + w), code):
+            return step + w
+    return None
+
+
+def _totp_uri(secret, account, issuer="Oceano"):
+    """The otpauth:// URI an authenticator app reads from the QR code."""
+    from urllib.parse import quote
+    return (f"otpauth://totp/{quote(issuer)}:{quote(account or 'user')}?secret={secret}"
+            f"&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30")
+
+
 def _auth_seed():
     """Default login: admin / admin. Secret signs session cookies (persisted so
     logins survive restarts). Override the default password in Settings → Account."""
@@ -235,13 +276,25 @@ def whoami(request: Request):
 @app.post("/api/login")
 async def login(request: Request, response: Response):
     body = await request.json()
-    auth = load().get("auth", {})
+    data = load()
+    auth = data.get("auth", {})
     user = (body.get("user") or "").strip()
     pw = body.get("password") or ""
     ok = (user == auth.get("user")
-          and hmac.compare_digest(_hash_pw(pw, auth["salt"]), auth["pwhash"]))
+          and hmac.compare_digest(_hash_pw(pw, auth.get("salt", "")), auth.get("pwhash", "")))
     if not ok:
         raise HTTPException(401, "invalid username or password")
+    if auth.get("totp_enabled"):                        # second factor required
+        code = (body.get("code") or "").strip()
+        if not code:
+            return {"ok": False, "need_code": True}     # password was right — UI now asks for the code
+        step = _totp_verify(auth.get("totp_secret", ""), code)
+        last = auth.get("totp_last_step")
+        if step is None or (last is not None and step <= last):
+            raise HTTPException(401, "invalid authentication code")
+        auth["totp_last_step"] = step                   # replay guard — this step can't be reused
+        data["auth"] = auth
+        save(data)
     _set_session_cookie(response, user, auth["secret"])
     return {"ok": True, "user": user, "must_change": _is_default_pw(auth)}
 
@@ -273,6 +326,68 @@ async def change_account(request: Request, response: Response):
     save(data)
     _set_session_cookie(response, new_user, auth["secret"])   # re-issue (username may have changed)
     return {"ok": True, "user": new_user}
+
+
+# ---------------- two-factor auth (optional TOTP) ----------------
+@app.get("/api/2fa/status")
+def twofa_status():
+    auth = load().get("auth", {})
+    return {"enabled": bool(auth.get("totp_enabled")), "pending": bool(auth.get("totp_pending"))}
+
+
+@app.post("/api/2fa/setup")
+def twofa_setup():
+    """Mint a pending TOTP secret and return the otpauth URI + a QR (SVG) to scan. Not active until
+    confirmed with a valid code via /api/2fa/enable, so a mis-scan can't lock the user out."""
+    data = load()
+    auth = data["auth"]
+    secret = _totp_secret()
+    auth["totp_pending"] = secret
+    data["auth"] = auth
+    save(data)
+    uri = _totp_uri(secret, auth.get("user", "user"))
+    try:
+        import segno
+        svg = segno.make(uri, error="m").svg_inline(scale=5)
+    except Exception:
+        svg = ""                                        # UI falls back to showing the secret/URI
+    return {"ok": True, "uri": uri, "secret": secret, "svg": svg}
+
+
+@app.post("/api/2fa/enable")
+async def twofa_enable(req: Request):
+    """Confirm the pending secret with a current code, then turn 2FA on."""
+    data = load()
+    auth = data["auth"]
+    pending = auth.get("totp_pending")
+    if not pending:
+        raise HTTPException(400, "no pending 2FA setup — start with Set up")
+    code = ((await req.json()).get("code") or "").strip()
+    step = _totp_verify(pending, code)
+    if step is None:
+        raise HTTPException(400, "that code didn't match — check your authenticator and try again")
+    auth["totp_secret"] = pending
+    auth["totp_enabled"] = True
+    auth["totp_last_step"] = step                       # the confirming code can't be replayed at login
+    auth.pop("totp_pending", None)
+    data["auth"] = auth
+    save(data)
+    return {"ok": True, "enabled": True}
+
+
+@app.post("/api/2fa/disable")
+async def twofa_disable(req: Request):
+    """Turn 2FA off. Requires the current password (a deliberate action), like change_account."""
+    data = load()
+    auth = data["auth"]
+    pw = (await req.json()).get("current_password") or ""
+    if not hmac.compare_digest(_hash_pw(pw, auth.get("salt", "")), auth.get("pwhash", "")):
+        raise HTTPException(403, "current password is incorrect")
+    for k in ("totp_enabled", "totp_secret", "totp_pending", "totp_last_step"):
+        auth.pop(k, None)
+    data["auth"] = auth
+    save(data)
+    return {"ok": True, "enabled": False}
 
 
 def _agent(sid):
@@ -518,6 +633,9 @@ _TOOL_CATEGORY = {
     "update_calendar_event": "calendar", "delete_calendar_event": "calendar",
     "add_calendar_events": "calendar", "find_free_slots": "calendar",
     "manage_calendar": "calendar",
+    "transcribe_media": "media", "speak_to_file": "media", "fetch_media": "media", "convert": "media",
+    "git": "dev", "code_search": "dev", "run_tests": "dev",
+    "http_request": "web", "rss": "web", "sql_query": "data",
 }
 
 

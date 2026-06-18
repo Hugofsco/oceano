@@ -992,6 +992,10 @@ const SETTINGS_PAGES = {
       <label class="field-label">New password <span class="lbl-sub">leave blank to keep current</span></label>
       <input id="acctNew" type="password" autocomplete="new-password" placeholder="new password">
       <div class="acct-actions"><button class="ghost-btn sm" id="logoutBtn">Log out</button><span class="acct-msg" id="acctMsg"></span><button class="primary sm" id="acctSave">Save</button></div>
+    </div>
+    <div class="drawer-section">
+      <h3>Two-factor authentication <span class="lbl-sub">optional</span></h3>
+      <div id="twofaBody"><div class="acct-row">checking…</div></div>
     </div>`,
   endpoints: `
     <div class="drawer-section">
@@ -1348,6 +1352,53 @@ async function loadAccount() {
     if (who) who.textContent = me.user || "—";
     if (u) u.value = me.user || "";
   } catch {}
+  load2fa();
+}
+async function load2fa() {
+  const box = $("#twofaBody"); if (!box) return;
+  let s; try { s = await api("/api/2fa/status"); } catch { return; }
+  if (s.enabled) {
+    box.innerHTML = `<div class="acct-row">🔒 On — a code from your authenticator app is required at login.</div>
+      <label class="field-label">Current password <span class="lbl-sub">required to turn it off</span></label>
+      <input id="twofaPw" type="password" autocomplete="current-password" placeholder="current password">
+      <div class="acct-actions"><span class="acct-msg" id="twofaMsg"></span><button class="ghost-btn sm danger" id="twofaOff">Turn off 2FA</button></div>`;
+    $("#twofaOff", box).onclick = twofaDisable;
+  } else {
+    box.innerHTML = `<div class="acct-row">Add a second factor: scan a QR with an authenticator app (Google Authenticator, Authy, …), then a 6-digit code is required at login.</div>
+      <div class="acct-actions"><span class="acct-msg" id="twofaMsg"></span><button class="primary sm" id="twofaSetup">Set up 2FA</button></div>
+      <div id="twofaSetupBox"></div>`;
+    $("#twofaSetup", box).onclick = twofaSetup;
+  }
+}
+async function twofaSetup() {
+  const wrap = $("#twofaSetupBox"); if (!wrap) return;
+  wrap.innerHTML = `<div class="acct-row">generating…</div>`;
+  let d; try { d = await (await fetch("/api/2fa/setup", { method: "POST" })).json(); } catch { wrap.innerHTML = `<div class="acct-row">setup failed</div>`; return; }
+  const qr = (window.DOMPurify && d.svg) ? DOMPurify.sanitize(d.svg, { USE_PROFILES: { svg: true, svgFilters: true } }) : "";
+  wrap.innerHTML = `
+    <div class="twofa-qr">${qr}</div>
+    <div class="acct-row">Scan the QR, or type this key into your app:<br><code class="twofa-secret">${escapeHtml(d.secret || "")}</code></div>
+    <label class="field-label">Enter the 6-digit code to confirm</label>
+    <input id="twofaCode" inputmode="numeric" maxlength="7" placeholder="123456" autocomplete="one-time-code">
+    <div class="acct-actions"><span class="acct-msg" id="twofaMsg2"></span><button class="primary sm" id="twofaEnable">Verify & turn on</button></div>
+    <div class="acct-row lbl-sub">Lost your device later? On the host, set <code>totp_enabled</code> to false in <code>data/web.json</code> (or delete the <code>totp_*</code> keys) and restart.</div>`;
+  $("#twofaEnable", wrap).onclick = async () => {
+    const msg = $("#twofaMsg2"), code = $("#twofaCode").value.trim();
+    const r = await fetch("/api/2fa/enable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { msg.textContent = j.detail || "verification failed"; msg.className = "acct-msg err"; return; }
+    msg.textContent = "2FA is on ✓"; msg.className = "acct-msg ok";
+    setTimeout(load2fa, 800);
+  };
+}
+async function twofaDisable() {
+  const msg = $("#twofaMsg"), pw = ($("#twofaPw") || {}).value || "";
+  if (!pw) { msg.textContent = "enter your current password"; msg.className = "acct-msg err"; return; }
+  const r = await fetch("/api/2fa/disable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ current_password: pw }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { msg.textContent = j.detail || "could not disable"; msg.className = "acct-msg err"; return; }
+  msg.textContent = "2FA turned off"; msg.className = "acct-msg ok";
+  setTimeout(load2fa, 600);
 }
 async function saveAccount() {
   const msg = $("#acctMsg"), cur = $("#acctCur").value, user = $("#acctUser").value.trim(), npw = $("#acctNew").value;
@@ -4138,12 +4189,24 @@ function showLogin() {
       e.preventDefault();
       const btn = $("#loginBtn"), err = $("#loginErr");
       btn.disabled = true; err.textContent = "";
-      const pw = $("#loginPass").value;
+      const pw = $("#loginPass").value, codeEl = $("#loginCode");
       try {
-        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user: $("#loginUser").value, password: pw }) });
-        if (!r.ok) { err.textContent = "Invalid username or password."; $("#loginPass").value = ""; $("#loginPass").focus(); return; }
+        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user: $("#loginUser").value, password: pw, code: codeEl ? codeEl.value.trim() : "" }) });
         const d = await r.json().catch(() => ({}));
+        if (r.ok && d.need_code) {                         // password OK — second factor required
+          if (codeEl) { codeEl.style.display = ""; codeEl.value = ""; codeEl.focus(); }
+          err.textContent = "Enter the 6-digit code from your authenticator app.";
+          return;
+        }
+        if (!r.ok) {
+          const inCode = codeEl && codeEl.style.display !== "none";
+          err.textContent = inCode ? "Invalid or expired code." : "Invalid username or password.";
+          if (inCode) { codeEl.value = ""; codeEl.focus(); } else { $("#loginPass").value = ""; $("#loginPass").focus(); }
+          return;
+        }
         gate.style.display = "none";
+        if (codeEl) { codeEl.style.display = "none"; codeEl.value = ""; }   // reset for next time
         if (d.must_change) { showPwChange(pw); return; }   // first login on the default password
         initApp();
       } catch { err.textContent = "Could not reach the server."; }

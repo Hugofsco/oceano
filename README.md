@@ -10,8 +10,9 @@ commands inside a real `workspace/` folder, browses the web in a headless Chromi
 you can watch and drive, remembers things across conversations, and can be reached
 from a web UI or Telegram.
 
-> Conceived as a workspace-based take on PewDiePie's *Odysseus*. The aesthetic is an
-> "abyssal instrument console": dark water, bathymetric contours, bioluminescent cyan.
+> Inspired by PewDiePie's *Odysseus*, reimagined as a workspace-based local agent. The
+> aesthetic is an "abyssal instrument console": dark water, bathymetric contours,
+> bioluminescent cyan.
 
 ---
 
@@ -24,10 +25,11 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **37 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
-  headless browser, long-term memory, document RAG, skills, scheduling, workflows, an
-  agent-managed calendar (schedule a whole conflict-aware plan in one shot), and
-  delegation; plus any tools from MCP servers you connect.
+- **47 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+  tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
+  HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
+  scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
+  one shot), and delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -100,11 +102,14 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (37)
+## The agent's tools (47)
 
 | Group | Tools |
 |-------|-------|
 | **Workspace / shell** | `list_files`, `read_file`, `write_file`, `edit_file` (surgical patch), `make_folder`, `run_shell`, `python_exec` |
+| **Dev** | `git` (status/diff/commit/blame in the workspace; push refused), `code_search` (ripgrep), `run_tests` (auto-detect pytest/npm/cargo/make) |
+| **Media** | `transcribe_media` (audio/video → text, faster-whisper), `speak_to_file` (text → spoken `.ogg`, Piper), `fetch_media` (download via yt-dlp), `convert` (ffmpeg / pandoc / ImageMagick) |
+| **Web / data** | `http_request` (authenticated REST + webhooks + Home Assistant; SSRF-guarded with an opt-in `OCEANO_HTTP_ALLOW` allowlist for local hosts), `rss` (read RSS/Atom feeds), `sql_query` (read-only DuckDB over CSV/TSV/Parquet/JSON) |
 | **Web** | `web_search` (SearXNG), `fetch_url` (renders in the live browser) |
 | **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget_memory`, `search_chats` (recall past conversations) |
@@ -255,7 +260,8 @@ Served at `http://127.0.0.1:8800` (login required — default **admin / admin**,
 it in Settings → Account). It's a single-page app with:
 
 - **Auth** — cookie session, password hashed (PBKDF2) in `data/web.json`; all `/api`
-  routes gated.
+  routes gated. **Optional TOTP 2FA** (Settings → Account): scan a QR with any authenticator
+  app and a 6-digit code is required at login. Off by default.
 - **Chat** — SSE streaming, streamed reasoning (collapsible, auto-scrolling), inline
   tool-call cards, a **Stop** button, an **Agent** toggle (persists) that hands the model
   its tools, Telegram-style **slash commands** (`/context`, `/compact`, `/status`,
@@ -426,7 +432,8 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
 - **systemd hardening** — `NoNewPrivileges`, `ProtectHome=read-only` with
   `ReadWritePaths` limited to `workspace/`, `data/`, `skills/`, the `llama.cpp/` model dir,
   and `PrivateTmp`.
-- **Localhost binding** + **login auth** on the web UI.
+- **Localhost binding** + **login auth** on the web UI, with **optional TOTP 2FA** (RFC 6238 —
+  authenticator app + QR; secret stays in the hardened `data/web.json`).
 - **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API
   keys) is written atomically, so a crash can't corrupt it and lock you out; session cookies and
   the sandboxed-preview capability tokens are HMAC domain-separated, so one can't be replayed as

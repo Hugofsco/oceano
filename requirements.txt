@@ -18,3 +18,11 @@ mcp>=1.0
 faster-whisper>=1.0
 piper-tts>=1.2
 pathvalidate>=3.0
+# extra agent tools: fetch_media (yt-dlp), sql_query (duckdb), rss (feedparser). Each tool
+# degrades gracefully if its dep/binary is absent, so these are optional-but-recommended.
+yt-dlp>=2024.1
+duckdb>=1.0
+feedparser>=6.0
+# optional 2FA: render the authenticator QR code (pure-python, no dependencies). TOTP itself
+# is stdlib. 2FA is off unless enabled in Settings → Account.
+segno>=1.5

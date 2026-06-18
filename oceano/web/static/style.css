@@ -1034,6 +1034,13 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .serve-adv .serve-grid{margin-top:4px}
 .serve-adv>input{width:100%;box-sizing:border-box;padding:8px 10px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12.5px;outline:none}
 .serve-adv>input:focus{border-color:var(--biolum)}
+/* optional 2FA (Settings → Account) + login code field */
+.twofa-qr{margin:12px 0;width:200px}
+.twofa-qr svg{width:200px;height:200px;background:#fff;border-radius:10px;padding:8px;box-sizing:border-box}
+.twofa-secret{font-family:var(--font-mono);font-size:12.5px;color:var(--biolum-2);word-break:break-all;letter-spacing:.5px}
+.ghost-btn.danger{color:var(--coral);border-color:rgba(255,111,107,.4)}
+.ghost-btn.danger:hover{background:rgba(255,111,107,.12)}
+#loginCode{letter-spacing:4px;text-align:center}
 
 /* ===== Settings → Wipe ===== */
 .wipe-list{display:flex;flex-direction:column;gap:8px;margin:6px 0 10px}

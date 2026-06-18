@@ -25,6 +25,11 @@ WORKSPACE = Path(os.environ.get("OCEANO_WORKSPACE", Path(__file__).parent / "wor
 # --- Web search (your running SearXNG) ---
 SEARXNG_URL = os.environ.get("OCEANO_SEARXNG", "http://127.0.0.1:8080")
 
+# --- http_request tool: hosts it may reach even though they're internal/local (e.g. a Home
+# Assistant box at 192.168.x.x or homeassistant.local). The SSRF guard blocks ALL other internal
+# addresses; this is the deliberate, opt-in exception. Comma-separated hostnames/IPs.
+HTTP_ALLOW = {h.strip().lower() for h in os.environ.get("OCEANO_HTTP_ALLOW", "").split(",") if h.strip()}
+
 # --- Local model serving (llama.cpp + llama-swap), used by the Rivers ---
 # Knob: OCEANO_LLAMA_DIR (single, canonical — install.sh reads the same name).
 # Default: keep the stack tidy under the Oceano dir (fresh installs build there),
