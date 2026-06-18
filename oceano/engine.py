@@ -31,6 +31,21 @@ ROOT = Path(__file__).resolve().parent.parent
 EMBED_SCRIPT = ROOT / "scripts" / "serve-embeddings.sh"
 SCHED_INTERVAL = 30      # seconds between due-task checks
 
+_embed_proc = None       # the current embedding child, so the UI can restart it on demand
+
+
+def restart_embed():
+    """Terminate the current embedding child; embed_supervisor() then respawns it. Returns True if a
+    live child was signalled. Call from the event loop (it touches the asyncio subprocess transport)."""
+    p = _embed_proc
+    if p is None or p.returncode is not None:
+        return False
+    try:
+        p.terminate()
+        return True
+    except ProcessLookupError:
+        return False
+
 
 def log(msg):
     print(msg, flush=True)   # flush: stdout is block-buffered into the journal
@@ -54,9 +69,11 @@ async def embed_supervisor(stop):
         log(f"[embed] launcher missing: {EMBED_SCRIPT} — not starting embed server")
         return
 
+    global _embed_proc
     backoff = 2
     while not stop.is_set():
         proc = await asyncio.create_subprocess_exec("bash", str(EMBED_SCRIPT))
+        _embed_proc = proc
         log(f"[embed] embedding server up (pid {proc.pid})")
 
         # Wait for the child to exit OR a shutdown request, whichever comes first.

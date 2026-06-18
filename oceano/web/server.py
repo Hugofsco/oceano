@@ -532,13 +532,48 @@ def _embed_reachable():
         return False
 
 
+def _searxng_reachable():
+    try:                                        # SearXNG (:8080) reachable?
+        return requests.get(config.SEARXNG_URL, timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
 @app.get("/api/status")
 def system_status():
     """Live state of the consolidated daemons, for the Settings → Services panel."""
+    from oceano import voice
     beat = scheduler.last_beat()
     return {"embed": _embed_reachable(),
             "scheduler_beat_ago": (time.time() - beat) if beat else None,
-            "telegram": telegram_runtime.status()}
+            "telegram": telegram_runtime.status(),
+            "llamaswap": _llamaswap_status(),
+            "searxng": _searxng_reachable(),
+            "voice": voice.status()}
+
+
+@app.post("/api/services/restart")
+async def services_restart(request: Request):
+    """Restart an individual in-process service. External units (llama-swap :8081, SearXNG :8080) are
+    NOT restartable from here — the daemon runs with NoNewPrivileges — so they return a manual hint."""
+    name = ((await request.json()).get("service") or "").lower()
+    if name == "embeddings":
+        from oceano import engine
+        ok = engine.restart_embed()
+        return {"ok": ok, "msg": "embedding server restarting…" if ok
+                else "embedding server isn't managed by the daemon here"}
+    if name == "telegram":
+        await telegram_runtime.stop()
+        st = await _apply_telegram()                      # re-reads saved settings, starts if enabled
+        return {"ok": "error" not in st,
+                "msg": "Telegram restarted" if st.get("running") else "Telegram stopped (not enabled)",
+                "error": st.get("error")}
+    if name in ("tts", "stt", "voice"):
+        from oceano import voice
+        voice.reload()
+        return {"ok": True, "msg": "voice models reloaded — the next utterance loads them fresh"}
+    return {"ok": False, "error": "managed by systemd — can't restart from here. "
+            "Run on the host:  sudo systemctl restart oceano-llama-swap"}
 
 
 def _llamaswap_status():
@@ -890,6 +925,12 @@ async def rivers_estimate(filename: str, ctx: int = 8192, kv: str = "f16",
                           kv_v: str = "", ngl: int = 99):
     """VRAM estimate for a serve config (reads the GGUF header off the event loop)."""
     return await asyncio.to_thread(rivers.estimate, filename, ctx, kv, ngl, kv_v or None)
+
+
+@app.get("/api/rivers/recommend")
+async def rivers_recommend(filename: str):
+    """Suggested serving config for this model on this box (ngl/ctx/KV/threads/MoE), with reasons."""
+    return await asyncio.to_thread(rivers.recommend, filename)
 
 
 @app.post("/api/rivers/update")

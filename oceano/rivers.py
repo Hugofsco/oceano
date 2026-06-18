@@ -13,6 +13,7 @@ against the local llama.cpp/llama-swap stack.
   serve(...)            -> append a model block to llama-swap.yaml (it hot-reloads)
   installed()           -> .gguf already on disk + whether each is wired into llama-swap
 """
+import os
 import re
 import struct
 import subprocess
@@ -269,6 +270,7 @@ def _gguf_meta(path, window=32 * 1024 * 1024):
     return {"arch": arch, "n_layers": int(n_layers), "n_head_kv": int(n_head_kv),
             "head_dim": int(head_dim), "head_dim_v": int(head_dim_v), "n_embd": int(n_embd or 0),
             "sliding_window": int(g("attention.sliding_window") or 0),
+            "n_expert": int(g("expert_count") or 0),                 # >1 → Mixture-of-Experts
             "n_ctx_train": int(g("context_length") or 0)}
 
 
@@ -317,6 +319,133 @@ def estimate(filename, ctx=8192, kv="f16", ngl=99, kv_v=None):
             "approx": approx, "note": note,
             "n_layers": meta["n_layers"] if meta else None,
             "n_ctx_train": meta["n_ctx_train"] if meta else None}
+
+
+# ============================ recommended serving config ============================
+def _ram_bytes():
+    """Total system RAM in bytes (Linux /proc/meminfo), or None."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024              # kB → bytes
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _phys_cores():
+    """Best-effort PHYSICAL core count (Linux /proc/cpuinfo) — the sweet spot for llama.cpp threads.
+    Falls back to logical/2 (assume hyperthreading) then logical."""
+    try:
+        seen, phys = set(), None
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("physical id"):
+                phys = line.split(":")[1].strip()
+            elif line.startswith("core id") and phys is not None:
+                seen.add((phys, line.split(":")[1].strip()))
+        if seen:
+            return len(seen)
+    except (OSError, IndexError):
+        pass
+    n = os.cpu_count() or 4
+    return max(1, n // 2)
+
+
+_CTX_STEPS = [32768, 16384, 8192, 4096, 2048]      # clean context sizes; pick the largest that fits
+
+
+def _rec_result(rec, why, notes, is_moe, total_vram, free_vram, ram, cores, trained):
+    return {"ok": True, "rec": rec, "why": why, "notes": notes, "is_moe": is_moe,
+            "vram_total": total_vram, "vram_free": free_vram, "ram_total": ram,
+            "cores": cores, "n_ctx_train": trained or None}
+
+
+def recommend(filename):
+    """Suggest a sensible serving config for `filename` on THIS machine — context / GPU-offload / KV
+    dtype / threads / (MoE→CPU) — each with a one-line 'why'. A hardware-aware heuristic; the user can
+    override anything and watch the live VRAM estimate. Returns {ok, rec, why, notes, <hw fields>}."""
+    base = Path(filename or "").name
+    if not _safe_gguf(base):
+        return {"ok": False, "error": "invalid filename"}
+    path = config.MODELS_DIR / base
+    if not path.exists():
+        return {"ok": False, "error": "model file not found on disk"}
+    size = path.stat().st_size
+    meta = _gguf_meta(path)
+    total_vram, free_vram = _vram_bytes()
+    ram, cores = _ram_bytes(), _phys_cores()
+    trained = (meta and meta["n_ctx_train"]) or 0
+    ctx_cap = trained or 32768                              # don't exceed the trained context (needs rope-scaling)
+    is_moe = bool(meta and meta.get("n_expert", 0) > 1)
+
+    rec = {"ngl": 99, "ctx": 8192, "kv": "f16", "kv_v": "f16", "fa": True, "threads": "",
+           "n_cpu_moe": "", "batch": "", "ubatch": "", "parallel": 1, "ttl": 600, "extra": ""}
+    why = {"fa": "On — less KV memory and faster attention on modern GPUs/CPU."}
+    notes = []
+
+    if not meta:                                           # no metadata → can't size the KV cache
+        f = fit(size, total_vram)
+        rec["ngl"], rec["ctx"] = f["ngl"], min(8192, ctx_cap)
+        rec["threads"] = cores if f["ngl"] < 99 else ""
+        why["ngl"] = f["note"]
+        why["ctx"] = "Modest default — couldn't read model metadata to size the KV cache."
+        notes.append("Model metadata didn't parse — these are coarse defaults; trust the live VRAM estimate.")
+        return _rec_result(rec, why, notes, False, total_vram, free_vram, ram, cores, trained)
+
+    n_layers = meta["n_layers"]
+    kv_per_tok = lambda k: (n_layers * meta["n_head_kv"]
+                            * (meta["head_dim"] * _KV_BYTES[k] + meta["head_dim_v"] * _KV_BYTES[k]))
+
+    def biggest_ctx(budget, k):                            # largest clean ctx whose KV (dtype k) fits
+        return next((c for c in _CTX_STEPS if c <= ctx_cap and kv_per_tok(k) * c <= budget), None)
+
+    if not total_vram:                                     # ---------- CPU-only box ----------
+        rec["ngl"], rec["ctx"], rec["threads"] = 0, min(8192, ctx_cap), cores
+        why["ngl"] = "No GPU detected — run on CPU (-ngl 0)."
+        why["ctx"] = f"Modest {rec['ctx']:,} so the KV cache stays small in RAM."
+        why["threads"] = f"{cores} physical cores — the throughput sweet spot for CPU inference."
+        if ram and size > ram * 0.9:
+            notes.append("Model is close to / larger than your RAM — expect heavy swapping or a failed load.")
+        return _rec_result(rec, why, notes, is_moe, total_vram, free_vram, ram, cores, trained)
+
+    # ---------- GPU present ----------
+    usable = total_vram * 0.92 - _VRAM_OVERHEAD            # headroom for compute buffers + driver
+    if size < usable:                                      # whole model fits → offload everything
+        budget = usable - size
+        c16 = biggest_ctx(budget, "f16")
+        if c16:
+            rec.update(ngl=99, ctx=c16, kv="f16", kv_v="f16")
+            why["ngl"] = "Whole model fits in VRAM — offload every layer to the GPU (fastest)."
+            why["ctx"] = f"Largest clean context that fits alongside the weights" + (f"; model trained for {trained:,}" if trained else "") + "."
+            why["kv"] = "f16 KV — full quality, and there's room for it."
+        else:
+            c8 = biggest_ctx(budget, "q8_0")
+            rec.update(ngl=99, ctx=(c8 or min(2048, ctx_cap)), kv="q8_0", kv_v="q8_0")
+            why["ngl"] = "Weights fit on the GPU — all layers offloaded."
+            why["ctx"] = "Context sized to the VRAM left after the weights."
+            why["kv"] = "q8_0 KV — halves the cache so a useful context fits (near-lossless)."
+            if not c8:
+                notes.append("This model nearly fills your VRAM — context is tight; a smaller quant would breathe easier.")
+    elif is_moe:                                           # too big, but MoE → experts to CPU, attention on GPU
+        rec.update(ngl=99, ctx=min(8192, ctx_cap), kv="q8_0", kv_v="q8_0", n_cpu_moe=n_layers, threads=cores)
+        why["ngl"] = "Keep the attention layers on the GPU."
+        why["n_cpu_moe"] = (f"MoE model bigger than VRAM — push expert (FFN) weights to CPU RAM and keep attention "
+                            f"on the GPU. Start near {n_layers} and dial it DOWN (watching the estimate) to move more onto the GPU.")
+        why["ctx"] = "Moderate context to leave VRAM for attention + KV."
+        why["kv"] = "q8_0 KV to save VRAM."
+        why["threads"] = f"{cores} cores — the CPU now runs the expert layers."
+        if ram and size > ram:
+            notes.append("Even with experts on the CPU, the model is larger than your RAM — it may not load.")
+    else:                                                  # dense + too big → partial GPU offload
+        ngl = min(n_layers - 1, max(1, int((usable * 0.85) / (size / n_layers))))
+        rec.update(ngl=ngl, ctx=min(8192, ctx_cap), kv="q8_0", kv_v="q8_0", threads=cores)
+        why["ngl"] = f"Model is larger than VRAM — offload ~{ngl} of {n_layers} layers to the GPU, the rest on CPU."
+        why["ctx"] = "Moderate context; partial offload is already memory-tight."
+        why["kv"] = "q8_0 KV to save VRAM."
+        why["threads"] = f"{cores} cores for the CPU-resident layers."
+        notes.append("Partial offload is much slower than a full fit — a smaller quant that fits entirely in VRAM would be faster.")
+
+    return _rec_result(rec, why, notes, is_moe, total_vram, free_vram, ram, cores, trained)
 
 
 # ============================ Hugging Face ============================

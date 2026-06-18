@@ -286,6 +286,15 @@ def status():
             "wake": s["wake"], "wake_word": s["wake_word"]}
 
 
+def reload():
+    """Drop the loaded STT/TTS models so the next call reloads them — e.g. after changing the voice or
+    swapping the model files on disk. Models are lazy-loaded, so this just clears the in-process cache."""
+    global _whisper, _kokoro
+    with _tts_lock:
+        _whisper = _kokoro = None
+    return True
+
+
 # ---------------- speech → text ----------------
 def _model():
     global _whisper

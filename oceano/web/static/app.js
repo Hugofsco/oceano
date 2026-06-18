@@ -1068,8 +1068,10 @@ async function saveTelegram(extra = {}) {
 }
 
 /* ---------------- services status ---------------- */
-function _svc(label, ok, detail) {
-  return `<div class="svc"><span class="svc-dot ${ok ? 'on' : 'off'}"></span><span class="svc-name">${label}</span><span class="svc-detail">${escapeHtml(detail)}</span></div>`;
+function _svc(label, ok, detail, restart) {
+  const dot = ok === null ? "idle" : ok ? "on" : "off";
+  const btn = restart ? `<button class="svc-restart" data-svc="${restart}" title="restart this service">⟳</button>` : "";
+  return `<div class="svc"><span class="svc-dot ${dot}"></span><span class="svc-name">${label}</span><span class="svc-detail">${escapeHtml(detail)}</span>${btn}</div>`;
 }
 async function loadServices() {
   const box = $("#svcList"); if (!box) return;
@@ -1077,13 +1079,28 @@ async function loadServices() {
     const s = await api("/api/status");
     const beat = s.scheduler_beat_ago;
     const schedOk = beat != null && beat < 90;   // heartbeat is every 30s
-    const tg = s.telegram || {};
+    const tg = s.telegram || {}, ls = s.llamaswap || {}, vo = s.voice || {};
+    const lsDetail = ls.ok ? (ls.loaded ? "loaded: " + ls.loaded : `${(ls.models || []).length} served · idle`) : "down";
     box.innerHTML =
       _svc("Web UI", true, "this page") +
-      _svc("Embeddings (:8082)", s.embed, s.embed ? "reachable" : "down") +
+      _svc("Chat models (:8081)", ls.ok, lsDetail) +                              // llama-swap — systemd, not restartable here
+      _svc("Embeddings (:8082)", s.embed, s.embed ? "reachable" : "down", "embeddings") +
+      _svc("Web search (:8080)", s.searxng, s.searxng ? "SearXNG reachable" : "down") +
+      _svc("Voice · speak (TTS)", vo.tts, vo.tts ? `${vo.tts_engine || "?"}${vo.tts_voice ? " · " + vo.tts_voice : ""}` : "unavailable", vo.tts ? "tts" : "") +
+      _svc("Voice · listen (STT)", vo.stt, vo.stt ? (vo.stt_model || "whisper") : "unavailable", vo.stt ? "stt" : "") +
       _svc("Scheduler", schedOk, beat == null ? "no heartbeat" : `beat ${Math.round(beat)}s ago`) +
-      _svc("Telegram", tg.running, tg.running ? "@" + (tg.username || "bot") : (tg.error ? "error" : "off"));
+      _svc("Telegram", tg.running, tg.running ? "@" + (tg.username || "bot") : (tg.error ? "error" : "off"), (tg.running || tg.enabled) ? "telegram" : "");
+    box.querySelectorAll(".svc-restart").forEach(b => b.onclick = () => restartService(b));
   } catch { box.innerHTML = `<div class="svc"><span class="svc-dot off"></span><span class="svc-name">status unavailable</span></div>`; }
+}
+async function restartService(btn) {
+  const svc = btn.dataset.svc; btn.disabled = true; btn.classList.add("spin");
+  let r; try {
+    r = await api("/api/services/restart", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ service: svc }) });
+  } catch { r = { ok: false, error: "request failed" }; }
+  btn.classList.remove("spin");
+  toast(r.ok ? (r.msg || "restarted") : (r.error || "restart failed"), r.ok ? "info" : "err");
+  setTimeout(loadServices, 1400);   // re-poll once it's had a moment to come back
 }
 
 /* ================= SETTINGS WINDOW ================= */
@@ -2817,12 +2834,17 @@ function _riverDialog({ mode, filename, name, vals }) {
     <h3>${editing ? "Edit" : "Serve"} <code>${escapeHtml(filename)}</code></h3>
     <label class="field-label">Name <span class="lbl-sub">${editing ? "rename isn't supported — unserve & serve again to change it" : "how it shows in the model picker"}</span></label>
     <input id="svName" value="${escapeHtml(name)}" autocomplete="off" ${editing ? "readonly" : ""}>
+    <button class="exp-btn rec-btn" id="svRec" type="button">✨ Recommend settings for my hardware</button>
+    <div class="rec-why" id="svRecWhy" style="display:none"></div>
     <div class="serve-grid">
-      <div><label class="field-label">Context (tokens)</label><input id="svCtx" type="number" value="${+vals.ctx}" min="256" step="1024"></div>
-      <div><label class="field-label">GPU layers (ngl)</label><input id="svNgl" type="number" value="${+vals.ngl}" min="0" max="999"></div>
+      <div><label class="field-label">Context (tokens)</label><input id="svCtx" type="number" value="${+vals.ctx}" min="256" step="1024">
+        <div class="preset-chips" id="svCtxChips">${[2048, 4096, 8192, 16384, 32768, 65536, 131072].map(c => `<button type="button" class="chip" data-v="${c}">${c / 1024}k</button>`).join("")}</div></div>
+      <div><label class="field-label">GPU layers (ngl)</label><input id="svNgl" type="number" value="${+vals.ngl}" min="0" max="999">
+        <div class="slider-row"><span class="sl-min">CPU</span><input type="range" id="svNglSlider" min="0" max="99" value="${Math.min(99, +vals.ngl)}"><span class="sl-max">all GPU</span></div></div>
       <div><label class="field-label">K cache</label><select id="svKv">${_KV_OPTS}</select></div>
       <div><label class="field-label">V cache</label><select id="svKvV">${_KV_OPTS}</select></div>
-      <div><label class="field-label">TTL (sec resident)</label><input id="svTtl" type="number" value="${+vals.ttl}" min="0"></div>
+      <div><label class="field-label">TTL (sec resident)</label><input id="svTtl" type="number" value="${+vals.ttl}" min="0">
+        <div class="preset-chips" id="svTtlChips">${[["300", "5m"], ["1800", "30m"], ["3600", "1h"], ["0", "∞"]].map(([v, l]) => `<button type="button" class="chip" data-v="${v}">${l}</button>`).join("")}</div></div>
       <div><label class="field-label">Parallel slots</label><input id="svPar" type="number" value="${+vals.parallel}" min="1" max="64"></div>
     </div>
     <label class="serve-fa"><input type="checkbox" id="svFa" ${vals.fa ? "checked" : ""}> Flash attention (<code>-fa</code>)</label>
@@ -2858,7 +2880,48 @@ function _riverDialog({ mode, filename, name, vals }) {
   ["svCtx", "svNgl", "svKv", "svKvV"].forEach(id => {
     const el = $("#" + id, body); el.addEventListener("input", recompute); el.addEventListener("change", recompute);
   });
+  // preset chips + the ngl slider, all kept in sync with their number inputs
+  const markChips = (wrap, inp) => wrap && wrap.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", String(c.dataset.v) === String(inp.value)));
+  const ctxChips = $("#svCtxChips", body), ttlChips = $("#svTtlChips", body);
+  const ctxIn = $("#svCtx", body), ttlIn = $("#svTtl", body), nglIn = $("#svNgl", body), sl = $("#svNglSlider", body);
+  const syncControls = () => {
+    if (sl && nglIn) sl.value = Math.min(99, Math.max(0, +nglIn.value || 0));
+    markChips(ctxChips, ctxIn); markChips(ttlChips, ttlIn);
+  };
+  if (ctxChips) ctxChips.querySelectorAll(".chip").forEach(c => c.onclick = () => { ctxIn.value = c.dataset.v; markChips(ctxChips, ctxIn); recompute(); });
+  if (ttlChips) ttlChips.querySelectorAll(".chip").forEach(c => c.onclick = () => { ttlIn.value = c.dataset.v; markChips(ttlChips, ttlIn); });
+  if (sl && nglIn) {
+    sl.addEventListener("input", () => { nglIn.value = sl.value; markChips(ctxChips, ctxIn); recompute(); });
+    nglIn.addEventListener("input", syncControls);
+  }
+  ctxIn.addEventListener("input", () => markChips(ctxChips, ctxIn));
+  ttlIn.addEventListener("input", () => markChips(ttlChips, ttlIn));
+  syncControls();
   recompute();
+  $("#svRec", body).onclick = async () => {
+    const rb = $("#svRec", body), w = $("#svRecWhy", body);
+    rb.disabled = true; const lbl = rb.textContent; rb.textContent = "analyzing your hardware…";
+    let d; try { d = await api("/api/rivers/recommend?filename=" + encodeURIComponent(filename)); } catch { d = null; }
+    rb.disabled = false; rb.textContent = lbl;
+    if (!d || !d.ok) { if (w) { w.style.display = "block"; w.className = "rec-why err"; w.textContent = (d && d.error) || "couldn't analyze this model"; } return; }
+    const r = d.rec;
+    $("#svCtx", body).value = r.ctx; $("#svNgl", body).value = r.ngl;
+    $("#svKv", body).value = r.kv; $("#svKvV", body).value = r.kv_v;
+    $("#svFa", body).checked = !!r.fa;
+    $("#svThreads", body).value = r.threads || ""; $("#svMoe", body).value = r.n_cpu_moe || "";
+    if (r.threads || r.n_cpu_moe) { const adv = body.querySelector(".serve-adv"); if (adv) adv.open = true; }
+    if (w) {
+      const labels = { ngl: "GPU layers", ctx: "Context", kv: "KV cache", n_cpu_moe: "MoE→CPU", threads: "Threads", fa: "Flash attn" };
+      const g = x => (x / GB).toFixed(0);
+      const hw = `<div class="rw-hw">Your box: ${d.vram_total ? g(d.vram_total) + " GB VRAM" : "no GPU"}${d.ram_total ? " · " + g(d.ram_total) + " GB RAM" : ""} · ${d.cores} cores${d.is_moe ? " · MoE model" : ""}</div>`;
+      const rows = ["ngl", "ctx", "kv", "n_cpu_moe", "threads", "fa"].filter(k => d.why[k])
+        .map(k => `<div class="rw-row"><b>${labels[k]}</b><span>${escapeHtml(d.why[k])}</span></div>`).join("");
+      const notes = (d.notes || []).map(n => `<div class="rw-note">⚠ ${escapeHtml(n)}</div>`).join("");
+      w.innerHTML = hw + rows + notes; w.className = "rec-why"; w.style.display = "block";
+    }
+    syncControls();
+    recompute();
+  };
   $("#svGo", body).onclick = async () => {
     const msg = $("#svMsg", body), go = $("#svGo", body); go.disabled = true;
     const payload = { filename, name: $("#svName", body).value.trim(),
