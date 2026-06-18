@@ -26,6 +26,7 @@ _VOICE_SETTINGS = config.WORKSPACE.parent / "data" / "voice.json"   # runtime TT
 _whisper = None        # lazily-loaded faster-whisper model (load once, reuse)
 _kokoro = None         # lazily-loaded Kokoro TTS model (load once, reuse)
 _tts_lock = threading.Lock()   # guards the lazy model loads against concurrent first-use
+_synth_lock = threading.Lock() # serializes Kokoro inference (kokoro-onnx isn't guaranteed re-entrant)
 
 # Piper voices live next to the bundled one (assets/voice/), so a downloaded voice packages the
 # same way. The rhasspy/piper-voices catalog (one small JSON) lists every voice + its files; each
@@ -132,12 +133,15 @@ def _piper_voice_path():
 
 
 def piper_installed():
-    """Local Piper voices: every <name>.onnx under PIPER_DIR. Returns [{file, name, active}]."""
+    """Local Piper voices: every <name>.onnx under PIPER_DIR that also has its <name>.onnx.json config
+    sibling — so a half-downloaded voice never shows as usable. Returns [{file, name, active}]."""
     active = _piper_voice_path()
     active = active.name if active else None
     out = []
     try:
         for p in sorted(PIPER_DIR.glob("*.onnx")):
+            if not p.with_name(p.name + ".json").exists():   # no config → Piper can't use it; skip
+                continue
             out.append({"file": p.name, "name": p.stem, "active": p.name == active})
     except OSError:
         pass
@@ -205,7 +209,9 @@ def piper_list(lang=None):
 
 def piper_download(key):
     """Download a catalog voice's .onnx + .onnx.json into PIPER_DIR (md5-verified, confined to that
-    dir). Returns {'ok': True, 'file': '<key>.onnx'} or {'ok': False, 'error': '...'}."""
+    dir). Every file is staged to a .part and verified BEFORE anything is committed, so a flaky
+    network can't leave a half-installed voice; leftover .part files are always cleaned up. Returns
+    {'ok': True, 'file': '<key>.onnx'} or {'ok': False, 'error': '...'}."""
     import re
     v = piper_catalog().get(key)
     if not v:
@@ -214,15 +220,18 @@ def piper_download(key):
             if p.endswith(".onnx") or p.endswith(".onnx.json")]
     if not any(p.endswith(".onnx") for p, _ in want):
         return {"ok": False, "error": "no model file in catalog entry"}
+    staged = []                                          # (final_path, part_path) downloaded but not yet committed
     try:
         import httpx
         PIPER_DIR.mkdir(parents=True, exist_ok=True)
         saved = None
+        # 1) fetch EVERY file to a .part and md5-verify it before committing anything
         for path, meta in want:
             name = os.path.basename(path)
             if not re.fullmatch(r"[A-Za-z0-9._-]+\.onnx(\.json)?", name):   # no traversal / junk names
                 return {"ok": False, "error": "bad filename in catalog"}
             tmp = PIPER_DIR / (name + ".part")
+            staged.append((PIPER_DIR / name, tmp))
             h = hashlib.md5()
             with httpx.stream("GET", _PIPER_HF + path, timeout=300, follow_redirects=True) as r:
                 r.raise_for_status()
@@ -232,17 +241,22 @@ def piper_download(key):
                         h.update(chunk)
             digest = meta.get("md5_digest")
             if digest and h.hexdigest() != digest:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
                 return {"ok": False, "error": "checksum mismatch — download corrupt, try again"}
-            os.replace(tmp, PIPER_DIR / name)
             if name.endswith(".onnx"):
                 saved = name
+        # 2) all files present + verified → commit them together
+        for dst, tmp in staged:
+            os.replace(tmp, dst)
+        staged = []                                      # committed; nothing left to clean up
         return {"ok": True, "file": saved}
     except Exception as e:
         return {"ok": False, "error": f"download failed: {type(e).__name__}"}
+    finally:
+        for _dst, tmp in staged:                         # any .part not committed (error/mismatch) → remove
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _engine():
@@ -312,7 +326,8 @@ def _kokoro_wav(text, wav_path):
     try:
         import soundfile as sf
         s = get_settings()
-        samples, sr = _kokoro_model().create(text, voice=s["voice"], speed=s["speed"], lang="en-us")
+        with _synth_lock:                            # one Kokoro inference at a time (web + Telegram can overlap)
+            samples, sr = _kokoro_model().create(text, voice=s["voice"], speed=s["speed"], lang="en-us")
         if samples is None or len(samples) == 0:
             return False
         sf.write(wav_path, samples, sr)
