@@ -24,9 +24,10 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **34 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
+- **37 built-in tools** + **MCP** — filesystem, shell, Python, web search, a real
   headless browser, long-term memory, document RAG, skills, scheduling, workflows, an
-  agent-managed calendar, and delegation; plus any tools from MCP servers you connect.
+  agent-managed calendar (schedule a whole conflict-aware plan in one shot), and
+  delegation; plus any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -99,7 +100,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (34)
+## The agent's tools (37)
 
 | Group | Tools |
 |-------|-------|
@@ -112,7 +113,7 @@ from a web UI or Telegram.
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
-| **Calendar** | `calendar_events` (read schedule), `add_calendar_event`, `update_calendar_event`, `delete_calendar_event` (manage your local calendar; synced feeds stay read-only) |
+| **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
 
 File/shell operations are fenced to `workspace/` by default (`OCEANO_CONFINE=1`).
@@ -238,6 +239,13 @@ Browse and provision local models from the UI (Brain → Rivers):
   hardware-fit badge and size.
 - **Download** with a progress bar, **serve** with one click (appends a model block to
   `llama-swap.yaml`, which hot-reloads), and **search your on-device models**.
+- **Tune serving fully** — context, GPU layers, KV-cache dtype (K & V), flash-attention,
+  threads, batch/ubatch, MoE-offload, TTL, and free-form extra flags — with a **live VRAM
+  estimate** (weights + KV-cache read straight from the GGUF) that updates as you change them,
+  plus a **live "VRAM used" monitor** in the header.
+- **Edit, unserve, or delete** an already-served model from the Installed list: re-tune its
+  parameters, drop it from `llama-swap`, or remove its `.gguf` from disk. Edits are surgical text
+  splices, so your hand-written comments and custom flags are preserved.
 
 ---
 
@@ -409,7 +417,8 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
 
 - **`oceano/safety.py`** — `check_shell` (refuses catastrophic commands), `check_url`
   (SSRF guard: blocks loopback/private/link-local/metadata so injections can't reach
-  your DBs/LLM/cloud metadata), and `wrap_untrusted` (fences web / doc / email text — and
+  your DBs/LLM/cloud metadata — re-validated on *every* browser navigation, so a fetched
+  page can't 302/redirect its way to an internal address), and `wrap_untrusted` (fences web / doc / email text — and
   the passive research-note auto-injection — as data so the model never obeys instructions
   hidden inside it).
 - **Workspace confinement** — file tools resolve relative to `workspace/` and refuse
@@ -418,6 +427,10 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
   `ReadWritePaths` limited to `workspace/`, `data/`, `skills/`, the `llama.cpp/` model dir,
   and `PrivateTmp`.
 - **Localhost binding** + **login auth** on the web UI.
+- **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API
+  keys) is written atomically, so a crash can't corrupt it and lock you out; session cookies and
+  the sandboxed-preview capability tokens are HMAC domain-separated, so one can't be replayed as
+  the other; and destructive file ops refuse to act on the workspace root itself.
 
 For true isolation, run it in a container or under bubblewrap/firejail.
 
