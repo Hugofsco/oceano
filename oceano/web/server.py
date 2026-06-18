@@ -572,6 +572,27 @@ async def services_restart(request: Request):
         from oceano import voice
         voice.reload()
         return {"ok": True, "msg": "voice models reloaded — the next utterance loads them fresh"}
+    if name in ("llamaswap", "llama-swap", "chat-models"):
+        # plain systemctl (NOT sudo — sudo would trip NoNewPrivileges); the polkit rule from
+        # scripts/install.sh authorizes the daemon's user to manage this one unit.
+        import subprocess
+
+        def _restart_swap():
+            try:
+                r = subprocess.run(["systemctl", "restart", "--no-block", "oceano-llama-swap.service"],
+                                   capture_output=True, text=True, timeout=20)
+                if r.returncode == 0:
+                    return {"ok": True, "msg": "chat model server restarting…"}
+                err = (r.stderr or r.stdout or "").strip().splitlines()
+                err = err[-1] if err else "systemctl restart failed"
+                if "authentication" in err.lower() or "authorized" in err.lower():
+                    err = "not authorized — install the polkit rule (re-run scripts/install.sh) to enable this"
+                return {"ok": False, "error": err}
+            except FileNotFoundError:
+                return {"ok": False, "error": "systemctl not available on this host"}
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error": "restart timed out"}
+        return await asyncio.to_thread(_restart_swap)
     return {"ok": False, "error": "managed by systemd — can't restart from here. "
             "Run on the host:  sudo systemctl restart oceano-llama-swap"}
 

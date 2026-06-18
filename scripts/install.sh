@@ -320,6 +320,27 @@ install_service() {
 }
 
 # ============================================================================
+# 8b. polkit rule — restart the llama-swap model server from the web UI (no password,
+#     without weakening the daemon's NoNewPrivileges). Optional; degrades gracefully.
+# ============================================================================
+install_polkit() {
+  say "polkit rule (restart the model server from the web UI)"
+  local src="$ROOT/systemd/oceano-polkit.rules" dst=/etc/polkit-1/rules.d/49-oceano.rules
+  [ -f "$src" ] || { warn "missing $src — skipping (llama-swap won't be restartable from the UI)"; return; }
+  if [ ! -d /etc/polkit-1/rules.d ]; then
+    warn "no /etc/polkit-1/rules.d (older polkit?) — skipping; restart llama-swap with: sudo systemctl restart oceano-llama-swap"
+    return
+  fi
+  local rendered; rendered=$(sed -e "s#__OCEANO_USER__#$(id -un)#g" "$src")
+  if [ -f "$dst" ] && [ "$rendered" = "$(cat "$dst" 2>/dev/null)" ]; then ok "polkit rule already installed + current"; return; fi
+  warn "installing $dst (lets $(id -un) restart oceano-llama-swap without a password)"
+  confirm || { skip "skipped"; return; }
+  printf '%s\n' "$rendered" | sudo tee "$dst" >/dev/null
+  sudo systemctl reload polkit 2>/dev/null || sudo systemctl restart polkit 2>/dev/null || true   # polkitd also auto-reloads rules.d
+  ok "polkit rule installed"
+}
+
+# ============================================================================
 # 9. the `oceano` terminal command (the rich cli.py launcher)
 # ============================================================================
 install_cli() {
@@ -424,6 +445,7 @@ baremetal_main() {
   ensure_searxng
   install_llama_swap
   install_service
+  install_polkit
   install_cli
   summary
 }

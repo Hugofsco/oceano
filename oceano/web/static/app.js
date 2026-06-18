@@ -1083,7 +1083,7 @@ async function loadServices() {
     const lsDetail = ls.ok ? (ls.loaded ? "loaded: " + ls.loaded : `${(ls.models || []).length} served · idle`) : "down";
     box.innerHTML =
       _svc("Web UI", true, "this page") +
-      _svc("Chat models (:8081)", ls.ok, lsDetail) +                              // llama-swap — systemd, not restartable here
+      _svc("Chat models (:8081)", ls.ok, lsDetail, "llamaswap") +                 // llama-swap — restartable via the polkit rule
       _svc("Embeddings (:8082)", s.embed, s.embed ? "reachable" : "down", "embeddings") +
       _svc("Web search (:8080)", s.searxng, s.searxng ? "SearXNG reachable" : "down") +
       _svc("Voice · speak (TTS)", vo.tts, vo.tts ? `${vo.tts_engine || "?"}${vo.tts_voice ? " · " + vo.tts_voice : ""}` : "unavailable", vo.tts ? "tts" : "") +

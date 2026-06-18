@@ -1,0 +1,18 @@
+// Oceano — let the daemon's user manage the llama-swap model server (start/stop/restart)
+// from the web UI, with no password and no interactive prompt.
+//
+// Why this is safe: `systemctl restart` only sends a D-Bus request; systemd (PID 1, already root)
+// performs the restart, and polkit authorizes it here. The daemon never gains privileges, so the
+// unit's NoNewPrivileges=true hardening is untouched. Scoped to the ONE unit + the manage-units
+// action only — nothing else is granted.
+//
+// Installed by scripts/install.sh to /etc/polkit-1/rules.d/49-oceano.rules with __OCEANO_USER__
+// replaced by the user the oceano.service runs as.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "__OCEANO_USER__") {
+        if (action.lookup("unit") == "oceano-llama-swap.service") {
+            return polkit.Result.YES;
+        }
+    }
+});
