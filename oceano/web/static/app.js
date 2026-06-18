@@ -1378,13 +1378,15 @@ async function twofaSetup() {
   wrap.innerHTML = `
     <div class="twofa-qr">${qr}</div>
     <div class="acct-row">Scan the QR, or type this key into your app:<br><code class="twofa-secret">${escapeHtml(d.secret || "")}</code></div>
-    <label class="field-label">Enter the 6-digit code to confirm</label>
+    <label class="field-label">Confirm with your password and a 6-digit code</label>
+    <input id="twofaPwc" type="password" autocomplete="current-password" placeholder="current password">
     <input id="twofaCode" inputmode="numeric" maxlength="7" placeholder="123456" autocomplete="one-time-code">
     <div class="acct-actions"><span class="acct-msg" id="twofaMsg2"></span><button class="primary sm" id="twofaEnable">Verify & turn on</button></div>
     <div class="acct-row lbl-sub">Lost your device later? On the host, set <code>totp_enabled</code> to false in <code>data/web.json</code> (or delete the <code>totp_*</code> keys) and restart.</div>`;
   $("#twofaEnable", wrap).onclick = async () => {
-    const msg = $("#twofaMsg2"), code = $("#twofaCode").value.trim();
-    const r = await fetch("/api/2fa/enable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+    const msg = $("#twofaMsg2"), code = $("#twofaCode").value.trim(), pw = $("#twofaPwc").value;
+    if (!pw) { msg.textContent = "enter your current password"; msg.className = "acct-msg err"; return; }
+    const r = await fetch("/api/2fa/enable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, current_password: pw }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { msg.textContent = j.detail || "verification failed"; msg.className = "acct-msg err"; return; }
     msg.textContent = "2FA is on ✓"; msg.className = "acct-msg ok";

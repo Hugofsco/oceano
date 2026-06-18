@@ -356,13 +356,18 @@ def twofa_setup():
 
 @app.post("/api/2fa/enable")
 async def twofa_enable(req: Request):
-    """Confirm the pending secret with a current code, then turn 2FA on."""
+    """Turn 2FA on: confirm the pending secret with a current code AND the account password — so a
+    hijacked session (which has the cookie but not the password) can't silently enroll its own
+    authenticator. Matches the password gate on change_account / 2fa disable."""
     data = load()
     auth = data["auth"]
     pending = auth.get("totp_pending")
     if not pending:
         raise HTTPException(400, "no pending 2FA setup — start with Set up")
-    code = ((await req.json()).get("code") or "").strip()
+    body = await req.json()
+    if not hmac.compare_digest(_hash_pw(body.get("current_password") or "", auth.get("salt", "")), auth.get("pwhash", "")):
+        raise HTTPException(403, "current password is incorrect")
+    code = (body.get("code") or "").strip()
     step = _totp_verify(pending, code)
     if step is None:
         raise HTTPException(400, "that code didn't match — check your authenticator and try again")
