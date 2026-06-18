@@ -37,7 +37,7 @@ RestartSec=10
 # local llama.cpp — still starts cleanly.
 NoNewPrivileges=true
 ProtectHome=read-only
-ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills -__OCEANO_LLAMA_DIR__ -__OCEANO_HOME__/.claude
+ReadWritePaths=__OCEANO_ROOT__/workspace __OCEANO_ROOT__/data __OCEANO_ROOT__/skills -__OCEANO_ROOT__/assets/voice -__OCEANO_LLAMA_DIR__ -__OCEANO_HOME__/.claude
 PrivateTmp=true
 # SIGTERM the engine first so it can shut the embed child down cleanly, then
 # SIGKILL anything still in the cgroup after the grace period.

@@ -42,6 +42,9 @@ LLAMA_BUILD="$LLAMA_DIR/build"
 MODELS_DIR="${OCEANO_MODELS_DIR:-$LLAMA_DIR/models}"
 EMBED_MODEL="${EMBED_MODEL:-$MODELS_DIR/nomic-embed-text-v1.5.Q8_0.gguf}"
 EMBED_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
+# Kokoro neural TTS voice (~120 MB total; the natural default voice). Falls back to Piper if absent.
+KOKORO_DIR="${OCEANO_KOKORO_DIR:-$ROOT/assets/kokoro}"
+KOKORO_REL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 LLAMA_SWAP_BIN="${OCEANO_LLAMA_SWAP_BIN:-/usr/local/bin/llama-swap}"
 LLAMA_SWAP_CFG="${OCEANO_LLAMA_SWAP_CFG:-$LLAMA_DIR/llama-swap.yaml}"
 SEARXNG_COMPOSE="${SEARXNG_COMPOSE:-$ROOT/deploy/searxng/docker-compose.yml}"
@@ -126,7 +129,8 @@ apt_deps() {
   command -v apt-get >/dev/null || { warn "not an apt system — install build deps manually: cmake, git, python3-venv, + your GPU's dev libs"; return; }
   # libcurl4-openssl-dev: llama.cpp builds with LLAMA_CURL=ON by default and won't
   # configure without it. ccache speeds up rebuilds.
-  local base=(build-essential cmake git curl ca-certificates python3-venv python3-pip libcurl4-openssl-dev)
+  # ffmpeg + espeak-ng power the voice stack (Kokoro/Piper → ogg conversion, espeak phonemizer/fallback).
+  local base=(build-essential cmake git curl ca-certificates python3-venv python3-pip libcurl4-openssl-dev ffmpeg espeak-ng)
   local missing=()
   for p in "${base[@]}" "${APT_GPU[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
@@ -177,6 +181,8 @@ fetch_model() {  # $1=path $2=url
 models() {
   say "Models"
   fetch_model "$EMBED_MODEL" "$EMBED_MODEL_URL"
+  fetch_model "$KOKORO_DIR/kokoro-v1.0.int8.onnx" "$KOKORO_REL/kokoro-v1.0.int8.onnx"
+  fetch_model "$KOKORO_DIR/voices-v1.0.bin" "$KOKORO_REL/voices-v1.0.bin"
   if [ "$WITH_MODELS" = 1 ]; then for m in "${!CHAT_MODELS[@]}"; do fetch_model "$m" "${CHAT_MODELS[$m]}"; done
   else skip "chat models: pass --with-models to fetch (several GB); $(ls "$MODELS_DIR"/*.gguf 2>/dev/null | grep -ivc nomic) chat gguf already present"; fi
 }
@@ -200,6 +206,10 @@ python_env() {
     "$VENV/bin/python" -m playwright install chromium >/dev/null 2>&1 && ok "playwright chromium ready" \
       || warn "playwright chromium download failed (browser tools won't work until fixed)"
   fi
+  # Pre-fetch the speech-to-text model so voice works offline immediately (faster-whisper would
+  # otherwise download it on first use). Best-effort — voice degrades gracefully if this fails.
+  "$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('${OCEANO_STT_MODEL:-base.en}', download_root='$ROOT/assets/whisper')" >/dev/null 2>&1 \
+    && ok "speech-to-text model ready" || skip "STT model prefetch skipped (will download on first use)"
 }
 
 # ============================================================================
@@ -294,7 +304,8 @@ install_service() {
   # __OCEANO_HOME__ / __OCEANO_LLAMA_DIR__ tokens (venv, ExecStart, EnvironmentFile, PATH,
   # ReadWritePaths) → the real user / $ROOT / $HOME / $LLAMA_DIR. (%h is unusable here — on
   # a system unit it = /root.)
-  mkdir -p "$HOME/.claude"   # the ReadWritePaths entry below; Claude Code writes its state here
+  mkdir -p "$HOME/.claude"        # the ReadWritePaths entry below; Claude Code writes its state here
+  mkdir -p "$ROOT/assets/voice"   # ditto — the daemon downloads Piper voices here (must exist + be writable)
   local rendered; rendered=$(sed -e "s#__OCEANO_ROOT__#$ROOT#g" -e "s#__OCEANO_HOME__#$HOME#g" \
                                  -e "s#__OCEANO_LLAMA_DIR__#$LLAMA_DIR#g" \
                                  -e "s#^User=__OCEANO_USER__#User=$(id -un)#" "$src")

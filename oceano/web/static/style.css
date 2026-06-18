@@ -1155,6 +1155,26 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 /* ---------------- Voice console ---------------- */
 .vc-win{padding:18px;height:100%;display:flex;flex-direction:column;gap:14px;align-items:stretch}
 .vc-status{font-family:var(--font-mono);font-size:11.5px;color:var(--faint);text-align:center}
+.vc-voice{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.vc-voice-lbl{font-size:12px;color:var(--mist);white-space:nowrap}
+.vc-voice select{flex:1;min-width:0;padding:7px 9px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;outline:none}
+.vc-voice select:focus{border-color:var(--biolum)}
+/* hands-free conversation mode (composer) */
+.converse-btn.on{color:var(--biolum);background:rgba(55,227,198,.15);box-shadow:0 0 0 1px var(--biolum) inset}
+.converse-bar{display:flex;align-items:center;gap:8px;padding:6px 11px;margin:0 0 6px;border:1px solid var(--line-strong);border-radius:9px;background:rgba(4,17,26,.45);font-size:12px;color:var(--mist);font-family:var(--font-mono)}
+.converse-bar .cv-dot{width:8px;height:8px;border-radius:50%;background:var(--biolum);animation:vcpulse 1.2s ease-in-out infinite;flex:none}
+.converse-bar .cv-wake{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--faint);cursor:pointer}
+/* voice settings tab */
+.vc-range{width:100%;accent-color:var(--biolum);margin:5px 0 2px;cursor:pointer}
+#vcEngVoice,#vcPiperVoice,#vcPiperLang{padding:7px 9px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;outline:none}
+#vcEngVoice:focus,#vcPiperVoice:focus,#vcPiperLang:focus{border-color:var(--biolum)}
+.vc-catalog{margin:8px 0 4px;padding:10px;border:1px solid var(--line);border-radius:9px;background:rgba(4,17,26,.35)}
+.vc-cat-list{max-height:240px;overflow:auto;margin-top:8px;display:flex;flex-direction:column;gap:5px}
+.vc-cat-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border:1px solid var(--line);border-radius:8px}
+.vc-cat-row .vcc-info{display:flex;flex-direction:column;gap:2px;min-width:0}
+.vcc-name{color:var(--foam);font-size:13px}
+.vcc-meta{color:var(--mist);font-size:11px;font-family:var(--font-mono)}
+.empty-note.err{color:var(--coral)}
 .vc-mic{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:radial-gradient(circle at 50% 35%,rgba(55,227,198,.12),rgba(4,17,26,.5));border:1px solid var(--line-strong);border-radius:16px;color:var(--mist);cursor:pointer;padding:22px;font-family:var(--font-body);font-size:13px;transition:.18s;flex:0 0 auto}
 .vc-mic:hover:not(:disabled){border-color:var(--biolum);color:var(--foam)}
 .vc-mic:disabled{opacity:.5;cursor:not-allowed}

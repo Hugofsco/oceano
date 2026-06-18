@@ -67,6 +67,7 @@ function toast(msg, kind = "info") {
 
 const state = { session: null, model: null, baseUrl: null, agent: false, models: [], busy: false, view: "chat", cwd: "", file: null };
 let _chatAbort = null;   // AbortController for the in-flight /api/chat stream
+let _voiceSpeak = null;  // conversation mode: a sink that streams answer tokens to TTS (else null)
 
 /* ---------------- markdown (sanitized) ---------------- */
 function renderMD(el, text, highlight = false) {
@@ -393,7 +394,8 @@ async function send() {
         } else if (ev.type === "token") {
           killSounding(); flushThink();
           if (!bubble) bubble = addAssistant("");
-          acc += ev.text; if (!rafP) { rafP = true; requestAnimationFrame(draw); } toBottom();
+          acc += ev.text; if (_voiceSpeak) _voiceSpeak.push(ev.text);   // conversation mode: stream to TTS
+          if (!rafP) { rafP = true; requestAnimationFrame(draw); } toBottom();
         } else if (ev.type === "tool_call") {
           killSounding(); flushThink(); flushBubble();
           if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
@@ -441,6 +443,124 @@ function setSendMode(stopping) {
 function stopChat() {
   fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: state.session }) }).catch(() => {});
   if (_chatAbort) _chatAbort.abort();   // stops the client read; server cancels too
+}
+
+/* ---------- hands-free voice conversation (talk ↔ it talks back; reuses the chat turn) ----------
+   Loop: energy-VAD listen → /api/voice/stt → [optional wake-word gate] → send() (the SAME agent turn,
+   so tools + UI control fire) with answer tokens streamed sentence-by-sentence to /api/voice/tts →
+   play → resume listening. Half-duplex (we pause listening while it speaks, so it can't hear itself). */
+let _converse = null;
+
+function cvStatus(t) { const e = $("#converseStatus"); if (e) e.textContent = t; }
+
+function makeVoiceSpeaker(onPlay) {
+  // accumulate the FULL answer, then speak it as ONE clip — smooth & continuous, no per-phrase gaps
+  let buf = "", dead = false, done;
+  const drained = new Promise(r => done = r);
+  const audio = new Audio();
+  return {
+    push(t) { buf += t; },                 // just collect; nothing is synthesized until end()
+    async end() {
+      const text = buf.trim();
+      if (dead || !text) { done(); return; }
+      try {
+        const r = await fetch("/api/voice/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+        if (r.ok && !dead) {
+          if (onPlay) onPlay();
+          const url = URL.createObjectURL(await r.blob());
+          audio.src = url;
+          await audio.play().catch(() => {});
+          await new Promise(res => { audio.onended = res; audio.onerror = res; });
+          URL.revokeObjectURL(url);
+        }
+      } catch {}
+      done();
+    },
+    stop() { dead = true; try { audio.pause(); } catch {} done(); },
+    drained,
+  };
+}
+
+async function toggleConverse() {
+  if (_converse) { stopConverse(); return; }
+  if (!state.model) { flashModel(); return; }
+  let s; try { s = await api("/api/voice/status"); } catch { s = {}; }
+  if (!s.stt || !s.tts) { toast("voice conversation needs STT + TTS — run the installer or set up a voice", "err"); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+  catch { toast("microphone permission denied", "err"); return; }
+  _converse = { stream, wake: !!s.wake, wakeWord: (s.wake_word || "oceano").toLowerCase(), busy: false };
+  const btn = $("#converseBtn"); if (btn) btn.classList.add("on");
+  const bar = $("#converseBar"); if (bar) bar.style.display = "flex";
+  toast("conversation mode on — just talk", "info");
+  startListening();
+}
+function stopConverse() {
+  if (!_converse) return;
+  if (_converse._stopListen) _converse._stopListen();
+  if (_converse.speaker) _converse.speaker.stop();
+  try { _converse.stream.getTracks().forEach(t => t.stop()); } catch {}
+  _converse = null;
+  const btn = $("#converseBtn"); if (btn) btn.classList.remove("on");
+  const bar = $("#converseBar"); if (bar) bar.style.display = "none";
+}
+function startListening() {
+  if (!_converse || _converse.busy) return;
+  cvStatus("listening…");
+  const stream = _converse.stream;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const an = ctx.createAnalyser(); an.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(an);
+  const data = new Uint8Array(an.fftSize);
+  let rec, chunks = [], speaking = false, recording = false, t0 = 0, sil = 0;
+  const SIL = 800, THRESH = 0.02;     // ~0.8s trailing silence ends the utterance
+  const iv = setInterval(() => {
+    if (!_converse) { clearInterval(iv); ctx.close().catch(() => {}); return; }
+    an.getByteTimeDomainData(data);
+    let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+    const rms = Math.sqrt(sum / data.length), now = performance.now();
+    if (rms > THRESH) {
+      if (!speaking) { speaking = true; t0 = now; }
+      sil = 0;
+      if (!recording && now - t0 > 120) {
+        rec = new MediaRecorder(stream); chunks = [];
+        rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+        rec.onstop = async () => { clearInterval(iv); ctx.close().catch(() => {}); await handleUtterance(new Blob(chunks, { type: "audio/webm" })); };
+        rec.start(); recording = true;
+      }
+    } else if (speaking) {
+      if (!sil) sil = now;
+      if (recording && now - sil > SIL) { try { rec.stop(); } catch {} }      // → onstop handles it
+      else if (!recording && now - t0 > 1500) speaking = false;               // a blip, not speech
+    }
+  }, 50);
+  _converse._stopListen = () => { clearInterval(iv); try { if (rec && rec.state === "recording") rec.stop(); } catch {} ctx.close().catch(() => {}); };
+}
+async function handleUtterance(blob) {
+  if (!_converse) return;
+  _converse.busy = true;
+  cvStatus("transcribing…");
+  let text = "";
+  try { const r = await fetch("/api/voice/stt", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: blob }); text = ((await r.json()).text || "").trim(); }
+  catch {}
+  const resume = () => { if (_converse) { _converse.busy = false; startListening(); } };
+  if (!text) return resume();
+  if (_converse.wake) {       // wake-word gate (transcript prefix) — configured in Settings → Voice
+    const ww = _converse.wakeWord, low = text.toLowerCase();
+    if (!low.startsWith(ww) && !low.startsWith("hey " + ww)) return resume();   // not addressed
+    text = text.replace(new RegExp("^\\s*(hey\\s+)?" + ww.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[\\s,.:]*", "i"), "").trim();
+    if (!text) return resume();
+  }
+  cvStatus("thinking…");
+  const speaker = makeVoiceSpeaker(() => cvStatus("speaking…"));
+  _converse.speaker = speaker; _voiceSpeak = speaker;
+  const input = $("#input"); input.value = text; input.dispatchEvent(new Event("input"));
+  try { await send(); } catch {}
+  _voiceSpeak = null;
+  speaker.end();
+  await speaker.drained;
+  if (_converse) _converse.speaker = null;
+  resume();
 }
 // After a reload, re-attach to a reply that was still being generated server-side (the turn keeps
 // running even though the SSE dropped). Renders what was buffered, polls for the rest, then saves.
@@ -970,7 +1090,7 @@ async function loadServices() {
 const SETTINGS_TABS = [
   ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
   ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
-  ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
+  ["voice", "🔊", "Voice"], ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
 // each wipe target: [key, label, description, confirm-detail]
 const WIPE_TARGETS = [
@@ -1100,6 +1220,36 @@ const SETTINGS_PAGES = {
 
       <div class="acct-actions"><span class="acct-msg" id="dgMsg"></span><button class="primary sm" id="dgSave">Save</button></div>
     </div>`,
+  voice: `
+    <div class="drawer-section">
+      <h3>Voice <span class="tool-count" id="vcAvail"></span></h3>
+      <p class="sub">The speak-out engine and the wake word for hands-free conversation (the 🎙 in the composer). Speech-in always uses faster-whisper. Changes apply on the next utterance / next time you start Converse — no restart.</p>
+      <label class="field-label">Speech engine</label>
+      <div class="dg-providers">
+        <label class="dg-prov"><input type="radio" name="vc-engine" value="auto"><span><b>Auto</b><i>Kokoro if installed, else Piper</i></span></label>
+        <label class="dg-prov"><input type="radio" name="vc-engine" value="kokoro"><span><b>Kokoro</b><i>natural neural voice · local · CPU</i></span></label>
+        <label class="dg-prov"><input type="radio" name="vc-engine" value="piper"><span><b>Piper</b><i>lightweight · downloadable voices</i></span></label>
+      </div>
+      <div id="vcKokoroBlock">
+        <label class="field-label">Voice <span class="lbl-sub">Kokoro voices · af_/am_ = US f/m · bf_/bm_ = UK</span></label>
+        <select id="vcEngVoice" style="min-width:220px"></select>
+        <label class="field-label">Speed <span class="lbl-sub" id="vcSpeedVal">1.0×</span></label>
+        <input type="range" id="vcSpeed" class="vc-range" min="0.5" max="2" step="0.1" value="1">
+      </div>
+      <div id="vcPiperBlock" style="display:none">
+        <label class="field-label">Piper voice <span class="lbl-sub" id="vcPiperCount"></span></label>
+        <div class="dg-row"><select id="vcPiperVoice" style="min-width:220px"></select><button class="exp-btn" id="vcPiperBrowse">Browse &amp; download…</button></div>
+        <div id="vcPiperCatalog" class="vc-catalog" style="display:none">
+          <div class="dg-row"><select id="vcPiperLang" style="min-width:170px"></select><span class="lbl-sub">pick a language, then download a voice into assets/voice/</span></div>
+          <div class="vc-cat-list" id="vcPiperList"><div class="empty-note">loading catalog…</div></div>
+        </div>
+      </div>
+      <div class="dg-row" style="margin-top:10px"><button class="exp-btn" id="vcTestBtn">▶ Test voice</button><span class="dg-probe" id="vcTestMsg"></span></div>
+      <label class="set-toggle" style="margin-top:14px"><input type="checkbox" id="vcWake"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Require a wake word <span class="st-note">— in conversation mode, only act on speech that starts with the phrase below (otherwise every utterance is sent)</span></span></label>
+      <label class="field-label">Wake word</label>
+      <input id="vcWakeWord" placeholder="oceano" autocomplete="off" spellcheck="false">
+      <div class="acct-actions"><span class="acct-msg" id="vcSetMsg"></span><button class="primary sm" id="vcSetSave">Save</button></div>
+    </div>`,
   services: `
     <div class="drawer-section">
       <h3>Services</h3>
@@ -1145,6 +1295,8 @@ function openSettings() {
   $("#toolAllOff", body).onclick = () => toggleAllTools(false);
   $("#dgSave", body).onclick = saveDelegation;
   $$(".dg-test", body).forEach(b => b.onclick = () => testDelegation(b.dataset.role));
+  $("#vcSetSave", body).onclick = saveVoiceSettings;
+  $("#vcTestBtn", body).onclick = testVoiceSettings;
   $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
   loadSettingsAll();
 }
@@ -1161,7 +1313,132 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+async function loadVoiceSettings() {
+  let d; try { d = await api("/api/voice/voices"); } catch { return; }
+  const s = d.settings || {}, voices = d.voices || [];
+  const avail = $("#vcAvail"); if (avail) avail.textContent = voices.length ? `${voices.length} Kokoro voices` : "Kokoro not installed";
+  const er = $$('input[name="vc-engine"]').find(r => r.value === (s.engine || "auto")); if (er) er.checked = true;
+  $$('input[name="vc-engine"]').forEach(r => r.onchange = vcSyncEngine);
+  const sel = $("#vcEngVoice");
+  if (sel) {
+    if (voices.length) { sel.innerHTML = voices.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join(""); sel.value = s.voice || sel.value; sel.disabled = false; }
+    else { sel.innerHTML = `<option>—</option>`; sel.disabled = true; }
+  }
+  const sp = $("#vcSpeed"), spv = $("#vcSpeedVal");
+  if (sp) { sp.value = s.speed || 1; if (spv) spv.textContent = (+sp.value).toFixed(1) + "×"; sp.oninput = () => { if (spv) spv.textContent = (+sp.value).toFixed(1) + "×"; }; }
+  vcFillPiper(d.piper_installed || [], s.piper_voice);
+  const browse = $("#vcPiperBrowse"); if (browse) browse.onclick = vcBrowsePiper;
+  const wk = $("#vcWake"); if (wk) wk.checked = !!s.wake;
+  const ww = $("#vcWakeWord"); if (ww) ww.value = s.wake_word || "oceano";
+  vcSyncEngine();
+}
+function _voicePayload() {
+  const eng = ($$('input[name="vc-engine"]').find(r => r.checked) || {}).value;
+  const sel = $("#vcEngVoice"), sp = $("#vcSpeed"), wk = $("#vcWake"), ww = $("#vcWakeWord"), pv = $("#vcPiperVoice"), p = {};
+  if (eng) p.engine = eng;
+  if (sel && !sel.disabled && sel.value) p.voice = sel.value;
+  if (sp) p.speed = +sp.value;
+  if (pv && !pv.disabled && pv.value) p.piper_voice = pv.value;
+  if (wk) p.wake = wk.checked;
+  if (ww) p.wake_word = ww.value.trim() || "oceano";
+  return p;
+}
+// show the Kokoro voice/speed block or the Piper voice block depending on the chosen engine
+function vcSyncEngine() {
+  const eng = ($$('input[name="vc-engine"]').find(r => r.checked) || {}).value || "auto";
+  const kokoroOK = $("#vcEngVoice") && !$("#vcEngVoice").disabled;
+  const usePiper = eng === "piper" || (eng === "auto" && !kokoroOK);
+  const kb = $("#vcKokoroBlock"), pb = $("#vcPiperBlock");
+  if (kb) kb.style.display = usePiper ? "none" : "";
+  if (pb) pb.style.display = usePiper ? "" : "none";
+}
+function vcFillPiper(list, active) {
+  const sel = $("#vcPiperVoice"), cnt = $("#vcPiperCount"); if (!sel) return;
+  if (list && list.length) {
+    sel.innerHTML = list.map(v => `<option value="${escapeHtml(v.file)}">${escapeHtml(v.name)}</option>`).join("");
+    sel.value = active || (list.find(v => v.active) || {}).file || sel.value;
+    sel.disabled = false; if (cnt) cnt.textContent = `${list.length} installed`;
+  } else {
+    sel.innerHTML = `<option>(none installed)</option>`; sel.disabled = true;
+    if (cnt) cnt.textContent = "none installed — browse below";
+  }
+}
+async function vcBrowsePiper() {
+  const cat = $("#vcPiperCatalog"); if (!cat) return;
+  const show = cat.style.display === "none";
+  cat.style.display = show ? "" : "none";
+  if (show && !cat.dataset.loaded) { cat.dataset.loaded = "1"; await loadPiperLangs(); }
+}
+async function loadPiperLangs() {
+  const list = $("#vcPiperList");
+  let d; try { d = await api("/api/voice/piper/languages"); }
+  catch { if (list) list.innerHTML = `<div class="empty-note err">couldn't reach the Piper catalog (no internet?)</div>`; return; }
+  const sel = $("#vcPiperLang"); if (!sel) return;
+  sel.innerHTML = (d.languages || []).map(l => `<option value="${escapeHtml(l.code)}">${escapeHtml(l.name)} (${l.count})</option>`).join("");
+  sel.onchange = () => loadPiperVoices(sel.value);
+  if (sel.value) loadPiperVoices(sel.value);
+}
+async function loadPiperVoices(lang) {
+  const list = $("#vcPiperList"); if (!list) return;
+  list.innerHTML = `<div class="empty-note">loading…</div>`;
+  let d; try { d = await api("/api/voice/piper/voices?lang=" + encodeURIComponent(lang)); }
+  catch { list.innerHTML = `<div class="empty-note err">failed to load voices</div>`; return; }
+  const voices = d.voices || [];
+  if (!voices.length) { list.innerHTML = `<div class="empty-note">no voices for this language</div>`; return; }
+  list.innerHTML = "";
+  voices.forEach(v => {
+    const row = document.createElement("div"); row.className = "vc-cat-row";
+    row.innerHTML = `<div class="vcc-info"><span class="vcc-name">${escapeHtml(v.name)}</span><span class="vcc-meta">${escapeHtml(v.quality || "—")} · ${v.size_mb} MB${v.speakers > 1 ? " · " + v.speakers + " speakers" : ""}</span></div>`;
+    const btn = document.createElement("button"); btn.className = "exp-btn";
+    if (v.installed) { btn.textContent = "installed ✓"; btn.disabled = true; }
+    else { btn.textContent = "Download"; btn.onclick = () => downloadPiper(v.key, btn); }
+    row.appendChild(btn); list.appendChild(row);
+  });
+}
+async function downloadPiper(key, btn) {
+  btn.disabled = true; const old = btn.textContent; btn.textContent = "downloading…";
+  let r; try { r = await (await fetch("/api/voice/piper/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key }) })).json(); }
+  catch { r = { ok: false, error: "network" }; }
+  if (r && r.ok) {
+    btn.textContent = "installed ✓";
+    toast("voice downloaded — selected as the active Piper voice", "info");
+    try { const d = await api("/api/voice/voices"); vcFillPiper(d.piper_installed || [], r.file); } catch {}
+    saveVoiceSettings();   // persist the new active Piper voice immediately
+  } else {
+    btn.disabled = false; btn.textContent = old;
+    toast("download failed: " + ((r && r.error) || "unknown"), "err");
+  }
+}
+async function saveVoiceSettings() {
+  const msg = $("#vcSetMsg"); if (msg) { msg.textContent = ""; msg.className = "acct-msg"; }
+  try {
+    const r = await fetch("/api/voice/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(_voicePayload()) });
+    if (!r.ok) throw 0;
+    const st = ((await r.json()).settings) || {};
+    if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+    if (_converse) { _converse.wake = !!st.wake; _converse.wakeWord = (st.wake_word || "oceano").toLowerCase(); }  // live-apply to an active conversation
+    return st;
+  } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+}
+// The name to greet in voice samples: the logged-in user (capitalized), or "" if Oceano doesn't
+// really know it (empty / still the default 'admin' login). Cached after the first lookup.
+let _meUser;
+async function userGreetName() {
+  if (_meUser === undefined) { try { _meUser = ((await api("/api/me")).user || "").trim(); } catch { _meUser = ""; } }
+  return (_meUser && _meUser.toLowerCase() !== "admin") ? _meUser.charAt(0).toUpperCase() + _meUser.slice(1) : "";
+}
+async function testVoiceSettings() {
+  const msg = $("#vcTestMsg"); if (msg) { msg.textContent = "synthesizing…"; msg.className = "dg-probe"; }
+  await saveVoiceSettings();   // apply the current selection first so the sample uses it
+  const name = await userGreetName();
+  try {
+    const r = await fetch("/api/voice/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: `Hi${name ? " " + name : ""}, this is Oceano. How do I sound?` }) });
+    if (!r.ok) throw 0;
+    const a = new Audio(URL.createObjectURL(await r.blob())); a.play().catch(() => {});
+    if (msg) msg.textContent = "";
+  } catch { if (msg) { msg.textContent = "test failed"; msg.className = "dg-probe err"; } }
+}
 async function loadJobsSetting() {
   const t = $("#serializeToggle"), tc = $("#serializeChatToggle"); if (!t) return;
   let d; try { d = await api("/api/jobs"); } catch { return; }
@@ -1520,7 +1797,8 @@ function _snapRegion() { const r = $(".views").getBoundingClientRect(); return {
 function _zoneRect(zone) {
   const R = _snapRegion(), hw = R.w / 2, hh = R.h / 2;
   const m = { full: [R.left, R.top, R.w, R.h], left: [R.left, R.top, hw, R.h], right: [R.left + hw, R.top, hw, R.h],
-    bottom: [R.left, R.top + hh, R.w, hh], tl: [R.left, R.top, hw, hh], tr: [R.left + hw, R.top, hw, hh],
+    top: [R.left, R.top, R.w, hh], bottom: [R.left, R.top + hh, R.w, hh],
+    tl: [R.left, R.top, hw, hh], tr: [R.left + hw, R.top, hw, hh],
     bl: [R.left, R.top + hh, hw, hh], br: [R.left + hw, R.top + hh, hw, hh] };
   const [x, y, w, h] = m[zone]; return { x, y, w, h };
 }
@@ -3565,6 +3843,11 @@ async function openVoice() {
   body.classList.add("vc-win");
   body.innerHTML = `
     <div class="vc-status" id="vcStatus">checking voice engines…</div>
+    <div class="vc-voice" id="vcVoiceRow" style="display:none">
+      <span class="vc-voice-lbl">🔊 voice</span>
+      <select id="vcVoice" title="speaking voice"></select>
+      <button class="ghost-btn sm" id="vcTest">▶ test</button>
+    </div>
     <button class="vc-mic" id="vcMic" disabled><span class="vc-mic-ic">🎙</span><span id="vcMicLabel">…</span></button>
     <div class="vc-transcript" id="vcTx" contenteditable="true" data-ph="your words appear here — editable"></div>
     <div class="vc-actions">
@@ -3577,6 +3860,31 @@ async function openVoice() {
   st.innerHTML = `${s.stt ? "🎙 STT: " + escapeHtml(s.stt_model || "ready") : "🎙 STT: not installed"} · ${s.tts ? "🔊 TTS: " + escapeHtml(s.tts_voice || "ready") : "🔊 TTS: not installed"}`;
   mic.disabled = !s.stt;
   micLabel.textContent = s.stt ? "click to talk" : "speech-to-text unavailable";
+  // voice picker (Kokoro) — change/audition the speaking voice live
+  const vrow = $("#vcVoiceRow", body), vsel = $("#vcVoice", body);
+  const speakSample = async () => {
+    const name = await userGreetName();
+    try {
+      const r = await fetch("/api/voice/tts", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: `Hi${name ? " " + name : ""}, this is the ${vsel.value} voice.` }) });
+      if (r.ok) { audio.src = URL.createObjectURL(await r.blob()); audio.play(); }
+    } catch {}
+  };
+  const saveVoice = () => fetch("/api/voice/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ voice: vsel.value }) });
+  try {
+    const vv = await api("/api/voice/voices");
+    if (vv.voices && vv.voices.length) {
+      vsel.innerHTML = vv.voices.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+      if (vv.settings && vv.settings.voice) vsel.value = vv.settings.voice;
+      vrow.style.display = "flex";
+      vsel.onchange = async () => {
+        await saveVoice();
+        st.innerHTML = `${s.stt ? "🎙 STT: " + escapeHtml(s.stt_model || "ready") : "🎙 STT: not installed"} · 🔊 TTS: ${escapeHtml(vsel.value)}`;
+        speakSample();
+      };
+      $("#vcTest", body).onclick = async () => { await saveVoice(); speakSample(); };
+    }
+  } catch {}
   const startRec = async () => {
     if (!navigator.mediaDevices) { toast("microphone unavailable", "err"); return; }
     let stream; try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch { toast("mic permission denied", "err"); return; }
@@ -4127,6 +4435,7 @@ function wire() {
   });
   input.addEventListener("blur", () => setTimeout(cmdACHide, 120));
   $("#send").onclick = () => state.busy ? stopChat() : send();
+  { const cb = $("#converseBtn"); if (cb) cb.onclick = toggleConverse; }   // hands-free voice mode
   $("#newVoyage").onclick = newVoyage;
   $("#agentToggle").onchange = e => {
     state.agent = e.target.checked;
@@ -4246,6 +4555,89 @@ function showPwChange(currentPw) {
   }
   setTimeout(() => { const f = $(currentPw ? "#pwNew" : "#pwCurrent"); if (f) f.focus(); }, 60);
 }
+/* ---------- agent-driven UI control (server pushes ui_open/ui_close/ui_arrange over /api/ui/stream) ---------- */
+let _uiES = null;
+const UI_OPENERS = {
+  files: () => openExplorer(), explorer: () => openExplorer(),
+  calendar: () => openCalendar(), brain: () => openBrain(),
+  memory: () => openBrain("mem"), knowledge: () => openBrain("kn"), skills: () => openBrain("skills"),
+  rivers: () => openBrain("rivers"), evals: () => openBrain("evals"),
+  "memory-graph": () => openMemoryGraph(), scheduler: () => openScheduler(),
+  researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
+  search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
+  live: () => openLiveView(), settings: () => openSettings(),
+};
+const UI_WINIDS = {
+  files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
+  brain: "win-brain", memory: "win-brain", knowledge: "win-brain", skills: "win-brain",
+  rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
+  researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
+  voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
+};
+function startUiStream() {
+  if (_uiES) return;                                   // one stream; survives re-login (idempotent init)
+  _uiES = new EventSource("/api/ui/stream");
+  _uiES.onmessage = e => { let c; try { c = JSON.parse(e.data); } catch { return; } handleUiCommand(c); };
+  _uiES.onerror = () => {};                            // EventSource auto-reconnects
+}
+function handleUiCommand(c) {
+  if (!c || c.type !== "ui") return;
+  try {
+    if (c.action === "open") uiOpen(c);
+    else if (c.action === "close") uiClose(c);
+    else if (c.action === "arrange") uiArrange(c);
+  } catch { /* a bad command must never break the page */ }
+}
+function uiOpen(c) {
+  if (c.path) {
+    const p = String(c.path);
+    isPreviewable(p) ? openPreview(p) : openFile(p);
+    return;
+  }
+  const fn = UI_OPENERS[(c.window || "").toLowerCase()];
+  if (fn) fn();
+}
+const _UI_ZONE = { left: "left", right: "right", top: "top", bottom: "bottom", maximize: "full",
+  "top-left": "tl", "top-right": "tr", "bottom-left": "bl", "bottom-right": "br" };
+function _uiWin(name) {
+  if (name) { const id = UI_WINIDS[name.toLowerCase()]; return id ? document.getElementById(id) : null; }
+  const vis = $$("#windows .win").filter(w => w.style.display !== "none");   // no name → the front-most window
+  return vis.sort((a, b) => (+a.style.zIndex || 0) - (+b.style.zIndex || 0)).pop() || null;
+}
+function uiClose(c) { const el = _uiWin(c.window), x = el && $(".win-close", el); if (x) x.click(); }
+function uiArrange(c) {
+  const mode = (c.mode || "").toLowerCase();
+  if (mode === "focus" || mode === "center" || mode === "minimize" || _UI_ZONE[mode]) {
+    const el = _uiWin(c.window); if (!el) return;             // window optional → the active window
+    if (mode === "minimize") return minimizeWindow(el);
+    el.style.display = "flex"; el.style.zIndex = ++_winZ;        // surface + un-minimize
+    if (el._chip) { el._chip.remove(); el._chip = null; _setWinMin(el.id, false); }
+    if (_UI_ZONE[mode]) { _applySnap(el, _UI_ZONE[mode]); return; }   // snap to a half / quarter / full
+    if (mode === "center") {
+      el.dataset.snapped = ""; el.dataset.maximized = "";
+      el.style.left = Math.max(0, (innerWidth - el.offsetWidth) / 2) + "px";
+      el.style.top = Math.max(40, (innerHeight - el.offsetHeight) / 2) + "px";
+    }
+    return;                                                  // focus = surface it (handled above)
+  }
+  const wins = $$("#windows .win").filter(w => w.style.display !== "none");
+  if (!wins.length) return;
+  if (mode === "cascade") {
+    wins.forEach((w, i) => { w.style.left = (60 + i * 30) + "px"; w.style.top = (70 + i * 30) + "px";
+      w.dataset.snapped = ""; w.dataset.maximized = ""; w.style.zIndex = ++_winZ; });
+  } else {                                             // tile into a grid
+    const n = wins.length, cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols), top = 64, gap = 6;
+    const cw = Math.floor((innerWidth - gap * (cols + 1)) / cols);
+    const ch = Math.floor((innerHeight - top - gap * (rows + 1)) / rows);
+    wins.forEach((w, i) => {
+      const r = Math.floor(i / cols), col = i % cols;
+      w.style.left = (gap + col * (cw + gap)) + "px"; w.style.top = (top + gap + r * (ch + gap)) + "px";
+      w.style.width = cw + "px"; w.style.height = ch + "px";
+      w.dataset.snapped = ""; w.dataset.maximized = ""; w.style.zIndex = ++_winZ;
+    });
+  }
+}
+
 async function initApp() {
   if (_appStarted) return;        // idempotent — survives a mid-session re-login
   _appStarted = true;
@@ -4261,6 +4653,7 @@ async function initApp() {
   else newVoyage();
   await maybeReconnectChat();       // re-attach to a reply that was still generating before the reload
   restoreWindows();                // re-open the app windows that were open before a reload
+  startUiStream();                 // listen for agent-driven window commands (ui_open / ui_arrange…)
   setInterval(loadModels, 30000);
 }
 async function boot() {

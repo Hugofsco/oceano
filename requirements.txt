@@ -18,6 +18,10 @@ mcp>=1.0
 faster-whisper>=1.0
 piper-tts>=1.2
 pathvalidate>=3.0
+# natural neural TTS (local, CPU, Apache-2.0 model under assets/kokoro/) — the default voice when
+# its model is present; Piper/espeak-ng remain the fallbacks. soundfile writes Kokoro's audio to WAV.
+kokoro-onnx>=0.4
+soundfile>=0.12
 # extra agent tools: fetch_media (yt-dlp), sql_query (duckdb), rss (feedparser). Each tool
 # degrades gracefully if its dep/binary is absent, so these are optional-but-recommended.
 yt-dlp>=2024.1

@@ -93,10 +93,14 @@
               <button class="model-pill" id="modelPill"><span class="mp-dot"></span><span id="modelLabel">select model</span><span class="mp-caret">▾</span></button>
               <div class="model-menu" id="modelMenu"></div>
             </div>
+            <div class="converse-bar" id="converseBar" style="display:none">
+              <span class="cv-dot"></span><span id="converseStatus">listening…</span>
+            </div>
             <div class="attach-tray" id="attachTray"></div>
             <textarea id="input" rows="1" placeholder="Send a transmission…"></textarea>
             <input type="file" id="attachInput" multiple style="display:none">
             <div class="composer-actions">
+              <button class="icon-btn converse-btn" id="converseBtn" title="hands-free voice conversation — talk and it talks back">🎙</button>
               <button class="icon-btn ghost attach-btn" id="attachBtn" title="attach files or images (or drag & drop / paste)">📎</button>
               <span class="hint">↵ send · ⇧↵ newline</span>
               <button class="send" id="send" aria-label="send">

@@ -77,6 +77,18 @@ STT_DIR = Path(os.environ.get("OCEANO_STT_DIR", ASSETS / "whisper"))
 STT_DEVICE = os.environ.get("OCEANO_STT_DEVICE", "cpu")
 STT_COMPUTE = os.environ.get("OCEANO_STT_COMPUTE", "int8")         # int8 = fast on CPU
 TTS_VOICE = Path(os.environ.get("OCEANO_TTS_VOICE", ASSETS / "voice" / "alan.onnx"))
-TTS_MAX_CHARS = int(os.environ.get("OCEANO_TTS_MAX_CHARS", "900")) # cap spoken length
+TTS_MAX_CHARS = int(os.environ.get("OCEANO_TTS_MAX_CHARS", "2000")) # cap spoken length (a full reply, not just a Telegram note)
+# TTS engine: 'kokoro' (natural neural voice, local, CPU — recommended), 'piper' (lightweight), or
+# 'auto' (default → Kokoro when its model is present under assets/kokoro/, else Piper). Kokoro is
+# Apache-2.0; the int8 model (~92 MB) runs on CPU and is far more natural than Piper/espeak.
+TTS_ENGINE = os.environ.get("OCEANO_TTS_ENGINE", "auto")
+KOKORO_DIR = Path(os.environ.get("OCEANO_KOKORO_DIR", ASSETS / "kokoro"))
+KOKORO_MODEL = Path(os.environ.get("OCEANO_KOKORO_MODEL", KOKORO_DIR / "kokoro-v1.0.int8.onnx"))
+KOKORO_VOICES = Path(os.environ.get("OCEANO_KOKORO_VOICES", KOKORO_DIR / "voices-v1.0.bin"))
+KOKORO_VOICE = os.environ.get("OCEANO_KOKORO_VOICE", "af_heart")   # 54 voices (af_/am_/bf_/bm_ …)
+KOKORO_SPEED = float(os.environ.get("OCEANO_KOKORO_SPEED", "1.0"))
+# Hands-free voice conversation: when the user turns on "wake word", only utterances starting with
+# this phrase are acted on (matched on the transcript, case-insensitive). Default 'oceano'.
+WAKE_WORD = os.environ.get("OCEANO_WAKE_WORD", "oceano")
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)

@@ -25,11 +25,12 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **47 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **50 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
   HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
-  one shot), and delegation; plus any tools from MCP servers you connect.
+  one shot), agent-driven UI control (it opens & arranges your windows), and delegation; plus
+  any tools from MCP servers you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -102,14 +103,15 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (47)
+## The agent's tools (50)
 
 | Group | Tools |
 |-------|-------|
 | **Workspace / shell** | `list_files`, `read_file`, `write_file`, `edit_file` (surgical patch), `make_folder`, `run_shell`, `python_exec` |
 | **Dev** | `git` (status/diff/commit/blame in the workspace; push refused), `code_search` (ripgrep), `run_tests` (auto-detect pytest/npm/cargo/make) |
-| **Media** | `transcribe_media` (audio/video → text, faster-whisper), `speak_to_file` (text → spoken `.ogg`, Piper), `fetch_media` (download via yt-dlp), `convert` (ffmpeg / pandoc / ImageMagick) |
+| **Media** | `transcribe_media` (audio/video → text, faster-whisper), `speak_to_file` (text → spoken `.ogg`, natural Kokoro voice), `fetch_media` (download via yt-dlp), `convert` (ffmpeg / pandoc / ImageMagick) |
 | **Web / data** | `http_request` (authenticated REST + webhooks + Home Assistant; SSRF-guarded with an opt-in `OCEANO_HTTP_ALLOW` allowlist for local hosts), `rss` (read RSS/Atom feeds), `sql_query` (read-only DuckDB over CSV/TSV/Parquet/JSON) |
+| **UI** (web only) | `ui_open` (pop a window or a file/folder — Preview, Calendar, Files…), `ui_close`, `ui_arrange` (tile · cascade · focus · center · minimize) — the agent drives the floating-window desktop, so it can *show* you what it made, not just describe it |
 | **Web** | `web_search` (SearXNG), `fetch_url` (renders in the live browser) |
 | **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget_memory`, `search_chats` (recall past conversations) |
@@ -268,11 +270,17 @@ it in Settings → Account). It's a single-page app with:
   `/skill`, …) with autocomplete, and **file/image attachments** (drag · paste · 📎). A reply
   still being generated when you reload **reconnects** to it (the turn keeps running
   server-side). The sidebar slides between the app menu and dated **chat-history folders**.
+- **Hands-free voice** — a 🎙 **Converse** toggle in the composer turns chat into a spoken
+  conversation: it listens (browser voice-activity detection), transcribes locally
+  (faster-whisper), runs the *same* agent turn (so it uses tools and **opens/arranges windows
+  as it works**), and speaks the reply back (Kokoro, streamed sentence-by-sentence). Half-duplex,
+  with an optional **wake word** ("Oceano …"). All local; the installer provisions the stack.
 - **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
   Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
   upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
   (memories · documents · conversations), **Notes** (Kanban), **Health** (live system
-  dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out), the
+  dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out — natural local
+  **Kokoro** neural voice, falling back to Piper), the
   **Live browser** (multi-tab — watch the agent research source-by-source), and a
   sandboxed **Preview**. Drag, resize, snap, minimize — and the set of open windows
   **reopens after a reload**.
@@ -465,7 +473,7 @@ oceano/
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
   calsync.py         calendar — agent-managed local events + read-only ICS feed sync
-  voice.py           speech-in (faster-whisper) / speech-out (Piper) for web + Telegram
+  voice.py           speech-in (faster-whisper) / speech-out (Kokoro → Piper → espeak) for web + Telegram
   rivers.py          Hugging Face model catalog + hardware-fit + serve
   mcp_client.py      optional MCP server connections
   browser.py         agent browser surface (SSRF-guarded)

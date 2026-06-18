@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 import config
-from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills
+from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills, uibridge
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -641,6 +641,7 @@ _TOOL_CATEGORY = {
     "transcribe_media": "media", "speak_to_file": "media", "fetch_media": "media", "convert": "media",
     "git": "dev", "code_search": "dev", "run_tests": "dev",
     "http_request": "web", "rss": "web", "sql_query": "data",
+    "ui_open": "ui", "ui_close": "ui", "ui_arrange": "ui",
 }
 
 
@@ -1446,6 +1447,52 @@ def voice_status():
     return voice.status()
 
 
+@app.get("/api/voice/voices")
+def voice_voices():
+    """Available Kokoro voices, installed Piper voices, and current TTS settings — for the Voice tab."""
+    from oceano import voice
+    return {"voices": voice.list_voices(), "settings": voice.get_settings(),
+            "piper_installed": voice.piper_installed()}
+
+
+@app.post("/api/voice/settings")
+async def voice_settings(req: Request):
+    """Set the active TTS engine / voice / speed / Piper voice and the wake-word config (persisted;
+    takes effect on the next utterance / the next time conversation mode is started)."""
+    from oceano import voice
+    b = await req.json()
+    return {"ok": True, "settings": voice.set_settings(engine=b.get("engine"), voice=b.get("voice"),
+                                                       speed=b.get("speed"), wake=b.get("wake"),
+                                                       wake_word=b.get("wake_word"),
+                                                       piper_voice=b.get("piper_voice"))}
+
+
+@app.get("/api/voice/piper/languages")
+def voice_piper_languages():
+    """Languages available in the Piper voice catalog (+ what's already installed) — for Browse."""
+    from oceano import voice
+    return {"languages": voice.piper_languages(), "installed": voice.piper_installed()}
+
+
+@app.get("/api/voice/piper/voices")
+def voice_piper_voices(lang: str = ""):
+    """Piper catalog voices, filtered to one language code (e.g. ?lang=en_US)."""
+    from oceano import voice
+    return {"voices": voice.piper_list(lang or None)}
+
+
+@app.post("/api/voice/piper/download")
+async def voice_piper_download(req: Request):
+    """Download a Piper voice from the catalog into assets/voice/ (md5-verified). Runs in a worker
+    thread so the (sync, ~tens-of-MB) download doesn't block the event loop."""
+    from starlette.concurrency import run_in_threadpool
+    from oceano import voice
+    key = (await req.json()).get("key", "")
+    if not key:
+        return {"ok": False, "error": "no voice key"}
+    return await run_in_threadpool(voice.piper_download, key)
+
+
 @app.post("/api/voice/stt")
 async def voice_stt(req: Request):
     """Transcribe an uploaded audio blob (the browser's MediaRecorder gives webm/opus;
@@ -2236,6 +2283,29 @@ async def browser_stream():
                     idle = 0
                     yield ": ka\n\n"
             await asyncio.sleep(0.1)     # ~10 fps relay
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@app.get("/api/ui/stream")
+async def ui_stream():
+    """Server→browser UI commands (the agent's ui_open/ui_close/ui_arrange land here). Auth-gated by
+    the middleware; the browser holds this open and executes whatever the agent pushes."""
+    loop = asyncio.get_running_loop()
+    q = uibridge.subscribe(loop)
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    cmd = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ka\n\n"          # keep-alive
+                    continue
+                yield _sse(cmd)
+        finally:
+            uibridge.unsubscribe(q)
+
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
