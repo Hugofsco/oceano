@@ -516,6 +516,8 @@ _TOOL_CATEGORY = {
     "run_workflow": "workflow", "list_workflows": "workflow",
     "calendar_events": "calendar", "add_calendar_event": "calendar",
     "update_calendar_event": "calendar", "delete_calendar_event": "calendar",
+    "add_calendar_events": "calendar", "find_free_slots": "calendar",
+    "manage_calendar": "calendar",
 }
 
 
