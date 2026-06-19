@@ -494,10 +494,16 @@ class Agent:
         holder = {}
 
         def on_prog(ev):
-            if ev.get("kind") == "text" and ev.get("text"):
+            k = ev.get("kind")
+            if k == "text" and ev.get("text"):
                 q.put(("token", ev["text"]))
-            elif ev.get("kind") == "tool":
-                q.put(("tool", (ev.get("tool", "tool") + " " + str(ev.get("detail", ""))).strip()))
+            elif k == "tool":
+                name = ev.get("tool", "tool")
+                if name.startswith("mcp__oceano__"):       # show the bare Oceano tool name, not the MCP prefix
+                    name = name[len("mcp__oceano__"):]
+                q.put(("tool", (name, str(ev.get("detail", "")))))
+            elif k == "tool_result":
+                q.put(("toolres", str(ev.get("text", ""))))
 
         def work():
             try:
@@ -517,16 +523,34 @@ class Agent:
                 q.put(("done", None))
 
         threading.Thread(target=work, daemon=True).start()
+        # Surface Claude's tool use as real chips. pending = (name, hidden) of a call awaiting its
+        # result. Hide ToolSearch — that's Claude Code's internal deferred-tool loader, not an action.
+        _HIDDEN = {"ToolSearch"}
         parts = []
+        pending = None
         while True:
             kind, data = q.get()
             if kind == "done":
                 break
-            if kind == "token":
+            if kind == "tool":
+                if pending and not pending[1]:          # prior visible tool ended without a result
+                    yield {"type": "tool_result", "name": pending[0], "result": ""}
+                name, detail = data
+                if name not in _HIDDEN:
+                    yield {"type": "tool_call", "name": name, "args": detail}   # → a real tool chip
+                pending = (name, name in _HIDDEN)
+            elif kind == "toolres":
+                if pending and not pending[1]:
+                    yield {"type": "tool_result", "name": pending[0], "result": data[:2000]}
+                pending = None
+            elif kind == "token":
+                if pending and not pending[1]:
+                    yield {"type": "tool_result", "name": pending[0], "result": ""}
+                pending = None
                 parts.append(data)
                 yield {"type": "token", "text": data}
-            elif kind == "tool":
-                yield {"type": "tool_progress", "text": "⚙ " + data}
+        if pending and not pending[1]:
+            yield {"type": "tool_result", "name": pending[0], "result": ""}
 
         res = holder.get("res") or {}
         answer = "".join(parts).strip() or (res.get("output") or "").strip()

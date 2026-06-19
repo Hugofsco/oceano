@@ -354,6 +354,13 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
                 elif bt == "tool_use":
                     emit({"kind": "tool", "tool": block.get("name", "tool"),
                           "detail": _tool_detail(block.get("input") or {})})
+        elif t == "user":                              # tool results come back as a 'user' message
+            for block in (ev.get("message", {}).get("content") or []):
+                if block.get("type") == "tool_result":
+                    c = block.get("content")
+                    if isinstance(c, list):            # content can be a list of text blocks or a string
+                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+                    emit({"kind": "tool_result", "text": (c or "").strip()})
         elif t == "result":
             final = ev.get("result") or final
             is_error = bool(ev.get("is_error"))
