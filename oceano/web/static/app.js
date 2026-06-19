@@ -506,6 +506,7 @@ function stopConverse() {
 }
 function startListening() {
   if (!_converse || _converse.busy) return;
+  if (_converse._stopListen) { try { _converse._stopListen(); } catch {} _converse._stopListen = null; }  // close the previous AudioContext + interval before opening a new one
   cvStatus("listening…");
   const stream = _converse.stream;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -764,8 +765,12 @@ async function loadModels() {
   catch { state.claudeAvailable = false; }
   buildModelMenu();
   setStatus(state.models.some(m => m.base_url.includes("8081") && !m.error));
-  if (state.mind === "claude" && state.claudeAvailable) { if (state.model !== "claude") selectClaude(false); }
-  else if (!state.model || state.model === "claude") await selectDefaultModel();
+  // Auto-pick only when nothing is chosen yet (or a chosen Claude has vanished) — never override
+  // the user's live selection on the 30s refresh (that caused a mid-chat revert to Claude).
+  if (!state.model || (state.model === "claude" && !state.claudeAvailable)) {
+    if (state.mind === "claude" && state.claudeAvailable) selectClaude(false);
+    else await selectDefaultModel();
+  }
 }
 async function selectDefaultModel() {
   if (state.mind === "claude" && state.claudeAvailable) { selectClaude(false); return; }   // Claude is the chosen mind → stays the default everywhere

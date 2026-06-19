@@ -1131,7 +1131,7 @@ async def chat(req: Request):
                     # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
                     # manage what it knows about you without full agent mode; agent mode → all tools.
                     from oceano import tools as _tools
-                    stream = ag.run_stream(turn_msg) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools())
+                    stream = ag.run_stream(turn_msg, cancel=cancel) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools(), cancel=cancel)
                     for ev in stream:
                         if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
                             _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status

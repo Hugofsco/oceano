@@ -409,7 +409,7 @@ def recommend(filename):
         return _rec_result(rec, why, notes, is_moe, total_vram, free_vram, ram, cores, trained)
 
     # ---------- GPU present ----------
-    usable = total_vram * 0.92 - _VRAM_OVERHEAD            # headroom for compute buffers + driver
+    usable = max(0.0, total_vram * 0.92 - _VRAM_OVERHEAD)  # headroom for compute buffers + driver (never < 0)
     if size < usable:                                      # whole model fits → offload everything
         budget = usable - size
         c16 = biggest_ctx(budget, "f16")
@@ -436,14 +436,25 @@ def recommend(filename):
         why["threads"] = f"{cores} cores — the CPU now runs the expert layers."
         if ram and size > ram:
             notes.append("Even with experts on the CPU, the model is larger than your RAM — it may not load.")
-    else:                                                  # dense + too big → partial GPU offload
-        ngl = min(n_layers - 1, max(1, int((usable * 0.85) / (size / n_layers))))
-        rec.update(ngl=ngl, ctx=min(8192, ctx_cap), kv="q8_0", kv_v="q8_0", threads=cores)
-        why["ngl"] = f"Model is larger than VRAM — offload ~{ngl} of {n_layers} layers to the GPU, the rest on CPU."
-        why["ctx"] = "Moderate context; partial offload is already memory-tight."
-        why["kv"] = "q8_0 KV to save VRAM."
-        why["threads"] = f"{cores} cores for the CPU-resident layers."
-        notes.append("Partial offload is much slower than a full fit — a smaller quant that fits entirely in VRAM would be faster.")
+    else:                                                  # dense + too big → partial GPU offload (or CPU if no room)
+        per_layer = size / max(1, n_layers)
+        ngl = int((usable * 0.85) / per_layer) if per_layer else 0
+        ngl = max(0, min(ngl, n_layers - 1)) if n_layers > 1 else 0
+        rec.update(ctx=min(8192, ctx_cap), kv="q8_0", kv_v="q8_0", threads=cores)
+        if ngl <= 0:                                       # GPU can't usefully hold even one layer → CPU
+            rec.update(ngl=0)
+            why["ngl"] = "Too large for your VRAM to hold any layers — running on CPU."
+            why["ctx"] = "Moderate context to keep the KV cache small in RAM."
+            why["kv"] = "q8_0 KV to save RAM."
+            why["threads"] = f"{cores} cores — CPU inference."
+            notes.append("This model doesn't fit your GPU at all; CPU inference will be slow — a smaller quant is strongly recommended.")
+        else:
+            rec.update(ngl=ngl)
+            why["ngl"] = f"Model is larger than VRAM — offload ~{ngl} of {n_layers} layers to the GPU, the rest on CPU."
+            why["ctx"] = "Moderate context; partial offload is already memory-tight."
+            why["kv"] = "q8_0 KV to save VRAM."
+            why["threads"] = f"{cores} cores for the CPU-resident layers."
+            notes.append("Partial offload is much slower than a full fit — a smaller quant that fits entirely in VRAM would be faster.")
 
     return _rec_result(rec, why, notes, is_moe, total_vram, free_vram, ram, cores, trained)
 

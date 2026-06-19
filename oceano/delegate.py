@@ -270,7 +270,7 @@ def _tool_detail(inp):
 
 def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
                      max_total=None, max_turns=None, on_progress=None, append_system=None,
-                     mcp_config=None, disallow=None):
+                     mcp_config=None, disallow=None, cancel=None):
     """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
 
     Three wins over the old blocking call:
@@ -325,17 +325,26 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             q.put(None)                              # EOF sentinel
     threading.Thread(target=reader, daemon=True).start()
 
-    final, is_error, turns, cost = "", False, 0, 0.0
-    started, stalled, capped = time.monotonic(), False, False
+    final, is_error, turns, cost, cancelled = "", False, 0, 0.0, False
+    started = last_evt = time.monotonic()
+    stalled, capped = False, False
+    poll = 0.5 if cancel is not None else idle_timeout   # short polls so a Stop is honoured promptly
     while True:
-        if time.monotonic() - started > max_total:
+        now = time.monotonic()
+        if cancel is not None and cancel.is_set():   # the user hit Stop → kill the run now
+            cancelled = True
+            break
+        if now - started > max_total:
             capped = True
             break
-        try:
-            line = q.get(timeout=idle_timeout)
-        except queue.Empty:
-            stalled = True                           # no event for idle_timeout → treat as hung
+        if now - last_evt > idle_timeout:            # genuinely idle (the clock resets on every event)
+            stalled = True
             break
+        try:
+            line = q.get(timeout=poll)
+        except queue.Empty:
+            continue                                 # loop back to re-check cancel / cap / idle
+        last_evt = time.monotonic()
         if line is None:
             break                                    # process finished, stream closed
         line = line.strip()
@@ -368,7 +377,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             cost = ev.get("total_cost_usd") or cost
         # system / hook_* / rate_limit_event / user(tool_result) → not surfaced
 
-    if stalled or capped:
+    if stalled or capped or cancelled:
         try:
             proc.kill()
         except Exception:
@@ -379,7 +388,9 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         pass
 
     err = ""
-    if stalled:
+    if cancelled:
+        err = "stopped by the user"
+    elif stalled:
         err = f"the delegate produced no output for {idle_timeout}s and was stopped (looked stalled)"
     elif capped:
         err = f"the delegate hit the {max_total}s time cap and was stopped"

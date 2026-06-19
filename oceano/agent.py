@@ -463,7 +463,7 @@ class Agent:
         return text
 
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
-    def _claude_mind_stream(self, user_message: str):
+    def _claude_mind_stream(self, user_message: str, cancel=None):
         """Drive this turn with Claude Code (the user's subscription) as the resident mind: Oceano's
         persona + memory + conversation history as context, working in the workspace with Claude's
         own tools. Streams Claude's text back as tokens, surfaces its tool use as progress, keeps the
@@ -516,7 +516,7 @@ class Agent:
                     allow += "," + ",".join("mcp__oceano__" + n for n in mindbridge.tool_names())
                 holder["res"] = delegate.to_claude_stream(
                     prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
-                    on_progress=on_prog, append_system=sys_prompt)
+                    on_progress=on_prog, append_system=sys_prompt, cancel=cancel)
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
@@ -554,25 +554,29 @@ class Agent:
 
         res = holder.get("res") or {}
         answer = "".join(parts).strip() or (res.get("output") or "").strip()
+        if cancel is not None and cancel.is_set():             # Stopped → leave history clean, don't learn
+            return
         if not parts and answer:                               # a final result with no streamed text
             yield {"type": "token", "text": answer}
-        if not answer:
-            answer = res.get("error") or "(Claude returned no response)"
-            yield {"type": "token", "text": answer}
+        if not answer:                                         # genuine failure → surface it, but do NOT
+            yield {"type": "token", "text": res.get("error") or "(Claude returned no response)"}
+            yield {"type": "answer_done"}                      # persist the error to history or "learn" from it
+            return
         self.messages.append({"role": "assistant", "content": answer})
         self._learn(user_message, answer)
         yield {"type": "answer_done"}
 
-    def run_stream(self, user_message: str, only_tools=None):
+    def run_stream(self, user_message: str, only_tools=None, cancel=None):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat
         mode passes MEMORY_TOOLS so the model can still recall/remember without full agent
-        mode. None = the whole enabled toolset."""
+        mode. None = the whole enabled toolset. `cancel` (an Event) lets a Stop kill the
+        Claude-mind subprocess and skip persisting/learning a stopped turn."""
         # "Mind: Claude" — the user chose Claude Code as the resident mind. Only the main chat
         # agent (inject_context) honours it; delegates/utility agents keep their own provider.
         if self.inject_context:
             from oceano import delegate
             if delegate.mind_is_claude() and delegate.available():
-                yield from self._claude_mind_stream(user_message)
+                yield from self._claude_mind_stream(user_message, cancel=cancel)
                 return
         if not self.model:                         # nothing served/configured → guide, don't 400
             # stream it as the answer so every frontend (CLI, web SSE, Telegram) shows it
