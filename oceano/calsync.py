@@ -27,7 +27,24 @@ SYNC_INTERVAL = int(os.environ.get("OCEANO_CAL_SYNC", "900"))   # seconds betwee
 WINDOW_PAST = timedelta(days=7)        # keep a little history
 WINDOW_FUTURE = timedelta(days=400)    # expand recurrences this far ahead
 
-_LOCAL_TZ = datetime.now().astimezone().tzinfo
+def _local_zone():
+    """The real local zone (DST-aware), not the fixed UTC offset that `datetime.now().astimezone()`
+    captures at import — that one would shift every timed event by an hour across a DST boundary.
+    Resolves the IANA key from $TZ or the /etc/localtime symlink; falls back to the fixed offset."""
+    try:
+        from zoneinfo import ZoneInfo
+        key = os.environ.get("TZ")
+        if not key:
+            p = os.path.realpath("/etc/localtime")
+            if "/zoneinfo/" in p:
+                key = p.split("/zoneinfo/", 1)[1]
+        if key:
+            return ZoneInfo(key)
+    except Exception:
+        pass
+    return datetime.now().astimezone().tzinfo
+
+_LOCAL_TZ = _local_zone()
 
 
 def _db():

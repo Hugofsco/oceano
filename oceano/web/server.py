@@ -1062,14 +1062,15 @@ async def chat(req: Request):
                     if e["base_url"] == base_url), "")
 
     ag = _agent(sid)
-    ag.model = body.get("model") or ag.model
-    ag.base_url = base_url
-    ag.api_key = api_key
+    # Capture the request's model/endpoint; APPLY them to the shared agent INSIDE the session lock
+    # (below), so a second turn for the same session can't swap the model out from under this one.
+    req_model = body.get("model") or ag.model
+    req_base_url, req_api_key = base_url, api_key
     agent_mode = bool(body.get("agent_mode"))
     attachments = body.get("attachments") or []      # [{path, name, kind}] from /api/upload
     # so it's verifiable in the journal which mode a message actually ran in (tools
     # are only attached in agent mode) — settles "the toggle was on but it didn't use tools".
-    print(f"[chat] model={ag.model!r} agent_mode={agent_mode}", flush=True)
+    print(f"[chat] model={req_model!r} agent_mode={agent_mode}", flush=True)
 
     # The agent is blocking (a single LLM step or a slow tool can take 20s+ with no
     # output). Run it in a worker thread and feed events through a queue, so the
@@ -1086,13 +1087,21 @@ async def chat(req: Request):
         if ev is not None:                                # buffer every event so a refresh can reconnect
             b = _chat_live.get(sid)
             if b is not None:
-                b["events"].append(ev)
-                if isinstance(ev, dict) and ev.get("type") == "tool_progress":
+                evs = b["events"]
+                t = ev.get("type") if isinstance(ev, dict) else None
+                # Coalesce consecutive streamed deltas into ONE buffered event (a fresh dict — never
+                # mutate the object already handed to the live queue), so a long answer is a handful
+                # of events on reconnect, not thousands. The live consumer still gets every delta.
+                if t in ("token", "reasoning") and evs and isinstance(evs[-1], dict) and evs[-1].get("type") == t:
+                    evs[-1] = {"type": t, "text": evs[-1].get("text", "") + ev.get("text", "")}
+                else:
+                    evs.append(ev)
+                if t == "tool_progress":
                     # progress events are ephemeral live updates; keep only the most recent so a
                     # long delegation (hundreds of them) can't bloat the reconnect buffer.
-                    prog = [e for e in b["events"] if e.get("type") == "tool_progress"]
+                    prog = [e for e in evs if isinstance(e, dict) and e.get("type") == "tool_progress"]
                     if len(prog) > 60:
-                        b["events"].remove(prog[0])
+                        evs.remove(prog[0])
                 if isinstance(ev, dict) and ev.get("type") in ("done", "error"):
                     b["running"] = False
         loop.call_soon_threadsafe(q.put_nowait, ev)
@@ -1114,6 +1123,7 @@ async def chat(req: Request):
                 # One turn at a time per session: another tab's turn or a /compact must not
                 # mutate ag.messages while this stream is appending to it.
                 with _session_lock(sid):
+                    ag.model, ag.base_url, ag.api_key = req_model, req_base_url, req_api_key  # apply under the lock
                     cap = _ctx_cap.get(sid)              # /context <n> → auto-compact before the turn
                     if cap and len(ag.messages) > cap:
                         dropped = ag.compact()
