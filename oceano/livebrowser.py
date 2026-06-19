@@ -8,9 +8,9 @@ reliable across tab switches (CDP screencast only fires on visual change, so swi
 to an already-loaded tab would leave the view stale).
 
 Research lifecycle:
-  • a web_search arms "research mode" and clears the previous research's tabs
-  • each fetch_url / browser_open while armed opens the source in a NEW tab, and the
-    view follows the newest one
+  • a web_search arms "research mode" — from then on each fetch_url / browser_open opens
+    the source in a NEW tab and the view follows the newest one. Tabs PERSIST across
+    searches (capped at MAX_TABS; the oldest is evicted) — a new search does NOT wipe them
   • manual navigation (address bar) reuses the active tab; a one-off open with no
     preceding search just navigates — tabs are left alone
 """
@@ -231,15 +231,8 @@ def _worker():
                 try:
                     if cmd == "__quit__":              # clean shutdown — close Chrome, then exit
                         closing = True
-                    elif cmd == "research_reset":      # a web_search → fresh research group
-                        for t in tabs[1:]:
-                            try: t["page"].close()
-                            except Exception: pass
-                        del tabs[1:]
-                        try: tabs[0]["page"].goto("about:blank")
-                        except Exception: pass
-                        tabs[0]["title"] = "new tab"; tabs[0]["fresh"] = True
-                        st["active"] = 0; st["armed"] = True
+                    elif cmd == "research_arm":         # a web_search → open results as tabs from here on
+                        st["armed"] = True             # tabs PERSIST across searches (MAX_TABS evicts the oldest)
                     elif cmd == "open":                # agent fetch/open a source
                         if st["armed"]:
                             c = tabs[st["active"]]
@@ -364,8 +357,9 @@ def capture(url, path, full_page=True, timeout=30000):
 
 # --- convenience wrappers ---
 def start_research():
-    """A web_search begins a fresh research tab-group (clears the previous one)."""
-    submit("research_reset")
+    """A web_search arms research mode so results open as tabs. Tabs persist across searches
+    (capped at MAX_TABS — the oldest is evicted); they are NOT wiped on each search."""
+    submit("research_arm")
 
 
 def open(url, read=False):

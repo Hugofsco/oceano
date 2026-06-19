@@ -412,7 +412,7 @@ def _http_fetch(url, max_redirects=4):
 })
 def web_search(query):
     if live_browser_available():
-        livebrowser.start_research()  # fresh research tab-group; results open as tabs via fetch_url
+        livebrowser.start_research()  # arm research mode; results open as persistent tabs via fetch_url
     r = requests.get(
         f"{config.SEARXNG_URL}/search",
         params={"q": query, "format": "json"},
