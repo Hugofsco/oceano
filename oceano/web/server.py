@@ -776,21 +776,28 @@ async def mind_set(req: Request):
 
 
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
-#     (mindbridge.token()), localhost; exempt from the session middleware above. ---
-@app.get("/api/mcp/tools")
-def mcp_tools(token: str = ""):
+#     (mindbridge.token()), localhost; exempt from the session middleware above. The token rides in a
+#     header (never the URL/body, so it can't leak into access logs) and is compared constant-time. ---
+def _mcp_authed(request: Request):
     from oceano import mindbridge
-    if not token or token != mindbridge.token():
+    tok = request.headers.get("x-oceano-mind-token", "")
+    return bool(tok) and hmac.compare_digest(tok, mindbridge.token())
+
+
+@app.get("/api/mcp/tools")
+def mcp_tools(request: Request):
+    if not _mcp_authed(request):
         raise HTTPException(403, "bad bridge token")
+    from oceano import mindbridge
     return {"tools": mindbridge.tool_schemas()}
 
 
 @app.post("/api/mcp/call")
 async def mcp_call(req: Request):
+    if not _mcp_authed(req):
+        raise HTTPException(403, "bad bridge token")
     from oceano import mindbridge
     b = await req.json()
-    if b.get("token") != mindbridge.token():
-        raise HTTPException(403, "bad bridge token")
     name, args = b.get("name", ""), b.get("args") or {}
     print(f"[mind] tool {name}({list(args)})", flush=True)            # so the body's actions land in the journal
     return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args)}

@@ -19,6 +19,7 @@ import mcp.types as t
 
 URL = os.environ.get("OCEANO_MCP_URL", "http://127.0.0.1:8800").rstrip("/")
 TOKEN = os.environ.get("OCEANO_MCP_TOKEN", "")
+HEADERS = {"X-Oceano-Mind-Token": TOKEN}        # token in a header, never the URL/body (no log leak)
 
 server = Server("oceano")
 _SCHEMAS = []
@@ -37,7 +38,7 @@ async def call_tool(name, arguments):
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(f"{URL}/api/mcp/call",
-                             json={"token": TOKEN, "name": name, "args": arguments or {}}, timeout=600)
+                             json={"name": name, "args": arguments or {}}, headers=HEADERS, timeout=600)
             r.raise_for_status()
             out = r.json().get("result", "")
     except Exception as e:                                 # never crash Claude's tool loop
@@ -49,7 +50,7 @@ async def main():
     global _SCHEMAS
     try:
         async with httpx.AsyncClient() as c:
-            r = await c.get(f"{URL}/api/mcp/tools", params={"token": TOKEN}, timeout=15)
+            r = await c.get(f"{URL}/api/mcp/tools", headers=HEADERS, timeout=15)
             r.raise_for_status()
             _SCHEMAS = r.json().get("tools", [])
     except Exception:
