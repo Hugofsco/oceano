@@ -51,13 +51,21 @@ from a web UI or Telegram.
   assistant — Claude Code (no API key) or a cloud model run as a full agent — *who* chosen
   in Settings, with separate targets for the self-improving jobs. Pick **any model from any
   endpoint** as Oceano's primary (local-first is opt-in), or turn delegation **fully off**.
+- **Oceano as body, Claude as mind (optional).** Pick **🧠 Claude** in the model picker and the
+  whole conversation is driven by Claude Code (your subscription, no API key) wearing Oceano's
+  persona, memory, and history — and reaching for *Oceano's own tools* (memory, calendar, windows,
+  notify) over an in-process **MCP bridge**, so it acts as the resident mind of the local body
+  (its tool use shows as chips in the chat, just like the local model). Flip back to the local
+  model for fully-offline. See [Claude as the mind](#claude-as-the-mind).
 - **Watch it browse.** A multi-tab live browser streams what the agent sees; a web
   search spins up a tab per source so you can see exactly what it read.
 - **Run-aware + optional queue.** A live indicator shows every background job
   (workflows, scheduled tasks, research, …); an optional setting serializes them — and,
   if you want, chat — so the single local model isn't hit in parallel.
 - **Rivers** — browse Hugging Face GGUF models, see which fit your GPU (auto-scored),
-  download them, and one-click "serve" them into `llama-swap`.
+  download them, one-click "serve" them into `llama-swap`, and **✨ Recommend settings for your
+  hardware** (it reads the model's GGUF + your VRAM/RAM/cores and fills in context, GPU layers,
+  KV dtype, threads, and MoE-offload, each with a reason).
 - **A desktop of apps.** Floating windows: chat with dated history folders, a "Brain"
   (memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
   Scheduler, Calendar, Researcher, semantic Search, a Kanban Notes board, a
@@ -236,6 +244,30 @@ chat, Telegram, the CLI, and background jobs). A master toggle turns **delegatio
 
 ---
 
+## Claude as the mind
+
+Delegation hands *subtasks* to Claude. The inverse is also possible: make **Claude the resident
+mind** of the whole assistant. Pick **🧠 Claude** in the chat model picker (or Settings → Delegation
+→ *Primary intelligence*) and every turn — chat **and** voice — is driven by the `claude` CLI (your
+Claude subscription, **no API key**), while **Oceano stays the body**:
+
+- It wears Oceano's **persona**, your **memory**, and the **conversation history** — so it knows you
+  and the thread — and its reply streams into the chat as usual.
+- It reaches for **Oceano's own tools** — memory (`remember`/`recall`/…), the calendar, the floating
+  **windows** (`ui_open`/`ui_arrange`), `notify` — over an in-process, token-gated **MCP bridge**, so
+  the mind drives the real body: it pops your Calendar, saves to *Oceano's* memory (not its own), and
+  so on. Its tool use shows as **chips in the chat**, and its strong native tools (files, shell, web)
+  stay available too.
+- Memory is the continuity: Claude's intelligence **+** Oceano's memory = a presence that remembers you.
+
+The bridge is **localhost-only and token-gated** (a header token, constant-time compared), the mind
+can't delegate to itself, and tool calls execute *inside* the daemon (so windows actually open). Flip
+back to a **local model** anytime for fully-offline operation — that's the trade-off: Claude is
+sharper, the local model keeps Oceano sovereign and offline. A common setup is Claude as the
+interactive mind with the local model still running the background/scheduled work.
+
+---
+
 ## Rivers — the model "cookbook"
 
 Browse and provision local models from the UI (Brain → Rivers):
@@ -246,10 +278,16 @@ Browse and provision local models from the UI (Brain → Rivers):
   hardware-fit badge and size.
 - **Download** with a progress bar, **serve** with one click (appends a model block to
   `llama-swap.yaml`, which hot-reloads), and **search your on-device models**.
+- **✨ Recommend settings for your hardware** — one click reads the model's GGUF metadata and your
+  VRAM/RAM/cores and fills in context, GPU layers, KV dtype, threads, and MoE→CPU offload (each with
+  a one-line reason): full offload when it fits, the largest context that fits, q8 KV only when it
+  helps, expert-offload for MoE models too big for VRAM, partial/CPU otherwise — always with VRAM
+  headroom so it shows "fits".
 - **Tune serving fully** — context, GPU layers, KV-cache dtype (K & V), flash-attention,
-  threads, batch/ubatch, MoE-offload, TTL, and free-form extra flags — with a **live VRAM
-  estimate** (weights + KV-cache read straight from the GGUF) that updates as you change them,
-  plus a **live "VRAM used" monitor** in the header.
+  threads, batch/ubatch, MoE-offload, TTL, and free-form extra flags — with **preset chips**
+  (context 8k/16k/32k…, an "all-GPU ↔ CPU" layers slider) and a **live VRAM estimate** (weights +
+  KV-cache read straight from the GGUF) that updates as you change them, plus a **live "VRAM used"
+  monitor** in the header.
 - **Edit, unserve, or delete** an already-served model from the Installed list: re-tune its
   parameters, drop it from `llama-swap`, or remove its `.gguf` from disk. Edits are surgical text
   splices, so your hand-written comments and custom flags are preserved.
@@ -273,8 +311,9 @@ it in Settings → Account). It's a single-page app with:
 - **Hands-free voice** — a 🎙 **Converse** toggle in the composer turns chat into a spoken
   conversation: it listens (browser voice-activity detection), transcribes locally
   (faster-whisper), runs the *same* agent turn (so it uses tools and **opens/arranges windows
-  as it works**), and speaks the reply back (Kokoro, streamed sentence-by-sentence). Half-duplex,
-  with an optional **wake word** ("Oceano …"). All local; the installer provisions the stack.
+  as it works**), and speaks the reply back in a natural **Kokoro** voice (markdown/emoji stripped
+  so it reads cleanly). Half-duplex, with an optional **wake word** ("Oceano …"). All local; the
+  installer provisions the stack.
 - **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
   Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
   upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
@@ -288,7 +327,14 @@ it in Settings → Account). It's a single-page app with:
   diagram, a Chart.js spec, or a `.slides` deck, a chip opens it rendered in an
   origin-isolated sandbox iframe (device presets + live reload).
 - **Multiple endpoints** — local `llama.cpp` plus remote providers; models from all of
-  them appear in the composer's picker.
+  them appear in the composer's picker — alongside **🧠 Claude** (when the CLI is present), which
+  makes Claude the mind ([above](#claude-as-the-mind)).
+- **Settings, deepened** — a **Voice** tab (pick the speak-out engine — Kokoro / Piper / auto —
+  plus voice, speed, and wake word, and **browse & download Piper voices** from the Hugging Face
+  catalog straight into `assets/voice/`), and a **Services** panel listing every piece (chat
+  models · embeddings · SearXNG · voice TTS/STT · scheduler · Telegram) with a **per-service
+  restart** where it's safe — reload a voice model, respawn the embedding child, restart Telegram,
+  or restart `llama-swap` (via a scoped polkit rule, no password).
 
 > Bound to localhost on purpose — the agent can run shell commands. Reach it over an
 > SSH tunnel or Tailscale; do **not** expose `0.0.0.0` without additional auth.
@@ -437,15 +483,18 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
   hidden inside it).
 - **Workspace confinement** — file tools resolve relative to `workspace/` and refuse
   to escape it.
-- **systemd hardening** — `NoNewPrivileges`, `ProtectHome=read-only` with
-  `ReadWritePaths` limited to `workspace/`, `data/`, `skills/`, the `llama.cpp/` model dir,
-  and `PrivateTmp`.
+- **systemd hardening** — `NoNewPrivileges`, `ProtectHome=read-only` with `ReadWritePaths`
+  limited to `workspace/`, `data/`, `skills/`, `assets/voice/`, and the `llama.cpp/` model dir,
+  plus `PrivateTmp`. A **scoped polkit rule** lets the daemon restart only the `oceano-llama-swap`
+  unit from the UI — `NoNewPrivileges` stays intact (no escalation; systemd does the work over D-Bus).
 - **Localhost binding** + **login auth** on the web UI, with **optional TOTP 2FA** (RFC 6238 —
   authenticator app + QR; secret stays in the hardened `data/web.json`).
 - **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API
   keys) is written atomically, so a crash can't corrupt it and lock you out; session cookies and
   the sandboxed-preview capability tokens are HMAC domain-separated, so one can't be replayed as
-  the other; and destructive file ops refuse to act on the workspace root itself.
+  the other; and destructive file ops refuse to act on the workspace root itself. When **Claude is
+  the mind**, its tool bridge is localhost-only behind a header token (constant-time compared,
+  persisted in a gitignored `data/.mind-token`), so only the launched `claude` process can reach it.
 
 For true isolation, run it in a container or under bubblewrap/firejail.
 
@@ -468,7 +517,9 @@ oceano/
   reindex.py         locked job: re-sync doc / memory / skill / chat indexes to disk
   workflows.py       visual branching workflows (graph engine + run history)
   jobs.py            background-job registry + optional serialization gate (queue)
-  delegate.py        delegation to Claude Code / a cloud model (per-role config)
+  delegate.py        delegation to Claude Code / a cloud model (per-role config) + the "mind" toggle
+  mindbridge.py      Claude-as-mind: Oceano's tools exposed to the mind, executed in the daemon
+  mcp_bridge_server.py  stdio MCP proxy Claude Code launches to reach those tools (token-gated)
   notes.py           Kanban scratchpad (JSON-persisted)
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
@@ -489,7 +540,7 @@ scripts/
   install.sh         host bootstrapper (GPU detect → build → services; --docker for containers)
   install-cli.sh     installs the `oceano` terminal command (a cli.py launcher)
   serve-embeddings.sh  the embedding server launcher
-systemd/             oceano.service + oceano-llama-swap.service
+systemd/             oceano.service + oceano-llama-swap.service + oceano-polkit.rules
 deploy/searxng/      bundled SearXNG compose + settings
 skills/              skill library (one folder per skill)
 cli.py               rich terminal client (streamed; sessions persist to data/chats/; installed as `oceano`)
