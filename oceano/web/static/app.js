@@ -768,6 +768,7 @@ async function loadModels() {
   else if (!state.model || state.model === "claude") await selectDefaultModel();
 }
 async function selectDefaultModel() {
+  if (state.mind === "claude" && state.claudeAvailable) { selectClaude(false); return; }   // Claude is the chosen mind → stays the default everywhere
   const ok = (state.models || []).filter(m => !m.error);
   if (!ok.length) return;
   let d = {}; try { d = await api("/api/default-model"); } catch {}   // the configured primary
@@ -4759,7 +4760,7 @@ async function initApp() {
   if (_appStarted) return;        // idempotent — survives a mid-session re-login
   _appStarted = true;
   wire();
-  loadModels();
+  await loadModels();             // resolve the model + mind (Claude vs local) before any chat opens
   loadPrefs();
   setView("chat");
   await loadChats();              // chats now live on Oceano (dated folders), not the browser
