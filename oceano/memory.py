@@ -133,9 +133,8 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
             words = set(query.lower().split())
             scored = [(float(sum(w in r[1].lower() for w in words)), r) for r in pool]
         scored.sort(key=lambda x: x[0], reverse=True)
-        for s, r in scored[:k]:
-            if s >= threshold:
-                take(r)
+        for s, r in [sr for sr in scored if sr[0] >= threshold][:k]:   # threshold FIRST, then top-k
+            take(r)
     return list(chosen.values())
 
 

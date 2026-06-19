@@ -462,6 +462,9 @@ def fetch_url(url):
     },
 })
 def python_exec(code):
+    refusal = safety.check_python(code)          # parity with run_shell — can't shell out to bypass the guard
+    if refusal:
+        return refusal
     r = subprocess.run(
         [sys.executable, "-"], input=code, cwd=str(_ws()),
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,

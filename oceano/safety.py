@@ -36,7 +36,7 @@ _DANGEROUS = [
 ]
 
 # Absolute/home/system targets that recursive-force rm must never touch.
-_RM_TARGETS = r"(\s|=)(/|~|/\*|\$HOME|/home|/etc|/usr|/var|/boot|/bin|/lib|/sbin|/root)(\s|/|\*|$)"
+_RM_TARGETS = r"""(\s|=|['"])(/|~|/\*|\$HOME|/home|/etc|/usr|/var|/boot|/bin|/lib|/sbin|/root)(\s|/|\*|$|['"])"""
 
 
 def _refuse(why):
@@ -81,6 +81,28 @@ def check_url(url):
                 or ip.is_reserved or ip.is_multicast):
             return _refuse(f"{host} -> internal address {ip} (blocked: protects "
                            f"local DBs/LLM/metadata endpoints)")
+    return None
+
+
+_PY_DANGEROUS = [
+    (r"(shutil\.rmtree|os\.removedirs)\s*\(\s*[ru]?['\"]?\s*(/|~|\$HOME|/home|/etc|/usr|/var|/boot|/bin|/lib|/sbin|/root)(['\"/\s]|$)",
+     "recursive tree removal of a system/home path"),
+]
+
+
+def check_python(code):
+    """Light guard for python_exec — same spirit as check_shell, so shelling out from Python can't
+    sidestep the shell guard. Catches a catastrophic command passed to os.system/subprocess/os.popen
+    (the shell patterns match the source string) and an obvious destructive rmtree of a system path.
+    NOT a sandbox — for real isolation run under a container/bubblewrap. Returns a refusal or None."""
+    if not SHELL_GUARD:
+        return None
+    refusal = check_shell(code)                  # rm -rf /, mkfs, dd of=/dev, pipe|bash, shutdown, …
+    if refusal:
+        return refusal
+    for pat, label in _PY_DANGEROUS:
+        if re.search(pat, code, re.IGNORECASE):
+            return _refuse(f"matches dangerous pattern ({label})")
     return None
 
 

@@ -369,9 +369,11 @@ async function send() {
 
   const payload = { session: state.session, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
                     attachments: atts.map(a => ({ path: a.path, name: a.name, kind: a.kind })) };
-  let sounding = addThinking(), bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, rafP = false, stats = null, livePopped = false;
+  let sounding = addThinking(), bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, _lastDraw = 0, stats = null, livePopped = false;
   const killSounding = () => { if (sounding) { sounding.remove(); sounding = null; } };
-  const draw = () => { rafP = false; if (bubble) renderMD(bubble, acc + " ▌"); };
+  // throttle the live re-render to ~10/s — renderMD re-parses the WHOLE answer each call, so drawing
+  // every token/frame is O(n²) on a long reply. Skipped frames are caught by the final full render.
+  const draw = () => { if (bubble && performance.now() - _lastDraw >= 100) { _lastDraw = performance.now(); renderMD(bubble, acc + " ▌"); toBottom(); } };
   const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
   // close the current answer bubble so the next segment (tool/think) doesn't slot UNDER it
   const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
@@ -395,7 +397,7 @@ async function send() {
           killSounding(); flushThink();
           if (!bubble) bubble = addAssistant("");
           acc += ev.text; if (_voiceSpeak) _voiceSpeak.push(ev.text);   // conversation mode: stream to TTS
-          if (!rafP) { rafP = true; requestAnimationFrame(draw); } toBottom();
+          draw();                                                        // throttled internally; final render catches the tail
         } else if (ev.type === "tool_call") {
           killSounding(); flushThink(); flushBubble();
           if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
@@ -1765,6 +1767,7 @@ async function saveAccount() {
   msg.textContent = "saved ✓"; msg.className = "acct-msg ok";
   $("#acctCur").value = ""; $("#acctNew").value = "";
   if ($("#acctWho")) $("#acctWho").textContent = d.user;
+  _meUser = undefined;                                     // re-fetch the greeting name (it may have changed)
 }
 async function logout() {
   await fetch("/api/logout", { method: "POST" }).catch(() => {});
@@ -2007,6 +2010,8 @@ function openLiveView() {
   _lastTabsSig = null;                       // force a tab-bar rebuild on (re)open
   _liveES = new EventSource("/api/browser/stream");
   _liveES.onmessage = e => {
+    const win = document.getElementById("win-live");
+    if (win && win.style.display === "none") return;       // minimized → don't decode frames into a hidden view
     let d; try { d = JSON.parse(e.data); } catch { return; }
     if (d.frame && img) { img.src = d.frame; img.style.display = "block"; const w = $("#liveWait", body); if (w) w.style.display = "none"; }
     const u = $("#liveUrl", body);
