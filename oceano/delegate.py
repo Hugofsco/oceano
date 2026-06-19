@@ -269,7 +269,8 @@ def _tool_detail(inp):
 
 
 def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
-                     max_total=None, max_turns=None, on_progress=None, append_system=None):
+                     max_total=None, max_turns=None, on_progress=None, append_system=None,
+                     mcp_config=None, disallow=None):
     """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
 
     Three wins over the old blocking call:
@@ -295,6 +296,10 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         cmd += ["--allowedTools", tools]
     if append_system:
         cmd += ["--append-system-prompt", append_system]   # Oceano's persona + memory ride on top
+    if mcp_config:
+        cmd += ["--mcp-config", mcp_config, "--strict-mcp-config"]   # only Oceano's tool-bridge, not the user's other MCP servers
+    if disallow:
+        cmd += ["--disallowedTools", disallow]      # block native write/shell so it acts through Oceano + can't touch ~/.claude
 
     def emit(ev):
         if on_progress:

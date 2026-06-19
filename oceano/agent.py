@@ -469,10 +469,19 @@ class Agent:
         own tools. Streams Claude's text back as tokens, surfaces its tool use as progress, keeps the
         history + post-turn learning. Oceano is the body; Claude is the mind."""
         import queue
-        from oceano import delegate
+        from oceano import delegate, mindbridge
         self._prepare_turn(user_message)                       # system msg now carries persona + memory + context
         self.messages.append({"role": "user", "content": user_message})
-        sys_prompt = self.messages[0]["content"]
+        sys_prompt = self.messages[0]["content"] + (
+            "\n\nOCEANO'S BODY — you have Oceano's own tools (named mcp__oceano__*) on top of your built-in ones:\n"
+            "• MEMORY — use these, NOT your own: mcp__oceano__remember / recall / forget_memory / update_memory. "
+            "Oceano's memory is the ONE memory the user actually sees; save and recall facts there. Never use "
+            "your own file-based memory or write to ~/.claude.\n"
+            "• CALENDAR: mcp__oceano__calendar_events / manage_calendar / find_free_slots.\n"
+            "• WINDOWS (show, don't just tell): mcp__oceano__ui_open / ui_close / ui_arrange — pop and arrange "
+            "the user's web-UI windows (e.g. open Calendar before discussing the schedule).\n"
+            "• mcp__oceano__notify to ping the user.\n"
+            "Use your built-in tools for files, shell, and web search. Touch files only inside the workspace.")
         convo = []
         for m in self.messages[1:]:                            # the conversation Claude continues (no system msg)
             c = (m.get("content") or "").strip()
@@ -492,8 +501,15 @@ class Agent:
 
         def work():
             try:
+                mcp_path = mindbridge.mcp_config_path()        # the body: Oceano's own tools, executed in the daemon
+                # Claude keeps its strong native tools for files/shell/web; Oceano's BODY (memory,
+                # calendar, windows, notify) rides alongside as mcp__oceano — Claude reaches for those
+                # because nothing native competes. No disallow: a blocked native tool just makes it flail.
+                allow = "Read,Glob,Grep,Write,Edit,Bash,WebSearch,WebFetch"
+                if mcp_path:                                   # EXACT tool names load directly; the bare server name gets deferred behind ToolSearch (flaky headless)
+                    allow += "," + ",".join("mcp__oceano__" + n for n in mindbridge.tool_names())
                 holder["res"] = delegate.to_claude_stream(
-                    prompt, cwd=config.WORKSPACE, tools="Read,Glob,Grep,Write,Edit,Bash",
+                    prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
                     on_progress=on_prog, append_system=sys_prompt)
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}

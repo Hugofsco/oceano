@@ -258,7 +258,8 @@ def _set_session_cookie(response, user, secret):
 async def _require_auth(request: Request, call_next):
     path = request.url.path
     webhook = path.startswith("/api/workflows/") and "/webhook/" in path   # gated by its secret token
-    if path.startswith("/api/") and path not in _PUBLIC_API and not webhook:
+    mcp = path.startswith("/api/mcp/")                                      # gated by the mindbridge token
+    if path.startswith("/api/") and path not in _PUBLIC_API and not webhook and not mcp:
         if not _current_user(request):
             return JSONResponse({"error": "authentication required"}, status_code=401)
     return await call_next(request)
@@ -772,6 +773,27 @@ async def mind_set(req: Request):
     from oceano import delegate
     mind = (await req.json()).get("mind", "local")
     return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
+
+
+# --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
+#     (mindbridge.token()), localhost; exempt from the session middleware above. ---
+@app.get("/api/mcp/tools")
+def mcp_tools(token: str = ""):
+    from oceano import mindbridge
+    if not token or token != mindbridge.token():
+        raise HTTPException(403, "bad bridge token")
+    return {"tools": mindbridge.tool_schemas()}
+
+
+@app.post("/api/mcp/call")
+async def mcp_call(req: Request):
+    from oceano import mindbridge
+    b = await req.json()
+    if b.get("token") != mindbridge.token():
+        raise HTTPException(403, "bad bridge token")
+    name, args = b.get("name", ""), b.get("args") or {}
+    print(f"[mind] tool {name}({list(args)})", flush=True)            # so the body's actions land in the journal
+    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args)}
 
 
 @app.get("/api/delegate")
