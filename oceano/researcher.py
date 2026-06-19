@@ -164,8 +164,10 @@ Finish with a 2-3 line summary of what you added or changed this run."""
 def run_topic(rid):
     """One research run, registered as a background job so the UI can show it running."""
     from oceano import jobs
-    with jobs.job("research", f"research #{rid}", ref=f"research:{rid}"):
-        return _run_topic(rid)
+    with jobs.job("research", f"research #{rid}", ref=f"research:{rid}") as jid:
+        r = _run_topic(rid)
+        jobs.set_result(jid, r)                          # surface the research result in the activity log
+        return r
 
 
 def _run_topic(rid):

@@ -704,6 +704,13 @@ def activity_logs(kind: str = "", limit: int = 200):
     return {"runs": logs.recent(min(max(int(limit), 1), 500), kind or None), "kinds": logs.kinds()}
 
 
+@app.get("/api/logs/system")
+async def system_logs(unit: str = "oceano", lines: int = 400):
+    """Tail of a daemon's systemd journal (oceano / llama-swap) — runs journalctl off the event loop."""
+    from oceano import logs
+    return await asyncio.to_thread(logs.system_log, unit, lines)
+
+
 @app.post("/api/jobs/serialize")
 async def jobs_set_serialize(req: Request):
     """Turn the queue on/off. `enabled` → background jobs; `chat` → chat turns. Both run

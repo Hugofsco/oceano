@@ -6,9 +6,13 @@ Written by jobs.job() when a background job finishes (interactive chat is delibe
 surfaced in the web UI's Logs window via /api/logs. SQLite, capped to the most recent _MAX rows.
 """
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 
 import config
+
+# The systemd units we'll surface (allowlisted — never read an arbitrary unit's journal).
+_UNITS = {"oceano": "oceano.service", "llama-swap": "oceano-llama-swap.service"}
 
 DB_PATH = config.WORKSPACE.parent / "data" / "logs.db"
 _MAX = 1000                       # keep the most recent N runs; older ones are pruned on write
@@ -52,6 +56,33 @@ def recent(limit=200, kind=None):
                  "summary": r[5], "duration": r[6], "ref": r[7]} for r in rows]
     except Exception:
         return []
+
+
+def system_log(unit="oceano", lines=400):
+    """The tail of a daemon's systemd journal — so a user can see if Oceano (and its model server)
+    are actually healthy: startup, errors, tracebacks. Unit is allowlisted; reads via journalctl
+    (the daemon's user can read its own journal). Returns {ok, unit, text} or {ok: False, error}."""
+    svc = _UNITS.get(unit)
+    if not svc:
+        return {"ok": False, "error": f"unknown unit {unit!r}"}
+    try:
+        n = max(20, min(int(lines), 2000))
+    except (TypeError, ValueError):
+        n = 400
+    try:
+        r = subprocess.run(["journalctl", "-u", svc, "-n", str(n), "--no-pager", "-o", "short-iso"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return {"ok": True, "unit": svc, "text": (r.stdout or "")[-120000:]}
+        err = (r.stderr or "").strip().splitlines()
+        msg = err[-1] if err else "journalctl failed"
+        if "permission" in msg.lower() or "not seen" in msg.lower():
+            msg += " — add this user to the 'systemd-journal' or 'adm' group to read the journal"
+        return {"ok": False, "error": msg}
+    except FileNotFoundError:
+        return {"ok": False, "error": "journalctl not available on this host"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "journalctl timed out"}
 
 
 def kinds():

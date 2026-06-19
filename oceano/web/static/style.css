@@ -1130,8 +1130,14 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .mg-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
 
 /* ---------------- Health dashboard ---------------- */
-/* logs — activity log */
+/* logs — activity log + system journal */
 .logs-win{padding:0;height:100%;display:flex;flex-direction:column}
+.logs-win .logs-tabs{display:flex;gap:2px;padding:8px 10px 0;border-bottom:1px solid var(--line);flex:none}
+.logs-win .logs-tab{background:none;border:none;border-bottom:2px solid transparent;color:var(--mist);padding:8px 14px;cursor:pointer;font-size:13px;font-family:var(--font-body)}
+.logs-win .logs-tab:hover{color:var(--foam)}
+.logs-win .logs-tab.on{color:var(--biolum);border-bottom-color:var(--biolum)}
+.logs-win .logs-pane{flex:1;min-height:0;display:flex;flex-direction:column}
+.logs-win .logs-sys{flex:1;min-height:0;margin:0;padding:10px 12px;overflow:auto;font-family:var(--font-mono);font-size:11px;line-height:1.5;color:var(--mist);white-space:pre-wrap;word-break:break-word;background:rgba(4,17,26,.45)}
 .logs-win .logs-bar{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line);flex:none}
 .logs-win #logKind{padding:6px 9px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;outline:none}
 .logs-win #logKind:focus{border-color:var(--biolum)}

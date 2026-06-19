@@ -515,7 +515,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                         "current": None, "steps": [], "summary": "", "finished": None, "run_id": None}
     from oceano import jobs
     try:
-        with jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}"), tools.background():
+        with jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}") as _jid, tools.background():
             while cur and visits < _VISIT_CAP:
                 visits += 1
                 t = cur["type"]
@@ -568,13 +568,14 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                     nxt = outs[0][1] if outs else None
                 cur = nodes.get(nxt) if nxt is not None else None
 
-        status = "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error")
-        done = sum(1 for r in results if r["ok"])
-        summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
-        rec = _record_run(wf["id"], trigger, status, results, summary)
-        emit({"event": "done", "status": status, "run": rec})
-        fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id})   # chain-trigger any followers
-        return rec
+            status = "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error")
+            done = sum(1 for r in results if r["ok"])
+            summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
+            rec = _record_run(wf["id"], trigger, status, results, summary)
+            emit({"event": "done", "status": status, "run": rec})
+            fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id})   # chain-trigger any followers
+            jobs.set_result(_jid, summary)                # surface the workflow outcome in the activity log
+            return rec
     finally:
         with _LIVE_LOCK:                                # never leave a 'running' entry stranded
             st = _LIVE.get(wf_id)

@@ -3860,21 +3860,52 @@ function openHealth() {
    Logs — the durable activity log of unattended runs (scheduled tasks,
    workflows, research, evals, upkeep): status, duration, and the result.
    ==================================================================== */
-let _logsKind = "";
+let _logsKind = "", _logsTab = "activity";
 function openLogs() {
-  const { body, reused } = createWindow({ id: "win-logs", title: "Logs — activity", icon: "▤", width: 660, height: 600 });
-  if (reused) { loadLogs(); return; }
+  const { body, reused } = createWindow({ id: "win-logs", title: "Logs — activity & system", icon: "▤", width: 680, height: 620 });
+  if (reused) { _logsTab === "system" ? loadSysLog() : loadLogs(); return; }
   body.classList.add("logs-win");
   body.innerHTML = `
-    <div class="logs-bar">
-      <select id="logKind"><option value="">all activity</option></select>
-      <span class="logs-hint">scheduled tasks · workflows · research · evals · upkeep</span>
-      <button class="ed-btn" id="logReload" title="refresh">↻</button>
+    <div class="logs-tabs">
+      <button class="logs-tab on" data-tab="activity">Activity</button>
+      <button class="logs-tab" data-tab="system">System</button>
     </div>
-    <div class="logs-list" id="logList"><div class="empty-note">loading…</div></div>`;
+    <div class="logs-pane" data-pane="activity">
+      <div class="logs-bar">
+        <select id="logKind"><option value="">all activity</option></select>
+        <span class="logs-hint">scheduled tasks · workflows · research · evals · upkeep</span>
+        <button class="ed-btn" id="logReload" title="refresh">↻</button>
+      </div>
+      <div class="logs-list" id="logList"><div class="empty-note">loading…</div></div>
+    </div>
+    <div class="logs-pane" data-pane="system" style="display:none">
+      <div class="logs-bar">
+        <select id="sysUnit"><option value="oceano">Oceano daemon</option><option value="llama-swap">llama-swap (models)</option></select>
+        <span class="logs-hint">live systemd journal — is everything running?</span>
+        <button class="ed-btn" id="sysReload" title="refresh">↻</button>
+      </div>
+      <pre class="logs-sys" id="sysLog">loading…</pre>
+    </div>`;
+  $$(".logs-tab", body).forEach(t => t.onclick = () => {
+    _logsTab = t.dataset.tab;
+    $$(".logs-tab", body).forEach(x => x.classList.toggle("on", x === t));
+    $$(".logs-pane", body).forEach(p => p.style.display = p.dataset.pane === _logsTab ? "flex" : "none");
+    _logsTab === "system" ? loadSysLog() : loadLogs();
+  });
   $("#logKind", body).onchange = e => { _logsKind = e.target.value; loadLogs(); };
   $("#logReload", body).onclick = () => loadLogs();
+  $("#sysUnit", body).onchange = () => loadSysLog();
+  $("#sysReload", body).onclick = () => loadSysLog();
   loadLogs();
+}
+async function loadSysLog() {
+  const pre = $("#sysLog"); if (!pre) return;
+  const unit = ($("#sysUnit") || {}).value || "oceano";
+  pre.textContent = "loading…";
+  let d; try { d = await api("/api/logs/system?lines=500&unit=" + encodeURIComponent(unit)); }
+  catch { pre.textContent = "system log unavailable"; return; }
+  pre.textContent = d.ok ? (d.text || "(no log output)") : (d.error || "couldn't read the journal");
+  pre.scrollTop = pre.scrollHeight;                       // jump to the newest lines
 }
 function _relTime(iso) {
   const t = new Date(iso).getTime(); if (!t) return "";
