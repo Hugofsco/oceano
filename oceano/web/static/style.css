@@ -1078,6 +1078,7 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .dg-line.ok{color:var(--biolum)}.dg-line.err{color:var(--coral)}
 .dg-line code,.dg-hint code{font-family:var(--font-mono);font-size:11px;color:var(--foam);background:var(--panel);padding:1px 5px;border-radius:5px}
 .dg-hint{font-size:11px;color:var(--faint);margin-top:5px;line-height:1.5}
+.dg-hint.warn{color:#e8b34a}
 .dg-providers{display:flex;flex-direction:column;gap:7px;margin-bottom:12px}
 .dg-prov{display:flex;align-items:flex-start;gap:9px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:rgba(4,17,26,.4)}
 .dg-prov input{margin-top:3px}

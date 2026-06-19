@@ -189,6 +189,28 @@ def set_enabled(on):
         atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
     except OSError:
         pass
+
+
+def get_mind():
+    """Which mind drives the PRIMARY chat turn: 'local' (the served local model — fully offline,
+    default) or 'claude' (Claude Code via the user's subscription, wearing Oceano's persona + memory
+    and working in the workspace). Oceano is the body; this picks the mind."""
+    m = (_raw().get("mind") or "local").strip().lower()
+    return m if m in ("local", "claude") else "local"
+
+
+def set_mind(mind):
+    d = _raw()
+    d["mind"] = "claude" if str(mind).strip().lower() == "claude" else "local"
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return d["mind"]
+
+
+def mind_is_claude():
+    return get_mind() == "claude"
     return bool(on)
 
 
@@ -247,7 +269,7 @@ def _tool_detail(inp):
 
 
 def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
-                     max_total=None, max_turns=None, on_progress=None):
+                     max_total=None, max_turns=None, on_progress=None, append_system=None):
     """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
 
     Three wins over the old blocking call:
@@ -271,6 +293,8 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
            "--max-turns", str(int(max_turns))]
     if tools:
         cmd += ["--allowedTools", tools]
+    if append_system:
+        cmd += ["--append-system-prompt", append_system]   # Oceano's persona + memory ride on top
 
     def emit(ev):
         if on_progress:

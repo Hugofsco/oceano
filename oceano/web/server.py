@@ -759,6 +759,21 @@ async def chat_tools_set(req: Request):
 
 
 # ---------------- delegation (Claude Code readiness + per-role provider config) ----------------
+@app.get("/api/mind")
+def mind_get():
+    """Which mind drives the primary chat: 'local' (served model, offline) or 'claude' (Claude Code
+    via the user's subscription, with Oceano's persona/memory/workspace). + whether Claude is present."""
+    from oceano import delegate
+    return {"mind": delegate.get_mind(), "claude_available": delegate.available()}
+
+
+@app.post("/api/mind")
+async def mind_set(req: Request):
+    from oceano import delegate
+    mind = (await req.json()).get("mind", "local")
+    return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
+
+
 @app.get("/api/delegate")
 def delegate_status():
     """Claude readiness (shared) + per-role config/readiness: 'default' (agent delegate tool)

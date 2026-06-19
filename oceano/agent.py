@@ -463,10 +463,77 @@ class Agent:
         return text
 
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
+    def _claude_mind_stream(self, user_message: str):
+        """Drive this turn with Claude Code (the user's subscription) as the resident mind: Oceano's
+        persona + memory + conversation history as context, working in the workspace with Claude's
+        own tools. Streams Claude's text back as tokens, surfaces its tool use as progress, keeps the
+        history + post-turn learning. Oceano is the body; Claude is the mind."""
+        import queue
+        from oceano import delegate
+        self._prepare_turn(user_message)                       # system msg now carries persona + memory + context
+        self.messages.append({"role": "user", "content": user_message})
+        sys_prompt = self.messages[0]["content"]
+        convo = []
+        for m in self.messages[1:]:                            # the conversation Claude continues (no system msg)
+            c = (m.get("content") or "").strip()
+            if c:
+                convo.append(("Oceano" if m.get("role") == "assistant" else "User") + ": " + c)
+        prompt = ("\n\n".join(convo) + "\n\nReply as Oceano to the User's latest message — direct and "
+                  "conversational. Use your tools to act in the workspace when it helps.")
+
+        q = queue.Queue()
+        holder = {}
+
+        def on_prog(ev):
+            if ev.get("kind") == "text" and ev.get("text"):
+                q.put(("token", ev["text"]))
+            elif ev.get("kind") == "tool":
+                q.put(("tool", (ev.get("tool", "tool") + " " + str(ev.get("detail", ""))).strip()))
+
+        def work():
+            try:
+                holder["res"] = delegate.to_claude_stream(
+                    prompt, cwd=config.WORKSPACE, tools="Read,Glob,Grep,Write,Edit,Bash",
+                    on_progress=on_prog, append_system=sys_prompt)
+            except Exception as e:                             # noqa: BLE001
+                holder["res"] = {"ok": False, "error": str(e), "output": ""}
+            finally:
+                q.put(("done", None))
+
+        threading.Thread(target=work, daemon=True).start()
+        parts = []
+        while True:
+            kind, data = q.get()
+            if kind == "done":
+                break
+            if kind == "token":
+                parts.append(data)
+                yield {"type": "token", "text": data}
+            elif kind == "tool":
+                yield {"type": "tool_progress", "text": "⚙ " + data}
+
+        res = holder.get("res") or {}
+        answer = "".join(parts).strip() or (res.get("output") or "").strip()
+        if not parts and answer:                               # a final result with no streamed text
+            yield {"type": "token", "text": answer}
+        if not answer:
+            answer = res.get("error") or "(Claude returned no response)"
+            yield {"type": "token", "text": answer}
+        self.messages.append({"role": "assistant", "content": answer})
+        self._learn(user_message, answer)
+        yield {"type": "answer_done"}
+
     def run_stream(self, user_message: str, only_tools=None):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat
         mode passes MEMORY_TOOLS so the model can still recall/remember without full agent
         mode. None = the whole enabled toolset."""
+        # "Mind: Claude" — the user chose Claude Code as the resident mind. Only the main chat
+        # agent (inject_context) honours it; delegates/utility agents keep their own provider.
+        if self.inject_context:
+            from oceano import delegate
+            if delegate.mind_is_claude() and delegate.available():
+                yield from self._claude_mind_stream(user_message)
+                return
         if not self.model:                         # nothing served/configured → guide, don't 400
             # stream it as the answer so every frontend (CLI, web SSE, Telegram) shows it
             yield {"type": "token", "text": _NO_MODEL_MSG}

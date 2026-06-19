@@ -1187,6 +1187,15 @@ const SETTINGS_PAGES = {
     </div>`,
   delegate: `
     <div class="drawer-section">
+      <h3>Primary intelligence</h3>
+      <p class="sub">Who actually drives your chats. <b>Oceano is the body</b> — its memory, workspace, voice, and windows. This picks the <b>mind</b>.</p>
+      <div class="dg-providers" id="mindPick">
+        <label class="dg-prov"><input type="radio" name="oc-mind" value="local"><span><b>Local model</b><i>fully offline, on your box — the model you serve in Rivers</i></span></label>
+        <label class="dg-prov"><input type="radio" name="oc-mind" value="claude"><span><b>Claude (your subscription)</b><i>Claude Code as the resident mind — Oceano's persona, memory & workspace, no API key</i></span></label>
+      </div>
+      <div class="dg-hint" id="mindNote"></div>
+    </div>
+    <div class="drawer-section">
       <h3>Delegation</h3>
       <p class="sub">Who handles delegated subtasks. The local model never reviews its own work. A cloud model runs through Oceano's own agent loop with your tools — it can read, write, and run things, just like a local model.</p>
       <div class="dg-status" id="dgStatus">checking…</div>
@@ -1330,7 +1339,28 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+async function loadMind() {
+  let d; try { d = await api("/api/mind"); } catch { return; }
+  const radios = $$('input[name="oc-mind"]'), note = $("#mindNote");
+  const sel = radios.find(x => x.value === (d.mind || "local")); if (sel) sel.checked = true;
+  const claudeR = radios.find(x => x.value === "claude");
+  if (!d.claude_available) {
+    if (claudeR) claudeR.disabled = true;
+    if (note) { note.textContent = "Claude Code isn't detected on this box — install it (or set OCEANO_CLAUDE_BIN) to use Claude as the mind."; note.className = "dg-hint warn"; }
+  } else if (note) {
+    note.textContent = d.mind === "claude"
+      ? "Claude is driving your chats — Oceano's memory + workspace, on your subscription (no API key, but it uses your Claude quota)."
+      : "The local model drives your chats — fully offline. Switch to Claude for a sharper mind.";
+    note.className = "dg-hint";
+  }
+  radios.forEach(x => x.onchange = async () => {
+    if (!x.checked) return;
+    try { const r = await api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: x.value }) });
+      toast("primary intelligence → " + (r.mind === "claude" ? "Claude" : "local model"), "info"); loadMind(); }
+    catch { toast("couldn't change the mind", "err"); }
+  });
+}
 async function loadVoiceSettings() {
   let d; try { d = await api("/api/voice/voices"); } catch { return; }
   const s = d.settings || {}, voices = d.voices || [];
