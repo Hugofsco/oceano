@@ -3066,7 +3066,7 @@ async function loadScheduler() {
       } catch { toast("Run failed", "err"); }
       row.classList.remove("running"); loadScheduler();
     };
-    $(".sr-edit", row).onclick = () => t.managed ? editTaskSchedule(t) : editTask(t);
+    $(".sr-edit", row).onclick = () => openTaskEditor(t);
     if (t.managed) {
       $(".sr-res", row).onclick = isSkills ? () => openBrain("skills") : openResearcher;
     } else {
@@ -3082,15 +3082,70 @@ function renderBeat(ago) {
   else if (ago < 90) { if (dot) dot.classList.add("on"); txt.textContent = `♥ heartbeat alive · last beat ${Math.round(ago)}s ago`; }
   else { if (dot) dot.classList.remove("on"); txt.textContent = `⚠ scheduler stale · last beat ${Math.round(ago)}s ago`; }
 }
-async function editTask(t) {
-  const cron = await promptDialog("Edit schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Next" }); if (cron === null) return;
-  const instr = await promptDialog("Edit instruction", { value: t.instruction, okLabel: "Save" }); if (instr === null) return;
-  fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron, instruction: instr }) }).then(() => loadScheduler());
-}
-async function editTaskSchedule(t) {  // locked job: only its schedule is user-editable here
-  const cron = await promptDialog("Edit schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Save" }); if (cron === null) return;
-  fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron: cron.trim() }) })
-    .then(r => r.json()).then(r => { if (!r.ok && r.error) toast(r.error, "err"); loadScheduler(); });
+// A proper editor window for a scheduled task — multi-line instruction, a preset+cron field
+// with a LIVE "next runs" preview, and an enabled toggle. Replaces the old stacked prompt
+// dialogs. Managed jobs (Researcher/Skills own the instruction) show it read-only and let you
+// retime + toggle only — exactly what the backend permits.
+function openTaskEditor(t) {
+  const managed = !!t.managed;
+  const mgr = (t.source || "").startsWith("skills") ? "Skills" : "Researcher";
+  const { body } = createWindow({ id: "win-taskedit", title: managed ? "Edit schedule" : "Edit scheduled task",
+    icon: "✎", width: 540, height: 500 });
+  body.classList.add("set-win");
+  const presets = `<option value="">preset…</option>`
+    + Object.entries(SCHED_PRESETS).map(([k, v]) => `<option value="${escapeHtml(v)}">${escapeHtml(k)}</option>`).join("");
+  body.innerHTML = `<div class="drawer-section">
+    <label class="field-label">Instruction <span class="lbl-sub">what the agent does when this fires</span></label>
+    ${managed
+      ? `<div class="te-managed">${escapeHtml(t.instruction)}</div>
+         <div class="te-note">🔒 owned by ${mgr} — edit the text in its panel. Schedule &amp; on/off are yours.</div>`
+      : `<textarea id="teInstr" spellcheck="false" placeholder="e.g. summarize my unread email and post it to Notes">${escapeHtml(t.instruction)}</textarea>`}
+    <label class="field-label">Schedule <span class="lbl-sub">cron · min hr day mon wkday</span></label>
+    <div class="te-cron-row">
+      <select id="tePreset" class="sched-preset">${presets}</select>
+      <input id="teCron" class="sched-cron" value="${escapeHtml(t.cron)}" placeholder="0 8 * * *">
+    </div>
+    <div id="tePreview" class="te-preview">…</div>
+    <label class="te-enabled"><span class="sw sm"><input type="checkbox" id="teEnabled" ${t.enabled ? "checked" : ""}><span></span></span> Enabled</label>
+    <div class="acct-actions"><span class="acct-msg" id="teMsg"></span>
+      <button class="ghost sm" id="teCancel">Cancel</button>
+      <button class="primary sm" id="teSave">Save</button></div>
+  </div>`;
+  const cronEl = $("#teCron", body), prev = $("#tePreview", body);
+  let pvTimer = null, pvSeq = 0;
+  async function refreshPreview() {
+    const cron = cronEl.value.trim();
+    if (!cron) { prev.className = "te-preview"; prev.textContent = "enter a cron expression"; return; }
+    const seq = ++pvSeq;
+    try {
+      const d = await api("/api/cron/preview?n=4&cron=" + encodeURIComponent(cron));
+      if (seq !== pvSeq) return;                       // a newer keystroke already fired
+      if (!d.valid) { prev.className = "te-preview bad"; prev.textContent = "✗ " + (d.error || "invalid cron"); return; }
+      if (!d.runs.length) { prev.className = "te-preview"; prev.textContent = "valid ✓"; return; }
+      prev.className = "te-preview ok";
+      prev.innerHTML = `<span class="te-pv-lbl">next runs · UTC</span>`
+        + d.runs.map(r => `<span class="te-pv-when">${escapeHtml(r.slice(0, 16).replace("T", " "))}</span>`).join("");
+    } catch { if (seq === pvSeq) { prev.className = "te-preview"; prev.textContent = ""; } }
+  }
+  cronEl.oninput = () => { clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); };
+  $("#tePreset", body).onchange = e => { if (e.target.value) { cronEl.value = e.target.value; refreshPreview(); } };
+  refreshPreview();
+  const close = () => { const w = body.closest(".win"); if (w) w.remove(); };
+  $("#teCancel", body).onclick = close;
+  $("#teSave", body).onclick = async () => {
+    const msg = $("#teMsg", body), cron = cronEl.value.trim();
+    if (!cron) { msg.textContent = "schedule required"; msg.className = "acct-msg err"; return; }
+    const payload = { cron, enabled: $("#teEnabled", body).checked };
+    if (!managed) {
+      const instr = $("#teInstr", body).value.trim();
+      if (!instr) { msg.textContent = "instruction required"; msg.className = "acct-msg err"; return; }
+      payload.instruction = instr;
+    }
+    const r = await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload) }).then(x => x.json()).catch(() => ({ ok: false }));
+    if (!r.ok) { msg.textContent = r.error || "save failed — check the cron"; msg.className = "acct-msg err"; return; }
+    close(); loadScheduler();
+  };
 }
 
 /* ---------- Brain → Evals (model eval harness · judged by Claude Code) ---------- */

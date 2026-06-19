@@ -2308,6 +2308,13 @@ def get_scheduler():
     return {"beat_ago": (_t.time() - lb) if lb else None, "tasks": scheduler.all_tasks()}
 
 
+@app.get("/api/cron/preview")
+def cron_preview_api(cron: str = "", n: int = 5):
+    """Validate a cron expression and list its next few fire times — the task editor's
+    live schedule preview."""
+    return scheduler.cron_preview(cron, n)
+
+
 @app.post("/api/tasks")
 async def add_task_api(req: Request):
     b = await req.json()

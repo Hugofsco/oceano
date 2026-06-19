@@ -856,6 +856,21 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .sw input:checked + span{background:rgba(55,227,198,.25);border-color:var(--biolum)}
 .sw input:checked + span::after{left:18px;background:var(--biolum)}
 
+/* ---------- scheduled-task editor (win-taskedit) ---------- */
+.set-win textarea#teInstr{width:100%;min-height:88px;resize:vertical;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-body);font-size:13px;line-height:1.5;padding:9px 11px;outline:none}
+.set-win textarea#teInstr:focus{border-color:var(--biolum)}
+.te-managed{background:rgba(4,17,26,.55);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:13px;color:var(--foam);line-height:1.5;max-height:120px;overflow-y:auto;white-space:pre-wrap}
+.te-note{font-size:11.5px;color:var(--faint);margin-top:6px}
+.te-cron-row{display:flex;gap:8px}
+.te-cron-row .sched-preset{flex:0 0 130px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-body);font-size:12.5px;padding:7px 9px;outline:none}
+.te-cron-row .sched-cron{flex:1}
+.te-cron-row .sched-cron:focus,.te-cron-row .sched-preset:focus{border-color:var(--biolum)}
+.te-preview{margin-top:9px;font-family:var(--font-mono);font-size:11px;color:var(--faint);display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:18px}
+.te-preview.bad{color:var(--coral)}
+.te-preview.ok .te-pv-lbl{color:var(--biolum);text-transform:uppercase;letter-spacing:.6px}
+.te-pv-when{background:rgba(4,17,26,.6);border:1px solid var(--line);color:var(--biolum-2);padding:2px 7px;border-radius:6px}
+.te-enabled{display:flex;align-items:center;gap:9px;margin-top:16px;font-size:13px;color:var(--mist);cursor:pointer}
+
 /* ---------- responsive ---------- */
 @media(max-width:820px){
   .shell{grid-template-columns:1fr}

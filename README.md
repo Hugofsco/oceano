@@ -319,7 +319,10 @@ it in Settings → Account). It's a single-page app with:
   upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
   (memories · documents · conversations), **Notes** (Kanban), **Health** (live system
   dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out — natural local
-  **Kokoro** neural voice, falling back to Piper), the
+  **Kokoro** neural voice, falling back to Piper), **Logs** (an **Activity** record of every
+  unattended run — scheduled tasks, workflows, research — *with the agent's actual result*, plus a
+  **System** tab tailing the `oceano` and `llama-swap` systemd journals so you can see if it's
+  healthy without SSH), the
   **Live browser** (multi-tab — watch the agent research source-by-source), and a
   sandboxed **Preview**. Drag, resize, snap, minimize — and the set of open windows
   **reopens after a reload**.
@@ -487,6 +490,8 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
   limited to `workspace/`, `data/`, `skills/`, `assets/voice/`, and the `llama.cpp/` model dir,
   plus `PrivateTmp`. A **scoped polkit rule** lets the daemon restart only the `oceano-llama-swap`
   unit from the UI — `NoNewPrivileges` stays intact (no escalation; systemd does the work over D-Bus).
+  The installer also offers to add the service user to the `systemd-journal` group so the Logs window's
+  **System** tab can read the journal (read-only; skipped if already in `systemd-journal`/`adm`).
 - **Localhost binding** + **login auth** on the web UI, with **optional TOTP 2FA** (RFC 6238 —
   authenticator app + QR; secret stays in the hardened `data/web.json`).
 - **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API

@@ -341,6 +341,31 @@ install_polkit() {
 }
 
 # ============================================================================
+# 8c. journal read access — so the Logs window's "System" tab can show the daemon's
+#     (and the model server's) systemd journal. Reading a SYSTEM unit's journal needs
+#     membership in 'systemd-journal' (or 'adm'); without it the tab degrades to a hint.
+# ============================================================================
+install_journal_access() {
+  say "journal access (Logs → System tab reads the systemd journal)"
+  local u; u="$(id -un)"
+  if id -nG "$u" | tr ' ' '\n' | grep -qx -e systemd-journal -e adm; then
+    ok "$u can already read the journal (in systemd-journal/adm)"; return
+  fi
+  if ! getent group systemd-journal >/dev/null; then
+    warn "no 'systemd-journal' group on this host — Logs → System will show a hint instead"; return
+  fi
+  warn "adding $u to 'systemd-journal' (lets the System tab read oceano + llama-swap logs)"
+  confirm || { skip "skipped — Logs → System will show a hint until $u joins systemd-journal/adm"; return; }
+  if sudo usermod -aG systemd-journal "$u"; then
+    # The daemon inherits supplementary groups at start, so restart it to pick up the new group.
+    sudo systemctl restart oceano.service 2>/dev/null || true
+    ok "added to systemd-journal (restarted oceano.service to apply; log out/in for your shell)"
+  else
+    warn "usermod failed — add manually: sudo usermod -aG systemd-journal $u"
+  fi
+}
+
+# ============================================================================
 # 9. the `oceano` terminal command (the rich cli.py launcher)
 # ============================================================================
 install_cli() {
@@ -446,6 +471,7 @@ baremetal_main() {
   install_llama_swap
   install_service
   install_polkit
+  install_journal_access
   install_cli
   summary
 }

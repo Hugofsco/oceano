@@ -105,10 +105,30 @@ def _models():
 
 
 def _apply_model(agent, m):
+    """Apply a /model pick. The synthetic '🧠 Claude' entry switches Oceano's resident MIND
+    to Claude Code (a global setting, like the web picker) rather than setting a per-chat model;
+    any real model hands the mind back to the local/cloud provider. The mind is honoured by
+    Agent.run_stream, so this turns Claude on/off for Telegram too."""
+    from oceano import delegate
+    if m.get("mind") == "claude":
+        delegate.set_mind("claude")
+        return
+    delegate.set_mind("local")
     from oceano.web import server
     agent.model = m["id"]
     agent.base_url = m["base_url"]
     agent.api_key = server.endpoint_key(m["base_url"])
+
+
+def _menu_models():
+    """The /model picker entries — '🧠 Claude' (the resident mind) first when the Claude CLI
+    is present, then every reachable endpoint model. The Claude row is a sentinel ({mind:'claude'}),
+    not a real model."""
+    from oceano import delegate
+    entries = []
+    if delegate.available():
+        entries.append({"id": "🧠 Claude", "endpoint": "your subscription", "mind": "claude"})
+    return entries + _models()
 
 
 async def model_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -116,25 +136,37 @@ async def model_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_denied(update)); return
     chat_id = update.effective_chat.id
     agent = _agent_for(chat_id)
-    models = await asyncio.to_thread(_models)
-    if not models:
-        await update.message.reply_text("No reachable models. Add an endpoint in Settings → Endpoints."); return
+    from oceano import delegate
+    entries = await asyncio.to_thread(_menu_models)
+    if not entries:
+        await update.message.reply_text("No reachable models. Add an endpoint in Settings → Endpoints "
+                                        "(or install Claude Code for the 🧠 Claude mind)."); return
 
-    if ctx.args:                                   # /model <name> → set directly by id/substring
+    if ctx.args:                                   # /model <name> → set directly by id/substring (or 'claude')
         q = " ".join(ctx.args).strip().lower()
-        match = next((m for m in models if m["id"].lower() == q), None) \
-            or next((m for m in models if q in m["id"].lower()), None)
+        if q in ("claude", "🧠 claude", "claude code", "mind"):
+            if not await asyncio.to_thread(delegate.available):
+                await update.message.reply_text("🧠 Claude isn't available — install Claude Code (the `claude` CLI) first."); return
+            _apply_model(agent, {"mind": "claude"})
+            await update.message.reply_text("✅ Mind set to *🧠 Claude* — your subscription, wearing "
+                                            "Oceano's persona + memory.", parse_mode="Markdown"); return
+        match = next((m for m in entries if not m.get("mind") and m["id"].lower() == q), None) \
+            or next((m for m in entries if not m.get("mind") and q in m["id"].lower()), None)
         if not match:
             await update.message.reply_text(f"No model matches {q!r}. Send /model to choose from a list."); return
         _apply_model(agent, match)
-        await update.message.reply_text(f"✅ Model set to `{match['id']}` — via *{match['endpoint']}*",
+        await update.message.reply_text(f"✅ Model set to `{match['id']}` — via `{match['endpoint']}`",
                                         parse_mode="Markdown"); return
 
-    _model_menu[chat_id] = models[:24]             # back the keyboard; cap so it stays tappable
-    rows = [[InlineKeyboardButton(("✅ " if m["id"] == agent.model else "🔹 ") + m["id"][:46],
+    claude_mind = await asyncio.to_thread(delegate.mind_is_claude)
+    _model_menu[chat_id] = entries[:24]            # back the keyboard; cap so it stays tappable
+    def _is_cur(m):                                # the current pick: Claude when it's the mind, else the per-chat model
+        return (m.get("mind") == "claude") if claude_mind else (not m.get("mind") and m["id"] == agent.model)
+    rows = [[InlineKeyboardButton(("✅ " if _is_cur(m) else "🔹 ") + m["id"][:46],
                                   callback_data=f"tgmodel:{i}")]
             for i, m in enumerate(_model_menu[chat_id])]
-    await update.message.reply_text(f"🧠 Current model: `{agent.model}`\nTap one for this chat:",
+    cur = "🧠 Claude" if claude_mind else f"`{agent.model}`"
+    await update.message.reply_text(f"🧠 Current: {cur}\nTap one for this chat:",
                                     parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -149,8 +181,13 @@ async def model_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         await q.answer("stale menu — send /model again"); return
     _apply_model(_agent_for(chat_id), m)
-    await q.answer(f"model: {m['id']}")
-    await q.edit_message_text(f"✅ Model set to `{m['id']}` — via *{m['endpoint']}*", parse_mode="Markdown")
+    if m.get("mind") == "claude":
+        await q.answer("mind: 🧠 Claude")
+        await q.edit_message_text("✅ Mind set to *🧠 Claude* — your subscription, wearing Oceano's "
+                                  "persona + memory.", parse_mode="Markdown")
+    else:
+        await q.answer(f"model: {m['id']}")
+        await q.edit_message_text(f"✅ Model set to `{m['id']}` — via `{m['endpoint']}`", parse_mode="Markdown")
 
 
 # ---------------- context / compaction ----------------
@@ -223,8 +260,9 @@ def _fmt_age(secs):
 
 
 def _status_text(chat_id):
-    from oceano import tools, memory, rag
+    from oceano import tools, memory, rag, delegate
     agent = _agent_for(chat_id)
+    claude_mind = delegate.mind_is_claude() and delegate.available()
     n, approx = _ctx_metrics(agent)
     st = _last_stats.get(chat_id, {})
     try:
@@ -244,16 +282,20 @@ def _status_text(chat_id):
         last += f" · {st.get('steps', 0)} tool-steps"
     vs = voice.status()
     spoken = "🔊 on" if _voice_on.get(chat_id) else "🔇 off"
+    # Model/voice names can carry Markdown specials (Piper's en_GB-..._male-medium has underscores) —
+    # wrap every dynamic identifier in backticks so legacy-Markdown parsing can't choke on it. An odd
+    # '_' or '*' otherwise makes Telegram reject the WHOLE message with a 400, so /status sends nothing.
+    stt_name = f" (`{vs['stt_model']}`)" if vs.get("stt") and vs.get("stt_model") else ""
+    tts_name = f" (`{vs['tts_voice']}`)" if vs.get("tts") and vs.get("tts_voice") else ""
     lines = [
         "🌊 *Oceano — status*",
-        f"🧠 *model* · `{agent.model}`",
+        ("🧠 *mind* · Claude (your subscription)" if claude_mind else f"🧠 *model* · `{agent.model}`"),
         f"📜 *context* · {n} msgs · {ctx_size}{cap}",
         f"🗜 *compactions* · {_compactions.get(chat_id, 0)} this session",
         f"⚡ *last turn* · {last}",
         f"🛠 *tools* · {len(tools.schemas())} available",
         f"💾 *memory* · {memory.count()} facts · {docs} docs indexed",
-        f"🎙️ *voice* · in {'✓' if vs['stt'] else '✗'} ({vs['stt_model']}) · out {spoken}"
-        + (f" ({vs['tts_voice']})" if vs['tts'] else ""),
+        f"🎙️ *voice* · in {'✓' if vs['stt'] else '✗'}{stt_name} · out {spoken}{tts_name}",
         f"⏱ *session* · {_fmt_age(time.time() - _started_at.get(chat_id, time.time()))}",
     ]
     return "\n".join(lines)
@@ -277,7 +319,7 @@ async def voice_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     on = not _voice_on.get(chat_id, False)
     _voice_on[chat_id] = on
     await update.message.reply_text(
-        (f"🔊 Spoken replies ON — I'll talk back using *{st['tts_voice']}*."
+        (f"🔊 Spoken replies ON — I'll talk back using `{st['tts_voice']}`."
          if on else "🔇 Spoken replies OFF — text only.")
         + ("\n(You can always send me a voice note and I'll transcribe it.)" if st["stt"] else ""),
         parse_mode="Markdown")
@@ -285,7 +327,7 @@ async def voice_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- lifecycle commands ----------------
 _HELP = ("🌊 *Oceano* online — send me a task, or a 🎙️ voice note and I'll transcribe it.\n\n"
-         "🧠 /model — pick the model for this chat\n"
+         "🧠 /model — pick the model (or 🧠 Claude as the mind) for this chat\n"
          "🔊 /voice — toggle spoken replies on/off\n"
          "📊 /status — model, context & live metrics\n"
          "🗜 /compact — summarize & shrink the context\n"

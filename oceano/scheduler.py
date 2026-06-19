@@ -103,6 +103,24 @@ def _next_run(cron, last_run):
         return None
 
 
+def cron_preview(cron, n=5):
+    """Validate a cron string and return its next `n` fire times — powers the task
+    editor's live preview so the user sees *when* a schedule fires before saving.
+    Times are UTC (the same base the scheduler/_next_run use). {valid, runs:[iso…]}
+    or {valid: False, error}."""
+    cron = (cron or "").strip()
+    try:
+        from croniter import croniter
+        if not croniter.is_valid(cron):
+            return {"valid": False, "error": "not a valid cron — format: min hr day mon wkday"}
+        it = croniter(cron, datetime.now(timezone.utc))
+        return {"valid": True, "runs": [it.get_next(datetime).isoformat() for _ in range(max(1, min(int(n), 10)))]}
+    except ImportError:
+        return {"valid": True, "runs": []}            # croniter absent → can't preview, don't block
+    except Exception as e:                            # noqa: BLE001
+        return {"valid": False, "error": str(e)[:160]}
+
+
 def all_tasks():
     con = _db()
     rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source FROM tasks ORDER BY id").fetchall()
