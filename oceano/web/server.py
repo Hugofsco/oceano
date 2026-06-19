@@ -575,12 +575,14 @@ async def services_restart(request: Request):
     if name in ("llamaswap", "llama-swap", "chat-models"):
         # plain systemctl (NOT sudo — sudo would trip NoNewPrivileges); the polkit rule from
         # scripts/install.sh authorizes the daemon's user to manage this one unit.
-        import subprocess
+        import subprocess, sys
 
         def _restart_swap():
             try:
                 r = subprocess.run(["systemctl", "restart", "--no-block", "oceano-llama-swap.service"],
                                    capture_output=True, text=True, timeout=20)
+                print(f"[services] systemctl restart oceano-llama-swap -> rc={r.returncode} "
+                      f"err={(r.stderr or '').strip()!r}", file=sys.stderr, flush=True)
                 if r.returncode == 0:
                     return {"ok": True, "msg": "chat model server restarting…"}
                 err = (r.stderr or r.stdout or "").strip().splitlines()

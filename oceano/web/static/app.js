@@ -1100,7 +1100,7 @@ async function restartService(btn) {
   } catch { r = { ok: false, error: "request failed" }; }
   btn.classList.remove("spin");
   toast(r.ok ? (r.msg || "restarted") : (r.error || "restart failed"), r.ok ? "info" : "err");
-  setTimeout(loadServices, 1400);   // re-poll once it's had a moment to come back
+  setTimeout(loadServices, 1500); setTimeout(loadServices, 5000);   // it's briefly down during a restart — re-poll twice so the status recovers
 }
 
 /* ================= SETTINGS WINDOW ================= */
