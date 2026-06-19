@@ -260,8 +260,13 @@ async def _require_auth(request: Request, call_next):
     webhook = path.startswith("/api/workflows/") and "/webhook/" in path   # gated by its secret token
     mcp = path.startswith("/api/mcp/")                                      # gated by the mindbridge token
     if path.startswith("/api/") and path not in _PUBLIC_API and not webhook and not mcp:
-        if not _current_user(request):
+        auth = load().get("auth", {})
+        if not _token_user(request.cookies.get(SESSION_COOKIE, ""), auth):
             return JSONResponse({"error": "authentication required"}, status_code=401)
+        # While the password is still the shipped default, confine EVERY session to the
+        # change-password call — the API enforces this, not just the UI gate.
+        if _is_default_pw(auth) and path != "/api/account":
+            return JSONResponse({"error": "set a non-default password first"}, status_code=403)
     return await call_next(request)
 
 
@@ -274,8 +279,31 @@ def whoami(request: Request):
     return {"user": user, "must_change": _is_default_pw(load().get("auth", {}))}
 
 
+# Throttle login (password AND 2FA-code) attempts per client IP — a brute force shouldn't be free,
+# especially over a tunnel. Sliding window, in-memory; cleared on a successful login.
+_LOGIN_FAILS = {}
+_LOGIN_MAX, _LOGIN_WINDOW = 8, 300                      # >8 failures in 5 min → cool off
+
+
+def _login_blocked(ip):
+    now = time.monotonic()
+    fails = [t for t in _LOGIN_FAILS.get(ip, ()) if now - t < _LOGIN_WINDOW]
+    if fails:
+        _LOGIN_FAILS[ip] = fails
+    else:
+        _LOGIN_FAILS.pop(ip, None)
+    return len(fails) >= _LOGIN_MAX
+
+
+def _login_fail(ip):
+    _LOGIN_FAILS.setdefault(ip, []).append(time.monotonic())
+
+
 @app.post("/api/login")
 async def login(request: Request, response: Response):
+    ip = request.client.host if request.client else "?"
+    if _login_blocked(ip):
+        raise HTTPException(429, "too many attempts — wait a few minutes and try again")
     body = await request.json()
     data = load()
     auth = data.get("auth", {})
@@ -284,6 +312,7 @@ async def login(request: Request, response: Response):
     ok = (user == auth.get("user")
           and hmac.compare_digest(_hash_pw(pw, auth.get("salt", "")), auth.get("pwhash", "")))
     if not ok:
+        _login_fail(ip)
         raise HTTPException(401, "invalid username or password")
     if auth.get("totp_enabled"):                        # second factor required
         code = (body.get("code") or "").strip()
@@ -292,10 +321,12 @@ async def login(request: Request, response: Response):
         step = _totp_verify(auth.get("totp_secret", ""), code)
         last = auth.get("totp_last_step")
         if step is None or (last is not None and step <= last):
+            _login_fail(ip)
             raise HTTPException(401, "invalid authentication code")
         auth["totp_last_step"] = step                   # replay guard — this step can't be reused
         data["auth"] = auth
         save(data)
+    _LOGIN_FAILS.pop(ip, None)                          # success → clear the counter
     _set_session_cookie(response, user, auth["secret"])
     return {"ok": True, "user": user, "must_change": _is_default_pw(auth)}
 

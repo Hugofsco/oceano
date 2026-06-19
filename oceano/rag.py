@@ -55,6 +55,8 @@ def index_docs(folder, only=None):
     if not base.is_absolute():
         base = config.WORKSPACE / folder
     base = base.resolve()
+    if config.CONFINE_TO_WORKSPACE and not base.is_relative_to(config.WORKSPACE):
+        return f"(refused: {folder!r} is outside the workspace — drop files into the workspace to index them)"
     if not base.exists():
         return f"(no such folder: {folder})"
 
@@ -62,7 +64,10 @@ def index_docs(folder, only=None):
         op = Path(only).expanduser()
         if not op.is_absolute():
             op = config.WORKSPACE / only
-        paths = [op.resolve()]
+        op = op.resolve()
+        if config.CONFINE_TO_WORKSPACE and not op.is_relative_to(config.WORKSPACE):
+            return f"(refused: {only!r} is outside the workspace)"
+        paths = [op]
         prune = False                     # single-file mode never prunes siblings
     else:
         paths = [p for p in base.rglob("*") if p.is_file()]

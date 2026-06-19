@@ -379,11 +379,10 @@ def _http_fetch(url, max_redirects=4):
     is re-checked against the SSRF guard (a fetched page could 302 to an internal
     address). Returns extracted text, or an error string."""
     for _ in range(max_redirects + 1):
-        refusal = safety.check_url(url)
-        if refusal:
-            return refusal
-        try:
-            r = requests.get(url, timeout=25, allow_redirects=False, headers=_HTTP_HEADERS)
+        try:                                    # pins the validated IP per hop — rebind-safe (no resolve-then-reconnect gap)
+            r = safety.guarded_get(url, timeout=25, allow_redirects=False, headers=_HTTP_HEADERS)
+        except safety.Blocked as b:
+            return str(b)
         except requests.RequestException as e:
             return f"(could not fetch {url}: {type(e).__name__})"
         loc = r.headers.get("Location")
@@ -1576,12 +1575,11 @@ def rss(url, limit=10):
     except (TypeError, ValueError):
         limit = 10
     cur = url
-    for _ in range(4):                            # SSRF-guarded fetch (re-check each redirect hop)
-        refusal = safety.check_url(cur)
-        if refusal:
-            return refusal
+    for _ in range(4):                            # SSRF-guarded fetch, IP pinned per hop (rebind-safe)
         try:
-            resp = _rq.get(cur, timeout=20, headers=_HTTP_HEADERS, allow_redirects=False)
+            resp = safety.guarded_get(cur, timeout=20, headers=_HTTP_HEADERS, allow_redirects=False)
+        except safety.Blocked as b:
+            return str(b)
         except _rq.RequestException as e:
             return f"(could not load feed: {type(e).__name__}: {e})"
         loc = resp.headers.get("Location")

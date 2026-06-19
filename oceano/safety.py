@@ -18,6 +18,9 @@ import re
 import socket
 from urllib.parse import urlparse
 
+import requests
+from requests.adapters import HTTPAdapter
+
 SHELL_GUARD = os.environ.get("OCEANO_SHELL_GUARD", "1") == "1"
 URL_GUARD = os.environ.get("OCEANO_URL_GUARD", "1") == "1"
 
@@ -79,6 +82,68 @@ def check_url(url):
             return _refuse(f"{host} -> internal address {ip} (blocked: protects "
                            f"local DBs/LLM/metadata endpoints)")
     return None
+
+
+class Blocked(Exception):
+    """The SSRF guard refused a URL; str(exc) is the human refusal message."""
+
+
+def _safe_ip(host):
+    """Resolve `host` and validate EVERY address; return one safe IP, or raise Blocked."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise Blocked(_refuse(f"cannot resolve host {host!r}"))
+    chosen = None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast):
+            raise Blocked(_refuse(f"{host} -> internal address {ip} (blocked: protects "
+                                  f"local DBs/LLM/metadata endpoints)"))
+        chosen = chosen or info[4][0]
+    if not chosen:
+        raise Blocked(_refuse(f"cannot resolve host {host!r}"))
+    return chosen
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """Pin the socket to a pre-validated IP while keeping the hostname for the Host header and TLS
+    SNI / cert verification — so DNS can't rebind to an internal IP between the check and the connect."""
+    def __init__(self, host, ip, **kw):
+        self._host, self._ip = host, ip
+        super().__init__(**kw)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kw):
+        kw["server_hostname"] = self._host                 # SNI + cert hostname stay the real host
+        kw["assert_hostname"] = self._host
+        super().init_poolmanager(connections, maxsize, block=block, **kw)
+
+    def send(self, request, **kw):
+        p = urlparse(request.url)
+        if (p.hostname or "").lower() == self._host.lower():
+            request.headers["Host"] = p.netloc             # keep the original host[:port]
+            request.url = p._replace(netloc=self._ip + (f":{p.port}" if p.port else "")).geturl()
+        return super().send(request, **kw)
+
+
+def guarded_get(url, **kw):
+    """SSRF-guarded GET that PINS the connection to the validated IP — defeats DNS rebinding (the
+    resolve-then-reconnect TOCTOU that plain `check_url(); requests.get()` leaves open). Returns a
+    requests.Response; raises safety.Blocked if the URL is internal/unresolvable. Guard off
+    (OCEANO_URL_GUARD=0) → a plain requests.get."""
+    if not URL_GUARD:
+        return requests.get(url, **kw)
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise Blocked(_refuse("only http/https URLs with a host are allowed"))
+    ip = _safe_ip(p.hostname)
+    sess = requests.Session()
+    sess.mount(p.scheme + "://", _PinnedAdapter(p.hostname, ip))
+    try:
+        return sess.get(url, **kw)
+    finally:
+        sess.close()
 
 
 def wrap_untrusted(source, content):
