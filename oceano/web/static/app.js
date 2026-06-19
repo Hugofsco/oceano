@@ -760,9 +760,12 @@ async function loadPrefs() {
 }
 async function loadModels() {
   state.models = await api("/api/models");
+  try { const md = await api("/api/mind"); state.claudeAvailable = !!md.claude_available; state.mind = md.mind; }
+  catch { state.claudeAvailable = false; }
   buildModelMenu();
   setStatus(state.models.some(m => m.base_url.includes("8081") && !m.error));
-  if (!state.model) await selectDefaultModel();
+  if (state.mind === "claude" && state.claudeAvailable) { if (state.model !== "claude") selectClaude(false); }
+  else if (!state.model || state.model === "claude") await selectDefaultModel();
 }
 async function selectDefaultModel() {
   const ok = (state.models || []).filter(m => !m.error);
@@ -776,6 +779,14 @@ async function selectDefaultModel() {
 }
 function buildModelMenu() {
   const menu = $("#modelMenu"); menu.innerHTML = "";
+  if (state.claudeAvailable) {                         // Claude Code as the resident mind (your subscription)
+    const g = document.createElement("div"); g.className = "mm-group"; g.textContent = "mind"; menu.appendChild(g);
+    const it = document.createElement("div");
+    it.className = "mm-item mm-claude" + (state.model === "claude" ? " sel" : "");
+    it.innerHTML = `<span class="mp-dot"></span>🧠 Claude <span class="mm-sub">your subscription · Oceano's body</span>`;
+    it.onclick = () => { selectClaude(); $("#modelMenu").classList.remove("open"); };
+    menu.appendChild(it);
+  }
   const groups = {}; state.models.forEach(m => (groups[m.endpoint] ||= []).push(m));
   for (const [ep, list] of Object.entries(groups)) {
     const g = document.createElement("div"); g.className = "mm-group"; g.textContent = ep; menu.appendChild(g);
@@ -791,6 +802,19 @@ function buildModelMenu() {
 function selectModel(m) {
   state.model = m.id; state.baseUrl = m.base_url;
   $("#modelLabel").textContent = m.id; $("#depthReadout").textContent = `${m.endpoint} · ${m.id}`;
+  if (state.mind === "claude") {                       // picking a real model → hand the mind back to local
+    state.mind = "local";
+    api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: "local" }) }).catch(() => {});
+  }
+  buildModelMenu();
+}
+// Claude as the mind: persists mind=claude so the turn routes to Claude Code (Oceano's persona +
+// memory + workspace). state.model="claude" is a sentinel so send() proceeds even with no local model.
+function selectClaude(persist = true) {
+  state.model = "claude"; state.baseUrl = ""; state.mind = "claude";
+  $("#modelLabel").textContent = "🧠 Claude";
+  $("#depthReadout").textContent = "mind · Claude (your subscription)";
+  if (persist) api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: "claude" }) }).catch(() => {});
   buildModelMenu();
 }
 function flashModel() { const p = $("#modelPill"); p.style.borderColor = "var(--coral)"; setTimeout(() => p.style.borderColor = "", 700); $("#modelMenu").classList.add("open"); }

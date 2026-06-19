@@ -283,6 +283,8 @@ body{
 .mm-item:hover{background:rgba(55,227,198,.1);color:var(--foam)}
 .mm-item.sel{color:var(--biolum)}
 .mm-item.err{color:var(--coral);cursor:default;opacity:.7}
+.mm-item.mm-claude{color:var(--biolum)}
+.mm-item .mm-sub{margin-left:auto;font-size:10px;color:var(--faint);font-family:var(--font-body)}
 
 #input{
   width:100%;resize:none;border:none;outline:none;background:none;
