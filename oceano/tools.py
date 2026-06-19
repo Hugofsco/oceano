@@ -741,7 +741,7 @@ def list_tasks():
     return scheduler.list_tasks()
 
 
-def _run_one_workflow(name):
+def _run_one_workflow(name, inp=""):
     from oceano import workflows
     name = str(name or "").strip()
     wf = workflows.get_by_name(name)
@@ -750,7 +750,11 @@ def _run_one_workflow(name):
     if not wf:
         avail = ", ".join(w["name"] for w in workflows.list_all()) or "(none defined)"
         return f"no workflow named {name!r}. Available: {avail}"
-    rec = workflows.run(wf, trigger="agent")
+    decl = wf.get("input") or {}
+    if decl.get("enabled") and decl.get("required") and not (inp or decl.get("default")):
+        return (f"workflow '{wf['name']}' needs an input"
+                + (f" ({decl['label']})" if decl.get("label") else "") + " — call run_workflow again with `input`.")
+    rec = workflows.run(wf, trigger="agent", inp=inp)
     lines = [f"Workflow '{wf['name']}' — {rec['summary']}"]
     for s in rec.get("steps", []):
         mark = "✓" if s["ok"] else "✗"
@@ -764,21 +768,26 @@ def _run_one_workflow(name):
         "name": "run_workflow",
         "description": "Run one of the user's saved workflows (a named, multi-step recipe) "
                        "right now, by name or id. Use this when the user asks to run a workflow, "
-                       "or when a task matches a workflow they've defined. You can RUN workflows "
-                       "but not create them — the user authors workflows in the UI. To see what "
-                       "exists, call list_workflows first. Run several in sequence by passing a "
-                       "comma-separated list.",
+                       "or when a task matches a workflow they've defined. Some workflows take an "
+                       "INPUT value (a workflow that processes whatever you pass it) — call "
+                       "list_workflows to see which, and pass the value as `input`. You can RUN "
+                       "workflows but not create them — the user authors workflows in the UI. Run "
+                       "several in sequence by passing a comma-separated list of names (the same "
+                       "input, if any, is given to each).",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "a workflow name or numeric id, or several comma-separated"},
+            "input": {"type": "string", "description": "the input value to feed the workflow, if it takes one"},
         }, "required": ["name"]},
     },
 })
-def run_workflow(name):
-    """Run one workflow, or several in sequence: pass a comma-separated list of names."""
+def run_workflow(name, input=""):
+    """Run one workflow, or several in sequence: pass a comma-separated list of names. `input`
+    is the workflow's argument (used by workflows that declare they take one)."""
+    inp = str(input or "")
     names = [n.strip() for n in str(name or "").split(",") if n.strip()]
     if len(names) > 1:
-        return "\n\n".join(_run_one_workflow(n) for n in names)
-    return _run_one_workflow(names[0] if names else str(name or ""))
+        return "\n\n".join(_run_one_workflow(n, inp) for n in names)
+    return _run_one_workflow(names[0] if names else str(name or ""), inp)
 
 
 @tool({
@@ -797,7 +806,13 @@ def list_workflows():
         return "(no workflows defined yet — the user can create them in the Workflows window)"
     def _nodes(w):
         return len([n for n in w.get("graph", {}).get("nodes", []) if n.get("type") not in ("start", "end")])
-    return "\n".join(f"- {w['name']} ({_nodes(w)} nodes)"
+    def _inp(w):
+        d = w.get("input") or {}
+        if not d.get("enabled"):
+            return ""
+        lab = d.get("label") or "a value"
+        return f" · takes input: {lab}" + ("" if d.get("required") else " (optional)")
+    return "\n".join(f"- {w['name']} ({_nodes(w)} nodes){_inp(w)}"
                      + (f": {w['description']}" if w.get("description") else "") for w in wfs)
 
 

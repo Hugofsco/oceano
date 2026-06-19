@@ -198,12 +198,16 @@ def _worker():
         def coalesce(batch):
             """Merge bursts of fire-and-forget input that queued up faster than
             Chromium executes them: consecutive scrolls sum their deltas, consecutive
-            type commands concatenate. Commands awaiting a response never merge."""
+            type commands concatenate, and consecutive mousemoves collapse to the newest
+            position (only where the pointer ended up matters). Commands awaiting a
+            response never merge."""
             out = []
             for cmd, arg, resp in batch:
-                if (out and resp is None and out[-1][2] is None
-                        and cmd == out[-1][0] and cmd in ("scroll", "type")):
+                mergeable = out and resp is None and out[-1][2] is None and cmd == out[-1][0]
+                if mergeable and cmd in ("scroll", "type"):
                     out[-1] = (cmd, out[-1][1] + arg, None)
+                elif mergeable and cmd == "mousemove":
+                    out[-1] = (cmd, arg, None)
                 else:
                     out.append((cmd, arg, resp))
             return out
@@ -261,6 +265,22 @@ def _worker():
                                     tabs.pop(idx); clamp_active(); break
                     elif cmd == "click":
                         cur().mouse.click(arg[0], arg[1]); cur().wait_for_timeout(300)
+                    elif cmd == "mousedown":           # press-hold-release, streamed live — lets the
+                        cur().mouse.move(arg[0], arg[1]); cur().mouse.down()   # user drag sliders /
+                    elif cmd == "mousemove":           # solve drag-to-verify captchas by hand. The
+                        cur().mouse.move(arg[0], arg[1])                       # path is the user's OWN
+                    elif cmd == "mouseup":             # mouse, so it reads as human movement.
+                        if arg:
+                            cur().mouse.move(arg[0], arg[1])
+                        cur().mouse.up(); cur().wait_for_timeout(150)
+                    elif cmd == "drag":                # whole gesture in one call: a path of [x,y] points
+                        pts = [p for p in (arg or []) if isinstance(p, (list, tuple)) and len(p) >= 2]
+                        if len(pts) >= 2:
+                            c = cur()
+                            c.mouse.move(pts[0][0], pts[0][1]); c.mouse.down()
+                            for (x, y) in pts[1:]:
+                                c.mouse.move(x, y); c.wait_for_timeout(16)
+                            c.mouse.up(); c.wait_for_timeout(250)
                     elif cmd == "click_text":
                         try:
                             cur().click(f"text={arg}", timeout=5000)

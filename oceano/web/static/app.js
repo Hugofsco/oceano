@@ -456,29 +456,72 @@ let _converse = null;
 function cvStatus(t) { const e = $("#converseStatus"); if (e) e.textContent = t; }
 
 function makeVoiceSpeaker(onPlay) {
-  // accumulate the FULL answer, then speak it as ONE clip — smooth & continuous, no per-phrase gaps
-  let buf = "", dead = false, done;
-  const drained = new Promise(r => done = r);
+  // Speak as it streams: harvest COMPLETE sentences from the token stream, synthesize them AHEAD of
+  // playback, and play them back-to-back through one <audio> + a queue. So speech starts ~1–2s in
+  // and flows continuously — instead of waiting for the whole reply (sluggish) and overflowing the
+  // TTS char cap. Each chunk is a sentence, so nothing is ever truncated.
+  let pending = "", dead = false, sealed = false;
+  let synthChain = Promise.resolve();        // serialize TTS calls so audio stays in order
+  const audioQ = [];                         // ready object-URLs awaiting playback
+  let wake = null;                           // resolver that wakes the player when audio/seal arrives
+  const bump = () => { if (wake) { wake(); wake = null; } };
   const audio = new Audio();
-  return {
-    push(t) { buf += t; },                 // just collect; nothing is synthesized until end()
-    async end() {
-      const text = buf.trim();
-      if (dead || !text) { done(); return; }
+  let playResolve = null;                    // resolver for the in-flight clip (so stop() can cut it)
+  let doneResolve; const drained = new Promise(r => doneResolve = r);
+
+  function synth(text) {                      // queue one sentence for synthesis (serialized)
+    synthChain = synthChain.then(async () => {
+      if (dead || !text) return;
       try {
         const r = await fetch("/api/voice/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-        if (r.ok && !dead) {
-          if (onPlay) onPlay();
-          const url = URL.createObjectURL(await r.blob());
-          audio.src = url;
-          await audio.play().catch(() => {});
-          await new Promise(res => { audio.onended = res; audio.onerror = res; });
-          URL.revokeObjectURL(url);
-        }
+        if (r.ok && !dead) { audioQ.push(URL.createObjectURL(await r.blob())); bump(); }
       } catch {}
-      done();
+    });
+  }
+  let pauseTimer = null;
+  function harvest(mode) {                     // mode: "stream" (needs trailing space) | "pause" (also end-of-buffer) | "force" (everything)
+    if (dead) { pending = ""; return; }
+    if (mode === "force") { const t = pending.trim(); pending = ""; if (t) synth(t); return; }
+    // In "pause" mode a terminator at the END of the buffer counts too — the stream went quiet (e.g. a
+    // tool call), so a buffered sentence with no trailing space (common at a burst boundary) is complete.
+    const re = mode === "pause" ? /[.!?…]["')\]]?(\s|$)|\n/g : /[.!?…]["')\]]?\s|\n/g;
+    let cut = -1, mm; while ((mm = re.exec(pending))) cut = mm.index + mm[0].length;
+    if (cut > 0) { const c = pending.slice(0, cut).trim(); pending = pending.slice(cut); if (c) synth(c); }
+    else if (mode === "stream" && pending.length > 350) {    // a run-on with no terminator → flush at a space so we start
+      let sp = pending.lastIndexOf(" ", 350); if (sp < 80) sp = 350;
+      const c = pending.slice(0, sp).trim(); pending = pending.slice(sp); if (c) synth(c);
+    }
+  }
+  const armPause = () => {                      // when tokens stop arriving, speak whatever sentence is complete
+    if (pauseTimer) clearTimeout(pauseTimer);
+    pauseTimer = setTimeout(() => { pauseTimer = null; harvest("pause"); }, 300);
+  };
+  async function player() {
+    while (!dead) {
+      if (!audioQ.length) { await new Promise(res => wake = res); continue; }   // wait for audio or the end-sentinel
+      const url = audioQ.shift();
+      if (url === "__END__") break;                  // every clip played → done
+      if (!url) continue;
+      if (onPlay) onPlay();
+      audio.src = url;
+      try { await audio.play(); await new Promise(res => { playResolve = res; audio.onended = res; audio.onerror = res; }); } catch {}
+      playResolve = null;
+      try { URL.revokeObjectURL(url); } catch {}
+    }
+    audioQ.splice(0).forEach(u => { if (u !== "__END__") { try { URL.revokeObjectURL(u); } catch {} } });   // free leftovers if cut short
+    doneResolve();
+  }
+  player();
+  return {
+    push(t) { if (dead) return; pending += t; harvest("stream"); armPause(); },
+    async end() {                                    // flush the tail, let all synths finish, then seal the queue
+      if (pauseTimer) { clearTimeout(pauseTimer); pauseTimer = null; }
+      harvest("force"); sealed = true;
+      try { await synthChain; } catch {}
+      audioQ.push("__END__"); bump();
+      await drained;
     },
-    stop() { dead = true; try { audio.pause(); } catch {} done(); },
+    stop() { dead = true; sealed = true; if (pauseTimer) { clearTimeout(pauseTimer); pauseTimer = null; } try { audio.pause(); } catch {} if (playResolve) { playResolve(); playResolve = null; } bump(); },
     drained,
   };
 }
@@ -1981,15 +2024,50 @@ function openLiveView() {
   body.innerHTML = `
     <div class="live-addr"><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button></div>
     <div class="live-tabs" id="liveTabs" style="display:none"></div>
-    <div class="live-url" id="liveUrl">idle — type a URL, click into the page, or let the agent browse</div>
-    <div class="live-stage" id="liveStage" tabindex="0"><span class="live-wait" id="liveWait">No frames yet. Enter a URL above, click into the page, or ask the agent to browse.</span><img id="liveImg" alt="live" draggable="false" style="display:none"></div>`;
+    <div class="live-url" id="liveUrl">idle — type a URL, click or drag in the page, or let the agent browse</div>
+    <div class="live-stage" id="liveStage" tabindex="0"><span class="live-wait" id="liveWait">No frames yet. Enter a URL above, click/drag into the page (drag works — solve slider captchas by hand), or ask the agent to browse.</span><img id="liveImg" alt="live" draggable="false" style="display:none"></div>`;
   const post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
   const go = () => { const url = $("#liveInput", body).value.trim(); if (!url) return; $("#liveUrl", body).textContent = "loading " + url + " …"; post("/api/browser/go", { url }); };
   $("#liveGo", body).onclick = go;
   $("#liveInput", body).addEventListener("keydown", e => { if (e.key === "Enter") { e.stopPropagation(); go(); } });
 
   const img = $("#liveImg", body), stage = $("#liveStage", body);
-  img.addEventListener("click", e => { const pt = _mapToPage(img, e.clientX, e.clientY); if (pt) post("/api/browser/click", pt); stage.focus(); });
+  // Pointer-driven click AND drag. A press that doesn't move is a click; once the pointer moves
+  // past a small threshold it becomes a real press→move→release drag (streamed live), so you can
+  // drag sliders and solve drag-to-verify captchas / bot checks by hand. mousedown is sent lazily
+  // (only once movement starts) so a normal click stays a click.
+  let _drag = null, _mvPt = null, _mvTimer = null;
+  const flushMove = () => { _mvTimer = null; if (_mvPt) { post("/api/browser/mousemove", _mvPt); _mvPt = null; } };
+  const queueMove = pt => { _mvPt = pt; if (!_mvTimer) _mvTimer = setTimeout(flushMove, 45); };  // throttle (trackpads fire fast)
+  img.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    const pt = _mapToPage(img, e.clientX, e.clientY); if (!pt) return;
+    _drag = { start: pt, last: pt, started: false };
+    try { img.setPointerCapture(e.pointerId); } catch {}
+    stage.focus(); e.preventDefault();
+  });
+  img.addEventListener("pointermove", e => {
+    if (!_drag) return;
+    const pt = _mapToPage(img, e.clientX, e.clientY); if (!pt) return;
+    _drag.last = pt;
+    if (!_drag.started) {
+      if (Math.abs(pt.x - _drag.start.x) + Math.abs(pt.y - _drag.start.y) < 5) return;   // still a click
+      _drag.started = true;
+      post("/api/browser/mousedown", _drag.start);    // begin the press where the user first pressed
+    }
+    queueMove(pt);
+  });
+  const endDrag = (e, cancel) => {
+    if (!_drag) return;
+    if (_mvTimer) { clearTimeout(_mvTimer); _mvTimer = null; } _mvPt = null;
+    const pt = (e && _mapToPage(img, e.clientX, e.clientY)) || _drag.last;
+    if (_drag.started) post("/api/browser/mouseup", pt);
+    else if (!cancel) post("/api/browser/click", _drag.start);   // no real movement → a click
+    try { if (e) img.releasePointerCapture(e.pointerId); } catch {}
+    _drag = null;
+  };
+  img.addEventListener("pointerup", e => endDrag(e, false));
+  img.addEventListener("pointercancel", e => endDrag(e, true));
   // throttle the wheel: trackpads fire dozens of events/sec — accumulate the delta
   // and post at most every 80ms, so the server isn't flooded with tiny scrolls
   let _wheelAcc = 0, _wheelTimer = null;
@@ -4400,10 +4478,12 @@ async function wfRenderList(body) {
     const acts = nodes.filter(n => n.type !== "start" && n.type !== "end");
     const hasDec = nodes.some(n => n.type === "decision");
     const sched = w.schedule ? `<span class="wf-sched" title="scheduled">⏱ ${escapeHtml(w.schedule.cron)}${w.schedule.enabled ? "" : " · off"}</span>` : "";
+    const inpBadge = (w.input && w.input.enabled)
+      ? `<span class="wf-inp-badge" title="takes an input${w.input.label ? ": " + escapeHtml(w.input.label) : ""}">⌨ input</span>` : "";
     const el = document.createElement("div"); el.className = "wf-card"; el.dataset.wid = w.id;
     el.innerHTML = `
       <div class="wf-card-main">
-        <div class="wf-card-name">${escapeHtml(w.name)} ${sched}</div>
+        <div class="wf-card-name">${escapeHtml(w.name)} ${sched}${inpBadge}</div>
         ${w.description ? `<div class="wf-card-desc">${escapeHtml(w.description)}</div>` : ""}
         <div class="wf-card-meta">${acts.length} node${acts.length === 1 ? "" : "s"}${hasDec ? " · ◆ branching" : ""}</div>
       </div>
@@ -4497,12 +4577,21 @@ async function wfTriggers(body, w) {
 async function wfRenderEditor(body, w) {
   await wfLoadTools();
   _wfEnumCache = {}; _wfFilesCache = null;        // refresh skill/workflow/file pickers each time the editor opens
+  const inp = (w && w.input) || { enabled: false, label: "", placeholder: "", required: false, default: "" };
   body.innerHTML = `
     <div class="wf-head"><button class="ed-btn" id="wfBack">←</button>
       <input id="wfName" class="wf-name-in" placeholder="workflow name" value="${w ? escapeHtml(w.name) : ""}">
       <input id="wfDesc" class="wf-desc-in" placeholder="description (optional)" value="${w ? escapeHtml(w.description || "") : ""}">
       <span class="fe-spacer"></span>
       <button class="primary sm" id="wfSave">${w ? "Save" : "Create"}</button></div>
+    <div class="wf-input-cfg" id="wfInputCfg">
+      <label class="wf-ic-en"><input type="checkbox" id="wfInpEn"${inp.enabled ? " checked" : ""}> Takes an input</label>
+      <input id="wfInpLabel" class="wfn-fld wf-ic-f" placeholder="label · e.g. “URL to summarize”" value="${escapeHtml(inp.label || "")}">
+      <input id="wfInpPh" class="wfn-fld wf-ic-f" placeholder="example value (optional)" value="${escapeHtml(inp.placeholder || "")}">
+      <label class="wf-ic-req"><input type="checkbox" id="wfInpReq"${inp.required ? " checked" : ""}> required</label>
+      <input id="wfInpDef" class="wfn-fld wf-ic-f" placeholder="default for scheduled/auto runs" value="${escapeHtml(inp.default || "")}">
+      <span class="wf-ic-hint">reference it as <code>{{input}}</code> in any node's text or args</span>
+    </div>
     <div class="wf-palette">
       <span class="wf-pal-lbl">add:</span>
       <button class="ed-btn" data-add="tool">🔧 Tool</button>
@@ -4516,6 +4605,12 @@ async function wfRenderEditor(body, w) {
     </div>
     <div class="wf-canvas" id="wfCanvas"></div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
+  const syncInpCfg = () => {                          // grey out the detail fields when input is off
+    const on = $("#wfInpEn", body).checked;
+    $("#wfInputCfg", body).classList.toggle("off", !on);
+    $$(".wf-ic-f, #wfInpReq", body).forEach(f => { f.disabled = !on; });
+  };
+  $("#wfInpEn", body).onchange = syncInpCfg; syncInpCfg();
   const editor = new Drawflow($("#wfCanvas", body));
   editor.reroute = true;
   editor.start();
@@ -4550,7 +4645,10 @@ async function wfRenderEditor(body, w) {
     const name = $("#wfName").value.trim(); if (!name) { toast("name is required", "err"); return; }
     const { graph, error } = wfReadCanvas(editor);
     if (error) { toast(error, "err"); return; }
-    const payload = { name, description: $("#wfDesc").value.trim(), graph };
+    const input = { enabled: $("#wfInpEn", body).checked, label: $("#wfInpLabel", body).value.trim(),
+      placeholder: $("#wfInpPh", body).value.trim(), required: $("#wfInpReq", body).checked,
+      default: $("#wfInpDef", body).value.trim() };
+    const payload = { name, description: $("#wfDesc").value.trim(), graph, input };
     if (w) await fetch("/api/workflows/" + w.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     else await _postJ("/api/workflows", payload);
     wfRenderList(body);
@@ -4578,8 +4676,22 @@ function wfReadCanvas(editor) {
   return { graph: { nodes, edges }, error };
 }
 async function wfRenderRun(body, w) {
+  // Reconnect to an already-running run (after a refresh) rather than starting a new one — check
+  // BEFORE prompting, so we don't ask for an input we won't use.
+  let liveState = null;
+  try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id); } catch {}
+  // A fresh run of an input-taking workflow: ask for the value first.
+  let inp = "";
+  if (!liveState && w.input && w.input.enabled) {
+    const v = await promptDialog("Run · " + w.name, { value: w.input.default || "",
+      placeholder: w.input.placeholder || "", message: w.input.label || "Input for this workflow", okLabel: "▶ Run" });
+    if (v === null) return wfRenderList(body);                       // cancelled
+    if (w.input.required && !v.trim()) { toast((w.input.label || "input") + " is required", "err"); return wfRenderList(body); }
+    inp = v;
+  }
   body.innerHTML = `
     <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
+    ${inp ? `<div class="wf-run-input" title="this run's input">⌨ ${escapeHtml(inp.length > 160 ? inp.slice(0, 160) + "…" : inp)}</div>` : ""}
     <div class="wf-run-steps" id="wfRunSteps"></div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
   const host = $("#wfRunSteps", body), status = $("#wfRunStatus", body), rows = {};
@@ -4588,12 +4700,10 @@ async function wfRenderRun(body, w) {
     r.innerHTML = `<div class="wf-rs-h"><span class="wf-rs-ic">◌</span><span class="wf-rs-label">${escapeHtml(label || "")}</span><span class="wf-rs-branch"></span></div><div class="wf-rs-tools"></div><div class="wf-rs-out"></div>`;
     host.appendChild(r); host.scrollTop = host.scrollHeight; rows[id] = r; return r;
   };
-  // Reconnect to an already-running run (e.g. after a browser refresh) rather than starting a new one.
-  let liveState = null;
-  try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id); } catch {}
   if (liveState) return wfReconnectRun(body, w, host, status, rows, addRow, liveState);
   try {
-    const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST" });
+    const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input: inp }) });
     const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = "";
     while (true) {
       const { value, done } = await reader.read(); if (done) break;

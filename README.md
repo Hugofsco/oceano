@@ -199,7 +199,18 @@ is a directed graph; execution walks it from a **start** node, following edges:
 - **start / end**
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
-runaway loops. **Triggers** (the ⚡ panel) decide *when* a workflow fires: manually (▶ Run),
+runaway loops.
+
+**Inputs (a workflow as a reusable skeleton).** A workflow can declare it takes **one input
+value** (Editor → *Takes an input*). Reference it as `{{input}}` anywhere — a node's
+instruction text, a delegate prompt, or a tool's arguments — and it's also seeded into the
+agent's context. The same graph then processes a different value each run: ▶ Run prompts for
+it, the agent can pass it via `run_workflow(name, input=…)`, a **webhook** body carries it
+(`{"input": …}` or raw text), a **chat keyword** hands the whole message in, and a **chain**
+passes the upstream workflow's output down as the next one's input. A stored **default** feeds
+unattended (scheduled) runs.
+
+**Triggers** (the ⚡ panel) decide *when* a workflow fires: manually (▶ Run),
 on a **cron** (managed in the Scheduler), or on an **event** — a watched workspace folder
 changing, an incoming **webhook** (a secret-token URL), a **chat keyword** (web / Telegram),
 or **another workflow finishing** (chaining, loop-guarded). Every run is recorded (live,

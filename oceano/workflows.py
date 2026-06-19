@@ -73,6 +73,7 @@ def _next_id(items):
 def _migrate(wf):
     """An older linear workflow ({steps:[...]}) -> a straight-line graph, so nothing breaks."""
     wf.setdefault("triggers", [])
+    wf["input"] = _norm_input(wf.get("input"))      # every workflow carries an input declaration
     if "graph" in wf and isinstance(wf["graph"], dict):
         return wf
     steps = wf.pop("steps", []) or []
@@ -133,6 +134,37 @@ def _norm_graph(graph):
     return {"nodes": nodes, "edges": edges}
 
 
+# ---------------- input / arguments (a workflow as a reusable "skeleton") ----------------
+# A workflow may declare it takes ONE input value. At run time that value is substituted into any
+# node text/args via the {{input}} placeholder AND seeded into the shared Agent's context, so the
+# same graph can process different values each run. The `default` is used when a run is triggered
+# with no explicit value (e.g. a scheduled run).
+_DEFAULT_INPUT = {"enabled": False, "label": "", "placeholder": "", "required": False, "default": ""}
+_INPUT_RE = re.compile(r"\{\{\s*input\s*\}\}", re.IGNORECASE)
+
+
+def _norm_input(d):
+    if not isinstance(d, dict):
+        return dict(_DEFAULT_INPUT)
+    return {"enabled": bool(d.get("enabled")),
+            "label": str(d.get("label", ""))[:80],
+            "placeholder": str(d.get("placeholder", ""))[:160],
+            "required": bool(d.get("required")),
+            "default": str(d.get("default", ""))[:4000]}
+
+
+def _fill(value, inp):
+    """Substitute {{input}} with the run's input value, recursively through tool-arg
+    dicts/lists. A lambda replacement avoids treating regex backrefs in `inp` specially."""
+    if isinstance(value, str):
+        return _INPUT_RE.sub(lambda _m: inp, value)
+    if isinstance(value, dict):
+        return {k: _fill(v, inp) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_fill(v, inp) for v in value]
+    return value
+
+
 # ---------------- CRUD ----------------
 def list_all():
     return _load()["workflows"]
@@ -147,17 +179,17 @@ def get_by_name(name):
     return next((w for w in _load()["workflows"] if w["name"].strip().lower() == name), None)
 
 
-def create(name, description="", graph=None):
+def create(name, description="", graph=None, input_cfg=None):
     data = _load()
     wf = {"id": _next_id(data["workflows"]), "name": (name or "Untitled").strip(),
           "description": (description or "").strip(), "graph": _norm_graph(graph or {}),
-          "triggers": [], "created": _now()}
+          "input": _norm_input(input_cfg), "triggers": [], "created": _now()}
     data["workflows"].append(wf)
     _save(data)
     return wf
 
 
-def update(wid, name=None, description=None, graph=None):
+def update(wid, name=None, description=None, graph=None, input_cfg=None):
     data = _load()
     wf = next((w for w in data["workflows"] if w["id"] == wid), None)
     if not wf:
@@ -168,6 +200,8 @@ def update(wid, name=None, description=None, graph=None):
         wf["description"] = description.strip()
     if graph is not None:
         wf["graph"] = _norm_graph(graph)
+    if input_cfg is not None:
+        wf["input"] = _norm_input(input_cfg)
     _save(data)
     if name is not None:
         t = _task_for(wid)
@@ -295,9 +329,9 @@ def set_triggers(wid, items):
     return wf["triggers"]
 
 
-def run_async(wf, trigger="trigger", chain_seen=frozenset()):
+def run_async(wf, trigger="trigger", chain_seen=frozenset(), inp=""):
     """Fire-and-forget a run in a daemon thread (used by every event trigger)."""
-    threading.Thread(target=lambda: run(wf, trigger=trigger, _chain_seen=chain_seen), daemon=True).start()
+    threading.Thread(target=lambda: run(wf, trigger=trigger, _chain_seen=chain_seen, inp=inp), daemon=True).start()
 
 
 def _folder_sig(folder):
@@ -337,8 +371,11 @@ def poll_watch_triggers():
 
 
 def fire_keyword(message, channel="web"):
-    """Run workflows whose keyword trigger matches a chat message. Returns the names fired."""
-    msg = (message or "").strip().lower()
+    """Run workflows whose keyword trigger matches a chat message. The full message becomes the
+    run's input (so a keyword-triggered workflow can process what the user actually said).
+    Returns the names fired."""
+    raw = (message or "").strip()
+    msg = raw.lower()
     fired = []
     if not msg:
         return fired
@@ -348,31 +385,34 @@ def fire_keyword(message, channel="web"):
                 continue
             pat = (tr.get("pattern") or "").strip().lower()
             if pat and pat in msg:
-                run_async(wf, trigger="keyword"); fired.append(wf["name"]); break
+                run_async(wf, trigger="keyword", inp=raw); fired.append(wf["name"]); break
     return fired
 
 
-def fire_chain(after_wid, status, seen=frozenset()):
-    """When a workflow finishes, run any workflow chained after it (loop-guarded by `seen`)."""
+def fire_chain(after_wid, status, seen=frozenset(), out=""):
+    """When a workflow finishes, run any workflow chained after it (loop-guarded by `seen`).
+    The upstream workflow's final output is handed to the next as its input — so data flows
+    down a chain."""
     for wf in list_all():
         if wf["id"] in seen:
             continue
         for tr in wf.get("triggers", []):
             if (tr.get("type") == "chain" and tr.get("enabled") and tr.get("after") == after_wid
                     and (tr.get("on") == "any" or status == "ok")):
-                run_async(wf, trigger="chain", chain_seen=seen)
+                run_async(wf, trigger="chain", chain_seen=seen, inp=out)
                 break
 
 
-def webhook_run(wid, token):
-    """Run a workflow if `token` matches one of its enabled webhook triggers."""
+def webhook_run(wid, token, inp=""):
+    """Run a workflow if `token` matches one of its enabled webhook triggers. The POST body may
+    carry an input value (see the web endpoint) that the workflow processes."""
     wf = get(wid)
     if not wf:
         return None
     for tr in wf.get("triggers", []):
         if (tr.get("type") == "webhook" and tr.get("enabled")
                 and secrets.compare_digest(str(tr.get("token", "")), str(token))):
-            run_async(wf, trigger="webhook")
+            run_async(wf, trigger="webhook", inp=inp)
             return wf
     return None
 
@@ -466,11 +506,18 @@ def _compact_event(kind, data):
     return ""
 
 
-def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
+def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None):
     """Walk the workflow graph from its start node, executing nodes and branching at
-    decision nodes. Shares one Agent so context accumulates. Returns the run record."""
+    decision nodes. Shares one Agent so context accumulates. Returns the run record.
+
+    `inp` is this run's input value: nodes can reference it via {{input}} (text/args), and it's
+    seeded into the agent's context. An empty/None `inp` falls back to the workflow's stored
+    default (so scheduled/unattended runs still get a value)."""
     from oceano.agent import Agent
     wf_id = wf["id"]
+    inp = "" if inp is None else str(inp)
+    if not inp:                                        # no explicit value → the workflow's default
+        inp = str((wf.get("input") or {}).get("default") or "")
 
     def emit(ev):
         e = ev.get("event")
@@ -506,6 +553,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                      graph["nodes"][0] if graph.get("nodes") else None)
 
     ag = Agent(learn=False, exclude_tools={"run_workflow"})
+    if inp:                                            # make the input visible to instruction nodes
+        ag.messages.append({"role": "user", "content": f"(workflow input)\n{inp}"})
     results, last_output, visits = [], "", 0
     cur = start
     with _LIVE_LOCK:
@@ -528,7 +577,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                     if t == "start":
                         output = ""
                     elif t == "tool":
-                        name, args = cur.get("tool", ""), cur.get("args", {})
+                        name, args = cur.get("tool", ""), _fill(cur.get("args", {}), inp)
                         if not tools.is_enabled(name):
                             ok, output = False, f"tool '{name}' is disabled or unknown"
                         else:
@@ -540,19 +589,21 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                         ag.on_event = lambda kind, d, _i=cur["id"]: (
                             emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
                             if kind in ("tool_call", "tool_result") else None)
-                        output = ag.run(cur.get("text", "")) or ""
+                        output = ag.run(_fill(cur.get("text", ""), inp)) or ""
                         ag.on_event = lambda kind, d: None
                         last_output = output
                     elif t == "delegate":
                         from oceano import delegate
-                        r = delegate.run(cur.get("text", ""), cwd=config.WORKSPACE,
+                        r = delegate.run(_fill(cur.get("text", ""), inp), cwd=config.WORKSPACE,
                                          tools="Read,Glob,Grep", timeout=600, role=cur.get("role", "default"))
                         ok = bool(r.get("ok"))
                         output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
                         last_output = output
                         ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
                     elif t == "decision":
-                        verdict, detail = _decide(cur, last_output, ag)
+                        fnode = {**cur, "question": _fill(cur.get("question", ""), inp),
+                                 "ruleValue": _fill(cur.get("ruleValue", ""), inp)}
+                        verdict, detail = _decide(fnode, last_output, ag)
                         branch = "yes" if verdict else "no"
                         output = detail
                 except Exception as ex:
@@ -573,7 +624,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
             summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
             rec = _record_run(wf["id"], trigger, status, results, summary)
             emit({"event": "done", "status": status, "run": rec})
-            fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id})   # chain-trigger any followers
+            # chain-trigger any followers, handing them this run's final output as their input
+            fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id}, out=last_output)
             jobs.set_result(_jid, summary)                # surface the workflow outcome in the activity log
             return rec
     finally:
@@ -583,8 +635,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset()):
                 st.update(status="error", current=None, finished=time.time(), summary="(ended unexpectedly)")
 
 
-def run_by_id(wid, trigger="manual", on_step=None):
+def run_by_id(wid, trigger="manual", on_step=None, inp=None):
     wf = get(wid)
     if not wf:
         return {"status": "error", "summary": f"no workflow #{wid}"}
-    return run(wf, trigger=trigger, on_step=on_step)
+    return run(wf, trigger=trigger, on_step=on_step, inp=inp)

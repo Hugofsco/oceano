@@ -1728,11 +1728,23 @@ async def workflows_triggers_set(wid: int, req: Request):
 
 
 @app.post("/api/workflows/{wid}/webhook/{token}")
-async def workflows_webhook(wid: int, token: str):
+async def workflows_webhook(wid: int, token: str, req: Request):
     """Fire a workflow from an external POST. Auth-exempt — the secret token IS the auth.
-    The server is localhost-bound by default; only reachable remotely if you tunnel it."""
+    The server is localhost-bound by default; only reachable remotely if you tunnel it.
+    An optional input value (the workflow's argument) is read from the body: JSON {"input": …}
+    or the raw request body as text."""
     from oceano import workflows
-    wf = workflows.webhook_run(wid, token)
+    inp = ""
+    try:
+        raw = await req.body()
+        if raw:
+            try:
+                inp = str((json.loads(raw) or {}).get("input", "") or "")
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                inp = raw.decode("utf-8", "replace")[:4000]
+    except Exception:
+        inp = ""
+    wf = workflows.webhook_run(wid, token, inp=inp)
     if not wf:
         raise HTTPException(404, "no matching/enabled webhook trigger")
     return JSONResponse({"ok": True, "started": wf["name"]}, status_code=202)
@@ -1743,14 +1755,16 @@ async def workflows_create(req: Request):
     from oceano import workflows
     b = await req.json()
     return {"ok": True, "workflow": workflows.create(b.get("name", "Untitled"),
-                                                      b.get("description", ""), b.get("graph"))}
+                                                      b.get("description", ""), b.get("graph"),
+                                                      input_cfg=b.get("input"))}
 
 
 @app.patch("/api/workflows/{wid}")
 async def workflows_update(wid: int, req: Request):
     from oceano import workflows
     b = await req.json()
-    wf = workflows.update(wid, name=b.get("name"), description=b.get("description"), graph=b.get("graph"))
+    wf = workflows.update(wid, name=b.get("name"), description=b.get("description"),
+                          graph=b.get("graph"), input_cfg=b.get("input"))
     return {"ok": wf is not None, "workflow": wf}
 
 
@@ -1774,21 +1788,28 @@ def workflows_runs(wid: int):
 
 
 @app.post("/api/workflows/{wid}/run")
-async def workflows_run(wid: int):
+async def workflows_run(wid: int, req: Request):
     """Run a workflow now, streaming step-by-step progress as SSE. The engine runs in a
     worker thread (it blocks on the local model + tools); events feed through a queue so
-    the response can keep-alive during quiet steps — same shape as /api/chat."""
+    the response can keep-alive during quiet steps — same shape as /api/chat.
+    An optional JSON body {"input": …} supplies the workflow's argument."""
     from oceano import workflows
     wf = workflows.get(wid)
     if not wf:
         raise HTTPException(404, "no such workflow")
+    inp = ""
+    try:
+        b = await req.json()
+        inp = str((b or {}).get("input", "") or "")
+    except Exception:
+        inp = ""
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
     put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)
 
     def worker():
         try:
-            workflows.run(wf, trigger="manual", on_step=put)
+            workflows.run(wf, trigger="manual", on_step=put, inp=inp)
         except Exception as ex:
             traceback.print_exc()
             put({"event": "error", "message": f"{type(ex).__name__}: {ex}"})
@@ -2274,6 +2295,50 @@ async def browser_click_ep(req: Request):
 async def browser_scroll_ep(req: Request):
     livebrowser.submit("scroll", (await req.json()).get("dy", 300))
     return {"ok": True}
+
+
+# Live drag: press → move → release, streamed as the user drags, so they can solve slider /
+# drag-to-verify captchas and bot checks by hand (the movement IS their real mouse path).
+@app.post("/api/browser/mousedown")
+async def browser_mousedown_ep(req: Request):
+    b = await req.json()
+    try:
+        livebrowser.submit("mousedown", (int(b["x"]), int(b["y"])))
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "x,y required"}
+    return {"ok": True}
+
+
+@app.post("/api/browser/mousemove")
+async def browser_mousemove_ep(req: Request):
+    b = await req.json()
+    try:
+        livebrowser.submit("mousemove", (int(b["x"]), int(b["y"])))
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "x,y required"}
+    return {"ok": True}
+
+
+@app.post("/api/browser/mouseup")
+async def browser_mouseup_ep(req: Request):
+    b = await req.json()
+    try:
+        arg = (int(b["x"]), int(b["y"])) if ("x" in b and "y" in b) else None
+    except (TypeError, ValueError):
+        arg = None
+    livebrowser.submit("mouseup", arg)
+    return {"ok": True}
+
+
+@app.post("/api/browser/drag")
+async def browser_drag_ep(req: Request):
+    """A whole drag gesture in one call — a path of [x,y] points (viewport coords)."""
+    b = await req.json()
+    pts = [(int(p[0]), int(p[1])) for p in (b.get("path") or [])
+           if isinstance(p, (list, tuple)) and len(p) >= 2][:200]
+    if len(pts) >= 2:
+        livebrowser.submit("drag", pts)
+    return {"ok": len(pts) >= 2}
 
 
 @app.post("/api/browser/type")

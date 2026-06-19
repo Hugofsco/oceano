@@ -401,21 +401,51 @@ def _extract_images(answer):
     return text.strip(), out
 
 
+def _chunks(text, limit=4000):
+    """Split a long reply into pieces no larger than `limit`, preferring to cut at a paragraph,
+    then a line, then a sentence, then a word boundary (hard-cut only as a last resort). Telegram
+    caps a message at 4096 chars and the TTS engine at TTS_MAX_CHARS — without this a big response
+    is silently truncated. Returns a list (possibly one element, or empty)."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    out, rest, half = [], text, limit // 2
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"))           # paragraph / line break
+        if cut < half:
+            cut = max((window.rfind(s) for s in (". ", "! ", "? ", "。", "… ")), default=-1)
+            if cut != -1:
+                cut += 1                                              # keep the sentence terminator
+        if cut < half:
+            cut = window.rfind(" ")                                   # fall back to a word boundary
+        if cut <= 0:
+            cut = limit                                              # no boundary at all → hard cut
+        out.append(rest[:cut].strip())
+        rest = rest[cut:].lstrip()
+    if rest.strip():
+        out.append(rest.strip())
+    return out
+
+
 async def _send_voice(update, ctx, text):
-    """Speak `text` as a Telegram voice note (best-effort; silent if TTS is down)."""
-    ogg = await asyncio.to_thread(voice.synthesize, text)
-    if not ogg:
-        return
-    try:
-        with open(ogg, "rb") as fh:
-            await ctx.bot.send_voice(update.effective_chat.id, voice=fh)
-    except Exception:
-        pass
-    finally:
+    """Speak `text` as Telegram voice note(s). A long reply is split into sentence-aligned chunks
+    (each under the TTS cap) and sent as sequential notes, so nothing is dropped (best-effort;
+    silent if TTS is down). Capped to a sane number of notes to avoid flooding on a huge reply."""
+    for part in _chunks(text, config.TTS_MAX_CHARS)[:8]:
+        ogg = await asyncio.to_thread(voice.synthesize, part)
+        if not ogg:
+            continue
         try:
-            os.remove(ogg)
-        except OSError:
+            with open(ogg, "rb") as fh:
+                await ctx.bot.send_voice(update.effective_chat.id, voice=fh)
+        except Exception:
             pass
+        finally:
+            try:
+                os.remove(ogg)
+            except OSError:
+                pass
 
 
 async def _respond(update, ctx, text):
@@ -449,7 +479,8 @@ async def _respond(update, ctx, text):
         if not body and not images:
             body = "🤔 (no response)"
         if body:
-            await update.message.reply_text(body[:4000])   # ← typing stops when this lands
+            for part in _chunks(body, 4000):               # deliver a long reply in full, not truncated
+                await update.message.reply_text(part)      # ← typing stops when the last lands
     for fp in images[:6]:                          # deliver charts/screenshots as photos
         try:
             await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
