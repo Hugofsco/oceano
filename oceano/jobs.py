@@ -93,10 +93,11 @@ def job(kind, label="", ref=None, gate=None):
     jid = next(_counter)
     gated = _serialize if gate is None else bool(gate)
     info = {"id": jid, "kind": kind, "label": (label or kind)[:140], "ref": ref,
-            "state": "queued" if gated else "running", "since": time.time()}
+            "state": "queued" if gated else "running", "since": time.time(), "result": ""}
     with _mx:
         _jobs[jid] = info
     held = False
+    err = None
     try:
         if gated:
             _gate.acquire()
@@ -105,8 +106,30 @@ def job(kind, label="", ref=None, gate=None):
                 info["state"] = "running"
                 info["since"] = time.time()    # reset so "running for Xs" is accurate
         yield jid
+    except Exception as e:                     # record the failure, then re-raise unchanged
+        err = e
+        raise
     finally:
         if held:
             _gate.release()
+        ran = round(time.time() - info["since"], 1)
         with _mx:
             _jobs.pop(jid, None)
+        if kind != "chat":                     # interactive chat isn't an unattended "run" — don't log it
+            try:
+                from oceano import logs
+                logs.log_run(kind=kind, title=info["label"],
+                             status="error" if err else "ok",
+                             summary=(f"{type(err).__name__}: {err}" if err else info.get("result", "")),
+                             duration=ran, ref=ref)
+            except Exception:
+                pass
+
+
+def set_result(jid, text):
+    """Attach the run's result/output (the agent's answer) to a live job, so the activity log
+    records WHAT it produced, not just that it ran. No-op if the job already finished."""
+    with _mx:
+        j = _jobs.get(jid)
+        if j is not None:
+            j["result"] = (str(text) or "")[:8000]

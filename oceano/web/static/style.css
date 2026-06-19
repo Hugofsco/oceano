@@ -1130,6 +1130,23 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .mg-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
 
 /* ---------------- Health dashboard ---------------- */
+/* logs — activity log */
+.logs-win{padding:0;height:100%;display:flex;flex-direction:column}
+.logs-win .logs-bar{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line);flex:none}
+.logs-win #logKind{padding:6px 9px;background:rgba(4,17,26,.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;outline:none}
+.logs-win #logKind:focus{border-color:var(--biolum)}
+.logs-win .logs-hint{flex:1;font-size:11px;color:var(--faint)}
+.logs-list{flex:1;min-height:0;padding:8px 10px;overflow:auto;display:flex;flex-direction:column;gap:5px}
+.log-row{border:1px solid var(--line);border-radius:9px;background:rgba(4,17,26,.35);overflow:hidden}
+.log-row .lr-head{display:flex;align-items:center;gap:9px;padding:8px 11px}
+.log-row .lr-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--biolum)}
+.log-row.err .lr-dot{background:var(--coral)}
+.log-row .lr-kind{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--biolum);font-family:var(--font-mono);flex:none;min-width:62px}
+.log-row.err .lr-kind{color:var(--coral)}
+.log-row .lr-title{flex:1;font-size:13px;color:var(--foam);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.log-row .lr-meta{font-size:11px;color:var(--faint);font-family:var(--font-mono);white-space:nowrap;flex:none}
+.log-row .lr-body{display:none;padding:8px 11px 10px 32px;font-size:12px;color:var(--mist);white-space:pre-wrap;line-height:1.5;max-height:340px;overflow:auto;border-top:1px solid var(--line)}
+.log-row.open .lr-body{display:block}
 .hd-win{padding:0;height:100%}
 .hd-grid{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:1fr 1fr;gap:11px;padding:14px}
 .hd-card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:12px 14px}

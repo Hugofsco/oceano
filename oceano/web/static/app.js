@@ -3857,6 +3857,59 @@ function openHealth() {
 }
 
 /* ====================================================================
+   Logs — the durable activity log of unattended runs (scheduled tasks,
+   workflows, research, evals, upkeep): status, duration, and the result.
+   ==================================================================== */
+let _logsKind = "";
+function openLogs() {
+  const { body, reused } = createWindow({ id: "win-logs", title: "Logs — activity", icon: "▤", width: 660, height: 600 });
+  if (reused) { loadLogs(); return; }
+  body.classList.add("logs-win");
+  body.innerHTML = `
+    <div class="logs-bar">
+      <select id="logKind"><option value="">all activity</option></select>
+      <span class="logs-hint">scheduled tasks · workflows · research · evals · upkeep</span>
+      <button class="ed-btn" id="logReload" title="refresh">↻</button>
+    </div>
+    <div class="logs-list" id="logList"><div class="empty-note">loading…</div></div>`;
+  $("#logKind", body).onchange = e => { _logsKind = e.target.value; loadLogs(); };
+  $("#logReload", body).onclick = () => loadLogs();
+  loadLogs();
+}
+function _relTime(iso) {
+  const t = new Date(iso).getTime(); if (!t) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+async function loadLogs() {
+  const list = $("#logList"); if (!list) return;
+  let d; try { d = await api("/api/logs?limit=300" + (_logsKind ? "&kind=" + encodeURIComponent(_logsKind) : "")); }
+  catch { list.innerHTML = `<div class="empty-note err">logs unavailable</div>`; return; }
+  const sel = $("#logKind");                                   // refresh the filter options, keep the selection
+  if (sel) { const cur = sel.value; sel.innerHTML = `<option value="">all activity</option>` + (d.kinds || []).map(k => `<option value="${escapeHtml(k)}">${escapeHtml(k)}</option>`).join(""); sel.value = cur; }
+  const runs = d.runs || [];
+  if (!runs.length) { list.innerHTML = `<div class="empty-note">No activity logged yet. Scheduled tasks, workflows, research, and upkeep show up here as they run.</div>`; return; }
+  list.innerHTML = "";
+  runs.forEach(r => {
+    const row = document.createElement("div"); row.className = "log-row " + (r.status === "error" ? "err" : "ok");
+    const dur = r.duration != null ? (r.duration < 60 ? r.duration + "s" : Math.round(r.duration / 60) + "m") : "";
+    row.innerHTML = `<div class="lr-head"><span class="lr-dot"></span><span class="lr-kind">${escapeHtml(r.kind || "run")}</span>`
+      + `<span class="lr-title">${escapeHtml(r.title || "")}</span><span class="lr-meta">${dur ? dur + " · " : ""}${escapeHtml(_relTime(r.ts))}</span></div>`;
+    if (r.summary) {
+      const head = $(".lr-head", row);
+      const b = document.createElement("div"); b.className = "lr-body"; b.textContent = r.summary;   // textContent — the result is untrusted text
+      row.appendChild(b);
+      head.style.cursor = "pointer";
+      head.onclick = () => row.classList.toggle("open");
+    }
+    list.appendChild(row);
+  });
+}
+
+/* ====================================================================
    Semantic search — ask the corpus (memories + indexed docs), with scores
    and jump-to-source.
    ==================================================================== */
@@ -4581,6 +4634,7 @@ function wire() {
     else if (v === "workflows") openWorkflows();
     else if (v === "search") openSearch();
     else if (v === "notes") openNotes();
+    else if (v === "logs") openLogs();
     else if (v === "health") openHealth();
     else setView(v);
   });

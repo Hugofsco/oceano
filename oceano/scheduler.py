@@ -221,8 +221,10 @@ def _dispatch(source, instruction, ref=None):
         if source and source.startswith("workflow:"):        # a user-defined workflow
             from oceano import workflows
             return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule").get("summary", "workflow ran")
-        with jobs.job("task", instruction, ref=ref):
-            return Agent().run(instruction)
+        with jobs.job("task", instruction, ref=ref) as jid:
+            answer = Agent().run(instruction)
+            jobs.set_result(jid, answer)       # so the activity log shows what the task actually produced
+            return answer
 
 
 def run_due_once():

@@ -696,6 +696,14 @@ def jobs_snapshot():
     return jobs.snapshot()
 
 
+@app.get("/api/logs")
+def activity_logs(kind: str = "", limit: int = 200):
+    """The durable activity log — finished unattended runs (scheduled tasks, workflows, research,
+    evals, memory upkeep…) with status, duration, and the result the agent produced."""
+    from oceano import logs
+    return {"runs": logs.recent(min(max(int(limit), 1), 500), kind or None), "kinds": logs.kinds()}
+
+
 @app.post("/api/jobs/serialize")
 async def jobs_set_serialize(req: Request):
     """Turn the queue on/off. `enabled` → background jobs; `chat` → chat turns. Both run
