@@ -870,7 +870,7 @@ def ssh_run(host, commands):
     if current_channel() != "web":
         return ("ssh_run only runs in the web UI with the user present — it's blocked in "
                 "background, scheduled, and Telegram runs.")
-    if safety.untrusted_seen():
+    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
         return ("Blocked for safety: this turn already read external content (a web page, email, or "
                 "document), so connecting to the user's servers is disabled — injected text must not "
                 "reach them. Ask the user to send a fresh message to run remote commands.")
@@ -1758,7 +1758,7 @@ def sql_query(query, path=""):
 # safe window openers — never arbitrary code.
 _UI_WINDOWS = {"files", "explorer", "preview", "calendar", "brain", "memory", "knowledge", "skills",
                "rivers", "evals", "memory-graph", "scheduler", "researcher", "notes", "health",
-               "search", "voice", "workflows", "live", "settings"}
+               "search", "voice", "workflows", "live", "logs", "hosts", "settings"}
 # whole-desktop modes + single-window modes (the positional ones snap to a half/quarter/maximize)
 _UI_POS = {"left", "right", "top", "bottom", "maximize",
            "top-left", "top-right", "bottom-left", "bottom-right"}
@@ -1787,7 +1787,8 @@ def _ui_push(action, **payload):
         "parameters": {"type": "object", "properties": {
             "window": {"type": "string", "description": "one of: files, preview, calendar, brain, "
                        "memory, knowledge, skills, rivers, evals, memory-graph, scheduler, researcher, "
-                       "notes, health, search, voice, workflows, live, settings"},
+                       "notes, health, search, voice, workflows, live, logs (activity & system journal), "
+                       "hosts (SSH servers), settings"},
             "path": {"type": "string", "description": "a workspace file (opens a preview if renderable, "
                      "else the editor) or a folder (opens the Files explorer there)"},
         }},

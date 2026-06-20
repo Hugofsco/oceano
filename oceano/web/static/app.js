@@ -5213,6 +5213,7 @@ const UI_OPENERS = {
   researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
   search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
   live: () => openLiveView(), settings: () => openSettings(), hosts: () => openHosts(),
+  logs: () => openLogs(),
 };
 const UI_WINIDS = {
   files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
@@ -5220,7 +5221,7 @@ const UI_WINIDS = {
   rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
   researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
   voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
-  hosts: "win-hosts",
+  hosts: "win-hosts", logs: "win-logs",
 };
 function startUiStream() {
   if (_uiES) return;                                   // one stream; survives re-login (idempotent init)

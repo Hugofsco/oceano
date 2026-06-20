@@ -323,7 +323,7 @@ class Agent:
         relevant memories, and the skills catalog — so the model gets them passively
         (it needn't call recall/list_skills). Rebuilt each turn, never accumulates.
         `voice` (hands-free conversation) appends a be-brief directive FOR THIS TURN ONLY."""
-        safety.reset_untrusted()        # fresh turn: clears the "ingested untrusted content" taint (gates ssh_run)
+        safety.reset_untrusted(); safety.reset_bridge_untrusted()   # fresh turn: clear the injection taint (local + MCP-bridge) that gates ssh_run
         if self.messages and self.messages[0]["role"] == "system":
             ctx = _context_block(user_message) if self.inject_context else \
                 "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note()) if p)
@@ -504,9 +504,15 @@ class Agent:
             "because they'd browse invisibly. After a search, OPEN the best result with mcp__oceano__fetch_url "
             "to actually read it.\n"
             "• CALENDAR: mcp__oceano__calendar_events / manage_calendar / find_free_slots.\n"
+            "• SERVERS — mcp__oceano__list_hosts to see the user's registered servers, mcp__oceano__ssh_run "
+            "to run command batches on one over SSH (it's gated: per-host policy, and armed hosts must be "
+            "unlocked by the user — if it refuses, relay why).\n"
             "• WINDOWS (show, don't just tell): mcp__oceano__ui_open / ui_close / ui_arrange — pop and arrange "
-            "the user's web-UI windows (e.g. open Calendar before discussing the schedule).\n"
-            "• mcp__oceano__notify to ping the user.\n"
+            "the user's web-UI windows. Available windows: files, preview, calendar, brain, memory, knowledge, "
+            "skills, rivers, evals, memory-graph, scheduler, researcher, notes, health, search, voice, workflows, "
+            "live, logs, hosts, settings (e.g. open Calendar before discussing the schedule, or Hosts when "
+            "managing servers).\n"
+            "• mcp__oceano__notify to ping the user (ntfy + Telegram).\n"
             "Use your built-in tools for files and shell. Touch files only inside the workspace.")
         convo = []
         for m in self.messages[1:]:                            # the conversation Claude continues (no system msg)

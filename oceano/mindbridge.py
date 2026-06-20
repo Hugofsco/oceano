@@ -26,6 +26,7 @@ _ALLOW = {
     "notify",                                                 # push a notification to the user
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
     "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
+    "list_hosts", "ssh_run",                                 # the SSH keychain (still web-channel + per-host policy gated)
 }
 
 _TOKEN = None
@@ -72,11 +73,20 @@ def tool_names():
 
 def run_tool(name, args):
     """Execute an Oceano tool IN THE DAEMON (web channel, so ui_* reach the live browser). Returns
-    the tool's string result. Re-checks the denylist so the proxy can't reach a withheld tool."""
+    the tool's string result. Re-checks the denylist so the proxy can't reach a withheld tool.
+
+    Carries the injection taint across the bridge: each call runs in its own request thread, so we
+    reset the thread-local taint, run, and if the tool read untrusted content (web page / email /
+    doc) raise the PROCESS-WIDE bridge taint — so a later ssh_run in the same mind turn is blocked."""
     if name not in _ALLOW:
         return f"ERROR: tool {name!r} is not available to the mind"
+    from oceano import safety
     with tools.channel("web"):
-        return tools.run(name, json.dumps(args or {}))
+        safety.reset_untrusted()                       # clean slate for this per-call thread
+        result = tools.run(name, json.dumps(args or {}))
+        if safety.untrusted_seen():                    # this tool ingested untrusted content → taint the turn
+            safety.mark_bridge_untrusted()
+        return result
 
 
 def mcp_config_path():

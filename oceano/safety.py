@@ -175,6 +175,14 @@ def guarded_get(url, **kw):
 # remote command in the same turn. Threading isolates concurrent web/telegram/background turns.
 _taint = threading.local()
 
+# The Claude-mind reaches Oceano's tools over an MCP bridge that handles each call in its OWN request
+# thread, so the thread-local _taint can't carry "this turn read untrusted content" from one bridge
+# call (fetch_url) to the next (ssh_run). This PROCESS-WIDE flag fills that gap: mindbridge.run_tool
+# sets it when a bridge tool reads untrusted content, the agent clears it at the start of each turn,
+# and ssh_run honours it too. (Concurrent mind turns share it — that only ever over-blocks, never
+# under-blocks the common single-turn case.)
+_bridge_seen = False
+
 
 def untrusted_seen():
     return getattr(_taint, "seen", False)
@@ -182,6 +190,20 @@ def untrusted_seen():
 
 def reset_untrusted():
     _taint.seen = False
+
+
+def bridge_untrusted_seen():
+    return _bridge_seen
+
+
+def mark_bridge_untrusted():
+    global _bridge_seen
+    _bridge_seen = True
+
+
+def reset_bridge_untrusted():
+    global _bridge_seen
+    _bridge_seen = False
 
 
 def wrap_untrusted(source, content, taint=True):
