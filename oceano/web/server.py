@@ -2737,6 +2737,20 @@ async def mail_action_human(aid: int, req: Request):
     return {"ok": False, "error": f"unknown op {op!r}"}
 
 
+@app.post("/api/mail/{aid}/bulk")
+async def mail_bulk_human(aid: int, req: Request):
+    """Human-driven bulk organize in one connection: act on many messages at once — an explicit `uids`
+    list, or all=True to act on every message matching the optional search `q`. op = move | delete | flag."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    b = await req.json()
+    return await asyncio.to_thread(mail.imap_bulk, a, b.get("op"), b.get("folder", "INBOX"),
+                                   b.get("uids"), b.get("q") or None, bool(b.get("all")),
+                                   b.get("dest"), b.get("flag"))
+
+
 @app.post("/api/mail/{aid}/ai-draft")
 async def mail_ai_draft(aid: int, req: Request):
     """Have the configured model draft a reply to a message. Returns the draft TEXT only — it is shown

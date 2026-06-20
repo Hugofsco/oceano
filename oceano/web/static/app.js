@@ -4326,17 +4326,44 @@ function mailRenderArmbar(body, acc) {
 
 async function mailLoadMessages(body) {
   const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  const q = body._mailQuery || "";
   const box = $("#mailBody", body); if (!box) return;
-  body._mailSel = new Set();
+  body._mailSel = new Set(); body._mailSelectAll = false;
   box.innerHTML = `<div class="empty-note">loading ${escapeHtml(folder)}…</div>`;
-  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=40`); } catch { return; }
+  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=50${q ? "&q=" + encodeURIComponent(q) : ""}`); } catch { return; }
   if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
-  if (!r.messages.length) { box.innerHTML = `<div class="empty-note">(${escapeHtml(folder)} is empty)</div>`; return; }
+  const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
+  const canWrite = acc.policy !== "readonly";
+  body._mailTotal = r.total; body._mailLoaded = r.messages.length;
   box.innerHTML = `
-    <div class="mail-listhead">${escapeHtml(folder)} · showing ${r.messages.length} of ${r.total}</div>
+    <div class="mail-listhead">
+      ${canWrite ? `<input type="checkbox" class="ml-allchk" id="mailAll" title="select all on this page">` : ""}
+      <input class="ml-search" id="mailSearch" placeholder="search ${escapeHtml(folder)}…" value="${escapeHtml(q)}" spellcheck="false">
+      ${q ? `<button class="ml-clear" id="mailSearchClear" title="clear search">✕</button>` : ""}
+      <span class="ml-count">${r.messages.length} of ${r.total}</span>
+    </div>
+    <div class="mail-selall" id="mailSelAll" style="display:none"></div>
     <div class="mail-bulkbar" id="mailBulk" style="display:none"></div>
     <div class="mail-list"></div>`;
+  const si = $("#mailSearch", box);
+  si.onkeydown = e => {
+    if (e.key === "Enter") { body._mailQuery = si.value.trim(); mailLoadMessages(body); }
+    else if (e.key === "Escape" && q) { body._mailQuery = ""; mailLoadMessages(body); }
+  };
+  { const sc = $("#mailSearchClear", box); if (sc) sc.onclick = () => { body._mailQuery = ""; mailLoadMessages(body); }; }
+  const allChk = $("#mailAll", box);
+  if (allChk) allChk.onchange = () => {
+    const on = allChk.checked;
+    body._mailSelectAll = false;
+    body._mailSel = new Set(on ? r.messages.map(m => m.uid) : []);
+    $$(".mail-row", box).forEach(row => { const c = $(".mr-chk", row); if (c) c.checked = on; row.classList.toggle("sel", on); });
+    mailUpdateSelAll(body); mailRenderBulk(body);
+  };
   const list = $(".mail-list", box);
+  if (!r.messages.length) {
+    list.innerHTML = `<div class="empty-note">${q ? "no messages match “" + escapeHtml(q) + "”" : "(" + escapeHtml(folder) + " is empty)"}</div>`;
+    return;
+  }
   r.messages.forEach(m => {
     const row = document.createElement("div"); row.className = "mail-row" + (m.seen ? "" : " unread");
     row.innerHTML = `<input type="checkbox" class="mr-chk" title="select">
@@ -4347,9 +4374,10 @@ async function mailLoadMessages(body) {
     const chk = $(".mr-chk", row);
     chk.onclick = e => {
       e.stopPropagation();
-      if (chk.checked) body._mailSel.add(m.uid); else body._mailSel.delete(m.uid);
+      if (chk.checked) body._mailSel.add(m.uid);
+      else { body._mailSel.delete(m.uid); body._mailSelectAll = false; if (allChk) allChk.checked = false; }
       row.classList.toggle("sel", chk.checked);
-      mailRenderBulk(body);
+      mailUpdateSelAll(body); mailRenderBulk(body);
     };
     $(".mr-cell", row).onclick = () => mailViewMessage(body, m.uid, m);
     list.appendChild(row);
@@ -4357,13 +4385,36 @@ async function mailLoadMessages(body) {
   mailRenderBulk(body);
 }
 
+function mailUpdateSelAll(body) {
+  const banner = $("#mailSelAll", body); if (!banner) return;
+  const sel = body._mailSel || new Set();
+  const total = body._mailTotal || 0, loaded = body._mailLoaded || 0;
+  if (body._mailSelectAll) {
+    banner.style.display = "block";
+    banner.innerHTML = `All <b>${total}</b> messages in this folder are selected. <a class="ml-link" id="mailSelClear">Clear</a>`;
+    $("#mailSelClear", banner).onclick = () => {
+      body._mailSelectAll = false; body._mailSel = new Set();
+      const a = $("#mailAll", body); if (a) a.checked = false;
+      $$(".mail-row.sel", body).forEach(r => { r.classList.remove("sel"); const c = $(".mr-chk", r); if (c) c.checked = false; });
+      mailUpdateSelAll(body); mailRenderBulk(body);
+    };
+  } else if (sel.size >= loaded && loaded > 0 && total > loaded) {
+    banner.style.display = "block";
+    banner.innerHTML = `All ${loaded} on this page selected. <a class="ml-link" id="mailSelAllN">Select all ${total} in this folder</a>`;
+    $("#mailSelAllN", banner).onclick = () => { body._mailSelectAll = true; mailUpdateSelAll(body); mailRenderBulk(body); };
+  } else {
+    banner.style.display = "none"; banner.innerHTML = "";
+  }
+}
+
 function mailRenderBulk(body) {
   const bar = $("#mailBulk", body); if (!bar) return;
   const sel = body._mailSel || new Set();
   const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
-  if (!sel.size || acc.policy === "readonly") { bar.style.display = "none"; bar.innerHTML = ""; return; }
+  if ((!sel.size && !body._mailSelectAll) || acc.policy === "readonly") { bar.style.display = "none"; bar.innerHTML = ""; return; }
   bar.style.display = "flex";
-  bar.innerHTML = `<span class="mb-count">${sel.size} selected</span>
+  const label = body._mailSelectAll ? `all ${body._mailTotal} in folder` : `${sel.size} selected`;
+  bar.innerHTML = `<span class="mb-count">${label}</span>
     <button class="ed-btn" id="mbRead">Mark read</button>
     <button class="ed-btn" id="mbMove">📁 Move…</button>
     <button class="ed-btn" id="mbDel">🗑 Delete</button>
@@ -4371,17 +4422,20 @@ function mailRenderBulk(body) {
     <button class="ed-btn" id="mbClear">Clear</button>`;
   $("#mbRead", bar).onclick = () => mailBulkAction(body, "flag", { flag: "read" });
   $("#mbDel", bar).onclick = async () => {
-    if (!await confirmAction("Delete selected?", `${sel.size} message(s) will move to Trash.`)) return;
+    const n = body._mailSelectAll ? body._mailTotal : sel.size;
+    if (!await confirmAction("Delete selected?", `${n} message(s) will move to Trash.`)) return;
     mailBulkAction(body, "delete", {});
   };
   $("#mbClear", bar).onclick = () => {
-    body._mailSel = new Set();
+    body._mailSel = new Set(); body._mailSelectAll = false;
+    const a = $("#mailAll", body); if (a) a.checked = false;
     $$(".mail-row.sel", body).forEach(r => { r.classList.remove("sel"); const c = $(".mr-chk", r); if (c) c.checked = false; });
-    mailRenderBulk(body);
+    mailUpdateSelAll(body); mailRenderBulk(body);
   };
   $("#mbMove", bar).onclick = () => {
     const dests = (body._folders || []).filter(f => f !== body._mailFolder);
-    bar.innerHTML = `<span class="mb-count">Move ${sel.size} to</span>
+    const n = body._mailSelectAll ? body._mailTotal : sel.size;
+    bar.innerHTML = `<span class="mb-count">Move ${n} to</span>
       <select class="te-model mb-dest" id="mbDest">${dests.map(f => `<option>${escapeHtml(f)}</option>`).join("")}</select>
       <button class="ed-btn" id="mbMoveGo">Move</button>
       <button class="ed-btn" id="mbMoveCancel">Cancel</button>`;
@@ -4392,17 +4446,18 @@ function mailRenderBulk(body) {
 
 async function mailBulkAction(body, op, extra) {
   const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  const all = !!body._mailSelectAll;
   const uids = [...(body._mailSel || [])];
-  if (!uids.length) return;
-  toast(`${op === "delete" ? "deleting" : op === "move" ? "moving" : "updating"} ${uids.length}…`, "info");
-  let ok = 0;
-  for (const uid of uids) {
-    try { const x = await _postJ(`/api/mail/${cur}/action`, { op, uid, folder, ...extra }); if (x.ok) ok++; } catch {}
-  }
-  toast(`${ok}/${uids.length} ${op === "delete" ? "deleted" : op === "move" ? "moved" : "marked read"}`, ok ? "info" : "err");
-  body._mailSel = new Set();
-  mailLoadMessages(body);
-  mailLoadUnreads(body);
+  if (!all && !uids.length) return;
+  const payload = { op, folder, ...extra };
+  if (all) { payload.all = true; payload.q = body._mailQuery || ""; }
+  else payload.uids = uids;
+  toast(`${op === "delete" ? "deleting" : op === "move" ? "moving" : "updating"}…`, "info");
+  let r; try { r = await _postJ(`/api/mail/${cur}/bulk`, payload); } catch { r = { ok: false }; }
+  toast(r.ok ? `✓ ${r.count} ${op === "delete" ? "deleted" : op === "move" ? "moved" : "updated"}`
+             : ("✗ " + (r.error || "failed")), r.ok ? "info" : "err");
+  body._mailSel = new Set(); body._mailSelectAll = false;
+  mailLoadMessages(body); mailLoadUnreads(body);
 }
 
 async function mailViewMessage(body, uid, meta) {

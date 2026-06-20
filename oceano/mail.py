@@ -342,8 +342,13 @@ def _imap(a):
         conn = imaplib.IMAP4(a["imap_host"], int(a.get("imap_port", 143)), timeout=_TIMEOUT)
         try:
             conn.starttls(ssl_context=ssl.create_default_context())
-        except Exception:
-            pass
+        except Exception as e:                   # STARTTLS failed → do NOT fall back to plaintext auth
+            try:
+                conn.shutdown()
+            except Exception:
+                pass
+            raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
+                             f"unencrypted connection. Use the SSL port (993), or fix the server's TLS.")
     conn.login(a.get("user") or a["email"], a.get("password") or "")
     return conn
 
@@ -754,6 +759,71 @@ def imap_flag(a, uid, flag, folder="INBOX"):
         _imap_close(conn)
 
 
+def _bulk_move(conn, uid_set, dest):
+    if "MOVE" in _capabilities(conn):
+        conn.uid("MOVE", uid_set, _q(dest))
+    else:
+        conn.uid("COPY", uid_set, _q(dest))
+        conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
+def imap_bulk(a, op, folder="INBOX", uids=None, query=None, select_all=False, dest=None, flag=None):
+    """Apply ONE op to MANY messages in a single connection (one IMAP command for the whole set, not
+    one-per-message). select_all=True acts on every message matching `query` (or the whole folder);
+    otherwise pass an explicit `uids` list. op: 'move' (needs dest) | 'delete' (→ Trash) | 'flag'
+    (flag: read|unread|flagged|unflagged|spam). Returns {ok, count, text}."""
+    op = (op or "").strip().lower()
+    if op not in ("move", "delete", "flag"):
+        return {"ok": False, "error": "op must be move, delete, or flag"}
+    try:
+        conn = _imap(a)
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    try:
+        if conn.select(_q(folder))[0] != "OK":
+            return {"ok": False, "error": f"no such folder {folder!r}"}
+        if select_all:
+            uid_list = [u.decode() if isinstance(u, bytes) else str(u) for u in _search_uids(conn, query or None)]
+        else:
+            uid_list = [str(u) for u in (uids or []) if str(u).strip()]
+        if not uid_list:
+            return {"ok": True, "count": 0, "text": "no messages matched"}
+        uid_set = ",".join(uid_list)
+        n = len(uid_list)
+        if op == "flag":
+            f = (flag or "").strip().lower()
+            if f == "spam":
+                target = _special_folder(conn, "\\Junk", _JUNK_NAMES)
+                _bulk_move(conn, uid_set, target)
+                _stamp_used(a["id"])
+                return {"ok": True, "count": n, "text": f"moved {n} message(s) to {target}"}
+            op_map = {"read": ("+FLAGS", "\\Seen"), "unread": ("-FLAGS", "\\Seen"),
+                      "flagged": ("+FLAGS", "\\Flagged"), "unflagged": ("-FLAGS", "\\Flagged")}
+            if f not in op_map:
+                return {"ok": False, "error": f"unknown flag {f!r}"}
+            sign, fl = op_map[f]
+            conn.uid("STORE", uid_set, sign, f"({fl})")
+            _stamp_used(a["id"])
+            return {"ok": True, "count": n, "text": f"marked {n} message(s) {f}"}
+        if op == "delete":
+            target = _special_folder(conn, "\\Trash", _TRASH_NAMES)
+            if (folder or "").strip().lower() == target.lower():
+                return {"ok": False, "error": f"already in {target}; permanent delete is disabled"}
+            _bulk_move(conn, uid_set, target)
+            _stamp_used(a["id"])
+            return {"ok": True, "count": n, "text": f"deleted {n} message(s) (→ {target})"}
+        if not (dest or "").strip():                 # move
+            return {"ok": False, "error": "move needs a destination folder"}
+        _bulk_move(conn, uid_set, dest)
+        _stamp_used(a["id"])
+        return {"ok": True, "count": n, "text": f"moved {n} message(s) → {dest}"}
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    finally:
+        _imap_close(conn)
+
+
 # ---------------- SMTP ----------------
 def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="", html=None):
     msg = EmailMessage()
@@ -782,8 +852,13 @@ def _smtp_send_msg(a, msg, recipients):
         try:
             srv.starttls(context=ssl.create_default_context())
             srv.ehlo()
-        except Exception:
-            pass
+        except Exception as e:                   # STARTTLS failed → do NOT fall back to plaintext auth
+            try:
+                srv.quit()
+            except Exception:
+                pass
+            raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
+                             f"unencrypted connection. Use the SSL port (465), or fix the server's TLS.")
     try:
         srv.login(a.get("user") or a["email"], a.get("password") or "")
         srv.send_message(msg, from_addr=a["email"], to_addrs=recipients)
@@ -865,8 +940,13 @@ def test(a):
             try:
                 srv.starttls(context=ssl.create_default_context())
                 srv.ehlo()
-            except Exception:
-                pass
+            except Exception as e:               # STARTTLS failed → do NOT fall back to plaintext auth
+                try:
+                    srv.quit()
+                except Exception:
+                    pass
+                raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over "
+                                 f"an unencrypted connection. Use the SSL port (465), or fix the TLS.")
         try:
             srv.login(a.get("user") or a["email"], a.get("password") or "")
         finally:
