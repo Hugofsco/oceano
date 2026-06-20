@@ -14,14 +14,18 @@ import secrets
 
 from oceano import tools
 
-# The mind's BODY: the Oceano tools with no native Claude equivalent, so the mind reaches for these
-# (its own Read/Write/Bash/WebSearch cover files/shell/web). Kept deliberately small so Claude Code
-# loads them all up front instead of deferring them behind its flaky ToolSearch.
+# The mind's BODY: Oceano's own tools, so the mind acts THROUGH Oceano (and the user can see it).
+# Its native Read/Write/Bash cover files+shell, but the WEB is routed here on purpose — Oceano's
+# web tools drive the shared live browser, so the user can watch (and hand-solve captchas) instead
+# of the mind browsing invisibly with WebFetch. Kept reasonably small so Claude Code loads them all
+# up front (exact names in --allowedTools) instead of deferring them behind its flaky ToolSearch.
 _ALLOW = {
     "remember", "recall", "forget_memory", "update_memory",   # memory — Oceano's, the one the user sees
     "calendar_events", "manage_calendar", "find_free_slots",  # the calendar
     "ui_open", "ui_close", "ui_arrange",                      # the windows (JARVIS bit)
     "notify",                                                 # push a notification to the user
+    "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
+    "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
 }
 
 _TOKEN = None
