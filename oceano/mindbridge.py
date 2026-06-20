@@ -26,7 +26,7 @@ _ALLOW = {
     "notify",                                                 # push a notification to the user
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
     "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
-    "list_hosts", "ssh_run",                                 # the SSH keychain (still web-channel + per-host policy gated)
+    "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
 }
 
 _TOKEN = None

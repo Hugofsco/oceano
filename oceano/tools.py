@@ -904,6 +904,48 @@ def ssh_run(host, commands):
 @tool({
     "type": "function",
     "function": {
+        "name": "sftp",
+        "description": "Transfer files between the workspace and a registered server over SFTP, or "
+                       "list a remote directory. action: 'list' (a remote dir), 'get' (download "
+                       "remote → workspace), 'put' (upload workspace → remote). Same safety gates as "
+                       "ssh_run (web-only, not after reading untrusted content, per-host policy — "
+                       "read-only hosts reject uploads). Local paths are confined to the workspace.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "get", "put"]},
+            "host": {"type": "string", "description": "host name (or id) from list_hosts"},
+            "remote_path": {"type": "string", "description": "path on the server (dir for list, file for get/put)"},
+            "local_path": {"type": "string", "description": "workspace-relative path (download target / upload source)"},
+        }, "required": ["action", "host"]},
+    },
+})
+def sftp(action, host, remote_path="", local_path=""):
+    from oceano import hosts, logs
+    action = (action or "").strip().lower()
+    if action not in ("list", "get", "put"):
+        return "action must be one of: list, get, put"
+    if current_channel() != "web":
+        return "sftp only runs in the web UI with the user present — blocked in background, scheduled, and Telegram runs."
+    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+        return ("Blocked for safety: this turn read external content (a web page, email, or document), "
+                "so transferring files to/from the user's servers is disabled. Ask for a fresh message.")
+    h = hosts._resolve(host)
+    if not h:
+        avail = ", ".join(x["name"] for x in hosts.list_all()) or "(none registered)"
+        return f"no host named {host!r}. Registered: {avail}"
+    refusal = hosts.check_sftp_policy(h, action)
+    if refusal:
+        return refusal
+    res = hosts.sftp(h["id"], action, remote_path=remote_path, local_path=local_path)
+    logs.log_run("ssh", f"sftp {action}: {h['name']}", "ok" if res.get("ok") else "error",
+                 res.get("text") or res.get("error", ""), ref=f"host:{h['id']}")
+    if not res.get("ok"):
+        return f"sftp {action} failed: {res.get('error')}"
+    return safety.wrap_untrusted(f"sftp:{h['name']}", res["text"], taint=False)
+
+
+@tool({
+    "type": "function",
+    "function": {
         "name": "notify",
         "description": "Send the user a push notification on the channels they enabled (ntfy on "
                        "their phone, and/or their Telegram). Use to report when a long or background "
@@ -1758,7 +1800,7 @@ def sql_query(query, path=""):
 # safe window openers — never arbitrary code.
 _UI_WINDOWS = {"files", "explorer", "preview", "calendar", "brain", "memory", "knowledge", "skills",
                "rivers", "evals", "memory-graph", "scheduler", "researcher", "notes", "health",
-               "search", "voice", "workflows", "live", "logs", "hosts", "settings"}
+               "search", "voice", "workflows", "live", "logs", "hosts", "terminal", "settings"}
 # whole-desktop modes + single-window modes (the positional ones snap to a half/quarter/maximize)
 _UI_POS = {"left", "right", "top", "bottom", "maximize",
            "top-left", "top-right", "bottom-left", "bottom-right"}
@@ -1788,19 +1830,29 @@ def _ui_push(action, **payload):
             "window": {"type": "string", "description": "one of: files, preview, calendar, brain, "
                        "memory, knowledge, skills, rivers, evals, memory-graph, scheduler, researcher, "
                        "notes, health, search, voice, workflows, live, logs (activity & system journal), "
-                       "hosts (SSH servers), settings"},
+                       "hosts (SSH servers), terminal (a workspace shell, or a live SSH session if you "
+                       "pass `host`), settings"},
             "path": {"type": "string", "description": "a workspace file (opens a preview if renderable, "
                      "else the editor) or a folder (opens the Files explorer there)"},
+            "host": {"type": "string", "description": "for window='terminal': a registered host name to "
+                     "open a LIVE SSH session into (it must be armed/trusted in the Hosts panel). Omit "
+                     "for a local workspace shell."},
         }},
     },
 })
-def ui_open(window="", path=""):
+def ui_open(window="", path="", host=""):
     if path:
         return _ui_push("open", path=str(path)) or f"opened {path} in the web UI"
     window = (window or "").strip().lower()
     if window not in _UI_WINDOWS:
         return f"unknown window {window!r}. Use one of: {', '.join(sorted(_UI_WINDOWS))} — or pass a file path."
-    return _ui_push("open", window=window) or f"opened the {window} window"
+    payload = {"window": window}
+    if window == "terminal" and host:
+        payload["host"] = str(host)
+    guard = _ui_push("open", **payload)
+    if guard:
+        return guard
+    return f"opened the {window} window" + (f" (live SSH session into {host})" if window == "terminal" and host else "")
 
 
 @tool({

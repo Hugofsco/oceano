@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import re
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -423,3 +424,81 @@ def run(name_or_id, commands, secret=None, timeout=60):
         rec["last_used"] = _now()
         _save(d)
     return {"ok": True, "host": h["name"], "results": results}
+
+
+# ---------------- SFTP (file transfer, reuses the keychain) ----------------
+def _ws_path(local):
+    """Resolve a LOCAL path under the workspace; reject anything that escapes it."""
+    p = (config.WORKSPACE / (local or "")).resolve()
+    if not (p == config.WORKSPACE.resolve() or str(p).startswith(str(config.WORKSPACE.resolve()) + "/")):
+        raise ValueError("local path escapes the workspace")
+    return p
+
+
+def check_sftp_policy(h, action):
+    """None if `action` ('list'|'get'|'put') is allowed on host h under its policy, else a refusal.
+    (Channel + taint gates run in the tool first.) 'put' writes the remote; 'get'/'list' only read it."""
+    pol = h.get("policy", "armed")
+    if pol == "trusted":
+        return None
+    if pol == "armed":
+        return None if is_armed(h["id"]) else (
+            f"host '{h['name']}' is not armed — ask the user to Arm it in the Hosts panel "
+            f"(grants a {_ARM_TTL // 60}-minute window).")
+    if pol == "readonly":
+        if action == "put":
+            return (f"host '{h['name']}' is read-only — uploads are blocked. "
+                    f"Ask the user to Arm it (or set its policy to trusted).")
+        return None
+    return f"host '{h['name']}' has an unknown policy"
+
+
+def sftp(name_or_id, action, remote_path="", local_path="", secret=None):
+    """SFTP against a registered host. action: 'list' (a remote dir) | 'get' (download remote →
+    workspace) | 'put' (upload workspace → remote). LOCAL paths are confined to the workspace.
+    No gating here — the tool enforces channel/taint/policy before calling this."""
+    h = _resolve(name_or_id)
+    if not h:
+        return {"ok": False, "error": f"no host named {name_or_id!r}"}
+    if not h.get("host_key"):
+        return {"ok": False, "error": f"host '{h['name']}' has no pinned key — Test & pin it first"}
+    try:
+        cli, _ = _open(h, secret or _armed_secret(h["id"]), pin_mode=False)
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "error": _clean_err(e)}
+    try:
+        sf = cli.open_sftp()
+        if action == "list":
+            items = sorted(sf.listdir_attr(remote_path or "."), key=lambda a: a.filename)[:300]
+            rows = []
+            for a in items:
+                d = stat.S_ISDIR(a.st_mode or 0)
+                rows.append(("📁 " if d else "   ") + a.filename + ("/" if d else f"   {a.st_size}B"))
+            return {"ok": True, "host": h["name"],
+                    "text": f"{remote_path or '.'} on {h['name']}:\n" + ("\n".join(rows) or "(empty)")}
+        if action == "get":
+            if not remote_path:
+                return {"ok": False, "error": "remote_path is required for get"}
+            dest = _ws_path(local_path or Path(remote_path).name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            sf.get(remote_path, str(dest))
+            return {"ok": True, "host": h["name"],
+                    "text": f"downloaded {remote_path} → workspace/{dest.relative_to(config.WORKSPACE)} "
+                            f"({dest.stat().st_size}B)"}
+        if action == "put":
+            src = _ws_path(local_path)
+            if not src.is_file():
+                return {"ok": False, "error": f"workspace file not found: {local_path}"}
+            dst = remote_path or Path(local_path).name
+            sf.put(str(src), dst)
+            return {"ok": True, "host": h["name"],
+                    "text": f"uploaded workspace/{src.relative_to(config.WORKSPACE)} → {dst} on "
+                            f"{h['name']} ({src.stat().st_size}B)"}
+        return {"ok": False, "error": f"unknown action {action!r} (use list, get, or put)"}
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "error": _clean_err(e)}
+    finally:
+        try:
+            cli.close()
+        except Exception:
+            pass

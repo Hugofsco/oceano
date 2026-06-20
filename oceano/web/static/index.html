@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="/static/vendor/codemirror/material-darker.css">
 <link rel="stylesheet" href="/static/vendor/codemirror/addon/dialog/dialog.css">
 <link rel="stylesheet" href="/static/vendor/drawflow.min.css">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/style.css">
 <script>
 /* Apply the saved appearance BEFORE first paint (no theme flash). Mirrors applyAppearance() in app.js. */
@@ -52,6 +53,7 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
             <button class="nav-item" data-view="notes"><span class="ni">❏</span> Notes</button>
             <button class="nav-item" data-view="logs"><span class="ni">▤</span> Logs</button>
             <button class="nav-item" data-view="hosts"><span class="ni">⌗</span> Hosts</button>
+            <button class="nav-item" data-view="terminal"><span class="ni">▸</span> Terminal</button>
             <button class="nav-item" data-view="health"><span class="ni">◉</span> Health</button>
           </nav>
         </div>
@@ -248,6 +250,8 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/drawflow.min.js"></script>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
 <!-- CodeMirror 5 (vendored): the IDE-grade editor for the Files view -->
 <script src="/static/vendor/codemirror/codemirror.min.js"></script>
 <script src="/static/vendor/codemirror/mode/meta.js"></script>

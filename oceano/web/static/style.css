@@ -1665,3 +1665,24 @@ html.density-compact{font-size:14px} html.density-spacious{font-size:17.5px}
 .host-keynote{font-size:11.5px;color:var(--biolum);margin:6px 0}
 .set-win input[type=file]{font-size:12px;color:var(--mist);width:100%;padding:6px 0;cursor:pointer}
 .host-del:hover{border-color:var(--coral);color:var(--coral)}
+
+/* ---------- Terminal (tabbed xterm.js) ---------- */
+.term-win{padding:0;min-height:0;overflow:hidden;background:var(--abyss-0);display:flex;flex-direction:column}
+.term-tabs{position:relative;display:flex;align-items:center;gap:2px;padding:5px 6px 0;background:rgba(var(--abyss-0-rgb),.6);border-bottom:1px solid var(--line);flex:none;overflow:visible}
+.term-tablist{display:flex;gap:2px;overflow-x:auto;flex:1}
+.term-tab{display:flex;align-items:center;gap:8px;padding:6px 11px;border-radius:8px 8px 0 0;color:var(--mist);font-size:12px;font-family:var(--font-body);cursor:pointer;white-space:nowrap;border:1px solid transparent;border-bottom:none}
+.term-tab:hover{color:var(--foam);background:rgba(var(--line-rgb),.06)}
+.term-tab.on{color:var(--biolum);background:var(--abyss-0);border-color:var(--line)}
+.term-tab .tt-x{color:var(--faint);font-size:10px;opacity:.65}
+.term-tab .tt-x:hover{color:var(--coral);opacity:1}
+.term-add{background:none;border:none;color:var(--mist);font-size:15px;line-height:1;cursor:pointer;padding:3px 9px;border-radius:6px;flex:none}
+.term-add:hover{color:var(--biolum);background:rgba(var(--biolum-rgb),.1)}
+.term-stack{flex:1;min-height:0;position:relative}
+.term-pane{position:absolute;inset:0;display:flex;flex-direction:column;padding:5px 4px 4px 7px;box-sizing:border-box;background:var(--abyss-0)}
+.term-pane .xterm{height:100%}
+.term-pane .xterm-viewport{overflow-y:auto}
+.term-pane .xterm-viewport::-webkit-scrollbar{width:9px}
+.term-pane .xterm-viewport::-webkit-scrollbar-thumb{background:rgba(var(--line-rgb),.3);border-radius:5px}
+.term-menu{position:absolute;top:34px;right:6px;z-index:60;background:var(--panel-solid);border:1px solid var(--line-strong);border-radius:9px;padding:4px;box-shadow:0 10px 28px rgba(0,0,0,.55);min-width:172px}
+.term-menu-item{padding:7px 11px;font-size:12.5px;color:var(--foam);border-radius:6px;cursor:pointer;white-space:nowrap}
+.term-menu-item:hover{background:rgba(var(--biolum-rgb),.12);color:var(--biolum)}

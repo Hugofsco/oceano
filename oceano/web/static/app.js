@@ -1944,7 +1944,7 @@ function _setWinMin(id, on) { const a = _winOpen(), w = a.find(x => x.id === id)
 function restoreWindows() {
   const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
                       brain: openBrain, workflows: openWorkflows, preview: openPreview,
-                      file: openFileWindow, cal: openCalendar, hosts: openHosts };
+                      file: openFileWindow, cal: openCalendar, hosts: openHosts, terminal: openTerminal };
   _winOpen().forEach(w => {
     const fn = RESTORERS[w.key];
     if (!fn) return;
@@ -4257,10 +4257,16 @@ async function hostsRenderList(body) {
       <div class="host-actions">
         <button class="ed-btn host-test">Test &amp; pin</button>
         ${h.policy === "armed" ? `<button class="ed-btn host-arm">${h.armed ? "Disarm" : "Arm"}</button>` : ""}
+        ${h.pinned ? `<button class="ed-btn host-term" title="open a live SSH terminal">⤢ Terminal</button>` : ""}
         <button class="ed-btn host-edit">Edit</button>
         <button class="ed-btn host-del" title="delete">✕</button>
       </div>`;
     $(".host-test", el).onclick = () => hostsTest(body, h);
+    const tbtn = $(".host-term", el);
+    if (tbtn) tbtn.onclick = () => {
+      if (h.policy === "armed" && !h.armed) { toast(`Arm ${h.name} first to open a shell`, "err"); return; }
+      openTerminal(h.name);
+    };
     const armBtn = $(".host-arm", el); if (armBtn) armBtn.onclick = () => h.armed ? hostsDisarm(body, h) : hostsArm(body, h);
     $(".host-edit", el).onclick = () => hostsRenderEditor(body, h);
     $(".host-del", el).onclick = async () => { if (!await confirmAction("Delete host?", `“${h.name}” and its stored key will be removed.`)) return; await fetch("/api/hosts/" + h.id, { method: "DELETE" }); hostsRenderList(body); };
@@ -4339,6 +4345,84 @@ function hostsRenderEditor(body, h) {
     }
     hostsRenderList(body);
   };
+}
+
+/* ====================================================================
+   Terminal — a real bash shell in the workspace (PTY ↔ xterm.js over a
+   WebSocket). Unguarded (you're driving), fenced by the systemd sandbox.
+   ==================================================================== */
+// One Terminal window, many tabs. host="" → a local workspace shell; host="name" → a live SSH
+// session into that registered host. The + button adds another (workspace shell or any pinned host).
+function openTerminal(host) {
+  host = (typeof host === "string" && host.trim()) ? host.trim() : "";
+  const { body, reused } = createWindow({ id: "win-terminal", title: "Terminal", icon: "▸", width: 780, height: 480, restoreKey: "terminal",
+    onClose: () => { (body._tabs || []).forEach(_termDispose); body._tabs = []; } });
+  if (typeof Terminal === "undefined") { if (!reused) body.innerHTML = `<div class="empty-note err" style="padding:20px">terminal library failed to load — hard-reload the page</div>`; return; }
+  if (!reused) {
+    body.classList.add("term-win");
+    body.innerHTML = `<div class="term-tabs"><div class="term-tablist" id="termTablist"></div><button class="term-add" id="termAdd" title="new terminal">＋</button></div><div class="term-stack" id="termStack"></div>`;
+    body._tabs = [];
+    $("#termAdd", body).onclick = e => termAddMenu(body, e.currentTarget);
+  }
+  if (reused && !host && body._tabs.length) return;   // just surface the window; don't spawn an extra shell
+  termAddTab(body, host);
+}
+function termAddTab(body, host) {
+  const id = "t" + Math.random().toString(36).slice(2, 8);
+  const pane = document.createElement("div"); pane.className = "term-pane"; $("#termStack", body).appendChild(pane);
+  const cs = getComputedStyle(document.documentElement), c = (n, f) => (cs.getPropertyValue(n).trim() || f);
+  const term = new Terminal({ cursorBlink: true, fontSize: 13, scrollback: 5000, allowProposedApi: true,
+    fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+    theme: { background: c("--abyss-0", "#04111a"), foreground: c("--foam", "#e8f2f3"),
+             cursor: c("--biolum", "#37e3c6"), cursorAccent: c("--abyss-0", "#04111a"), selectionBackground: "rgba(55,227,198,.25)" } });
+  const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(pane);
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/terminal/ws` + (host ? "?host=" + encodeURIComponent(host) : ""));
+  ws.binaryType = "arraybuffer"; const dec = new TextDecoder();
+  ws.onmessage = e => term.write(typeof e.data === "string" ? e.data : dec.decode(new Uint8Array(e.data)));
+  ws.onopen = () => { try { fit.fit(); } catch {} ws.send(JSON.stringify({ t: "r", c: term.cols, r: term.rows })); term.focus(); };
+  ws.onclose = () => term.write("\r\n\x1b[2m[ session ended ]\x1b[0m\r\n");
+  ws.onerror = () => term.write("\r\n\x1b[31m[ connection error ]\x1b[0m\r\n");
+  term.onData(d => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "i", d })); });
+  term.onResize(({ cols, rows }) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "r", c: cols, r: rows })); });
+  const ro = new ResizeObserver(() => { if (pane.style.display !== "none") { try { fit.fit(); } catch {} } }); ro.observe(pane);
+  const tabEl = document.createElement("div"); tabEl.className = "term-tab";
+  tabEl.innerHTML = `<span class="tt-name">${escapeHtml(host ? host + " ⤢" : "shell")}</span><span class="tt-x" title="close">✕</span>`;
+  $("#termTablist", body).appendChild(tabEl);
+  const tab = { id, host, term, ws, fit, ro, pane, tabEl };
+  body._tabs.push(tab);
+  tabEl.onclick = ev => { if (ev.target.classList.contains("tt-x")) { ev.stopPropagation(); termCloseTab(body, tab); } else termActivate(body, tab); };
+  termActivate(body, tab);
+}
+function termActivate(body, tab) {
+  body._tabs.forEach(t => { t.pane.style.display = t === tab ? "flex" : "none"; t.tabEl.classList.toggle("on", t === tab); });
+  setTimeout(() => { try { tab.fit.fit(); } catch {} tab.term.focus(); }, 30);
+}
+function _termDispose(tab) {
+  try { tab.ro.disconnect(); } catch {}
+  try { tab.ws.close(); } catch {}
+  try { tab.term.dispose(); } catch {}
+  try { tab.pane.remove(); tab.tabEl.remove(); } catch {}
+}
+function termCloseTab(body, tab) {
+  const i = body._tabs.indexOf(tab); if (i < 0) return;
+  _termDispose(tab); body._tabs.splice(i, 1);
+  if (!body._tabs.length) { const w = document.getElementById("win-terminal"); if (w) $(".win-close", w).click(); return; }
+  termActivate(body, body._tabs[Math.max(0, i - 1)]);
+}
+async function termAddMenu(body, btn) {
+  const existing = body.querySelector(".term-menu"); if (existing) { existing.remove(); return; }   // toggle off
+  let hs = []; try { hs = (await api("/api/hosts")) || []; } catch {}
+  const menu = document.createElement("div"); menu.className = "term-menu";
+  menu.innerHTML = `<div class="term-menu-item" data-h="">▸ Workspace shell</div>`
+    + hs.filter(h => h.pinned).map(h => `<div class="term-menu-item" data-h="${escapeHtml(h.name)}">⤢ ${escapeHtml(h.name)}${h.policy === "armed" && !h.armed ? " 🔒" : ""}</div>`).join("");
+  btn.parentElement.appendChild(menu);
+  $$(".term-menu-item", menu).forEach(it => it.onclick = () => {
+    const hn = it.dataset.h, h = hs.find(x => x.name === hn);
+    if (h && h.policy === "armed" && !h.armed) toast(`Arm ${hn} in Hosts first`, "err");
+    termAddTab(body, hn); menu.remove();
+  });
+  setTimeout(() => document.addEventListener("click", function off(e) { if (!menu.contains(e.target) && e.target !== btn) { menu.remove(); document.removeEventListener("click", off); } }), 0);
 }
 
 /* ====================================================================
@@ -5100,6 +5184,7 @@ function wire() {
     else if (v === "notes") openNotes();
     else if (v === "logs") openLogs();
     else if (v === "hosts") openHosts();
+    else if (v === "terminal") openTerminal();
     else if (v === "health") openHealth();
     else setView(v);
   });
@@ -5213,7 +5298,7 @@ const UI_OPENERS = {
   researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
   search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
   live: () => openLiveView(), settings: () => openSettings(), hosts: () => openHosts(),
-  logs: () => openLogs(),
+  logs: () => openLogs(), terminal: () => openTerminal(),
 };
 const UI_WINIDS = {
   files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
@@ -5221,7 +5306,7 @@ const UI_WINIDS = {
   rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
   researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
   voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
-  hosts: "win-hosts", logs: "win-logs",
+  hosts: "win-hosts", logs: "win-logs", terminal: "win-terminal",
 };
 function startUiStream() {
   if (_uiES) return;                                   // one stream; survives re-login (idempotent init)
@@ -5243,7 +5328,9 @@ function uiOpen(c) {
     isPreviewable(p) ? openPreview(p) : openFile(p);
     return;
   }
-  const fn = UI_OPENERS[(c.window || "").toLowerCase()];
+  const win = (c.window || "").toLowerCase();
+  if (win === "terminal" && c.host) { openTerminal(String(c.host)); return; }   // a live SSH session into a host
+  const fn = UI_OPENERS[win];
   if (fn) fn();
 }
 const _UI_ZONE = { left: "left", right: "right", top: "top", bottom: "bottom", maximize: "full",

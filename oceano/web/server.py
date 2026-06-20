@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -598,6 +598,54 @@ async def test_notify():
     from oceano import notifications
     msg = await asyncio.to_thread(notifications.send, "This is a test notification from Oceano. 🌊", "Oceano test")
     return {"ok": msg.startswith("notified"), "result": msg}
+
+
+# ---------------- interactive terminal (PTY ↔ xterm.js over a WebSocket) ----------------
+@app.websocket("/api/terminal/ws")
+async def terminal_ws(ws: WebSocket):
+    """A real shell in the workspace. Auth-gated here (the HTTP _require_auth middleware doesn't
+    cover the WS handshake): same-origin + a valid session cookie + a non-default password."""
+    # Cross-Site WebSocket Hijacking guard: a WS handshake isn't bound by CORS and the browser
+    # attaches cookies, so a malicious page could otherwise open a shell using the user's session.
+    # Require the handshake Origin to be THIS server's own origin. The browser sets Origin and
+    # forbids page JS from changing it, so a cross-site page can't pass this; non-browser clients
+    # can spoof Origin but hold no session cookie. (Empty/foreign Origin → rejected.)
+    host = ws.headers.get("host", "")
+    origin = ws.headers.get("origin", "")
+    if not host or origin not in (f"http://{host}", f"https://{host}"):
+        await ws.close(code=1008)
+        return
+    auth = load().get("auth", {})
+    if not _token_user(ws.cookies.get(SESSION_COOKIE, ""), auth) or _is_default_pw(auth):
+        await ws.close(code=1008)                  # policy violation
+        return
+    await ws.accept()
+    from oceano.web import terminal
+    host_param = (ws.query_params.get("host") or "").strip()
+    try:
+        if host_param:                             # a LIVE SSH session into a registered host
+            from oceano import hosts
+            h = hosts._resolve(host_param)
+            err = None
+            if not h:
+                err = f"no host named {host_param!r}"
+            elif not h.get("host_key"):
+                err = f"host {h['name']!r} has no pinned key — open Hosts and Test & pin it first"
+            elif not (hosts.is_armed(h["id"]) or h.get("policy") == "trusted"):
+                err = (f"host {h['name']!r} is locked — an interactive shell can't be command-filtered, "
+                       f"so Arm it in the Hosts panel (or set its policy to trusted) first")
+            if err:
+                await ws.send_bytes(f"\r\n\x1b[31m{err}\x1b[0m\r\n".encode())
+            else:
+                await terminal.serve_host(ws, h, hosts._armed_secret(h["id"]))
+        else:
+            await terminal.serve(ws)               # the local workspace shell
+    except Exception:
+        traceback.print_exc()
+    try:
+        await ws.close()
+    except Exception:
+        pass
 
 
 def _embed_reachable():

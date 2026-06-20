@@ -25,7 +25,7 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **52 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **53 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
   HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
@@ -70,8 +70,9 @@ from a web UI or Telegram.
 - **A desktop of apps.** Floating windows: chat with dated history folders, a "Brain"
   (memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
   Scheduler, Calendar, Researcher, semantic Search, a Kanban Notes board, a
-  System-health dashboard, a Memory graph, a Voice console, and a sandboxed Preview that
-  renders web apps, markdown, Mermaid, charts, and slide decks.
+  System-health dashboard, a Memory graph, a Voice console, an **interactive Terminal** (a real
+  bash shell in the workspace, xterm.js over a WebSocket — fenced by the systemd sandbox), and a
+  sandboxed Preview that renders web apps, markdown, Mermaid, charts, and slide decks.
 
 ---
 
@@ -112,7 +113,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (52)
+## The agent's tools (53)
 
 | Group | Tools |
 |-------|-------|
@@ -128,7 +129,7 @@ from a web UI or Telegram.
 | **Skills** | `list_skills`, `load_skill` (one or several), `learn_skill`, `evaluate_skill` (independent review → staging) |
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
-| **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server — gated; see [Hosts](#hosts--ssh-keychain)) |
+| **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server), `sftp` (list / get / put files — gated; see [Hosts](#hosts--ssh-keychain)) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
