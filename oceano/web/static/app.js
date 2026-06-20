@@ -1792,7 +1792,7 @@ function _setWinMin(id, on) { const a = _winOpen(), w = a.find(x => x.id === id)
 function restoreWindows() {
   const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
                       brain: openBrain, workflows: openWorkflows, preview: openPreview,
-                      file: openFileWindow, cal: openCalendar, hosts: openHosts, terminal: openTerminal };
+                      file: openFileWindow, cal: openCalendar, hosts: openHosts, mail: openMail, terminal: openTerminal };
   _winOpen().forEach(w => {
     const fn = RESTORERS[w.key];
     if (!fn) return;
@@ -4195,6 +4195,454 @@ function hostsRenderEditor(body, h) {
   };
 }
 
+/* ---------------- Mail (IMAP + SMTP) ---------------- */
+function openMail() {
+  const { body, reused } = createWindow({ id: "win-mail", title: "Mail", icon: "✉", width: 1000, height: 700, restoreKey: "mail" });
+  if (reused) return;
+  body.classList.add("set-win");
+  mailRenderMain(body);
+}
+
+async function mailRenderMain(body) {
+  let accts; try { accts = await api("/api/mail"); } catch { return; }
+  body._mailAccts = accts;
+  if (!accts.length) { mailRenderAccounts(body); return; }
+  const cur = body._mailAcct && accts.find(a => a.id === body._mailAcct) ? body._mailAcct
+            : (accts.find(a => a.primary) || accts[0]).id;
+  body._mailAcct = cur;
+  body._mailFolder = body._mailFolder || "INBOX";
+  const acc = accts.find(a => a.id === cur);
+  body.innerHTML = `
+    <div class="wf-head">
+      <select id="mailAcct" class="te-model mail-acctsel" title="mailbox">${accts.map(a =>
+        `<option value="${a.id}"${a.id === cur ? " selected" : ""}>${escapeHtml(a.name)}${a.primary ? " ★" : ""}</option>`).join("")}</select>
+      <span class="fe-spacer"></span>
+      ${acc.policy !== "readonly" ? `<button class="ed-btn" id="mailCompose">✎ Compose</button>` : ""}
+      <button class="ed-btn" id="mailRefresh" title="refresh">↻</button>
+      <button class="ed-btn" id="mailManage">⚙ Accounts</button>
+    </div>
+    <div class="mail-armbar" id="mailArmbar"></div>
+    <div class="mail-layout">
+      <div class="mail-sidebar" id="mailFolders"><div class="empty-note sm">loading…</div></div>
+      <div class="mail-main" id="mailBody"><div class="empty-note">loading…</div></div>
+    </div>`;
+  $("#mailAcct", body).onchange = e => { body._mailAcct = parseInt(e.target.value, 10); body._mailFolder = "INBOX"; mailRenderMain(body); };
+  $("#mailRefresh", body).onclick = () => { mailLoadMessages(body); mailLoadUnreads(body); };
+  $("#mailManage", body).onclick = () => mailRenderAccounts(body);
+  const cb = $("#mailCompose", body); if (cb) cb.onclick = () => mailCompose(body, null);
+  mailRenderArmbar(body, acc);
+  let folders = ["INBOX"];
+  try { const fr = await api(`/api/mail/${cur}/folders`); if (fr.ok && fr.folders && fr.folders.length) folders = fr.folders; } catch {}
+  body._folders = folders;
+  mailRenderFolders(body, folders);
+  mailLoadMessages(body);
+}
+
+function mailRenderFolders(body, folders) {
+  const box = $("#mailFolders", body); if (!box) return;
+  const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
+  const canWrite = acc.policy !== "readonly";
+  const ordered = folders.includes("INBOX") ? ["INBOX", ...folders.filter(f => f !== "INBOX")] : folders;
+  const cur = body._mailFolder || "INBOX";
+  box.innerHTML = `<div class="mf-head"><span>Folders</span>${canWrite ? `<button class="mf-add" id="mfNew" title="New folder">+</button>` : ""}</div><div class="mf-list"></div>`;
+  const list = $(".mf-list", box);
+  if (canWrite) $("#mfNew", box).onclick = () => mailNewFolder(body);
+  ordered.forEach(f => {
+    const el = document.createElement("div");
+    el.className = "mail-folder" + (f === cur ? " active" : "");
+    el.dataset.folder = f; el.title = f;
+    el.innerHTML = `<span class="mf-name">${escapeHtml(f)}</span><span class="mf-badge"></span>`;
+    el.onclick = () => {
+      body._mailFolder = f;
+      $$(".mail-folder", list).forEach(x => x.classList.toggle("active", x === el));
+      mailLoadMessages(body);
+    };
+    if (canWrite) el.oncontextmenu = e => { e.preventDefault(); mailFolderMenu(body, f, e.clientX, e.clientY); };
+    list.appendChild(el);
+  });
+  mailLoadUnreads(body);
+}
+
+function mailFolderMenu(body, folder, x, y) {
+  const isSystem = /^INBOX$/i.test(folder) || folder === "[Gmail]" || folder.indexOf("[Gmail]/") === 0;
+  const items = [
+    { label: "Open", action: () => { body._mailFolder = folder; mailRenderMain(body); } },
+    { label: "New folder…", action: () => mailNewFolder(body) },
+  ];
+  if (!isSystem) {
+    items.push({ sep: true });
+    items.push({ label: "Rename…", action: () => mailRenameFolder(body, folder) });
+    items.push({ label: "Delete folder", danger: true, action: () => mailDeleteFolder(body, folder) });
+  }
+  showCtx(x, y, items);
+}
+
+async function mailNewFolder(body) {
+  const name = await promptDialog("New folder", { placeholder: "folder name", okLabel: "Create" });
+  if (!name) return;
+  const r = await _postJ(`/api/mail/${body._mailAcct}/folder`, { op: "create", name });
+  toast(r.ok ? ("✓ created “" + name + "”") : ("✗ " + (r.error || "failed")), r.ok ? "info" : "err");
+  if (r.ok) mailRenderMain(body);
+}
+
+async function mailRenameFolder(body, folder) {
+  const name = await promptDialog("Rename folder", { value: folder, okLabel: "Rename" });
+  if (!name || name === folder) return;
+  const r = await _postJ(`/api/mail/${body._mailAcct}/folder`, { op: "rename", name: folder, new: name });
+  toast(r.ok ? "✓ renamed" : ("✗ " + (r.error || "failed")), r.ok ? "info" : "err");
+  if (r.ok) { if (body._mailFolder === folder) body._mailFolder = name; mailRenderMain(body); }
+}
+
+async function mailDeleteFolder(body, folder) {
+  if (!await confirmAction("Delete folder?",
+      `“${folder}” will be deleted on the server. On most providers this also deletes the messages inside it (on Gmail it only removes the label — messages stay in All Mail).`)) return;
+  const r = await _postJ(`/api/mail/${body._mailAcct}/folder`, { op: "delete", name: folder });
+  toast(r.ok ? ("🗑 deleted “" + folder + "”") : ("✗ " + (r.error || "failed")), r.ok ? "info" : "err");
+  if (r.ok) { if (body._mailFolder === folder) body._mailFolder = "INBOX"; mailRenderMain(body); }
+}
+
+async function mailLoadUnreads(body) {
+  const cur = body._mailAcct, box = $("#mailFolders", body); if (!box) return;
+  let r; try { r = await api(`/api/mail/${cur}/unreads`); } catch { return; }
+  if (!r || !r.ok) return;
+  const u = r.unreads || {};
+  $$(".mail-folder", box).forEach(el => {
+    const n = u[el.dataset.folder]; const badge = $(".mf-badge", el);
+    if (badge) { badge.textContent = n ? String(n) : ""; badge.classList.toggle("on", !!n); }
+    el.classList.toggle("hasunread", !!n);
+  });
+}
+
+function mailRenderArmbar(body, acc) {
+  const bar = $("#mailArmbar", body); if (!bar) return;
+  if (acc.policy === "trusted") { bar.innerHTML = `<span class="mail-note">policy <b>trusted</b> — the agent can send without arming</span>`; return; }
+  if (acc.policy === "readonly") { bar.innerHTML = `<span class="mail-note">policy <b>read-only</b> — the agent reads &amp; organizes but can't send</span>`; return; }
+  bar.innerHTML = acc.armed
+    ? `<span class="mail-note on">🔓 armed — the agent may send for 30 min</span><button class="ed-btn" id="mailDisarm">Disarm</button>`
+    : `<span class="mail-note">🔒 not armed — the agent can read/organize but not send</span><button class="ed-btn" id="mailArm">Arm sending</button>`;
+  const ab = $("#mailArm", body); if (ab) ab.onclick = async () => { await _postJ(`/api/mail/${acc.id}/arm`, {}); toast(`🔓 ${acc.name} armed for 30 min`, "info"); mailRenderMain(body); };
+  const db = $("#mailDisarm", body); if (db) db.onclick = async () => { await _postJ(`/api/mail/${acc.id}/disarm`, {}); toast(`🔒 ${acc.name} disarmed`, "info"); mailRenderMain(body); };
+}
+
+async function mailLoadMessages(body) {
+  const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  const box = $("#mailBody", body); if (!box) return;
+  body._mailSel = new Set();
+  box.innerHTML = `<div class="empty-note">loading ${escapeHtml(folder)}…</div>`;
+  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=40`); } catch { return; }
+  if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
+  if (!r.messages.length) { box.innerHTML = `<div class="empty-note">(${escapeHtml(folder)} is empty)</div>`; return; }
+  box.innerHTML = `
+    <div class="mail-listhead">${escapeHtml(folder)} · showing ${r.messages.length} of ${r.total}</div>
+    <div class="mail-bulkbar" id="mailBulk" style="display:none"></div>
+    <div class="mail-list"></div>`;
+  const list = $(".mail-list", box);
+  r.messages.forEach(m => {
+    const row = document.createElement("div"); row.className = "mail-row" + (m.seen ? "" : " unread");
+    row.innerHTML = `<input type="checkbox" class="mr-chk" title="select">
+      <div class="mr-cell">
+        <div class="mr-top"><span class="mr-from">${escapeHtml(m.from)}</span><span class="mr-date">${escapeHtml(m.date)}</span></div>
+        <div class="mr-subj">${m.flagged ? "★ " : ""}${escapeHtml(m.subject) || "(no subject)"}</div>
+      </div>`;
+    const chk = $(".mr-chk", row);
+    chk.onclick = e => {
+      e.stopPropagation();
+      if (chk.checked) body._mailSel.add(m.uid); else body._mailSel.delete(m.uid);
+      row.classList.toggle("sel", chk.checked);
+      mailRenderBulk(body);
+    };
+    $(".mr-cell", row).onclick = () => mailViewMessage(body, m.uid, m);
+    list.appendChild(row);
+  });
+  mailRenderBulk(body);
+}
+
+function mailRenderBulk(body) {
+  const bar = $("#mailBulk", body); if (!bar) return;
+  const sel = body._mailSel || new Set();
+  const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
+  if (!sel.size || acc.policy === "readonly") { bar.style.display = "none"; bar.innerHTML = ""; return; }
+  bar.style.display = "flex";
+  bar.innerHTML = `<span class="mb-count">${sel.size} selected</span>
+    <button class="ed-btn" id="mbRead">Mark read</button>
+    <button class="ed-btn" id="mbMove">📁 Move…</button>
+    <button class="ed-btn" id="mbDel">🗑 Delete</button>
+    <span class="fe-spacer"></span>
+    <button class="ed-btn" id="mbClear">Clear</button>`;
+  $("#mbRead", bar).onclick = () => mailBulkAction(body, "flag", { flag: "read" });
+  $("#mbDel", bar).onclick = async () => {
+    if (!await confirmAction("Delete selected?", `${sel.size} message(s) will move to Trash.`)) return;
+    mailBulkAction(body, "delete", {});
+  };
+  $("#mbClear", bar).onclick = () => {
+    body._mailSel = new Set();
+    $$(".mail-row.sel", body).forEach(r => { r.classList.remove("sel"); const c = $(".mr-chk", r); if (c) c.checked = false; });
+    mailRenderBulk(body);
+  };
+  $("#mbMove", bar).onclick = () => {
+    const dests = (body._folders || []).filter(f => f !== body._mailFolder);
+    bar.innerHTML = `<span class="mb-count">Move ${sel.size} to</span>
+      <select class="te-model mb-dest" id="mbDest">${dests.map(f => `<option>${escapeHtml(f)}</option>`).join("")}</select>
+      <button class="ed-btn" id="mbMoveGo">Move</button>
+      <button class="ed-btn" id="mbMoveCancel">Cancel</button>`;
+    $("#mbMoveGo", bar).onclick = () => mailBulkAction(body, "move", { dest: $("#mbDest", bar).value });
+    $("#mbMoveCancel", bar).onclick = () => mailRenderBulk(body);
+  };
+}
+
+async function mailBulkAction(body, op, extra) {
+  const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  const uids = [...(body._mailSel || [])];
+  if (!uids.length) return;
+  toast(`${op === "delete" ? "deleting" : op === "move" ? "moving" : "updating"} ${uids.length}…`, "info");
+  let ok = 0;
+  for (const uid of uids) {
+    try { const x = await _postJ(`/api/mail/${cur}/action`, { op, uid, folder, ...extra }); if (x.ok) ok++; } catch {}
+  }
+  toast(`${ok}/${uids.length} ${op === "delete" ? "deleted" : op === "move" ? "moved" : "marked read"}`, ok ? "info" : "err");
+  body._mailSel = new Set();
+  mailLoadMessages(body);
+  mailLoadUnreads(body);
+}
+
+async function mailViewMessage(body, uid, meta) {
+  const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  const acc = (body._mailAccts || []).find(a => a.id === cur) || {};
+  const box = $("#mailBody", body);
+  box.innerHTML = `<div class="empty-note">loading message…</div>`;
+  let r; try { r = await api(`/api/mail/${cur}/message?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}`); } catch { return; }
+  if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
+  const att = (r.attachments && r.attachments.length) ? `<div class="mv-att">📎 ${r.attachments.map(escapeHtml).join(", ")}</div>` : "";
+  const canWrite = acc.policy !== "readonly";
+  const seen = meta ? meta.seen : true;
+  box.innerHTML = `
+    <div class="mail-view">
+      <div class="mv-bar"><button class="ed-btn" id="mvBack">← list</button>
+        ${canWrite ? `<button class="ed-btn mv-ai" id="mvDraft">✨ AI draft reply</button>` : ""}
+        ${canWrite ? `<button class="ed-btn" id="mvReply">↩ Reply</button>` : ""}
+        ${canWrite ? `<button class="ed-btn" id="mvRead">${seen ? "Mark unread" : "Mark read"}</button>` : ""}
+        ${canWrite ? `<button class="ed-btn" id="mvSpam">⚑ Spam</button>` : ""}
+        ${canWrite ? `<button class="ed-btn" id="mvDel">🗑 Delete</button>` : ""}</div>
+      <div class="mv-hdr">
+        <div class="mv-subj">${escapeHtml(r.subject) || "(no subject)"}</div>
+        <div class="mv-meta">From: ${escapeHtml(r.from)}</div>
+        <div class="mv-meta">To: ${escapeHtml(r.to)}</div>
+        ${r.cc ? `<div class="mv-meta">Cc: ${escapeHtml(r.cc)}</div>` : ""}
+        <div class="mv-meta">${escapeHtml(r.date)}</div>${att}</div>
+      <pre class="mv-body"></pre>
+    </div>`;
+  $(".mv-body", box).textContent = r.body || "(no text body)";   // textContent — never inject raw email HTML
+  $("#mvBack", box).onclick = () => mailLoadMessages(body);
+  const dr = $("#mvDraft", box); if (dr) dr.onclick = () => mailAiDraft(body, uid, { to: r.from, subject: r.subject });
+  const rep = $("#mvReply", box); if (rep) rep.onclick = () => mailCompose(body, { uid, to: r.from, subject: r.subject });
+  const rd = $("#mvRead", box); if (rd) rd.onclick = async () => {
+    const flag = seen ? "unread" : "read";
+    const x = await _postJ(`/api/mail/${cur}/action`, { op: "flag", uid, flag, folder });
+    toast(x.ok ? ("✓ marked " + flag) : ("✗ " + (x.error || "failed")), x.ok ? "info" : "err"); if (x.ok) mailLoadMessages(body);
+  };
+  const sp = $("#mvSpam", box); if (sp) sp.onclick = async () => {
+    const x = await _postJ(`/api/mail/${cur}/action`, { op: "flag", uid, flag: "spam", folder });
+    toast(x.ok ? "⚑ moved to spam" : ("✗ " + (x.error || "failed")), x.ok ? "info" : "err"); if (x.ok) mailLoadMessages(body);
+  };
+  const dl = $("#mvDel", box); if (dl) dl.onclick = async () => {
+    if (!await confirmAction("Delete message?", "It will be moved to Trash.")) return;
+    const x = await _postJ(`/api/mail/${cur}/action`, { op: "delete", uid, folder });
+    toast(x.ok ? "🗑 moved to Trash" : ("✗ " + (x.error || "failed")), x.ok ? "info" : "err"); if (x.ok) mailLoadMessages(body);
+  };
+}
+
+async function mailAiDraft(body, uid, meta) {
+  const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
+  // Open the reply composer IMMEDIATELY so there's instant feedback (a local model can be slow),
+  // then fill it when the draft arrives — with a hard timeout so it never silently hangs.
+  mailCompose(body, { uid, to: meta.to, subject: meta.subject });
+  const ed = $("#mcBody", body), send = $("#mcSend", body), status = $("#mcStatus", body), note = $("#mcMsg", body);
+  if (!ed) return;
+  ed.setAttribute("contenteditable", "false");
+  ed.classList.remove("empty");
+  ed.innerHTML = `<div class="mc-drafting"><span class="mc-spin"></span> ✨ Generating draft… the model is writing your reply.</div>`;
+  if (status) status.innerHTML = `<span class="mc-spin"></span> drafting…`;
+  if (send) send.disabled = true;
+  note.textContent = ""; note.className = "acct-msg";
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000);
+  const restore = () => { clearTimeout(timer); ed.setAttribute("contenteditable", "true"); if (send) send.disabled = false; if (status) status.innerHTML = ""; };
+  try {
+    const resp = await fetch(`/api/mail/${cur}/ai-draft`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uid, folder }), signal: ctrl.signal });
+    const r = await resp.json();
+    restore();
+    if (!r.ok) { ed.innerHTML = ""; mcPlaceholder(ed); note.textContent = "✗ " + (r.error || "draft failed — write your reply below"); note.className = "acct-msg err"; ed.focus(); return; }
+    ed.innerText = r.draft || ""; mcPlaceholder(ed);
+    note.textContent = "✨ AI draft — review & edit before sending"; note.className = "acct-msg"; ed.focus();
+  } catch (e) {
+    restore();
+    ed.innerHTML = ""; mcPlaceholder(ed);
+    note.textContent = (e && e.name === "AbortError")
+      ? "draft timed out — the local model is busy/slow; write your reply below or retry"
+      : "draft failed — write your reply below";
+    note.className = "acct-msg err"; ed.focus();
+  }
+}
+
+function mcPlaceholder(ed) {
+  // contenteditable has no native placeholder — toggle a CSS one when it's visually empty
+  const empty = !ed.textContent.trim() && !ed.querySelector("img,li,blockquote");
+  ed.classList.toggle("empty", empty);
+}
+
+function mailCompose(body, reply) {
+  const cur = body._mailAcct;
+  const subj = reply ? (/^\s*re:/i.test(reply.subject || "") ? reply.subject : "Re: " + (reply.subject || "")) : "";
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="mcBack">←</button><h3>${reply ? "Reply" : "Compose"}</h3>
+      <span class="fe-spacer"></span><span class="mc-status" id="mcStatus"></span></div>
+    <div class="mail-compose">
+      <div class="mc-fields">
+        ${reply ? `<div class="mc-replyto">replying to <b>${escapeHtml(reply.to)}</b></div>`
+                : `<div class="mc-field"><label>To</label><input id="mcTo" placeholder="someone@example.com"></div>
+                   <div class="mc-field"><label>Cc</label><input id="mcCc" placeholder="optional"></div>`}
+        <div class="mc-field"><label>Subject</label><input id="mcSubj" value="${escapeHtml(subj)}"></div>
+      </div>
+      <div class="mc-toolbar">
+        <button class="mc-tool" data-cmd="bold" title="Bold (Ctrl-B)"><b>B</b></button>
+        <button class="mc-tool" data-cmd="italic" title="Italic (Ctrl-I)"><i>I</i></button>
+        <button class="mc-tool" data-cmd="underline" title="Underline (Ctrl-U)"><u>U</u></button>
+        <span class="mc-sep"></span>
+        <button class="mc-tool" data-cmd="insertUnorderedList" title="Bulleted list">•</button>
+        <button class="mc-tool" data-cmd="insertOrderedList" title="Numbered list">1.</button>
+        <button class="mc-tool" id="mcQuote" title="Quote">❝</button>
+        <button class="mc-tool" id="mcLink" title="Insert link">🔗</button>
+        <span class="mc-sep"></span>
+        <button class="mc-tool" id="mcClearFmt" title="Clear formatting">⌫</button>
+      </div>
+      <div class="mc-editor" id="mcBody" contenteditable="true" spellcheck="true" data-ph="Write your message…"></div>
+      <div class="mc-foot"><span class="acct-msg" id="mcMsg"></span>
+        <span class="te-btns"><button class="ghost-btn sm" id="mcCancel">Cancel</button>
+        <button class="primary sm" id="mcSend">Send</button></span></div>
+    </div>`;
+  $("#mcBack", body).onclick = () => mailRenderMain(body);
+  $("#mcCancel", body).onclick = () => mailRenderMain(body);
+  const ed = $("#mcBody", body);
+  $$(".mc-tool[data-cmd]", body).forEach(btn => btn.onclick = e => { e.preventDefault(); ed.focus(); document.execCommand(btn.dataset.cmd, false, null); mcPlaceholder(ed); });
+  $("#mcQuote", body).onclick = e => { e.preventDefault(); ed.focus(); document.execCommand("formatBlock", false, "blockquote"); };
+  $("#mcLink", body).onclick = async () => { ed.focus(); const u = await promptDialog("Insert link", { placeholder: "https://…", okLabel: "Insert" }); if (u) document.execCommand("createLink", false, u); };
+  $("#mcClearFmt", body).onclick = e => { e.preventDefault(); ed.focus(); document.execCommand("removeFormat"); };
+  ed.addEventListener("input", () => mcPlaceholder(ed));
+  if (reply && reply.prefill) ed.innerText = reply.prefill;
+  mcPlaceholder(ed);
+  $("#mcSend", body).onclick = async () => {
+    const msg = $("#mcMsg", body);
+    const text = ed.innerText.trim();
+    if (!text) { msg.textContent = "write a message first"; msg.className = "acct-msg err"; return; }
+    const html = (window.DOMPurify ? DOMPurify.sanitize(ed.innerHTML) : ed.innerHTML);
+    const payload = reply
+      ? { reply_uid: reply.uid, folder: body._mailFolder || "INBOX", body: ed.innerText, html }
+      : { to: ($("#mcTo", body).value || "").trim(), cc: ($("#mcCc", body).value || "").trim(),
+          subject: $("#mcSubj", body).value, body: ed.innerText, html };
+    if (!reply && !payload.to) { msg.textContent = "recipient required"; msg.className = "acct-msg err"; return; }
+    msg.textContent = "sending…"; msg.className = "acct-msg";
+    const r = await _postJ(`/api/mail/${cur}/send`, payload);
+    if (!r.ok) { msg.textContent = r.error || "send failed"; msg.className = "acct-msg err"; return; }
+    toast("✓ " + (r.text || "sent"), "info"); mailRenderMain(body);
+  };
+}
+
+async function mailRenderAccounts(body) {
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="maBack">←</button><h3>Mail accounts</h3><span class="fe-spacer"></span><button class="primary sm" id="maNew">+ Add account</button></div>
+    <div class="host-note">Email accounts Oceano can read, organize and send from (IMAP + SMTP). The agent acts on the <b>primary</b> by default and on <b>one mailbox per action</b>. Sending needs the account <b>armed</b> (or policy <b>trusted</b>); reading email blocks sending for that turn. App passwords are stored locally (0600) and never shown.</div>
+    <div class="host-list" id="maList"><div class="empty-note">loading…</div></div>`;
+  $("#maBack", body).onclick = () => mailRenderMain(body);
+  $("#maNew", body).onclick = () => mailRenderEditor(body, null);
+  let accts; try { accts = await api("/api/mail"); } catch { return; }
+  const list = $("#maList", body);
+  if (!accts.length) { list.innerHTML = `<div class="empty-note">No accounts yet. Add one — address, IMAP &amp; SMTP servers, username, and an app password.</div>`; return; }
+  list.innerHTML = "";
+  accts.forEach(a => {
+    const el = document.createElement("div"); el.className = "host-card";
+    const polClass = a.policy === "trusted" ? "trusted" : a.policy === "readonly" ? "readonly" : "armed";
+    const pol = `<span class="host-pol pol-${polClass}">${a.policy}</span>`;
+    const prim = a.primary ? `<span class="host-armed on">★ primary</span>` : "";
+    const armed = a.armed ? `<span class="host-armed on">🔓 armed</span>` : "";
+    el.innerHTML = `
+      <div class="host-main">
+        <div class="host-name">${escapeHtml(a.name)} ${pol} ${prim} ${armed}</div>
+        <div class="host-addr">${escapeHtml(a.email)} · IMAP ${escapeHtml(a.imap_host)}:${a.imap_port} · SMTP ${escapeHtml(a.smtp_host)}:${a.smtp_port}${a.has_password ? "" : " · <span class='host-pin warn'>no password</span>"}</div>
+      </div>
+      <div class="host-actions">
+        <button class="ed-btn ma-test">Test</button>
+        ${a.primary ? "" : `<button class="ed-btn ma-prim">Make primary</button>`}
+        ${a.policy === "trusted" ? "" : `<button class="ed-btn ma-arm">${a.armed ? "Disarm" : "Arm send"}</button>`}
+        <button class="ed-btn ma-edit">Edit</button>
+        <button class="ed-btn ma-del" title="delete">✕</button>
+      </div>`;
+    $(".ma-test", el).onclick = async () => { toast("testing " + a.name + "…", "info"); const r = await _postJ(`/api/mail/${a.id}/test`, {}); toast(r.ok ? "✓ IMAP + SMTP OK for " + a.name : "✗ " + (r.error || "failed"), r.ok ? "info" : "err"); };
+    const pb = $(".ma-prim", el); if (pb) pb.onclick = async () => { await _postJ(`/api/mail/${a.id}/primary`, {}); toast("★ " + a.name + " is now primary", "info"); mailRenderAccounts(body); };
+    const arm = $(".ma-arm", el); if (arm) arm.onclick = async () => { await _postJ(`/api/mail/${a.id}/${a.armed ? "disarm" : "arm"}`, {}); toast((a.armed ? "🔒 disarmed " : "🔓 armed ") + a.name, "info"); mailRenderAccounts(body); };
+    $(".ma-edit", el).onclick = () => mailRenderEditor(body, a);
+    $(".ma-del", el).onclick = async () => { if (!await confirmAction("Delete account?", `“${a.name}” will be removed from Oceano (no mail on the server is touched).`)) return; await fetch("/api/mail/" + a.id, { method: "DELETE" }); mailRenderAccounts(body); };
+    list.appendChild(el);
+  });
+}
+
+function mailRenderEditor(body, a) {
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="meBack">←</button><h3>${a ? "Edit account" : "Add mail account"}</h3></div>
+    <div class="drawer-section">
+      <label class="field-label">Name <span class="lbl-sub">the agent refers to it by this</span></label>
+      <input id="meName" placeholder="personal" value="${a ? escapeHtml(a.name) : ""}">
+      <label class="field-label">Email address</label>
+      <input id="meEmail" placeholder="you@example.com" value="${a ? escapeHtml(a.email) : ""}">
+      <div class="host-row">
+        <div style="flex:1"><label class="field-label">IMAP host <span class="lbl-sub">incoming</span></label><input id="meImapHost" placeholder="imap.example.com" value="${a ? escapeHtml(a.imap_host) : ""}"></div>
+        <div style="width:84px"><label class="field-label">Port</label><input id="meImapPort" value="${a ? a.imap_port : 993}"></div>
+      </div>
+      <label class="mail-check"><input type="checkbox" id="meImapSsl" ${!a || a.imap_ssl ? "checked" : ""}> IMAP uses SSL/TLS</label>
+      <div class="host-row">
+        <div style="flex:1"><label class="field-label">SMTP host <span class="lbl-sub">outgoing</span></label><input id="meSmtpHost" placeholder="smtp.example.com" value="${a ? escapeHtml(a.smtp_host) : ""}"></div>
+        <div style="width:84px"><label class="field-label">Port</label><input id="meSmtpPort" value="${a ? a.smtp_port : 465}"></div>
+      </div>
+      <label class="mail-check"><input type="checkbox" id="meSmtpSsl" ${!a || a.smtp_ssl ? "checked" : ""}> SMTP uses SSL/TLS</label>
+      <label class="field-label">Username <span class="lbl-sub">usually your full email address</span></label>
+      <input id="meUser" placeholder="you@example.com" value="${a ? escapeHtml(a.user) : ""}">
+      <label class="field-label">App password <span class="lbl-sub">stored locally (0600), never shown — most providers (Gmail/iCloud/Yahoo) need an app-specific password</span></label>
+      <input id="mePass" type="password" autocomplete="new-password" placeholder="${a && a.has_password ? "● set — type to replace" : "app password"}">
+      <label class="field-label">Agent policy <span class="lbl-sub">readonly = read/organize only · active = + send when armed · trusted = send freely</span></label>
+      <select id="mePolicy" class="te-model">${["readonly", "active", "trusted"].map(p => `<option value="${p}"${(a ? a.policy : "active") === p ? " selected" : ""}>${p}</option>`).join("")}</select>
+      <label class="mail-check"><input type="checkbox" id="mePrimary" ${a && a.primary ? "checked" : ""}> Make this the primary mailbox</label>
+      <div class="acct-actions"><span class="acct-msg" id="meMsg"></span>
+        <span class="te-btns"><button class="ghost-btn sm" id="meCancel">Cancel</button>
+        <button class="primary sm" id="meSave">${a ? "Save" : "Add account"}</button></span></div>
+    </div>`;
+  $("#meBack", body).onclick = () => mailRenderAccounts(body);
+  $("#meCancel", body).onclick = () => mailRenderAccounts(body);
+  $("#meSave", body).onclick = async () => {
+    const msg = $("#meMsg", body);
+    const payload = {
+      name: $("#meName", body).value.trim(), email: $("#meEmail", body).value.trim(),
+      imap_host: $("#meImapHost", body).value.trim(), imap_port: parseInt($("#meImapPort", body).value, 10) || 993,
+      imap_ssl: $("#meImapSsl", body).checked,
+      smtp_host: $("#meSmtpHost", body).value.trim(), smtp_port: parseInt($("#meSmtpPort", body).value, 10) || 465,
+      smtp_ssl: $("#meSmtpSsl", body).checked,
+      user: $("#meUser", body).value.trim(), policy: $("#mePolicy", body).value,
+      primary: $("#mePrimary", body).checked,
+    };
+    const pw = $("#mePass", body).value; if (pw) payload.password = pw;
+    if (!payload.name || !payload.email || !payload.imap_host || !payload.smtp_host) {
+      msg.textContent = "name, email, IMAP host and SMTP host are required"; msg.className = "acct-msg err"; return;
+    }
+    let res;
+    if (a) res = await (await fetch("/api/mail/" + a.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })).json();
+    else res = await _postJ("/api/mail", payload);
+    if (!res.ok) { msg.textContent = res.error || "save failed"; msg.className = "acct-msg err"; return; }
+    if (a && payload.primary && !a.primary) await _postJ(`/api/mail/${a.id}/primary`, {});   // PATCH doesn't change primary
+    toast(a ? "saved ✓" : "account added — Test it", "info");
+    mailRenderAccounts(body);
+  };
+}
+
 /* ====================================================================
    Terminal — a real bash shell in the workspace (PTY ↔ xterm.js over a
    WebSocket). Unguarded (you're driving), fenced by the systemd sandbox.
@@ -5032,6 +5480,7 @@ function wire() {
     else if (v === "notes") openNotes();
     else if (v === "logs") openLogs();
     else if (v === "hosts") openHosts();
+    else if (v === "mail") openMail();
     else if (v === "terminal") openTerminal();
     else if (v === "health") openHealth();
     else setView(v);

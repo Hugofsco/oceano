@@ -70,7 +70,7 @@ def _model(model):
 
 
 def chat(messages, tools=None, model=None, temperature=0.2, base_url=None, api_key=None,
-         return_usage=False):
+         return_usage=False, max_tokens=None):
     """One completion. Returns the raw `message` (text content OR tool_calls).
     With return_usage=True, returns (message, completion_tokens)."""
     resp = _c(base_url, api_key).chat.completions.create(
@@ -79,6 +79,7 @@ def chat(messages, tools=None, model=None, temperature=0.2, base_url=None, api_k
         tools=tools or None,
         tool_choice="auto" if tools else None,
         temperature=temperature,
+        max_tokens=max_tokens,
     )
     msg = resp.choices[0].message
     if return_usage:

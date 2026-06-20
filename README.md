@@ -25,13 +25,21 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **53 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **63 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
   HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
-  one shot), **a gated SSH keychain** (run command batches on registered servers), agent-driven
+  one shot), **a gated SSH keychain** (run command batches on registered servers),
+  **multi-account email** (IMAP + SMTP — read, organize, delete spam, send & reply), agent-driven
   UI control (it opens & arranges your windows), and delegation; plus any tools from MCP servers
   you connect.
+- **A built-in email client.** Connect IMAP/SMTP accounts (app passwords) and get a real client —
+  a folder sidebar with **unread counts**, a message reader, **multi-select** bulk move/delete,
+  a compose/reply editor with a **rich-text toolbar**, and a **✨ AI-draft-reply** button. The agent
+  works your mailboxes too — read, search, organize, delete likely-spam, send/reply, even add/rename/
+  delete folders — all gated (primary-mailbox default, one mailbox per action, web-only for changes,
+  sending and folder-deletion need you to *arm* the account, and reading mail blocks sending that turn
+  to stop prompt-injected exfiltration). See [Mail](#mail--imap--smtp).
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -113,7 +121,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (53)
+## The agent's tools (63)
 
 | Group | Tools |
 |-------|-------|
@@ -130,6 +138,7 @@ from a web UI or Telegram.
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server), `sftp` (list / get / put files — gated; see [Hosts](#hosts--ssh-keychain)) |
+| **Mail (IMAP/SMTP)** | `mail_accounts`, `mail_folders` (counts + which are empty), `mail_list`, `mail_read`, `mail_move`, `mail_delete` (→ Trash), `mail_flag` (read/unread/flag/spam), `mail_send`, `mail_reply`, `mail_folder` (create/rename/delete) — multi-account, gated; see [Mail](#mail--imap--smtp) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
@@ -246,6 +255,39 @@ biggest blast-radius in the project:
 
 Passphrases/passwords aren't stored by default — they're supplied when you arm a host and held
 only in memory. Uses [paramiko]; hosts live in `data/hosts.json` (gitignored).
+
+---
+
+## Mail — IMAP + SMTP
+
+Connect email accounts in the **Mail** window (address, IMAP + SMTP servers, an **app password** —
+stored locally in `data/mail.json` **0600**, masked in every API response, never committed). Mark a
+**primary** mailbox; the agent works on it by default and acts on **one mailbox per action** (target
+another by name, and it asks when a request is ambiguous). The window is a full client: a **folder
+sidebar with unread counts**, a message list with **multi-select** bulk **move / delete / mark-read**,
+a reader, **folder management** (create · rename · delete, with system folders protected), and a
+**compose/reply editor** with a rich-text toolbar and a **✨ AI-draft-reply** button (the configured
+model drafts a reply you review and edit before sending — never auto-sent).
+
+The agent gets the same power through ten tools (`mail_accounts`, `mail_folders`, `mail_list`,
+`mail_read`, `mail_move`, `mail_delete`, `mail_flag`, `mail_send`, `mail_reply`, `mail_folder`),
+under the same layered gates as the SSH keychain — because email is the classic prompt-injection
+vector:
+
+- **Web UI only** for any state change (send, move, delete, flag, folder ops); reading works on any
+  channel.
+- **Injection-gated** — every fetched message is fenced as untrusted, and reading one **taints the
+  turn**, so `mail_send` / `mail_reply` and folder changes refuse for the rest of that turn (text
+  injected into an email can't trigger an outbound message or restructure your mailbox).
+- **Per-account policy** — `readonly` (read/organize only), `active` (default; sending and
+  folder-deletion need you to **arm** the account for 30 min), or `trusted`. Delete is
+  **move-to-Trash** (reversible); INBOX and special-use folders (Sent/Trash/Drafts/Junk/`[Gmail]/*`)
+  can never be deleted.
+- **Audited** — every action lands in the **Logs** feed.
+
+Both the local model and the **Claude mind** get these tools (the mind via the curated MCP bridge).
+Uses Python's stdlib `imaplib` / `smtplib` (no new dependencies); Gmail / iCloud / Yahoo / Fastmail
+and self-hosted IMAP all work with an app password. Accounts live in `data/mail.json` (gitignored).
 
 ---
 
@@ -568,6 +610,7 @@ oceano/
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
   calsync.py         calendar — agent-managed local events + read-only ICS feed sync
+  mail.py            email — IMAP read/organize + SMTP send/reply (multi-account, gated)
   voice.py           speech-in (faster-whisper) / speech-out (Kokoro → Piper → espeak) for web + Telegram
   rivers.py          Hugging Face model catalog + hardware-fit + serve
   mcp_client.py      optional MCP server connections

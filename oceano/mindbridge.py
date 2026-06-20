@@ -27,6 +27,9 @@ _ALLOW = {
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
     "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
     "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
+    "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
+    "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)
+    "mail_folder",                                                       # create/rename/delete folders (gated; delete needs arming)
 }
 
 _TOKEN = None

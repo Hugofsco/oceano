@@ -1686,3 +1686,75 @@ html.density-compact{font-size:14px} html.density-spacious{font-size:17.5px}
 .term-menu{position:absolute;top:34px;right:6px;z-index:60;background:var(--panel-solid);border:1px solid var(--line-strong);border-radius:9px;padding:4px;box-shadow:0 10px 28px rgba(0,0,0,.55);min-width:172px}
 .term-menu-item{padding:7px 11px;font-size:12.5px;color:var(--foam);border-radius:6px;cursor:pointer;white-space:nowrap}
 .term-menu-item:hover{background:rgba(var(--biolum-rgb),.12);color:var(--biolum)}
+
+/* ---- Mail (IMAP + SMTP) ---- */
+.mail-armbar{display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--line);font-size:12.5px;min-height:18px;flex:0 0 auto}
+.mail-note{color:var(--mut)}
+.mail-note.on{color:var(--biolum)}
+.mail-layout{flex:1;min-height:0;display:flex}
+.mail-sidebar{flex:0 0 168px;width:168px;overflow-y:auto;border-right:1px solid var(--line);padding:0 0 6px}
+.mf-head{display:flex;align-items:center;justify-content:space-between;padding:5px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);position:sticky;top:0;background:var(--panel);z-index:1}
+.mf-add{width:19px;height:19px;line-height:15px;text-align:center;font-size:14px;color:var(--mist);background:transparent;border:1px solid var(--line);border-radius:5px;cursor:pointer;padding:0}
+.mf-add:hover{color:var(--biolum);border-color:var(--biolum)}
+.mf-list{display:flex;flex-direction:column}
+.mail-folder{display:flex;align-items:center;gap:6px;padding:6px 12px;font-size:12px;color:var(--mist);cursor:pointer;border-left:2px solid transparent}
+.mail-folder .mf-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mf-badge{flex:none;display:none}
+.mf-badge.on{display:inline-block;min-width:18px;text-align:center;font-size:10.5px;font-weight:600;color:var(--biolum);background:rgba(var(--biolum-rgb),.16);border-radius:9px;padding:1px 6px}
+.mail-folder.hasunread .mf-name{color:var(--foam);font-weight:600}
+.mail-folder:hover{background:rgba(var(--biolum-rgb),.08);color:var(--foam)}
+.mail-folder.active{background:rgba(var(--biolum-rgb),.12);color:var(--biolum);border-left-color:var(--biolum)}
+.mail-main{flex:1;min-width:0;overflow-y:auto;display:flex;flex-direction:column}
+.mail-body{flex:1;overflow:auto}
+.mail-listhead{padding:7px 13px;font-size:11.5px;color:var(--mut);border-bottom:1px solid rgba(var(--line-rgb),.5);position:sticky;top:0;background:var(--panel);z-index:1}
+.mail-bulkbar{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line);background:rgba(var(--biolum-rgb),.06)}
+.mb-count{font-size:12px;color:var(--biolum);font-weight:600}
+.mail-bulkbar select.mb-dest{padding:5px 26px 5px 9px;font-size:12px;max-width:210px;width:auto}
+.empty-note.sm{font-size:11.5px;padding:10px}
+.ed-btn.mv-ai{color:var(--biolum);border-color:rgba(var(--biolum-rgb),.4)}
+.ed-btn.mv-ai:hover{background:rgba(var(--biolum-rgb),.14)}
+.mail-list{display:flex;flex-direction:column}
+.mail-row{display:flex;align-items:flex-start;gap:9px;padding:9px 13px;border-bottom:1px solid rgba(var(--line-rgb),.5)}
+.mail-row:hover{background:rgba(var(--biolum-rgb),.08)}
+.mail-row.sel{background:rgba(var(--biolum-rgb),.12)}
+.mail-row.unread{border-left:2px solid var(--biolum)}
+.mail-row.unread .mr-subj{font-weight:600;color:var(--foam)}
+.mr-chk{flex:none;margin-top:2px;cursor:pointer}
+.mr-cell{flex:1;min-width:0;cursor:pointer}
+.mr-top{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:var(--mut)}
+.mr-from{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-date{flex:none}
+.mr-subj{font-size:13px;color:var(--foam);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mail-view{display:flex;flex-direction:column;flex:1;min-height:0}
+.mv-bar{display:flex;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line)}
+.mv-hdr{padding:10px 13px;border-bottom:1px solid var(--line)}
+.mv-subj{font-size:15px;font-weight:600;color:var(--foam);margin-bottom:5px}
+.mv-meta{font-size:12px;color:var(--mut)}
+.mv-att{font-size:12px;color:var(--biolum);margin-top:5px}
+.mv-body{flex:1;overflow:auto;margin:0;padding:13px;font-family:var(--mono),monospace;font-size:12.5px;line-height:1.5;color:var(--foam);white-space:pre-wrap;word-break:break-word}
+.mail-check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--foam);margin:8px 0}
+.mail-check input{width:auto;margin:0}
+.host-pol.pol-readonly{background:rgba(120,140,160,.2);color:#9fb2c2}
+.host-pol.pol-trusted{background:rgba(var(--biolum-rgb),.18);color:var(--biolum)}
+/* compose / reply — full-height rich editor */
+.mail-compose{flex:1;min-height:0;display:flex;flex-direction:column;padding:12px 14px;gap:10px}
+.mc-fields{display:flex;flex-direction:column;gap:7px;flex:0 0 auto}
+.mc-field{display:flex;align-items:center;gap:9px}
+.mc-field label{width:54px;font-size:12px;color:var(--mut);flex:none}
+.mc-field input{flex:1}
+.mc-replyto{font-size:12px;color:var(--mut)}
+.mc-toolbar{display:flex;align-items:center;gap:3px;flex:0 0 auto;padding:5px 6px;border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;background:var(--panel)}
+.mc-tool{min-width:28px;height:26px;padding:0 7px;font-size:12.5px;color:var(--mist);background:transparent;border:1px solid transparent;border-radius:6px;cursor:pointer}
+.mc-tool:hover{background:rgba(var(--biolum-rgb),.12);color:var(--foam)}
+.mc-sep{width:1px;height:18px;background:var(--line);margin:0 3px}
+.mc-editor{flex:1;min-height:150px;overflow-y:auto;border:1px solid var(--line);border-radius:0 0 8px 8px;padding:11px 12px;background:rgba(var(--abyss-0-rgb),.6);color:var(--foam);font-family:var(--font-body);font-size:13.5px;line-height:1.6;outline:none}
+.mc-editor:focus{border-color:var(--biolum)}
+.mc-editor.empty::before{content:attr(data-ph);color:var(--mut)}
+.mc-editor blockquote{border-left:3px solid var(--line-strong);margin:6px 0;padding-left:10px;color:var(--mist)}
+.mc-editor a{color:var(--biolum)}
+.mc-foot{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+.mc-foot .te-btns{margin-left:auto;display:flex;gap:8px}
+.mc-status{font-size:12px;color:var(--biolum);display:flex;align-items:center;gap:6px}
+.mc-drafting{display:flex;align-items:center;gap:9px;color:var(--biolum);font-size:13px;padding:6px 2px}
+.mc-spin{width:12px;height:12px;border:2px solid rgba(var(--biolum-rgb),.3);border-top-color:var(--biolum);border-radius:50%;display:inline-block;animation:mcspin .7s linear infinite}
+@keyframes mcspin{to{transform:rotate(360deg)}}
