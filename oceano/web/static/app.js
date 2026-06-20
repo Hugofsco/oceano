@@ -368,6 +368,7 @@ async function send() {
   touchTitle(text || (atts[0] && atts[0].name) || "attachment"); appendT({ role: "user", content: text });
 
   const payload = { session: state.session, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
+                    voice: !!_voiceSpeak,            // hands-free converse turn → ask for a short, spoken reply
                     attachments: atts.map(a => ({ path: a.path, name: a.name, kind: a.kind })) };
   let sounding = addThinking(), bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, _lastDraw = 0, stats = null, livePopped = false;
   const killSounding = () => { if (sounding) { sounding.remove(); sounding = null; } };
@@ -1131,6 +1132,32 @@ async function loadTelegram() {
   $("#tgToken").value = "";
   $("#tgToken").placeholder = tg.has_token ? "● token set — paste to change" : "paste to set";
   renderTgStatus(tg);
+  loadNotify();
+}
+async function loadNotify() {
+  let d; try { d = await api("/api/notify"); } catch { return; }
+  if ($("#ntTopic")) $("#ntTopic").value = d.ntfy_topic || "";
+  if ($("#ntUrl")) $("#ntUrl").value = d.ntfy_url || "https://ntfy.sh";
+  if ($("#ntTelegram")) $("#ntTelegram").checked = d.telegram !== false;
+  const el = $("#ntfyReady"); if (!el) return;
+  const on = [];
+  if (d.ready && d.ready.ntfy) on.push("ntfy ✓");
+  if (d.ready && d.ready.telegram) on.push("Telegram ✓");
+  el.textContent = on.length ? "active: " + on.join(" · ")
+    : (d.telegram && !d.telegram_running ? "Telegram on, but the bot isn't running" : "no channel active yet");
+  el.className = "tg-status" + (on.length ? " on" : "");
+}
+async function saveNotify() {
+  const btn = $("#ntSave"); if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  try {
+    await fetch("/api/notify", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ntfy_topic: $("#ntTopic").value, ntfy_url: $("#ntUrl").value, telegram: $("#ntTelegram").checked }) });
+    toast("notifications saved", "info"); loadNotify();
+  } finally { if (btn) { btn.disabled = false; btn.textContent = "Save"; } }
+}
+async function testNotify() {
+  const r = await _postJ("/api/notify/test", {});
+  toast(r.ok ? "✓ " + (r.result || "sent") : "✗ " + (r.result || "no channel ready"), r.ok ? "info" : "err");
 }
 async function saveTelegram(extra = {}) {
   const btn = $("#tgSave"); btn.disabled = true; btn.textContent = "Applying…";
@@ -1178,9 +1205,79 @@ async function restartService(btn) {
   setTimeout(loadServices, 1500); setTimeout(loadServices, 5000);   // it's briefly down during a restart — re-poll twice so the status recovers
 }
 
+/* ========= Appearance: theme · atmosphere · type · density (UI-only, persisted on this device) ========= */
+const THEMES = [
+  { id: "abyss",     name: "Abyss",     bg: "#04111a", a: "#37e3c6", a2: "#54c8ff" },   // Oceano's own (default)
+  { id: "dark",      name: "Slate",     bg: "#282c34", a: "#9cdef2", a2: "#e06c75" },
+  { id: "midnight",  name: "Midnight",  bg: "#0d1117", a: "#c9d1d9", a2: "#f85149" },
+  { id: "ocean",     name: "Ocean",     bg: "#0b1a2c", a: "#64d2ff", a2: "#4facfe" },
+  { id: "forest",    name: "Kelp",      bg: "#1b2a1b", a: "#a8d5a2", a2: "#7cb871" },
+  { id: "copper",    name: "Driftwood", bg: "#1c1410", a: "#e8c39e", a2: "#d4764e" },
+  { id: "claude",    name: "Clay",      bg: "#262624", a: "#f5f4f0", a2: "#c6613f" },
+  { id: "gpt",       name: "Graphite",  bg: "#212121", a: "#ececec", a2: "#949494" },
+  { id: "terminal",  name: "Sonar",     bg: "#000000", a: "#00ff41", a2: "#00ff41" },
+  { id: "cyberpunk", name: "Neon",      bg: "#0a0a0f", a: "#0ff0fc", a2: "#e040fb" },
+  { id: "retrowave", name: "Dusk",      bg: "#1a1a2e", a: "#e94560", a2: "#533483" },
+  { id: "ume",       name: "Anemone",   bg: "#2b1b2e", a: "#f5c2e7", a2: "#f5a0c0" },
+  { id: "organs",    name: "Ember",     bg: "#0a0406", a: "#efe1c8", a2: "#c83240" },
+  { id: "light",     name: "Sand",      bg: "#f0ebe3", a: "#5a5248", a2: "#c47d5a" },
+  { id: "paper",     name: "Foam",      bg: "#faf8f5", a: "#3b3836", a2: "#c5ac4a" },
+  { id: "lavender",  name: "Pearl",     bg: "#f3eef8", a: "#3d3551", a2: "#9b6dcc" },
+  { id: "cute",      name: "Blossom",   bg: "#fff0f5", a: "#d4608a", a2: "#ff6b9d" },
+];
+const PATTERNS = [["contour", "Contours"], ["dots", "Dots"], ["plankton", "Plankton"], ["clean", "Clean"]];
+const FONTS = [["", "Default"], ["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]];
+const DENSITIES = [["compact", "Compact"], ["", "Cozy"], ["spacious", "Spacious"]];
+const APPR = {
+  theme:   localStorage.getItem("oceano.theme")   || "abyss",
+  pattern: localStorage.getItem("oceano.pattern") || "contour",
+  font:    localStorage.getItem("oceano.font")    || "",
+  density: localStorage.getItem("oceano.density") || "",
+};
+function applyAppearance() {
+  const r = document.documentElement;
+  if (APPR.theme && APPR.theme !== "abyss") r.setAttribute("data-theme", APPR.theme); else r.removeAttribute("data-theme");
+  [...r.classList].forEach(c => { if (/^(pat|font|density)-/.test(c)) r.classList.remove(c); });
+  if (APPR.pattern && APPR.pattern !== "contour") r.classList.add("pat-" + APPR.pattern);
+  if (APPR.font) r.classList.add("font-" + APPR.font);
+  if (APPR.density) r.classList.add("density-" + APPR.density);
+}
+function setAppearance(key, val) {
+  APPR[key] = val; try { localStorage.setItem("oceano." + key, val); } catch {}
+  applyAppearance();
+}
+applyAppearance();   // the inline <head> boot applied it pre-paint; re-sync here for completeness
+function renderAppearance(root) {
+  const host = $("#apprBody", root); if (!host) return;
+  const seg = (label, opts, cur) =>
+    `<div class="appr-lbl">${label}</div><div class="appr-seg">${opts.map(([v, n]) =>
+      `<button data-v="${v}" class="${v === cur ? "sel" : ""}">${escapeHtml(n)}</button>`).join("")}</div>`;
+  host.innerHTML =
+    `<div class="appr-swatches">${THEMES.map(t =>
+      `<button class="appr-sw${t.id === APPR.theme ? " sel" : ""}" data-theme="${t.id}">
+         <span class="appr-sw-prev" style="background:${t.bg}">
+           <span class="appr-sw-dot" style="color:${t.a}"></span>
+           <span class="appr-sw-dot b2" style="color:${t.a2}"></span></span>
+         <span class="appr-sw-name">${escapeHtml(t.name)}</span></button>`).join("")}</div>`
+    + seg("Atmosphere", PATTERNS, APPR.pattern)
+    + seg("Type", FONTS, APPR.font)
+    + seg("Density", DENSITIES, APPR.density);
+  $$(".appr-sw", host).forEach(b => b.onclick = () => {
+    setAppearance("theme", b.dataset.theme);
+    $$(".appr-sw", host).forEach(x => x.classList.toggle("sel", x === b));
+  });
+  ["pattern", "font", "density"].forEach((key, i) => {        // segs are in DOM order: pattern, font, density
+    const segEl = $$(".appr-seg", host)[i]; if (!segEl) return;
+    $$("button", segEl).forEach(btn => btn.onclick = () => {
+      setAppearance(key, btn.dataset.v);
+      $$("button", segEl).forEach(x => x.classList.toggle("sel", x === btn));
+    });
+  });
+}
+
 /* ================= SETTINGS WINDOW ================= */
 const SETTINGS_TABS = [
-  ["account", "◐", "Account"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
+  ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
   ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
   ["voice", "🔊", "Voice"], ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
@@ -1209,6 +1306,12 @@ const SETTINGS_PAGES = {
       <h3>Two-factor authentication <span class="lbl-sub">optional</span></h3>
       <div id="twofaBody"><div class="acct-row">checking…</div></div>
     </div>`,
+  appearance: `
+    <div class="drawer-section">
+      <h3>Appearance <span class="lbl-sub">theme, atmosphere & type — saved on this device</span></h3>
+      <p class="sub">Switch the palette without changing anything else. <b>Abyss</b> is the original.</p>
+      <div id="apprBody"></div>
+    </div>`,
   endpoints: `
     <div class="drawer-section">
       <h3>Model endpoints</h3>
@@ -1234,6 +1337,16 @@ const SETTINGS_PAGES = {
       <label class="field-label">Allowed user IDs <span class="lbl-sub">comma-separated · agent can run shell, keep tight</span></label>
       <input id="tgAllowed" placeholder="e.g. 123456789, 987654321">
       <div class="tg-actions"><button class="ghost-btn sm" id="tgClearToken">Clear token</button><button class="primary" id="tgSave">Save &amp; apply</button></div>
+    </div>
+    <div class="drawer-section">
+      <h3>Notifications <span class="lbl-sub">how the agent pings you when it isn't a live chat</span></h3>
+      <p class="sub">The <code>notify</code> tool and scheduled-task results go to every channel you turn on. <span id="ntfyReady" class="tg-status">…</span></p>
+      <label class="set-toggle"><input type="checkbox" id="ntTelegram"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Send to Telegram <span class="st-note">— a proactive message to your allow-listed users (needs the bot running, above)</span></span></label>
+      <label class="field-label">ntfy topic <span class="lbl-sub">a private, hard-to-guess name; subscribe to it in the <a href="https://ntfy.sh" target="_blank" rel="noopener">ntfy</a> phone app</span></label>
+      <input id="ntTopic" placeholder="e.g. oceano-7h3k2x9 (blank = ntfy off)">
+      <label class="field-label">ntfy server <span class="lbl-sub">default ntfy.sh, or point at your self-hosted server</span></label>
+      <input id="ntUrl" placeholder="https://ntfy.sh">
+      <div class="tg-actions"><button class="ghost-btn sm" id="ntTest">Send test</button><button class="primary" id="ntSave">Save</button></div>
     </div>`,
   memory: `
     <div class="drawer-section">
@@ -1389,6 +1502,8 @@ function openSettings() {
   $("#addEndpoint", body).onclick = addEndpoint;
   $("#tgSave", body).onclick = () => saveTelegram();
   $("#tgClearToken", body).onclick = async () => { if (await confirmAction("Clear bot token?", "The Telegram bot will stop until you set a new token.", "Clear")) { $("#tgEnabled").checked = false; saveTelegram({ clear_token: true }); } };
+  $("#ntSave", body).onclick = saveNotify;
+  $("#ntTest", body).onclick = testNotify;
   $("#acctSave", body).onclick = saveAccount;
   $("#logoutBtn", body).onclick = logout;
   $("#memPolSave", body).onclick = saveMemoryPolicy;
@@ -1399,6 +1514,7 @@ function openSettings() {
   $("#vcSetSave", body).onclick = saveVoiceSettings;
   $("#vcTestBtn", body).onclick = testVoiceSettings;
   $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
+  renderAppearance(body);
   loadSettingsAll();
 }
 async function wipeTarget(key) {
@@ -1828,7 +1944,7 @@ function _setWinMin(id, on) { const a = _winOpen(), w = a.find(x => x.id === id)
 function restoreWindows() {
   const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
                       brain: openBrain, workflows: openWorkflows, preview: openPreview,
-                      file: openFileWindow, cal: openCalendar };
+                      file: openFileWindow, cal: openCalendar, hosts: openHosts };
   _winOpen().forEach(w => {
     const fn = RESTORERS[w.key];
     if (!fn) return;
@@ -3088,6 +3204,27 @@ function _riverDialog({ mode, filename, name, vals }) {
 /* ---------- Scheduler window (heartbeat + tasks) ---------- */
 let _schedTimer = null;
 const SCHED_PRESETS = { "every 5 min": "*/5 * * * *", "every 15 min": "*/15 * * * *", "hourly": "0 * * * *", "daily 8am": "0 8 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1" };
+// <option>s for "which model runs this task": a default + every reachable model (carrying its
+// base_url on data-base so the server can resolve the endpoint's key). Keeps a stale/offline
+// saved model selectable so editing a task doesn't silently drop it.
+function _schedModelOpts(models, selected, selBase) {
+  let html = `<option value="">default model</option>`, found = false;
+  if (state.claudeAvailable || selected === "claude") {       // run the task via the Claude mind (subscription)
+    const sel = selected === "claude"; if (sel) found = true;
+    html += `<option value="claude"${sel ? " selected" : ""}>🧠 Claude (mind)</option>`;
+  }
+  for (const m of (models || [])) {
+    if (m.error) continue;
+    const sel = m.id === selected; if (sel) found = true;
+    html += `<option value="${escapeHtml(m.id)}" data-base="${escapeHtml(m.base_url || "")}"${sel ? " selected" : ""}>${escapeHtml(m.id)} · ${escapeHtml(m.endpoint || "")}</option>`;
+  }
+  if (selected && !found) html += `<option value="${escapeHtml(selected)}" data-base="${escapeHtml(selBase || "")}" selected>${escapeHtml(selected)} (offline)</option>`;
+  return html;
+}
+function _schedModelPick(sel) {                          // read {model, base_url} from a populated <select>
+  const opt = sel && sel.selectedOptions[0];
+  return { model: sel ? sel.value : "", base_url: opt ? (opt.dataset.base || "") : "" };
+}
 function openScheduler() {
   const { body, reused } = createWindow({ id: "win-sched", title: "Scheduler — heartbeat & tasks", icon: "⏱", width: 660, height: 540,
     onClose: () => { if (_schedTimer) { clearInterval(_schedTimer); _schedTimer = null; } } });
@@ -3098,15 +3235,18 @@ function openScheduler() {
       <select id="schedPreset" class="sched-preset"></select>
       <input id="schedCron" class="sched-cron" placeholder="cron · min hr day mon wkday">
       <input id="schedInstr" placeholder="what should the agent do?">
+      <select id="schedModel" class="sched-preset" title="which model runs this task"><option value="">default model</option></select>
       <button class="primary sm" id="schedAdd">Add</button>
     </div>
     <div class="sched-list" id="schedList"></div>`;
   $("#schedPreset").innerHTML = `<option value="">preset…</option>` + Object.entries(SCHED_PRESETS).map(([k, v]) => `<option value="${v}">${k}</option>`).join("");
   $("#schedPreset").onchange = e => { if (e.target.value) $("#schedCron").value = e.target.value; };
+  api("/api/models").then(ms => { const sel = $("#schedModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, "", ""); }).catch(() => {});
   $("#schedAdd").onclick = async () => {
     const cron = $("#schedCron").value.trim(), instr = $("#schedInstr").value.trim();
     if (!cron || !instr) return;
-    const r = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron, instruction: instr }) }).then(x => x.json());
+    const { model, base_url } = _schedModelPick($("#schedModel", body));
+    const r = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cron, instruction: instr, model, base_url }) }).then(x => x.json());
     if (!r.ok) { const c = $("#schedCron"); c.style.borderColor = "var(--coral)"; setTimeout(() => c.style.borderColor = "", 900); return; }
     $("#schedCron").value = ""; $("#schedInstr").value = ""; loadScheduler();
   };
@@ -3127,8 +3267,10 @@ async function loadScheduler() {
     // Locked jobs (managed by Researcher/Skills): the schedule + on/off are yours to
     // change here; the instruction is owned by the manager and it can't be deleted.
     const lock = t.managed ? ` · <span class="sr-lock" title="created by ${mgrName} — schedule & on/off are editable here; managed there">🔒 ${mgrName}</span>` : "";
+    const modelTag = (!t.managed && t.model)
+      ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : escapeHtml(t.model)}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
-      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${lock}</div></div>` +
+      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${modelTag}${lock}</div></div>` +
       `<button class="sr-btn sr-run" title="run now, ignoring the schedule">▶ Run</button>` +
       `<button class="sr-btn sr-edit">${t.managed ? "schedule" : "edit"}</button>` +
       (t.managed ? `<button class="sr-btn sr-res" title="manage in ${mgrName}">${mgrName.toLowerCase()}</button>`
@@ -3184,10 +3326,12 @@ function openTaskEditor(t) {
       <input id="teCron" class="sched-cron" value="${escapeHtml(t.cron)}" placeholder="0 8 * * *">
     </div>
     <div id="tePreview" class="te-preview">…</div>
+    ${managed ? "" : `<label class="field-label">Model <span class="lbl-sub">which model runs this task — default uses your primary</span></label>
+      <select id="teModel" class="te-model"><option value="">default model</option></select>`}
     <label class="te-enabled"><span class="sw sm"><input type="checkbox" id="teEnabled" ${t.enabled ? "checked" : ""}><span></span></span> Enabled</label>
     <div class="acct-actions"><span class="acct-msg" id="teMsg"></span>
-      <button class="ghost sm" id="teCancel">Cancel</button>
-      <button class="primary sm" id="teSave">Save</button></div>
+      <span class="te-btns"><button class="ghost-btn sm te-cancel" id="teCancel">Cancel</button>
+      <button class="primary sm" id="teSave">Save</button></span></div>
   </div>`;
   const cronEl = $("#teCron", body), prev = $("#tePreview", body);
   let pvTimer = null, pvSeq = 0;
@@ -3208,6 +3352,7 @@ function openTaskEditor(t) {
   cronEl.oninput = () => { clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); };
   $("#tePreset", body).onchange = e => { if (e.target.value) { cronEl.value = e.target.value; refreshPreview(); } };
   refreshPreview();
+  if (!managed) api("/api/models").then(ms => { const sel = $("#teModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, t.model || "", t.base_url || ""); }).catch(() => {});
   const close = () => { const w = body.closest(".win"); if (w) w.remove(); };
   $("#teCancel", body).onclick = close;
   $("#teSave", body).onclick = async () => {
@@ -3218,6 +3363,8 @@ function openTaskEditor(t) {
       const instr = $("#teInstr", body).value.trim();
       if (!instr) { msg.textContent = "instruction required"; msg.className = "acct-msg err"; return; }
       payload.instruction = instr;
+      const pick = _schedModelPick($("#teModel", body));   // "" = system default
+      payload.model = pick.model; payload.base_url = pick.base_url;
     }
     const r = await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload) }).then(x => x.json()).catch(() => ({ ok: false }));
@@ -4060,17 +4207,138 @@ async function loadLogs() {
   runs.forEach(r => {
     const row = document.createElement("div"); row.className = "log-row " + (r.status === "error" ? "err" : "ok");
     const dur = r.duration != null ? (r.duration < 60 ? r.duration + "s" : Math.round(r.duration / 60) + "m") : "";
-    row.innerHTML = `<div class="lr-head"><span class="lr-dot"></span><span class="lr-kind">${escapeHtml(r.kind || "run")}</span>`
+    const hasBody = !!(r.summary && r.summary.trim());
+    row.innerHTML = `<div class="lr-head"><span class="lr-caret"${hasBody ? "" : ' style="visibility:hidden"'}>▸</span>`
+      + `<span class="lr-dot"></span><span class="lr-kind">${escapeHtml(r.kind || "run")}</span>`
       + `<span class="lr-title">${escapeHtml(r.title || "")}</span><span class="lr-meta">${dur ? dur + " · " : ""}${escapeHtml(_relTime(r.ts))}</span></div>`;
-    if (r.summary) {
+    if (hasBody) {
       const head = $(".lr-head", row);
-      const b = document.createElement("div"); b.className = "lr-body"; b.textContent = r.summary;   // textContent — the result is untrusted text
+      const b = document.createElement("div"); b.className = "lr-body";
+      renderMD(b, r.summary);                              // sanitized markdown — results (research/workflow/task) render readably
       row.appendChild(b);
       head.style.cursor = "pointer";
       head.onclick = () => row.classList.toggle("open");
     }
     list.appendChild(row);
   });
+}
+
+/* ====================================================================
+   Hosts — the SSH keychain. Register servers + keys; the agent reaches
+   them only via ssh_run (web-only, injection-gated, per-host policy).
+   ==================================================================== */
+function openHosts() {
+  const { body, reused } = createWindow({ id: "win-hosts", title: "Hosts — SSH keychain", icon: "⌗", width: 690, height: 600, restoreKey: "hosts" });
+  if (reused) return;
+  body.classList.add("set-win");
+  hostsRenderList(body);
+}
+async function hostsRenderList(body) {
+  body.innerHTML = `
+    <div class="wf-head"><h3>Hosts</h3><span class="fe-spacer"></span><button class="primary sm" id="hostNew">+ Add host</button></div>
+    <div class="host-note">Servers Oceano can SSH into. The agent runs commands only via <code>ssh_run</code> — <b>web UI only</b>, never in a turn that read a web page/email/doc, and each host's <b>policy</b> applies. Use a least-privilege remote user.</div>
+    <div class="host-list" id="hostList"><div class="empty-note">loading…</div></div>`;
+  $("#hostNew", body).onclick = () => hostsRenderEditor(body, null);
+  let hs; try { hs = await api("/api/hosts"); } catch { return; }
+  const list = $("#hostList", body);
+  if (!hs.length) { list.innerHTML = `<div class="empty-note">No hosts yet. Add one — name, address, user, and an SSH key — then <b>Test &amp; pin</b> it.</div>`; return; }
+  list.innerHTML = "";
+  hs.forEach(h => {
+    const el = document.createElement("div"); el.className = "host-card";
+    const pol = `<span class="host-pol pol-${h.policy}">${h.policy}</span>`;
+    const armed = h.policy === "armed" ? (h.armed ? `<span class="host-armed on">● armed</span>` : `<span class="host-armed">○ locked</span>`) : "";
+    const pin = h.pinned ? `<span class="host-pin" title="${escapeHtml(h.fingerprint || "")}">⚷ pinned</span>` : `<span class="host-pin warn">⚠ not pinned</span>`;
+    el.innerHTML = `
+      <div class="host-main">
+        <div class="host-name">${escapeHtml(h.name)} ${pol} ${armed}</div>
+        <div class="host-addr">${escapeHtml(h.user)}@${escapeHtml(h.host)}:${h.port} · ${pin}${h.has_key ? "" : " · <span class='host-pin warn'>no key</span>"}</div>
+        ${h.description ? `<div class="host-desc">${escapeHtml(h.description)}</div>` : ""}
+      </div>
+      <div class="host-actions">
+        <button class="ed-btn host-test">Test &amp; pin</button>
+        ${h.policy === "armed" ? `<button class="ed-btn host-arm">${h.armed ? "Disarm" : "Arm"}</button>` : ""}
+        <button class="ed-btn host-edit">Edit</button>
+        <button class="ed-btn host-del" title="delete">✕</button>
+      </div>`;
+    $(".host-test", el).onclick = () => hostsTest(body, h);
+    const armBtn = $(".host-arm", el); if (armBtn) armBtn.onclick = () => h.armed ? hostsDisarm(body, h) : hostsArm(body, h);
+    $(".host-edit", el).onclick = () => hostsRenderEditor(body, h);
+    $(".host-del", el).onclick = async () => { if (!await confirmAction("Delete host?", `“${h.name}” and its stored key will be removed.`)) return; await fetch("/api/hosts/" + h.id, { method: "DELETE" }); hostsRenderList(body); };
+    list.appendChild(el);
+  });
+}
+async function hostsTest(body, h) {
+  let secret = "";
+  if (h.needs_secret) { const v = await promptDialog("Test & pin · " + h.name, { message: h.auth_type === "password" ? "Password" : "Key passphrase", okLabel: "Connect" }); if (v === null) return; secret = v; }
+  toast("connecting to " + h.name + "…", "info");
+  const r = await _postJ("/api/hosts/" + h.id + "/test", { secret });
+  if (r.ok) toast("✓ pinned " + h.name + (r.fingerprint ? " · " + r.fingerprint : ""), "info"); else toast("✗ " + (r.error || "failed"), "err");
+  hostsRenderList(body);
+}
+async function hostsArm(body, h) {
+  let secret = "";
+  if (h.needs_secret) { const v = await promptDialog("Arm · " + h.name, { message: (h.auth_type === "password" ? "Password" : "Key passphrase") + " — unlocks for 30 min", okLabel: "Arm" }); if (v === null) return; secret = v; }
+  const r = await _postJ("/api/hosts/" + h.id + "/arm", { secret });
+  if (r.ok) toast("🔓 " + h.name + " armed for 30 min", "info");
+  hostsRenderList(body);
+}
+async function hostsDisarm(body, h) {
+  await _postJ("/api/hosts/" + h.id + "/disarm", {}); toast("🔒 " + h.name + " disarmed", "info"); hostsRenderList(body);
+}
+function hostsRenderEditor(body, h) {
+  const atype = h ? h.auth_type : "key";
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="hostBack">←</button><h3>${h ? "Edit host" : "Add host"}</h3></div>
+    <div class="drawer-section">
+      <label class="field-label">Name <span class="lbl-sub">the agent refers to it by this</span></label>
+      <input id="hName" placeholder="prod-web" value="${h ? escapeHtml(h.name) : ""}">
+      <div class="host-row">
+        <div style="flex:1"><label class="field-label">Address</label><input id="hHost" placeholder="203.0.113.10 or host.example.com" value="${h ? escapeHtml(h.host) : ""}"></div>
+        <div style="width:84px"><label class="field-label">Port</label><input id="hPort" value="${h ? h.port : 22}"></div>
+      </div>
+      <label class="field-label">User</label><input id="hUser" placeholder="deploy" value="${h ? escapeHtml(h.user) : ""}">
+      <label class="field-label">Authentication</label>
+      <select id="hAuthType" class="te-model"><option value="key"${atype === "key" ? " selected" : ""}>SSH private key</option><option value="password"${atype === "password" ? " selected" : ""}>Password</option></select>
+      <div id="hKeyBox">
+        <label class="field-label">Private key <span class="lbl-sub">stored 0600 under data/ — passphrase is asked at arm time, not stored</span></label>
+        <input id="hKeyFile" type="file">
+        ${h && h.has_key ? `<div class="host-keynote">✓ a key is already stored — upload again to replace</div>` : ""}
+        <label class="field-label">…or reference an existing key path <span class="lbl-sub">Oceano won't copy it</span></label>
+        <input id="hKeyPath" placeholder="/home/me/.ssh/id_ed25519 (optional)">
+      </div>
+      <label class="field-label">Policy <span class="lbl-sub">readonly = block changes · armed = unlock per session · trusted = run anything</span></label>
+      <select id="hPolicy" class="te-model">${["readonly", "armed", "trusted"].map(p => `<option value="${p}"${(h ? h.policy : "armed") === p ? " selected" : ""}>${p}</option>`).join("")}</select>
+      <label class="field-label">Description <span class="lbl-sub">optional</span></label>
+      <input id="hDesc" placeholder="front-end fleet" value="${h ? escapeHtml(h.description || "") : ""}">
+      <div class="acct-actions"><span class="acct-msg" id="hMsg"></span>
+        <span class="te-btns"><button class="ghost-btn sm te-cancel" id="hCancel">Cancel</button>
+        <button class="primary sm" id="hSave">${h ? "Save" : "Add host"}</button></span></div>
+    </div>`;
+  $("#hostBack", body).onclick = () => hostsRenderList(body);
+  $("#hCancel", body).onclick = () => hostsRenderList(body);
+  const syncAuth = () => { $("#hKeyBox", body).style.display = $("#hAuthType", body).value === "key" ? "" : "none"; };
+  $("#hAuthType", body).onchange = syncAuth; syncAuth();
+  $("#hSave", body).onclick = async () => {
+    const msg = $("#hMsg", body);
+    const name = $("#hName", body).value.trim(), host = $("#hHost", body).value.trim(), user = $("#hUser", body).value.trim();
+    if (!name || !host || !user) { msg.textContent = "name, address and user are required"; msg.className = "acct-msg err"; return; }
+    const authType = $("#hAuthType", body).value, keyPath = $("#hKeyPath", body).value.trim();
+    const payload = { name, host, user, port: parseInt($("#hPort", body).value, 10) || 22,
+      policy: $("#hPolicy", body).value, description: $("#hDesc", body).value.trim(),
+      auth: { type: authType, key_path: authType === "key" ? (keyPath || null) : null } };
+    let res;
+    if (h) res = await (await fetch("/api/hosts/" + h.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })).json();
+    else res = await _postJ("/api/hosts", payload);
+    if (!res.ok) { msg.textContent = res.error || "save failed"; msg.className = "acct-msg err"; return; }
+    const hid = h ? h.id : res.host.id;
+    const f = $("#hKeyFile", body).files[0];
+    if (authType === "key" && f) {
+      const fd = new FormData(); fd.append("file", f);
+      const kr = await (await fetch("/api/hosts/" + hid + "/key", { method: "POST", body: fd })).json();
+      if (!kr.ok) { msg.textContent = "host saved, but key upload failed: " + (kr.error || ""); msg.className = "acct-msg err"; return; }
+    }
+    hostsRenderList(body);
+  };
 }
 
 /* ====================================================================
@@ -4831,6 +5099,7 @@ function wire() {
     else if (v === "search") openSearch();
     else if (v === "notes") openNotes();
     else if (v === "logs") openLogs();
+    else if (v === "hosts") openHosts();
     else if (v === "health") openHealth();
     else setView(v);
   });
@@ -4943,7 +5212,7 @@ const UI_OPENERS = {
   "memory-graph": () => openMemoryGraph(), scheduler: () => openScheduler(),
   researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
   search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
-  live: () => openLiveView(), settings: () => openSettings(),
+  live: () => openLiveView(), settings: () => openSettings(), hosts: () => openHosts(),
 };
 const UI_WINIDS = {
   files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
@@ -4951,6 +5220,7 @@ const UI_WINIDS = {
   rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
   researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
   voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
+  hosts: "win-hosts",
 };
 function startUiStream() {
   if (_uiES) return;                                   // one stream; survives re-login (idempotent init)

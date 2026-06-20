@@ -68,6 +68,13 @@ def _telegram_seed():
             "allowed": sorted(config.TELEGRAM_ALLOWED)}
 
 
+def _notify_seed():
+    """Default notification config, seeded from the legacy OCEANO_NTFY_* env vars."""
+    return {"ntfy_url": os.environ.get("OCEANO_NTFY_URL", "https://ntfy.sh"),
+            "ntfy_topic": os.environ.get("OCEANO_NTFY_TOPIC", ""),
+            "telegram": True}
+
+
 def _hash_pw(password, salt):
     """PBKDF2-SHA256 — stdlib only, no bcrypt/passlib dependency."""
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
@@ -140,6 +147,8 @@ def load():
             data["telegram"] = _telegram_seed(); changed = True
         if "auth" not in data:
             data["auth"] = _auth_seed(); changed = True
+        if "notify" not in data:
+            data["notify"] = _notify_seed(); changed = True
         if changed:
             save(data)
         return data
@@ -147,6 +156,7 @@ def load():
                            "base_url": "http://127.0.0.1:8081/v1", "api_key": ""}],
             "prefs": {"agent_mode": False},
             "telegram": _telegram_seed(),
+            "notify": _notify_seed(),
             "auth": _auth_seed()}
     save(seed)
     return seed
@@ -554,6 +564,40 @@ async def set_telegram(req: Request):
     save(data)
     result = await _apply_telegram(data)
     return {"ok": "error" not in result, **result, "status": telegram_runtime.status()}
+
+
+# ---------------- notifications (how the agent pings you: ntfy + Telegram) ----------------
+@app.get("/api/notify")
+def get_notify():
+    from oceano import notifications
+    n = load().get("notify", _notify_seed())
+    ready = notifications.channels_ready()
+    return {"ntfy_url": n.get("ntfy_url", "https://ntfy.sh"), "ntfy_topic": n.get("ntfy_topic", ""),
+            "telegram": n.get("telegram", True) is not False,
+            "ready": ready, "telegram_running": telegram_runtime.status().get("running", False)}
+
+
+@app.post("/api/notify")
+async def set_notify(req: Request):
+    b = await req.json()
+    data = load()
+    n = data.get("notify", _notify_seed())
+    if "ntfy_url" in b:
+        n["ntfy_url"] = (b.get("ntfy_url") or "https://ntfy.sh").strip().rstrip("/")
+    if "ntfy_topic" in b:
+        n["ntfy_topic"] = (b.get("ntfy_topic") or "").strip()
+    if "telegram" in b:
+        n["telegram"] = bool(b["telegram"])
+    data["notify"] = n
+    save(data)
+    return {"ok": True, **{k: get_notify()[k] for k in ("ntfy_topic", "ntfy_url", "telegram", "ready")}}
+
+
+@app.post("/api/notify/test")
+async def test_notify():
+    from oceano import notifications
+    msg = await asyncio.to_thread(notifications.send, "This is a test notification from Oceano. 🌊", "Oceano test")
+    return {"ok": msg.startswith("notified"), "result": msg}
 
 
 def _embed_reachable():
@@ -1113,6 +1157,7 @@ async def chat(req: Request):
     req_model = body.get("model") or ag.model
     req_base_url, req_api_key = base_url, api_key
     agent_mode = bool(body.get("agent_mode"))
+    voice = bool(body.get("voice"))                  # hands-free converse → ask for a short, spoken-friendly reply
     attachments = body.get("attachments") or []      # [{path, name, kind}] from /api/upload
     # so it's verifiable in the journal which mode a message actually ran in (tools
     # are only attached in agent mode) — settles "the toggle was on but it didn't use tools".
@@ -1187,7 +1232,7 @@ async def chat(req: Request):
                     # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
                     # manage what it knows about you without full agent mode; agent mode → all tools.
                     from oceano import tools as _tools
-                    stream = ag.run_stream(turn_msg, cancel=cancel) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools(), cancel=cancel)
+                    stream = ag.run_stream(turn_msg, cancel=cancel, voice=voice) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools(), cancel=cancel, voice=voice)
                     for ev in stream:
                         if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
                             _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
@@ -2383,14 +2428,15 @@ def cron_preview_api(cron: str = "", n: int = 5):
 @app.post("/api/tasks")
 async def add_task_api(req: Request):
     b = await req.json()
-    tid = scheduler.add_task(b["cron"], b["instruction"])
+    tid = scheduler.add_task(b["cron"], b["instruction"], model=b.get("model"), base_url=b.get("base_url"))
     return {"ok": tid is not None, "id": tid}
 
 
 @app.patch("/api/tasks/{tid}")
 async def update_task_api(tid: int, req: Request):
     b = await req.json()
-    ok = scheduler.update_task(tid, b.get("cron"), b.get("instruction"), b.get("enabled"))
+    ok = scheduler.update_task(tid, b.get("cron"), b.get("instruction"), b.get("enabled"),
+                               model=b.get("model"), base_url=b.get("base_url"))
     return {"ok": ok, **({} if ok else {"error": "invalid cron expression (format: min hr day mon wkday)"})}
 
 
@@ -2405,6 +2451,79 @@ async def run_task_api(tid: int):
     """Run a scheduled task right now, on demand. Off the event loop — a task can block
     (it may call the model, delegate, or run a workflow)."""
     return await asyncio.to_thread(scheduler.run_task, tid)
+
+
+# ---------------- hosts (SSH keychain — registered servers the agent can ssh_run on) ----------------
+@app.get("/api/hosts")
+def hosts_list():
+    from oceano import hosts
+    return hosts.list_all()
+
+
+@app.post("/api/hosts")
+async def hosts_create(req: Request):
+    from oceano import hosts
+    b = await req.json()
+    h = hosts.create(b.get("name", ""), b.get("host", ""), b.get("user", ""),
+                     port=b.get("port", 22), auth=b.get("auth"),
+                     policy=b.get("policy", "armed"), description=b.get("description", ""))
+    return {"ok": h is not None, "host": h,
+            **({} if h else {"error": "name, host and user are required (and the name must be unique)"})}
+
+
+@app.patch("/api/hosts/{hid}")
+async def hosts_update(hid: int, req: Request):
+    from oceano import hosts
+    b = await req.json()
+    h = hosts.update(hid, **{k: b.get(k) for k in ("name", "host", "user", "port", "policy", "description", "auth")})
+    return {"ok": h is not None, "host": h}
+
+
+@app.delete("/api/hosts/{hid}")
+def hosts_delete(hid: int):
+    from oceano import hosts
+    return {"ok": hosts.remove(hid)}
+
+
+@app.post("/api/hosts/{hid}/key")
+async def hosts_key(hid: int, file: UploadFile = File(...)):
+    """Custody a private key for this host (written 0600 under data/hosts/)."""
+    from oceano import hosts
+    pem = (await file.read()).decode("utf-8", "replace")
+    if "PRIVATE KEY" not in pem:
+        return {"ok": False, "error": "that file doesn't look like an SSH private key (no PRIVATE KEY header)"}
+    return {"ok": hosts.set_key(hid, pem), "host": hosts.get(hid)}
+
+
+@app.post("/api/hosts/{hid}/test")
+async def hosts_test(hid: int, req: Request):
+    """Connect once and pin the server's host key (TOFU). Off the event loop — it blocks on the network."""
+    from oceano import hosts
+    secret = ""
+    try:
+        secret = (await req.json()).get("secret", "")
+    except Exception:
+        pass
+    return await asyncio.to_thread(hosts.test_and_pin, hid, secret)
+
+
+@app.post("/api/hosts/{hid}/arm")
+async def hosts_arm(hid: int, req: Request):
+    from oceano import hosts
+    secret = ""
+    try:
+        secret = (await req.json()).get("secret", "")
+    except Exception:
+        pass
+    ok = hosts.arm(hid, secret or None)
+    return {"ok": ok, "host": hosts.get(hid), "expires": hosts.arm_expiry(hid)}
+
+
+@app.post("/api/hosts/{hid}/disarm")
+def hosts_disarm(hid: int):
+    from oceano import hosts
+    hosts.disarm(hid)
+    return {"ok": True, "host": hosts.get(hid)}
 
 
 # ---------------- calendar (local copy, synced from ICS feeds) ----------------

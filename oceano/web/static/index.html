@@ -13,6 +13,15 @@
 <link rel="stylesheet" href="/static/vendor/codemirror/addon/dialog/dialog.css">
 <link rel="stylesheet" href="/static/vendor/drawflow.min.css">
 <link rel="stylesheet" href="/static/style.css">
+<script>
+/* Apply the saved appearance BEFORE first paint (no theme flash). Mirrors applyAppearance() in app.js. */
+(function(){try{var d=document.documentElement,g=function(k,f){return localStorage.getItem("oceano."+k)||f;};
+var t=g("theme","abyss"),p=g("pattern","contour"),f=g("font",""),de=g("density","");
+if(t&&t!=="abyss")d.setAttribute("data-theme",t);
+if(p&&p!=="contour")d.classList.add("pat-"+p);
+if(f)d.classList.add("font-"+f);
+if(de)d.classList.add("density-"+de);}catch(e){}})();
+</script>
 </head>
 <body>
 <div class="bg-abyss"></div>
@@ -42,6 +51,7 @@
             <button class="nav-item" data-view="search"><span class="ni">⌕</span> Search</button>
             <button class="nav-item" data-view="notes"><span class="ni">❏</span> Notes</button>
             <button class="nav-item" data-view="logs"><span class="ni">▤</span> Logs</button>
+            <button class="nav-item" data-view="hosts"><span class="ni">⌗</span> Hosts</button>
             <button class="nav-item" data-view="health"><span class="ni">◉</span> Health</button>
           </nav>
         </div>

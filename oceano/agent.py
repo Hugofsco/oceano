@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 
 import config
-from oceano import llm, tools
+from oceano import llm, safety, tools
 
 
 def _date_note():
@@ -281,6 +281,13 @@ def _default_primary():
 _NO_MODEL_MSG = ("No model is configured. Open Brain → Rivers to download & serve a model "
                  "(or pick a primary model in Settings → Delegation), then try again.")
 
+# Appended to the turn context only when the reply is being SPOKEN (hands-free voice). Speech is
+# slow and linear, so keep it short — the user can always ask a follow-up.
+_VOICE_NOTE = ("\n\nVOICE MODE — your reply is being read ALOUD. Keep it SHORT and natural: "
+               "one or two spoken sentences, get straight to the point. No markdown, lists, code, "
+               "URLs, or emoji (they sound wrong spoken). If a full answer is long, give the gist in "
+               "a sentence and offer to go deeper.")
+
 # Tools that emit live progress (run in a worker thread so run_stream can drain it). The
 # streaming delegate is the one that matters — a long build shouldn't look frozen.
 _STREAMING_TOOLS = {"delegate", "delegate_to_claude"}
@@ -311,13 +318,17 @@ class Agent:
         self.inject_context = inject_context
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + _date_note()}]
 
-    def _prepare_turn(self, user_message):
+    def _prepare_turn(self, user_message, voice=False):
         """Refresh the system message with this turn's context — current date,
         relevant memories, and the skills catalog — so the model gets them passively
-        (it needn't call recall/list_skills). Rebuilt each turn, never accumulates."""
+        (it needn't call recall/list_skills). Rebuilt each turn, never accumulates.
+        `voice` (hands-free conversation) appends a be-brief directive FOR THIS TURN ONLY."""
+        safety.reset_untrusted()        # fresh turn: clears the "ingested untrusted content" taint (gates ssh_run)
         if self.messages and self.messages[0]["role"] == "system":
             ctx = _context_block(user_message) if self.inject_context else \
                 "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note()) if p)
+            if voice:
+                ctx += _VOICE_NOTE
             self.messages[0]["content"] = SYSTEM_PROMPT + "\n\n" + ctx
 
     def context_metrics(self):
@@ -462,15 +473,25 @@ class Agent:
         self._learn(user_message, text)
         return text
 
+    def run_claude(self, user_message: str) -> str:
+        """Run one turn through the Claude mind (its subscription, wearing Oceano's persona + memory +
+        body tools) and return the collected answer. A BLOCKING entry point for callers like the
+        scheduler that want a specific task done by Claude regardless of the global mind setting."""
+        parts = []
+        for ev in self._claude_mind_stream(user_message):
+            if ev.get("type") == "token":
+                parts.append(ev.get("text", ""))
+        return "".join(parts).strip() or "(Claude returned no output)"
+
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
-    def _claude_mind_stream(self, user_message: str, cancel=None):
+    def _claude_mind_stream(self, user_message: str, cancel=None, voice=False):
         """Drive this turn with Claude Code (the user's subscription) as the resident mind: Oceano's
         persona + memory + conversation history as context, working in the workspace with Claude's
         own tools. Streams Claude's text back as tokens, surfaces its tool use as progress, keeps the
         history + post-turn learning. Oceano is the body; Claude is the mind."""
         import queue
         from oceano import delegate, mindbridge
-        self._prepare_turn(user_message)                       # system msg now carries persona + memory + context
+        self._prepare_turn(user_message, voice=voice)          # system msg now carries persona + memory + context
         self.messages.append({"role": "user", "content": user_message})
         sys_prompt = self.messages[0]["content"] + (
             "\n\nOCEANO'S BODY — you have Oceano's own tools (named mcp__oceano__*) on top of your built-in ones:\n"
@@ -573,24 +594,25 @@ class Agent:
         self._learn(user_message, answer)
         yield {"type": "answer_done"}
 
-    def run_stream(self, user_message: str, only_tools=None, cancel=None):
+    def run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat
         mode passes MEMORY_TOOLS so the model can still recall/remember without full agent
         mode. None = the whole enabled toolset. `cancel` (an Event) lets a Stop kill the
-        Claude-mind subprocess and skip persisting/learning a stopped turn."""
+        Claude-mind subprocess and skip persisting/learning a stopped turn. `voice` (hands-free
+        conversation) asks for a short, speech-friendly reply this turn only."""
         # "Mind: Claude" — the user chose Claude Code as the resident mind. Only the main chat
         # agent (inject_context) honours it; delegates/utility agents keep their own provider.
         if self.inject_context:
             from oceano import delegate
             if delegate.mind_is_claude() and delegate.available():
-                yield from self._claude_mind_stream(user_message, cancel=cancel)
+                yield from self._claude_mind_stream(user_message, cancel=cancel, voice=voice)
                 return
         if not self.model:                         # nothing served/configured → guide, don't 400
             # stream it as the answer so every frontend (CLI, web SSE, Telegram) shows it
             yield {"type": "token", "text": _NO_MODEL_MSG}
             yield {"type": "answer_done"}
             return
-        self._prepare_turn(user_message)
+        self._prepare_turn(user_message, voice=voice)
         self.messages.append({"role": "user", "content": user_message})
         total_tok = 0                    # tokens generated across the whole turn (incl. tool steps)
         turn_tools = self._tool_schemas(only=only_tools)

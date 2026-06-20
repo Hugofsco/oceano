@@ -30,3 +30,4 @@ feedparser>=6.0
 # optional 2FA: render the authenticator QR code (pure-python, no dependencies). TOTP itself
 # is stdlib. 2FA is off unless enabled in Settings → Account.
 segno>=1.5
+paramiko

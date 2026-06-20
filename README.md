@@ -25,12 +25,13 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **50 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **52 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
   HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
-  one shot), agent-driven UI control (it opens & arranges your windows), and delegation; plus
-  any tools from MCP servers you connect.
+  one shot), **a gated SSH keychain** (run command batches on registered servers), agent-driven
+  UI control (it opens & arranges your windows), and delegation; plus any tools from MCP servers
+  you connect.
 - **Memory that learns.** Relevant memories are injected automatically each turn,
   durable facts are extracted in the background, and you control *how* each type of
   memory is used (pin / always / when-relevant / off). A weekly maintenance job (run by
@@ -111,7 +112,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (50)
+## The agent's tools (52)
 
 | Group | Tools |
 |-------|-------|
@@ -127,6 +128,7 @@ from a web UI or Telegram.
 | **Skills** | `list_skills`, `load_skill` (one or several), `learn_skill`, `evaluate_skill` (independent review → staging) |
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
+| **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server — gated; see [Hosts](#hosts--ssh-keychain)) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
@@ -218,6 +220,31 @@ node-by-node over SSE), and a run still in progress when you **refresh the brows
 to its live state. The agent can also trigger saved workflows with `run_workflow`, but you
 author them in the UI. Stored in `data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).
+
+---
+
+## Hosts — SSH keychain
+
+Register servers in the **Hosts** window (name, address, user, an SSH key — uploaded and
+custodied at `data/hosts/<id>.key` **0600**, or referenced by path). **Test & pin** each one:
+the server's host key is **pinned on first connect** (TOFU) and verified every time, so a
+changed key (MITM) fails loudly. The agent then operates them through two tools — `list_hosts`
+and `ssh_run(host, commands)` (open → run the batch → close, in one call).
+
+It's wrapped in layered gates, because letting an agent run commands on real servers is the
+biggest blast-radius in the project:
+
+- **Web UI only** — never from the scheduler, Telegram, or any background run.
+- **Injection-gated** — `ssh_run` refuses in any turn that already read a web page, email, or
+  document, so text injected into something the agent fetched can't reach your servers.
+- **Per-host policy** — `readonly` (blocks write-looking commands), `armed` (you unlock it in
+  the UI for a 30-min window; the passphrase is entered then, not stored), or `trusted`.
+- **Audited** — every connection + command lands in the **Logs** activity feed.
+- Remote output is fenced as untrusted, and **a least-privilege remote account is the real
+  boundary** (the read-only heuristic is best-effort, not a sandbox).
+
+Passphrases/passwords aren't stored by default — they're supplied when you arm a host and held
+only in memory. Uses [paramiko]; hosts live in `data/hosts.json` (gitignored).
 
 ---
 
