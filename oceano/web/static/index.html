@@ -125,53 +125,9 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
         </div>
       </section>
 
-      <!-- FILES -->
-      <section class="view" id="view-files">
-        <div class="panel-head"><h2>Workspace</h2><div class="ph-actions"><button class="chip" id="fNew">+ New file</button><button class="chip" id="fNewDir">+ New folder</button><button class="chip" id="fRefresh">↻</button></div></div>
-        <div class="files-layout">
-          <div class="file-browser">
-            <div class="crumbs" id="crumbs"></div>
-            <div class="file-list" id="fileList"></div>
-          </div>
-          <div class="file-editor" id="fileEditor">
-            <div class="fe-empty" id="feEmpty">Select a file to view or edit.</div>
-            <div class="fe-open" id="feOpen" style="display:none">
-              <div class="fe-bar">
-                <span class="fe-name" id="feName"></span>
-                <span class="fe-dirty" id="feDirty" title="unsaved changes">●</span>
-                <span class="fe-spacer"></span>
-                <select class="fe-lang" id="feLang" title="syntax mode"></select>
-                <button class="ed-btn" id="feFind" title="Find / replace (Ctrl-F)">⌕</button>
-                <button class="ed-btn" id="feWrap" title="Toggle line wrap">⏎</button>
-                <button class="ed-btn" id="feSaveAs" title="Save as a new file">Save as…</button>
-                <button class="primary sm" id="fSave">Save</button>
-              </div>
-              <div class="fe-cm" id="feCm"></div>
-              <textarea id="feText" spellcheck="false" style="display:none"></textarea>
-              <div class="fe-image" id="feImage" style="display:none"><img id="feImg" alt="preview"></div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- SKILLS -->
-      <section class="view" id="view-skills">
-        <div class="panel-head"><h2>Skills</h2><div class="ph-actions"><button class="chip" id="skNew">+ New skill</button></div></div>
-        <div class="panel-body" id="skillsBody"></div>
-      </section>
-
-      <!-- MEMORY -->
-      <section class="view" id="view-memory">
-        <div class="panel-head"><h2>Memory</h2></div>
-        <div class="panel-body">
-          <div class="mem-add">
-            <input id="memText" placeholder="Teach Oceano a durable fact…">
-            <input id="memTags" placeholder="tags" class="mem-tags">
-            <button class="primary sm" id="memAdd">Remember</button>
-          </div>
-          <div class="mem-list" id="memList"></div>
-        </div>
-      </section>
+      <!-- Files, Brain (skills + memory), and the other panels now open as floating
+           windows (see openExplorer / openBrain / … in app.js), not in-page views.
+           Only the chat view lives here; the skill editor modal is defined below. -->
     </div>
   </main>
 </div>
@@ -254,6 +210,8 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <!-- CodeMirror 5 (vendored): the IDE-grade editor for the Files view -->
 <script src="/static/vendor/codemirror/codemirror.min.js"></script>
+<!-- defineSimpleMode addon — required by the dockerfile & rust modes below; must load before them -->
+<script src="/static/vendor/codemirror/addon/mode/simple.js"></script>
 <script src="/static/vendor/codemirror/mode/meta.js"></script>
 <script src="/static/vendor/codemirror/addon/search/searchcursor.js"></script>
 <script src="/static/vendor/codemirror/addon/search/search.js"></script>

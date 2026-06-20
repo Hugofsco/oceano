@@ -877,146 +877,14 @@ function setView(v) {
   state.view = v; document.body.dataset.view = v;
   $$(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.view === v));
   $$(".view").forEach(s => s.classList.toggle("active", s.id === "view-" + v));
-  if (v === "files") { loadFiles(state.cwd); if (_cm) setTimeout(() => _cm.refresh(), 0); }
-  if (v === "skills") loadSkills();
-  if (v === "memory") loadMemory();
 }
 
-/* ---------------- files ---------------- */
-async function loadFiles(path = "") {
-  state.cwd = path;
-  const d = await api("/api/files?path=" + encodeURIComponent(path));
-  state.cwd = d.path;
-  const crumbs = $("#crumbs"); crumbs.innerHTML = "";
-  const root = document.createElement("span"); root.textContent = "workspace"; root.onclick = () => loadFiles("");
-  crumbs.appendChild(root);
-  let acc = "";
-  (d.path ? d.path.split("/") : []).forEach(part => {
-    acc = acc ? acc + "/" + part : part; const here = acc;
-    crumbs.insertAdjacentText("beforeend", " / ");
-    const s = document.createElement("span"); s.textContent = part; s.onclick = () => loadFiles(here); crumbs.appendChild(s);
-  });
-  const list = $("#fileList"); list.innerHTML = "";
-  if (d.path) {
-    const up = document.createElement("div"); up.className = "f-row dir";
-    up.innerHTML = `<span class="fi">↰</span> ..`;
-    up.onclick = () => loadFiles(d.path.split("/").slice(0, -1).join("/")); list.appendChild(up);
-  }
-  if (!d.entries.length && !d.path) list.innerHTML += `<div class="empty-note">workspace is empty</div>`;
-  d.entries.forEach(e => {
-    const row = document.createElement("div"); row.className = "f-row" + (e.dir ? " dir" : "");
-    row.innerHTML = `<span class="fi">${e.dir ? "▸" : "·"}</span><span class="fn">${escapeHtml(e.name)}</span>` +
-      (e.dir ? "" : `<span class="fsz">${fmtSize(e.size)}</span><button class="f-del" title="delete">✕</button>`);
-    row.onclick = () => e.dir ? loadFiles(e.path) : openFile(e.path);
-    const del = $(".f-del", row);
-    if (del) del.onclick = async (ev) => {
-      ev.stopPropagation();
-      if (!await confirmAction("Delete file?", `“${e.name}” will be deleted.`)) return;
-      await fetch("/api/file?path=" + encodeURIComponent(e.path), { method: "DELETE" });
-      if (state.file === e.path) { $("#feOpen").style.display = "none"; $("#feEmpty").style.display = "block"; state.file = null; }
-      loadFiles(state.cwd);
-    };
-    list.appendChild(row);
-  });
-}
+/* fmtSize — shared file-size formatter (Explorer window + Rivers) */
 const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " K" : (n / 1048576).toFixed(1) + " M";
-/* ---- CodeMirror code editor (Files view) ---- */
-let _cm = null, _cmDirty = false;
-const CM_LANGS = [["", "Plain text"], ["javascript", "JavaScript"], ["application/json", "JSON"],
-  ["text/x-python", "Python"], ["text/x-csrc", "C"], ["text/x-c++src", "C++"], ["text/x-java", "Java"],
-  ["css", "CSS"], ["xml", "XML"], ["htmlmixed", "HTML"], ["text/x-markdown", "Markdown"], ["shell", "Shell"],
-  ["yaml", "YAML"], ["sql", "SQL"], ["rust", "Rust"], ["go", "Go"], ["php", "PHP"], ["ruby", "Ruby"],
-  ["lua", "Lua"], ["dockerfile", "Dockerfile"]];
-function _cmInit() {
-  if (_cm) return _cm;
-  _cm = CodeMirror($("#feCm"), {
-    value: "", mode: null, theme: "material-darker", lineNumbers: true, lineWrapping: false,
-    matchBrackets: true, autoCloseBrackets: true, styleActiveLine: true, indentUnit: 2, tabSize: 2,
-    extraKeys: {
-      "Ctrl-S": () => saveFile(), "Cmd-S": () => saveFile(),
-      "Ctrl-F": "findPersistent", "Cmd-F": "findPersistent",
-      "Alt-F": "replace", "Shift-Ctrl-F": "replaceAll",
-      "Ctrl-/": "toggleComment", "Cmd-/": "toggleComment",
-    },
-  });
-  _cm.on("change", () => { if (!_cmDirty) { _cmDirty = true; $("#feDirty").classList.add("on"); } });
-  const sel = $("#feLang");
-  sel.innerHTML = CM_LANGS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
-  sel.onchange = () => _cm.setOption("mode", sel.value || null);
-  return _cm;
-}
-function _applyMode(path) {                       // pick syntax mode from the file's extension/name
-  let mime = "";
-  try { const info = CodeMirror.findModeByFileName(path.split("/").pop()); if (info) mime = info.mime || info.mode; } catch {}
-  _cm.setOption("mode", mime || null);
-  const sel = $("#feLang"); sel.value = [...sel.options].some(o => o.value === mime) ? mime : "";
-}
-async function openFile(path) {
-  state.file = path;
-  $("#feEmpty").style.display = "none"; $("#feOpen").style.display = "flex";
-  $("#feName").textContent = path;
-  const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path);
-  $("#feImage").style.display = isImg ? "flex" : "none";
-  $("#feCm").style.display = isImg ? "none" : "block";
-  $("#feOpen").classList.toggle("is-image", isImg);
-  if (isImg) { $("#feImg").src = "/api/raw?path=" + encodeURIComponent(path); return; }
-  const d = await api("/api/file?path=" + encodeURIComponent(path));
-  _cmInit();
-  _cm.setOption("readOnly", !!d.binary);
-  _cm.setValue(d.binary ? "(binary file — not editable here)" : d.content);
-  _cm.clearHistory();
-  _applyMode(path);
-  _cmDirty = false; $("#feDirty").classList.remove("on");
-  setTimeout(() => _cm.refresh(), 0);             // CM mis-measures in a freshly-shown flex box
-}
-async function newFolder() {
-  const name = await promptDialog("New folder", { placeholder: "folder name", okLabel: "Create" }); if (!name) return;
-  const path = state.cwd ? state.cwd + "/" + name : name;
-  await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
-  loadFiles(state.cwd);
-}
-async function saveFile() {
-  if (!state.file || !_cm) return;
-  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: state.file, content: _cm.getValue() }) });
-  _cmDirty = false; $("#feDirty").classList.remove("on");
-  const btn = $("#fSave"); btn.textContent = "Saved ✓"; setTimeout(() => btn.textContent = "Save", 1200);
-  loadFiles(state.cwd);
-}
-async function saveFileAs() {
-  if (!_cm) return;
-  const suggested = state.file || (state.cwd ? state.cwd + "/untitled.txt" : "untitled.txt");
-  const path = await promptDialog("Save as", { value: suggested, message: "Path relative to the workspace", okLabel: "Save" });
-  if (!path || path === state.file) { if (path === state.file) saveFile(); return; }
-  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: _cm.getValue() }) });
-  await loadFiles(state.cwd);
-  openFile(path);
-}
-function toggleWrap() {
-  if (!_cm) return;
-  const w = !_cm.getOption("lineWrapping");
-  _cm.setOption("lineWrapping", w); $("#feWrap").classList.toggle("on", w);
-}
-async function newFile() {
-  const name = await promptDialog("New file", { placeholder: "file name (e.g. notes.md)", okLabel: "Create" }); if (!name) return;
-  const path = state.cwd ? state.cwd + "/" + name : name;
-  await fetch("/api/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: "" }) });
-  loadFiles(state.cwd); openFile(path);
-}
-
 /* ---------------- skills ---------------- */
+// skillsCache is populated by the Brain window (loadBrainSkills); the skill editor
+// modal below (openSkill / saveSkill / deleteSkill) is shared with it.
 let skillsCache = [];
-async function loadSkills() {
-  skillsCache = await api("/api/skills");
-  const body = $("#skillsBody"); body.innerHTML = "";
-  if (!skillsCache.length) body.innerHTML = `<div class="empty-note">No skills yet. Create one — teach Oceano a reusable procedure.</div>`;
-  skillsCache.forEach(s => {
-    const c = document.createElement("div"); c.className = "skill-card";
-    c.innerHTML = `<h3>${escapeHtml(s.name)}</h3><div class="sc-desc">${escapeHtml(s.description)}</div>
-      <div class="sc-snip">${escapeHtml(s.body.slice(0, 90))}…</div>`;
-    c.onclick = () => openSkill(s);
-    body.appendChild(c);
-  });
-}
 function openSkill(s) {
   $("#skModalTitle").textContent = s ? `Edit skill${s.status && s.status !== "published" ? " · " + s.status : ""}` : "New skill";
   $("#skName").value = s ? s.name : ""; $("#skDesc").value = s ? s.description : ""; $("#skBody").value = s ? s.body : "";
@@ -1040,26 +908,6 @@ async function deleteSkill() {
   if (!await confirmAction("Delete skill?", `“${$("#skName").value}” will be deleted.`)) return;
   await fetch("/api/skills/" + encodeURIComponent(dir), { method: "DELETE" });
   closeSkill(); loadBrainSkills();
-}
-
-/* ---------------- memory ---------------- */
-async function loadMemory() {
-  const mems = await api("/api/memories");
-  const list = $("#memList"); list.innerHTML = "";
-  if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
-  mems.forEach(m => {
-    const row = document.createElement("div"); row.className = "mem-row";
-    const tags = (m.tags || "").split(",").filter(Boolean).map(t => `<span class="tag">${escapeHtml(t.trim())}</span>`).join("");
-    const date = (m.ts || "").slice(0, 10);
-    row.innerHTML = `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${tags}${date}</div></div><button class="mr-del">✕</button>`;
-    $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadMemory(); };
-    list.appendChild(row);
-  });
-}
-async function addMemory() {
-  const text = $("#memText").value.trim(); if (!text) return;
-  await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, tags: $("#memTags").value.trim() }) });
-  $("#memText").value = ""; $("#memTags").value = ""; loadMemory();
 }
 
 /* ---------------- settings ---------------- */
@@ -5203,21 +5051,9 @@ function wire() {
   document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
   pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);
 
-  // files
-  $("#fRefresh").onclick = () => loadFiles(state.cwd);
-  $("#fNew").onclick = newFile;
-  $("#fNewDir").onclick = newFolder;
-  $("#fSave").onclick = saveFile;
-  $("#feSaveAs").onclick = saveFileAs;
-  $("#feWrap").onclick = toggleWrap;
-  $("#feFind").onclick = () => { if (_cm) { _cm.focus(); _cm.execCommand("findPersistent"); } };
-  // skills
-  $("#skNew").onclick = () => openSkill(null);
+  // skill editor modal (shared — opened from the Brain window's skill cards)
   $("#skClose").onclick = closeSkill; $("#skModalScrim").onclick = closeSkill;
   $("#skSave").onclick = saveSkill; $("#skDelete").onclick = deleteSkill;
-  // memory
-  $("#memAdd").onclick = addMemory;
-  $("#memText").addEventListener("keydown", e => { if (e.key === "Enter") addMemory(); });
 }
 
 /* ---------------- auth gate ---------------- */
@@ -5325,7 +5161,7 @@ function handleUiCommand(c) {
 function uiOpen(c) {
   if (c.path) {
     const p = String(c.path);
-    isPreviewable(p) ? openPreview(p) : openFile(p);
+    isPreviewable(p) ? openPreview(p) : openFileWindow(p);
     return;
   }
   const win = (c.window || "").toLowerCase();
