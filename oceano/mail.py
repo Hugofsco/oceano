@@ -119,7 +119,7 @@ def names():
 
 
 def resolve_target(account=None):
-    """The mailbox an agent action should act on, honouring Hugo's segregation rule:
+    """The mailbox an agent action should act on, honouring the user's segregation rule:
       explicit name → that account; else the PRIMARY; else (single account) it; else AMBIGUOUS.
     Returns (raw_record | None, error_message | None). The error is a string the tool relays to the
     user so the agent asks which mailbox to use instead of guessing."""
