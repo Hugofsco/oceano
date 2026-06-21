@@ -63,18 +63,29 @@ async def stop():
 
 def push(text):
     """Proactively message every allow-listed user. Safe to call from a SYNC worker thread (the
-    agent, scheduler) — it schedules onto the bot's event loop. Returns the number delivered."""
+    agent, scheduler) — it schedules onto the bot's event loop. A long message (e.g. a job report) is
+    split into Telegram-sized pieces and sent in order, NEVER truncated — Telegram caps one message at
+    4096 chars, so we reuse the chat path's boundary-aware chunker. Returns the number of users reached
+    (counted once, even when the message spans several chunks)."""
     app, loop = _app, _loop
     if not app or loop is None or not telegram_bot.ALLOWED:
         return 0
+    parts = telegram_bot._chunks(text or "")            # boundary-aware split, ≤4000 chars/piece
+    if not parts:
+        return 0
     sent = 0
     for uid in telegram_bot.ALLOWED:
-        try:
-            fut = asyncio.run_coroutine_threadsafe(app.bot.send_message(uid, (text or "")[:4000]), loop)
-            fut.result(timeout=10)
+        ok = True
+        for part in parts:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(app.bot.send_message(uid, part), loop)
+                fut.result(timeout=10)
+            except Exception:
+                log.exception("telegram push to %s failed", uid)
+                ok = False
+                break                                   # stop this user's stream on first failure
+        if ok:
             sent += 1
-        except Exception:
-            log.exception("telegram push to %s failed", uid)
     return sent
 
 
