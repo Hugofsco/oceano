@@ -229,6 +229,9 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
         if source == "skills:eval":                          # locked skills-evaluation entry
             from oceano import skills
             return skills.evaluate_all()
+        if source == "skills:distill":                       # locked feeder: mine recent chats → learning skills
+            from oceano import skills
+            return skills.distill_recent()
         if source == "evals:run":                            # locked model-eval suite
             from oceano import evals
             evals.run_all_bg()                               # long → background, don't wedge the caller
@@ -236,6 +239,9 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
         if source == "memory:maintain":                      # locked memory-hygiene job
             from oceano import memory
             return memory.maintain()                         # delegates to the configured reviewer, applies the plan
+        if source == "self:reflect":                         # locked nightly self-reflection
+            from oceano import reflect
+            return reflect.reflect()
         if source == "reindex:all":                          # locked index re-sync (docs/memories/skills/chats)
             from oceano import reindex
             return reindex.reindex_all()
