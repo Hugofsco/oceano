@@ -187,6 +187,7 @@ async def lifespan(_app):
         traceback.print_exc()
     try:
         skills.ensure_eval_task()    # the locked '[ SKILLS ] evaluate' schedule must exist
+        skills.ensure_distill_task()  # …and its feeder: distill recent chats into learning skills
     except Exception:
         traceback.print_exc()
     try:
@@ -201,6 +202,11 @@ async def lifespan(_app):
     try:
         from oceano import reindex
         reindex.ensure_task()              # the locked '[ INDEX ]' reindex schedule
+    except Exception:
+        traceback.print_exc()
+    try:
+        from oceano import reflect
+        reflect.ensure_task()              # the locked '[ SELF ]' nightly-reflection schedule
     except Exception:
         traceback.print_exc()
     yield
@@ -2699,6 +2705,36 @@ async def mail_get_message(aid: int, uid: str, folder: str = "INBOX"):
     return await asyncio.to_thread(mail.imap_read, a, uid, folder)
 
 
+@app.get("/api/mail/{aid}/attachment")
+async def mail_get_attachment(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0):
+    """Stream ONE attachment, FORCED to download (Content-Disposition: attachment) with a sanitized
+    filename, octet-stream type, and nosniff — so an HTML/SVG/script attachment can never render or
+    execute in the app's origin. The bytes are untrusted; we only hand them to the browser to save."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return JSONResponse({"ok": False, "error": "no such account"}, status_code=404)
+    res = await asyncio.to_thread(mail.fetch_attachment, a, uid, folder, index)
+    if not res.get("ok"):
+        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=404)
+    fn = res["filename"].replace('"', "").replace("\n", "").replace("\r", "")
+    return Response(content=res["data"], media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"',
+                             "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
+@app.post("/api/mail/{aid}/attachment/save")
+async def mail_save_attachment_human(aid: int, req: Request):
+    """Save an incoming attachment into the workspace (confined, sanitized name, no overwrite)."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    b = await req.json()
+    return await asyncio.to_thread(mail.save_attachment, a, b.get("uid"), b.get("folder", "INBOX"),
+                                   int(b.get("index", 0)))
+
+
 @app.post("/api/mail/{aid}/send")
 async def mail_send_human(aid: int, req: Request):
     """Human-composed send/reply from the Mail window — the account owner acting directly (auth-gated),
@@ -2715,6 +2751,29 @@ async def mail_send_human(aid: int, req: Request):
         return {"ok": False, "error": "recipient required"}
     return await asyncio.to_thread(mail.smtp_send, a, b.get("to", ""), b.get("subject", ""),
                                    b.get("body", ""), b.get("cc") or None, b.get("html") or None)
+
+
+@app.post("/api/mail/{aid}/compose")
+async def mail_compose_send(aid: int, to: str = Form(""), cc: str = Form(""), subject: str = Form(""),
+                            body: str = Form(""), html: str = Form(""), reply_uid: str = Form(""),
+                            folder: str = Form("INBOX"), files: list[UploadFile] = File(default=[])):
+    """Human send/reply WITH attachments (multipart). Files are read in memory and size-capped."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    atts, total = [], 0
+    for f in (files or []):
+        data = await f.read()
+        total += len(data)
+        if len(data) > 25 * 1024 * 1024 or total > 30 * 1024 * 1024:
+            return {"ok": False, "error": "attachments too large (25 MB each, 30 MB total)"}
+        atts.append({"filename": f.filename, "data": data, "content_type": f.content_type})
+    if reply_uid:
+        return await asyncio.to_thread(mail.smtp_reply, a, reply_uid, body, folder, html or None, atts)
+    if not to.strip():
+        return {"ok": False, "error": "recipient required"}
+    return await asyncio.to_thread(mail.smtp_send, a, to, subject, body, cc or None, html or None, atts)
 
 
 @app.post("/api/mail/{aid}/action")

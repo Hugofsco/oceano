@@ -4467,7 +4467,8 @@ async function mailViewMessage(body, uid, meta) {
   box.innerHTML = `<div class="empty-note">loading message…</div>`;
   let r; try { r = await api(`/api/mail/${cur}/message?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}`); } catch { return; }
   if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
-  const att = (r.attachments && r.attachments.length) ? `<div class="mv-att">📎 ${r.attachments.map(escapeHtml).join(", ")}</div>` : "";
+  const att = (r.attachments && r.attachments.length) ? `<div class="mv-atts">` + r.attachments.map(x =>
+    `<span class="att-chip"><a class="att-dl" href="/api/mail/${cur}/attachment?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}&index=${x.index}" download="${escapeHtml(x.filename)}" title="download">📎 ${escapeHtml(x.filename)} <span class="att-sz">${fmtSize(x.size)}</span></a><button class="att-save" data-i="${x.index}" title="save to workspace">💾</button></span>`).join("") + `</div>` : "";
   const canWrite = acc.policy !== "readonly";
   const seen = meta ? meta.seen : true;
   box.innerHTML = `
@@ -4488,6 +4489,10 @@ async function mailViewMessage(body, uid, meta) {
     </div>`;
   $(".mv-body", box).textContent = r.body || "(no text body)";   // textContent — never inject raw email HTML
   $("#mvBack", box).onclick = () => mailLoadMessages(body);
+  $$(".att-save", box).forEach(btn => btn.onclick = async () => {
+    const rr = await _postJ(`/api/mail/${cur}/attachment/save`, { folder, uid, index: parseInt(btn.dataset.i, 10) });
+    toast(rr.ok ? ("💾 saved → workspace/" + rr.path) : ("✗ " + (rr.error || "save failed")), rr.ok ? "info" : "err");
+  });
   const dr = $("#mvDraft", box); if (dr) dr.onclick = () => mailAiDraft(body, uid, { to: r.from, subject: r.subject });
   const rep = $("#mvReply", box); if (rep) rep.onclick = () => mailCompose(body, { uid, to: r.from, subject: r.subject });
   const rd = $("#mvRead", box); if (rd) rd.onclick = async () => {
@@ -4547,8 +4552,16 @@ function mcPlaceholder(ed) {
   ed.classList.toggle("empty", empty);
 }
 
+function mailRenderAttChips(body) {
+  const box = $("#mcAttList", body); if (!box) return;
+  const atts = body._mailAttach || [];
+  box.innerHTML = atts.map((f, i) => `<span class="att-chip">📎 ${escapeHtml(f.name)} <span class="att-sz">${fmtSize(f.size)}</span><button class="att-rm" data-i="${i}" title="remove">✕</button></span>`).join("");
+  $$(".att-rm", box).forEach(b => b.onclick = () => { (body._mailAttach || []).splice(parseInt(b.dataset.i, 10), 1); mailRenderAttChips(body); });
+}
+
 function mailCompose(body, reply) {
   const cur = body._mailAcct;
+  body._mailAttach = [];
   const subj = reply ? (/^\s*re:/i.test(reply.subject || "") ? reply.subject : "Re: " + (reply.subject || "")) : "";
   body.innerHTML = `
     <div class="wf-head"><button class="ed-btn" id="mcBack">←</button><h3>${reply ? "Reply" : "Compose"}</h3>
@@ -4571,8 +4584,12 @@ function mailCompose(body, reply) {
         <button class="mc-tool" id="mcLink" title="Insert link">🔗</button>
         <span class="mc-sep"></span>
         <button class="mc-tool" id="mcClearFmt" title="Clear formatting">⌫</button>
+        <span class="mc-sep"></span>
+        <button class="mc-tool" id="mcAttach" title="attach files">📎</button>
       </div>
       <div class="mc-editor" id="mcBody" contenteditable="true" spellcheck="true" data-ph="Write your message…"></div>
+      <input type="file" id="mcFiles" multiple style="display:none">
+      <div class="mc-attlist" id="mcAttList"></div>
       <div class="mc-foot"><span class="acct-msg" id="mcMsg"></span>
         <span class="te-btns"><button class="ghost-btn sm" id="mcCancel">Cancel</button>
         <button class="primary sm" id="mcSend">Send</button></span></div>
@@ -4585,20 +4602,30 @@ function mailCompose(body, reply) {
   $("#mcLink", body).onclick = async () => { ed.focus(); const u = await promptDialog("Insert link", { placeholder: "https://…", okLabel: "Insert" }); if (u) document.execCommand("createLink", false, u); };
   $("#mcClearFmt", body).onclick = e => { e.preventDefault(); ed.focus(); document.execCommand("removeFormat"); };
   ed.addEventListener("input", () => mcPlaceholder(ed));
+  { const ab = $("#mcAttach", body), fi = $("#mcFiles", body);
+    if (ab && fi) {
+      ab.onclick = () => fi.click();
+      fi.onchange = () => { for (const f of fi.files) (body._mailAttach = body._mailAttach || []).push(f); fi.value = ""; mailRenderAttChips(body); };
+    } }
   if (reply && reply.prefill) ed.innerText = reply.prefill;
   mcPlaceholder(ed);
   $("#mcSend", body).onclick = async () => {
     const msg = $("#mcMsg", body);
     const text = ed.innerText.trim();
-    if (!text) { msg.textContent = "write a message first"; msg.className = "acct-msg err"; return; }
+    const atts = body._mailAttach || [];
+    if (!text && !atts.length) { msg.textContent = "write a message first"; msg.className = "acct-msg err"; return; }
     const html = (window.DOMPurify ? DOMPurify.sanitize(ed.innerHTML) : ed.innerHTML);
-    const payload = reply
-      ? { reply_uid: reply.uid, folder: body._mailFolder || "INBOX", body: ed.innerText, html }
-      : { to: ($("#mcTo", body).value || "").trim(), cc: ($("#mcCc", body).value || "").trim(),
-          subject: $("#mcSubj", body).value, body: ed.innerText, html };
-    if (!reply && !payload.to) { msg.textContent = "recipient required"; msg.className = "acct-msg err"; return; }
-    msg.textContent = "sending…"; msg.className = "acct-msg";
-    const r = await _postJ(`/api/mail/${cur}/send`, payload);
+    const fd = new FormData();
+    if (reply) { fd.append("reply_uid", reply.uid); fd.append("folder", body._mailFolder || "INBOX"); }
+    else {
+      const to = ($("#mcTo", body).value || "").trim();
+      if (!to) { msg.textContent = "recipient required"; msg.className = "acct-msg err"; return; }
+      fd.append("to", to); fd.append("cc", ($("#mcCc", body).value || "").trim()); fd.append("subject", $("#mcSubj", body).value);
+    }
+    fd.append("body", ed.innerText); fd.append("html", html);
+    atts.forEach(f => fd.append("files", f, f.name));
+    msg.textContent = atts.length ? `sending with ${atts.length} attachment(s)…` : "sending…"; msg.className = "acct-msg";
+    let r; try { r = await (await fetch(`/api/mail/${cur}/compose`, { method: "POST", body: fd })).json(); } catch { r = { ok: false }; }
     if (!r.ok) { msg.textContent = r.error || "send failed"; msg.className = "acct-msg err"; return; }
     toast("✓ " + (r.text || "sent"), "info"); mailRenderMain(body);
   };

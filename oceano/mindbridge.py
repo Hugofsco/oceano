@@ -29,7 +29,7 @@ _ALLOW = {
     "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
     "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
     "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)
-    "mail_folder",                                                       # create/rename/delete folders (gated; delete needs arming)
+    "mail_folder", "mail_save_attachment",                              # folders (gated) + save an email attachment to the workspace
 }
 
 _TOKEN = None

@@ -15,6 +15,7 @@ import email.utils
 import html
 import imaplib
 import json
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -33,6 +34,7 @@ POLICIES = ("readonly", "active", "trusted")
 _ARM_TTL = 1800                 # a send-arm lasts 30 minutes
 _TIMEOUT = 25                   # IMAP/SMTP connect/op timeout (seconds)
 _BODY_CAP = 16000               # cap a fetched body like other tool outputs
+_ATTACH_CAP = 25 * 1024 * 1024  # 25 MB per attachment (download + send)
 _LIST_CAP = 50                  # never list more than this many messages per call
 
 _lock = threading.Lock()
@@ -322,14 +324,124 @@ def _payload_text(part):
         return ""
 
 
-def _attachment_names(msg):
-    names_ = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            disp = str(part.get("Content-Disposition") or "")
-            if "attachment" in disp.lower():
-                names_.append(_dh(part.get_filename()) or "(unnamed)")
-    return names_
+def _safe_filename(name):
+    """A safe download filename from an UNTRUSTED attachment name: basename only (no path traversal),
+    no control/path chars, no leading dots, length-capped."""
+    base = Path((name or "").replace("\x00", "")).name      # drop any directory components
+    base = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", base).strip().strip(".")
+    return base[:200] or "attachment"
+
+
+def _ws_path(rel):
+    """Resolve a workspace-relative path and refuse anything that escapes the workspace."""
+    root = config.WORKSPACE.resolve()
+    p = (config.WORKSPACE / (rel or "")).resolve()
+    if not p.is_relative_to(root):
+        raise ValueError("path escapes the workspace")
+    return p
+
+
+def _dedupe(path):
+    """If `path` exists, append ' (1)', ' (2)'… so a download never overwrites an existing file."""
+    if not path.exists():
+        return path
+    stem, suf, i = path.stem, path.suffix, 1
+    while True:
+        cand = path.with_name(f"{stem} ({i}){suf}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _iter_attachments(msg):
+    """Yield (index, part, filename) for each real attachment — disposition=attachment, or a named
+    part that isn't an inline (cid) body image. Indices are stable for list ↔ fetch."""
+    if not msg.is_multipart():
+        return
+    i = 0
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disp = str(part.get("Content-Disposition") or "").lower()
+        fname = _dh(part.get_filename())
+        if "attachment" in disp or (fname and "inline" not in disp):
+            yield i, part, (fname or f"part-{i}")
+            i += 1
+
+
+def list_attachments(msg):
+    """[{index, filename, content_type, size}] for an already-parsed message (no extra fetch)."""
+    out = []
+    for i, part, fname in _iter_attachments(msg):
+        try:
+            n = len(part.get_payload(decode=True) or b"")
+        except Exception:
+            n = 0
+        out.append({"index": i, "filename": _safe_filename(fname),
+                    "content_type": part.get_content_type(), "size": n})
+    return out
+
+
+def fetch_attachment(a, uid, folder, index):
+    """Fetch ONE attachment's bytes (size-capped). Returns {ok, filename, content_type, data} or error."""
+    try:
+        conn = _imap(a)
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    try:
+        if conn.select(_q(folder), readonly=True)[0] != "OK":
+            return {"ok": False, "error": f"no such folder {folder!r}"}
+        typ, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return {"ok": False, "error": f"message uid {uid} not found"}
+        msg = email.message_from_bytes(data[0][1])
+        for i, part, fname in _iter_attachments(msg):
+            if i == int(index):
+                raw = part.get_payload(decode=True) or b""
+                if len(raw) > _ATTACH_CAP:
+                    return {"ok": False, "error": f"attachment is {len(raw)//1048576} MB (cap 25 MB)"}
+                return {"ok": True, "filename": _safe_filename(fname),
+                        "content_type": part.get_content_type(), "data": raw}
+        return {"ok": False, "error": f"no attachment #{index} on this message"}
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    finally:
+        _imap_close(conn)
+
+
+def save_attachment(a, uid, folder, index, subdir="mail-attachments"):
+    """Download attachment #index and save it UNDER the workspace (confined, sanitized name, no
+    overwrite). Returns {ok, path (workspace-relative), filename, size, content_type}."""
+    res = fetch_attachment(a, uid, folder, index)
+    if not res.get("ok"):
+        return res
+    try:
+        sub = _safe_filename(subdir) or "mail-attachments"
+        dest = _dedupe(_ws_path(f"{sub}/{res['filename']}"))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(res["data"])
+    except Exception as e:
+        return {"ok": False, "error": f"could not save: {str(e)[:120]}"}
+    return {"ok": True, "path": str(dest.relative_to(config.WORKSPACE)),
+            "filename": dest.name, "size": len(res["data"]), "content_type": res["content_type"]}
+
+
+def workspace_attachments(paths):
+    """Build outgoing-attachment dicts from workspace-relative file paths (CONFINED) — used when the
+    agent attaches workspace files to an outgoing message. Returns (attachments, error)."""
+    atts = []
+    for p in (paths or []):
+        try:
+            fp = _ws_path(p)
+        except Exception:
+            return None, f"attachment path {p!r} escapes the workspace"
+        if not fp.is_file():
+            return None, f"no such workspace file to attach: {p}"
+        data = fp.read_bytes()
+        if len(data) > _ATTACH_CAP:
+            return None, f"{p} is too large to attach (cap 25 MB)"
+        atts.append({"filename": fp.name, "data": data, "content_type": None})
+    return atts, None
 
 
 # ---------------- IMAP ----------------
@@ -649,7 +761,7 @@ def imap_read(a, uid, folder="INBOX"):
         return {"ok": True, "uid": str(uid), "folder": folder,
                 "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
                 "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
-                "attachments": _attachment_names(msg), "body": _extract_text(msg)}
+                "attachments": list_attachments(msg), "body": _extract_text(msg)}
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:
@@ -825,7 +937,7 @@ def imap_bulk(a, op, folder="INBOX", uids=None, query=None, select_all=False, de
 
 
 # ---------------- SMTP ----------------
-def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="", html=None):
+def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="", html=None, attachments=None):
     msg = EmailMessage()
     from_name = a.get("name") or ""
     msg["From"] = email.utils.formataddr((from_name, a["email"])) if from_name else a["email"]
@@ -839,6 +951,12 @@ def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="",
     msg.set_content(body or "")                  # text/plain (the fallback)
     if html:
         msg.add_alternative(html, subtype="html")  # multipart/alternative: clients prefer the HTML part
+    for att in (attachments or []):
+        fname = _safe_filename(att.get("filename") or "attachment")
+        ctype = att.get("content_type") or mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        maintype, _, subtype = ctype.partition("/")
+        msg.add_attachment(att.get("data") or b"", maintype=maintype or "application",
+                           subtype=subtype or "octet-stream", filename=fname)
     return msg
 
 
@@ -876,11 +994,11 @@ def _recipients(to, cc=None):
     return out
 
 
-def smtp_send(a, to, subject, body, cc=None, html=None):
+def smtp_send(a, to, subject, body, cc=None, html=None, attachments=None):
     recips = _recipients(to, cc)
     if not recips:
         return {"ok": False, "error": "no valid recipient address"}
-    msg = _build_message(a, to, subject, body, cc=cc, html=html)
+    msg = _build_message(a, to, subject, body, cc=cc, html=html, attachments=attachments)
     try:
         _smtp_send_msg(a, msg, recips)
     except Exception as e:
@@ -889,7 +1007,7 @@ def smtp_send(a, to, subject, body, cc=None, html=None):
     return {"ok": True, "text": f"sent '{subject or '(no subject)'}' to {', '.join(recips)}"}
 
 
-def smtp_reply(a, uid, body, folder="INBOX", html=None):
+def smtp_reply(a, uid, body, folder="INBOX", html=None, attachments=None):
     """Reply to message `uid`: pulls the thread headers over IMAP, then sends via SMTP."""
     try:
         conn = _imap(a)
@@ -910,7 +1028,8 @@ def smtp_reply(a, uid, body, folder="INBOX", html=None):
     if not recips:
         return {"ok": False, "error": "original message had no replyable address"}
     msg = _build_message(a, ctx["to"], ctx["subject"], body,
-                         in_reply_to=ctx["message_id"], references=ctx["references"], html=html)
+                         in_reply_to=ctx["message_id"], references=ctx["references"], html=html,
+                         attachments=attachments)
     try:
         _smtp_send_msg(a, msg, recips)
     except Exception as e:
