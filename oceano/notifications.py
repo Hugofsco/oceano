@@ -44,10 +44,19 @@ def channels_ready():
     return {"ntfy": bool(cfg["ntfy_topic"]), "telegram": bool(cfg["telegram"] and tg)}
 
 
+# ntfy rejects a body over its server message-size-limit (4096 bytes by default) with a 413, so a long
+# task report would silently fail to reach the phone. A phone push is meant to be glanceable anyway, so
+# cap it — Telegram still delivers the full report in chunks.
+_NTFY_MAX = 3900
+
+
 def _send_ntfy(cfg, message, title):
+    body = message or ""
+    if len(body.encode("utf-8")) > _NTFY_MAX:
+        body = body.encode("utf-8")[:_NTFY_MAX].decode("utf-8", "ignore").rstrip() + "\n… (truncated — full report in the activity log / Telegram)"
     try:
         requests.post(f"{cfg['ntfy_url']}/{cfg['ntfy_topic']}",
-                      data=(message or "").encode("utf-8"),
+                      data=body.encode("utf-8"),
                       headers={"Title": title or "Oceano"}, timeout=10)
         return True
     except requests.RequestException:

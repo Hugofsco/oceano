@@ -289,7 +289,7 @@ def run_due_once():
         print(f"[scheduler] running #{tid}: {instruction}")
         try:
             answer = _dispatch(source, instruction, ref=source or f"task:{tid}", model=model, base_url=base_url)
-            notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task")
+            notify(f"{instruction}\n\n{answer}", title="Oceano task")  # full report; notify() chunks per channel
         except Exception as e:
             print(f"[scheduler] task #{tid} failed: {e}")
         con.execute("UPDATE tasks SET last_run=? WHERE id=?", (now.isoformat(), tid))
@@ -320,5 +320,5 @@ def run_task(tid, advance=True):
         con.execute("UPDATE tasks SET last_run=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), tid))
         con.commit()
         con.close()
-    notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task (manual)")
+    notify(f"{instruction}\n\n{answer}", title="Oceano task (manual)")  # full report; notify() chunks per channel
     return {"ok": True, "result": answer}
