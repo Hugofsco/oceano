@@ -445,7 +445,17 @@ async def twofa_disable(req: Request):
 
 def _agent(sid):
     if sid not in _sessions:
-        _sessions[sid] = Agent()
+        ag = Agent()
+        # Rehydrate the conversation so continuing an existing chat — or any chat after a
+        # server restart — has its real history, not a blank slate. (Bare Agent() starts with
+        # only the system message; without this the model has no memory of the chat it's in.)
+        try:
+            hist = chats.history_messages(sid)
+            if hist:
+                ag.messages.extend(hist)
+        except Exception:
+            pass
+        _sessions[sid] = ag
     return _sessions[sid]
 
 
@@ -1886,6 +1896,23 @@ def workflows_runs(wid: int):
     return workflows.runs(wid)
 
 
+@app.get("/api/workflows/approvals")
+def workflows_approvals():
+    """Approval-node pauses waiting on a human decision (issue 8 D)."""
+    from oceano import workflows
+    return {"pending": workflows.pending_approvals()}
+
+
+@app.post("/api/workflows/approve")
+async def workflows_approve(req: Request):
+    """Resolve an approval-node pause: {token, approved: bool} → the run continues down the
+    approved/rejected branch."""
+    from oceano import workflows
+    b = await req.json()
+    ok = workflows.resolve_approval(b.get("token", ""), bool(b.get("approved")))
+    return {"ok": ok}
+
+
 @app.post("/api/workflows/{wid}/run")
 async def workflows_run(wid: int, req: Request):
     """Run a workflow now, streaming step-by-step progress as SSE. The engine runs in a
@@ -2688,12 +2715,13 @@ async def mail_folder_op(aid: int, req: Request):
 
 
 @app.get("/api/mail/{aid}/messages")
-async def mail_get_messages(aid: int, folder: str = "INBOX", q: str = "", limit: int = 30, unread: bool = False):
+async def mail_get_messages(aid: int, folder: str = "INBOX", q: str = "", limit: int = 30,
+                            offset: int = 0, unread: bool = False):
     from oceano import mail
     a = mail._raw(aid)
     if not a:
         return {"ok": False, "error": "no such account"}
-    return await asyncio.to_thread(mail.imap_list, a, folder, q or None, limit, unread)
+    return await asyncio.to_thread(mail.imap_list, a, folder, q or None, limit, offset, unread)
 
 
 @app.get("/api/mail/{aid}/message")
@@ -2705,11 +2733,19 @@ async def mail_get_message(aid: int, uid: str, folder: str = "INBOX"):
     return await asyncio.to_thread(mail.imap_read, a, uid, folder)
 
 
+# content types we'll serve INLINE (for double-click "open"): a browser renders these in its own
+# viewer, and we still sandbox the response so even a crafted one can't reach the app's origin.
+# Anything else (HTML/SVG/scripts/unknown) always falls back to a forced download.
+_INLINE_OK = ("image/", "application/pdf", "text/plain")
+
+
 @app.get("/api/mail/{aid}/attachment")
-async def mail_get_attachment(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0):
-    """Stream ONE attachment, FORCED to download (Content-Disposition: attachment) with a sanitized
-    filename, octet-stream type, and nosniff — so an HTML/SVG/script attachment can never render or
-    execute in the app's origin. The bytes are untrusted; we only hand them to the browser to save."""
+async def mail_get_attachment(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0,
+                              disposition: str = "attachment"):
+    """Stream ONE attachment. Default: FORCED download (octet-stream + nosniff) so an HTML/SVG/script
+    attachment can never render or execute in the app's origin. disposition=inline opens safe types
+    (images/PDF/text) in the browser's own viewer, served sandboxed (unique origin, no script) — every
+    other type still downloads. The bytes are untrusted email content."""
     from oceano import mail
     a = mail._raw(aid)
     if not a:
@@ -2718,9 +2754,67 @@ async def mail_get_attachment(aid: int, folder: str = "INBOX", uid: str = "", in
     if not res.get("ok"):
         return JSONResponse({"ok": False, "error": res.get("error")}, status_code=404)
     fn = res["filename"].replace('"', "").replace("\n", "").replace("\r", "")
+    ctype = res.get("content_type") or ""
+    if disposition == "inline" and any(ctype.startswith(p) for p in _INLINE_OK):
+        # sandbox CSP → the resource gets a unique origin, so even a crafted PDF/image viewer
+        # context can't touch the app's cookies/DOM; nosniff stops content-type confusion.
+        return Response(content=res["data"], media_type=ctype,
+                        headers={"Content-Disposition": f'inline; filename="{fn}"',
+                                 "X-Content-Type-Options": "nosniff",
+                                 "Content-Security-Policy": "sandbox; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'",
+                                 "Cache-Control": "no-store"})
     return Response(content=res["data"], media_type="application/octet-stream",
                     headers={"Content-Disposition": f'attachment; filename="{fn}"',
                              "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
+@app.get("/api/mail/{aid}/attachment/sha256")
+async def mail_attachment_sha256(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0):
+    """SHA256 of one attachment (computed server-side from the bytes) for a keyless VirusTotal lookup."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    res = await asyncio.to_thread(mail.attachment_sha256, a, uid, folder, index)
+    if res.get("ok"):
+        from oceano import virustotal
+        res["report_url"] = virustotal.file_report_url(res["sha256"])
+    return res
+
+
+@app.post("/api/mail/{aid}/attachment/virustotal")
+async def mail_attachment_virustotal(aid: int, req: Request):
+    """Upload one attachment to VirusTotal for scanning (needs an API key in Settings → Mail).
+    Returns {ok, url} pointing at the analysis page."""
+    from oceano import mail, virustotal
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    key = (load().get("virustotal_key") or "").strip()
+    if not key:
+        return {"ok": False, "error": "no VirusTotal API key set — add one in Settings → Mail"}
+    b = await req.json()
+    fetched = await asyncio.to_thread(mail.fetch_attachment, a, b.get("uid"),
+                                      b.get("folder", "INBOX"), int(b.get("index", 0)))
+    if not fetched.get("ok"):
+        return fetched
+    return await asyncio.to_thread(virustotal.upload, key, fetched["data"], fetched["filename"])
+
+
+@app.get("/api/virustotal")
+def virustotal_key_get():
+    """Whether a VirusTotal API key is configured (never returns the key itself)."""
+    return {"has_key": bool((load().get("virustotal_key") or "").strip())}
+
+
+@app.post("/api/virustotal")
+async def virustotal_key_set(req: Request):
+    """Set or clear the VirusTotal API key (stored in web.json, chmod 600 like the other secrets)."""
+    b = await req.json()
+    data = load()
+    data["virustotal_key"] = (b.get("key") or "").strip()
+    save(data)
+    return {"ok": True, "has_key": bool(data["virustotal_key"])}
 
 
 @app.post("/api/mail/{aid}/attachment/save")

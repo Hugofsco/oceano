@@ -1283,7 +1283,7 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .vc-actions{display:flex;gap:9px;justify-content:flex-end;flex:0 0 auto}
 
 /* ---------------- Workflows ---------------- */
-.wf-win{padding:0;height:100%}
+.wf-win{padding:0;height:100%;display:flex;flex-direction:column}
 .wf-head{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);background:var(--panel);flex:0 0 auto}
 .wf-head h3{margin:0;font-family:var(--font-display);font-size:16px;color:var(--foam);font-weight:600}
 .wf-list{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
@@ -1363,10 +1363,28 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .wf-ic-hint code{background:rgba(var(--abyss-0-rgb),.7);color:var(--biolum);padding:1px 5px;border-radius:5px}
 .wf-inp-badge{font-family:var(--font-mono);font-size:11px;color:var(--biolum);background:rgba(var(--biolum-rgb),.12);border-radius:7px;padding:1px 7px;font-weight:400}
 .wf-run-input{margin:10px 12px 0;padding:8px 11px;background:rgba(var(--biolum-rgb),.08);border:1px solid rgba(var(--biolum-rgb),.25);border-radius:9px;font-size:12.5px;color:var(--foam);font-family:var(--font-mono);word-break:break-word}
+/* editor body: node palette on the SIDEBAR (left), canvas fills the rest (issue 8) */
+.wf-editor-main{flex:1;min-height:0;display:flex}
+.wf-sidebar{flex:0 0 172px;display:flex;flex-direction:column;gap:9px;padding:10px 9px;overflow-y:auto;border-right:1px solid var(--line);background:var(--panel)}
+.wf-pal-group{display:flex;flex-direction:column;gap:4px}
+.wf-pal-h{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin:2px 0}
+.wf-pal-btn{display:block;width:100%;text-align:left;background:var(--abyss-0);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-size:12px;padding:6px 9px;cursor:pointer;transition:border-color .12s,color .12s}
+.wf-pal-btn:hover{border-color:var(--biolum);color:var(--biolum)}
+.wf-pal-foot{margin-top:auto;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:9px;border-top:1px solid var(--line)}
+.wf-pal-foot .wf-hint{flex-basis:100%;font-family:var(--font-mono);font-size:9.5px;color:var(--faint);line-height:1.35}
+.wfn-mini{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--faint);font-family:var(--font-mono);margin-top:4px}
+.wfn-num{width:56px!important;flex:none}
+.wfn-hint{font-family:var(--font-mono);font-size:9.5px;color:var(--faint);line-height:1.3;margin-top:3px}
+/* approval node: Approve/Reject inside a running step (issue 8 D) */
+.wf-approve{display:flex;align-items:center;gap:8px;margin-top:8px;padding:8px 10px;background:rgba(255,196,90,.09);border:1px solid rgba(255,196,90,.5);border-radius:8px}
+.wf-ap-msg{font-size:12px;color:var(--buoy);flex:1}
 .wf-canvas{flex:1;min-height:0;position:relative;overflow:hidden;background:radial-gradient(circle,rgba(var(--line-rgb),.06) 1px,transparent 1px) 0 0/22px 22px,var(--abyss-0)}
 .wf-canvas .drawflow,.wf-canvas .parent-drawflow{width:100%;height:100%}
-.wf-canvas .drawflow-node{background:var(--panel-solid);border:1px solid var(--line-strong);border-radius:11px;color:var(--foam);padding:0;width:204px;box-shadow:0 6px 22px rgba(0,0,0,.4);font-family:var(--font-body)}
-.wf-canvas .drawflow-node.selected{border-color:var(--biolum);box-shadow:0 0 0 1px var(--biolum),0 6px 22px rgba(0,0,0,.55)}
+.wf-canvas .drawflow-node{background:var(--panel-solid);border:1px solid var(--line-strong);border-radius:11px;color:var(--foam);padding:0;width:236px;box-shadow:0 6px 22px rgba(0,0,0,.4);font-family:var(--font-body)}
+/* override Drawflow's vendor default (.drawflow-node.selected{background:red}) which turned the
+   whole node bright red on select and made the text unreadable — keep the panel bg, cyan accent only */
+.wf-canvas .drawflow-node.selected{background:var(--panel-solid)!important;border-color:var(--biolum);box-shadow:0 0 0 1px var(--biolum),0 6px 22px rgba(0,0,0,.55)}
+.wfn-f:focus,.wfn-fld:focus{background:var(--abyss-1)}   /* subtle lift on focus for readability */
 .wf-canvas .drawflow-node .drawflow_content_node{padding:0;width:100%}
 .wfn{padding:9px 11px;display:flex;flex-direction:column;gap:6px}
 .wfn b{font-size:12px;font-family:var(--font-mono);font-weight:500}
@@ -1413,13 +1431,33 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .tf-del{color:var(--mist)}.tf-del:hover{color:var(--coral)}
 .wf-running{color:#ffd166;font-size:10px;font-family:var(--font-mono)}
 .wfn-rule{display:flex;gap:5px}
-.wfn-rule input{flex:1;min-width:0}
+/* a <select> here is .wfn-f (width:100%), whose flex-basis would eat the whole row and collapse
+   the sibling input to 0px — size selects to content so inputs keep usable width */
+.wfn-rule>select{flex:0 0 auto;width:auto;min-width:0}
+.wfn-rule input{flex:1 1 0;min-width:0;width:auto}
+/* trigger / http node forms: preset dropdowns + header rows (friendlier than raw text boxes) */
+.wfn-trig-form,.wfn-http-form{display:flex;flex-direction:column;gap:6px}
+.wh-headers{display:flex;flex-direction:column;gap:4px}
+.wh-hrow{display:flex;gap:4px;align-items:center}
+.wh-hrow .wh-hk{flex:0 0 38%;min-width:0}
+.wh-hrow .wh-hv{flex:1;min-width:0}
+.wh-hx{flex:none;background:none;border:none;color:var(--mist);cursor:pointer;font-size:11px;padding:2px 4px;border-radius:5px}
+.wh-hx:hover{color:var(--coral)}
+.wfn-addbtn{align-self:flex-start;background:rgba(var(--biolum-rgb),.1);border:1px solid var(--line);border-radius:7px;color:var(--biolum);font-size:11px;padding:3px 9px;cursor:pointer}
+.wfn-addbtn:hover{border-color:var(--biolum)}
 .wfn-branches{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10px;color:var(--faint)}
 .wf-dfn-start .wfn b,.wf-dfn-tool .wfn b{color:var(--biolum)}
 .wf-dfn-end .wfn b{color:var(--coral)}
 .wf-dfn-instruction .wfn b{color:var(--biolum-2)}
 .wf-dfn-delegate .wfn b{color:var(--buoy)}
 .wf-dfn-decision .wfn b{color:#d6a3e0}
+.wf-dfn-trigger .wfn b{color:#7fd9b0}
+.wf-dfn-switch .wfn b{color:#d6a3e0}
+.wf-dfn-loop .wfn b{color:#e0c46a}
+.wf-dfn-http .wfn b{color:#6ab0e0}
+.wf-dfn-subflow .wfn b{color:#9fb0ff}
+.wf-dfn-transform .wfn b{color:#7fd9b0}
+.wf-dfn-approval .wfn b{color:var(--buoy)}
 .wf-canvas .drawflow-node.wf-dfn-start,.wf-canvas .drawflow-node.wf-dfn-end{width:120px}
 .wf-canvas .drawflow-node .input,.wf-canvas .drawflow-node .output{background:var(--abyss-1);border:2px solid var(--biolum);width:13px;height:13px;box-shadow:0 0 6px rgba(var(--biolum-rgb),.4)}
 .wf-canvas .drawflow-node .output{border-color:var(--biolum-2)}
@@ -1750,6 +1788,21 @@ html.density-compact{font-size:14px} html.density-spacious{font-size:17.5px}
 .mc-attlist{display:flex;flex-wrap:wrap;gap:6px;flex:0 0 auto}
 .mc-attlist:not(:empty){margin-top:2px}
 .mv-body{flex:1;overflow:auto;margin:0;padding:13px;font-family:var(--mono),monospace;font-size:12.5px;line-height:1.5;color:var(--foam);white-space:pre-wrap;word-break:break-word}
+/* message body wrapper holds either the plain <pre> or the sandboxed HTML iframe (issue 5) */
+.mv-body-wrap{flex:1;min-height:0;display:flex;flex-direction:column;overflow:auto}
+.mv-frame{flex:1;width:100%;min-height:340px;border:none;background:#fff;border-radius:0}
+.mv-imgnote{flex:none;font-size:11px;color:var(--mut);padding:5px 13px;border-top:1px solid rgba(var(--line-rgb),.5);background:var(--panel)}
+.mv-bar-sp{flex:1}
+.att-chip{cursor:pointer}
+.att-chip:hover{border-color:var(--biolum);color:var(--biolum)}
+.ed-btn.on{background:rgba(var(--biolum-rgb),.18);color:var(--biolum);border-color:var(--biolum)}
+/* email-list page-size selector + scroll-load footer (issue 4) */
+.ml-pagesize{flex:none;background:var(--panel);color:var(--foam);border:1px solid var(--line);border-radius:7px;font-size:11px;padding:2px 4px}
+.mail-more{flex:none;text-align:center;font-size:11px;color:var(--mut);padding:8px}
+/* VirusTotal key card (issue 6) */
+.vt-card{display:block}
+.vt-keyrow{display:flex;gap:6px;margin-top:8px}
+.vt-keyrow input{flex:1}
 .mail-check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--foam);margin:8px 0}
 .mail-check input{width:auto;margin:0}
 .host-pol.pol-readonly{background:rgba(120,140,160,.2);color:#9fb2c2}

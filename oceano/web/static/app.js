@@ -66,7 +66,14 @@ function toast(msg, kind = "info") {
 }
 
 const state = { session: null, model: null, baseUrl: null, agent: false, models: [], busy: false, view: "chat", cwd: "", file: null };
-let _chatAbort = null;   // AbortController for the in-flight /api/chat stream
+// Per-session so several chats can run in parallel: switching chats mid-stream must not bleed an
+// in-flight reply into another window, and stopping one chat must not stop the others.
+const _chatAborts = {};        // session_id -> AbortController for that chat's /api/chat stream
+const _busy = new Set();       // session_ids generating right now (a chat can stream while you view another)
+const _liveTurns = new Set();  // session_ids whose stream is owned by a local send() (persists itself;
+                               // a reconnect for these is display-only, so it can't double-save the turn)
+// state.busy mirrors whether the CURRENTLY VIEWED chat is generating (drives the send/stop button).
+function refreshViewBusy() { state.busy = _busy.has(state.session); setSendMode(state.busy); }
 let _voiceSpeak = null;  // conversation mode: a sink that streams answer tokens to TTS (else null)
 
 /* ---------------- markdown (sanitized) ---------------- */
@@ -104,6 +111,7 @@ function newVoyage() {
   localStorage.setItem("oceano.active", state.session);
   const thread = $("#thread"); thread.innerHTML = ""; thread.appendChild(welcomeNode());
   renderSessions(); $("#input").focus();
+  refreshViewBusy();                                 // a fresh chat is idle (other chats may still stream)
   selectDefaultModel();                              // a new chat adopts the configured primary
 }
 async function openVoyage(id) {
@@ -121,6 +129,8 @@ async function openVoyage(id) {
     else { const bb = addAssistant(m.content, true); if (m.meta) renderMeta(bb, m.meta); }
   });
   renderSessions(); $("#input").focus();
+  refreshViewBusy();                 // does the chat we just opened have a live turn? (Stop vs Send)
+  maybeReconnectChat();              // re-attach to an in-flight reply (display-only if a local turn owns it)
 }
 function _fmtChatDate(d) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
@@ -173,17 +183,17 @@ function touchTitle(text) {
   if (_curTitle === "New voyage" && text) { _curTitle = text.slice(0, 38); renderSessions(); }
 }
 function appendT(entry) { _curT.push(entry); }      // in memory during a turn; persistChat() writes it
-async function persistChat() {
-  if (!state.session || !_curT.length) return;
+async function persistChat(sid = state.session, msgs = _curT, title = _curTitle) {
+  if (!sid || !msgs.length) return;
   try {
-    await fetch("/api/chats/" + encodeURIComponent(state.session), {
+    await fetch("/api/chats/" + encodeURIComponent(sid), {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: _curTitle, messages: _curT }),
+      body: JSON.stringify({ title, messages: msgs }),
     });
   } catch {}
-  const ex = _chats.find(s => s.id === state.session), iso = new Date().toISOString();
-  if (ex) { ex.title = _curTitle; ex.count = _curT.length; ex.updated = iso; }
-  else { _chats.unshift({ id: state.session, title: _curTitle, date: iso.slice(0, 10), updated: iso, count: _curT.length }); }
+  const ex = _chats.find(s => s.id === sid), iso = new Date().toISOString();
+  if (ex) { ex.title = title; ex.count = msgs.length; ex.updated = iso; }
+  else { _chats.unshift({ id: sid, title, date: iso.slice(0, 10), updated: iso, count: msgs.length }); }
   renderSessions();
 }
 async function migrateLocalChats() {               // one-time: lift old browser chats into Oceano
@@ -360,31 +370,46 @@ async function send() {
     return;
   }
   if (!state.model) { flashModel(); return; }
-  state.busy = true; setSendMode(true);
+  // --- Capture this turn's chat identity NOW so switching chats mid-stream can never bleed an
+  // in-flight reply into — or save it to — a different conversation. myT is THIS chat's transcript
+  // array (openVoyage reassigns the global _curT); the turn keeps streaming server-side and persists
+  // to ITS chat regardless of what you're viewing. viewing()/renderable() gate the DOM writes. ---
+  const mySession = state.session;
+  const myT = _curT;
+  const viewing = () => state.session === mySession;
+  let handedOff = false;                            // user navigated away → display handed to reconnectChat
+  const renderable = () => viewing() && !handedOff;
+
+  _busy.add(mySession); _liveTurns.add(mySession); refreshViewBusy();
   $("#send").classList.add("ping"); setTimeout(() => $("#send").classList.remove("ping"), 600);
   input.value = ""; autosize(input);
   const atts = _pendingAttachments.slice(); clearAttachments();   // capture + reset the tray
   const ue = addUser(text); if (atts.length) renderMsgAttachments(ue, atts);
-  touchTitle(text || (atts[0] && atts[0].name) || "attachment"); appendT({ role: "user", content: text });
+  touchTitle(text || (atts[0] && atts[0].name) || "attachment");
+  const myTitle = _curTitle;
+  myT.push({ role: "user", content: text });
+  persistChat(mySession, myT, myTitle);            // save the user turn immediately → a chat you don't return to keeps it
 
-  const payload = { session: state.session, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
+  const payload = { session: mySession, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
                     voice: !!_voiceSpeak,            // hands-free converse turn → ask for a short, spoken reply
                     attachments: atts.map(a => ({ path: a.path, name: a.name, kind: a.kind })) };
-  let sounding = addThinking(), bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, _lastDraw = 0, stats = null, livePopped = false;
+  let sounding = renderable() ? addThinking() : null, bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, _lastDraw = 0, stats = null, livePopped = false;
   const killSounding = () => { if (sounding) { sounding.remove(); sounding = null; } };
   // throttle the live re-render to ~10/s — renderMD re-parses the WHOLE answer each call, so drawing
   // every token/frame is O(n²) on a long reply. Skipped frames are caught by the final full render.
-  const draw = () => { if (bubble && performance.now() - _lastDraw >= 100) { _lastDraw = performance.now(); renderMD(bubble, acc + " ▌"); toBottom(); } };
-  const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
+  const draw = () => { if (renderable() && bubble && performance.now() - _lastDraw >= 100) { _lastDraw = performance.now(); renderMD(bubble, acc + " ▌"); toBottom(); } };
+  // transcript pushes always go to myT (this chat); DOM writes are gated by renderable()
+  const flushThink = () => { if (thinkText) myT.push({ role: "thinking", text: thinkText }); if (thinkCard) finalizeThink(thinkCard); thinkCard = null; thinkText = ""; };
   // close the current answer bubble so the next segment (tool/think) doesn't slot UNDER it
-  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
+  const flushBubble = () => { if (acc) { myT.push({ role: "assistant", content: acc }); if (renderable() && bubble) renderMD(bubble, acc, true); } bubble = null; acc = ""; };
 
-  _chatAbort = new AbortController();
+  const myAbort = new AbortController(); _chatAborts[mySession] = myAbort;
   try {
-    const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: _chatAbort.signal });
+    const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: myAbort.signal });
     const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = "";
     while (true) {
       const { value, done } = await reader.read(); if (done) break;
+      if (!handedOff && !viewing()) handedOff = true;   // switched away → stop drawing here; reconnect owns display
       buf += dec.decode(value, { stream: true }); let i;
       while ((i = buf.indexOf("\n\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
@@ -392,50 +417,56 @@ async function send() {
         let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
         if (ev.type === "reasoning") {
           killSounding(); flushBubble();
-          if (!thinkCard) thinkCard = addThinkCard();
-          thinkText += ev.text; appendThink(thinkCard, ev.text);
+          thinkText += ev.text;
+          if (renderable()) { if (!thinkCard) thinkCard = addThinkCard(); appendThink(thinkCard, ev.text); }
         } else if (ev.type === "token") {
           killSounding(); flushThink();
-          if (!bubble) bubble = addAssistant("");
           acc += ev.text; if (_voiceSpeak) _voiceSpeak.push(ev.text);   // conversation mode: stream to TTS
+          if (renderable() && !bubble) bubble = addAssistant("");
           draw();                                                        // throttled internally; final render catches the tail
         } else if (ev.type === "tool_call") {
           killSounding(); flushThink(); flushBubble();
-          if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
-          lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args };
-          maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
+          lastTool = { name: ev.name, args: ev.args };
+          if (renderable()) {
+            if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
+            lastCard = addTool(ev.name, ev.args);
+            maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
+          }
         } else if (ev.type === "tool_progress") {
-          killSounding(); appendToolProgress(lastCard, ev);
+          killSounding(); if (renderable()) appendToolProgress(lastCard, ev);
         } else if (ev.type === "tool_result") {
-          fillTool(lastCard, ev.result);
-          if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
-          sounding = addThinking();                        // keep a "working" cue during the next step
+          if (renderable()) fillTool(lastCard, ev.result);
+          if (lastTool) { myT.push({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
+          if (renderable()) sounding = addThinking();       // keep a "working" cue during the next step
         } else if (ev.type === "answer_done") {
-          killSounding(); flushThink(); if (bubble) renderMD(bubble, acc, true);
+          killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
         } else if (ev.type === "answer") {                 // fallback (max steps)
-          killSounding(); flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom();
+          killSounding(); flushThink(); acc = ev.text;
+          if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc, true); toBottom(); }
         } else if (ev.type === "stats") {
           stats = ev;
         } else if (ev.type === "notice") {
-          killSounding(); flushThink(); flushBubble(); addSysNote(escapeHtml(ev.text));
+          killSounding(); flushThink(); flushBubble(); if (renderable()) addSysNote(escapeHtml(ev.text));
         } else if (ev.type === "error") {
-          killSounding(); flushThink(); if (!bubble) bubble = addAssistant(""); acc = "⚠️ " + ev.message; renderMD(bubble, acc);
+          killSounding(); flushThink(); acc = "⚠️ " + ev.message;
+          if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc); }
         }
       }
     }
-    killSounding(); flushThink(); if (bubble) renderMD(bubble, acc, true);
+    killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
   } catch (e) {
     killSounding(); flushThink();
     if (e.name === "AbortError") {                                   // user hit Stop
-      if (bubble && acc) { acc += "\n\n*(stopped)*"; renderMD(bubble, acc, true); }
-      else { bubble = bubble || addAssistant(""); acc = "_(stopped)_"; renderMD(bubble, acc, true); }
-    } else if (bubble && acc) { acc += "\n\n*(stream interrupted)*"; renderMD(bubble, acc, true); }   // keep partial answer
-    else { bubble = bubble || addAssistant(""); renderMD(bubble, "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + e.message + "`"); }
+      if (acc) { acc += "\n\n*(stopped)*"; } else { acc = "_(stopped)_"; }
+      if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc, true); }
+    } else if (acc) { acc += "\n\n*(stream interrupted)*"; if (renderable() && bubble) renderMD(bubble, acc, true); }   // keep partial answer
+    else { acc = "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + (e.message || "") + "`"; if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc); } }
   }
-  if (stats && bubble) renderMeta(bubble, stats);
-  if (bubble) appendT({ role: "assistant", content: acc, meta: stats });
-  persistChat();                                   // save the whole turn to Oceano (dated folder)
-  state.busy = false; setSendMode(false); _chatAbort = null; input.focus();
+  if (renderable() && stats && bubble) renderMeta(bubble, stats);
+  if (acc) myT.push({ role: "assistant", content: acc, meta: stats });
+  persistChat(mySession, myT, myTitle);            // save the whole turn to its chat (dated folder)
+  _busy.delete(mySession); _liveTurns.delete(mySession); delete _chatAborts[mySession];
+  if (viewing()) { _curT = myT; refreshViewBusy(); input.focus(); }   // keep the active view's transcript authoritative
 }
 function setSendMode(stopping) {
   const b = $("#send"); if (!b) return;
@@ -444,8 +475,9 @@ function setSendMode(stopping) {
   b.title = stopping ? "Stop generating" : "Send";
 }
 function stopChat() {
-  fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: state.session }) }).catch(() => {});
-  if (_chatAbort) _chatAbort.abort();   // stops the client read; server cancels too
+  const sid = state.session;                                        // stop only the chat you're viewing
+  fetch("/api/chat/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: sid }) }).catch(() => {});
+  const ab = _chatAborts[sid]; if (ab) ab.abort();   // stops the client read; server cancels too
 }
 
 /* ---------- hands-free voice conversation (talk ↔ it talks back; reuses the chat turn) ----------
@@ -615,24 +647,32 @@ async function maybeReconnectChat() {
   const sid = state.session; if (!sid) return;
   let live; try { live = await api("/api/chat/live/" + encodeURIComponent(sid)); } catch { return; }
   if (!live || (!live.running && !(live.events || []).length)) return;
-  const lastUser = [..._curT].reverse().find(m => m.role === "user");
-  if (!live.running && lastUser && lastUser.content === live.message) return;   // already saved — skip
-  reconnectChat(sid, live);
+  const localOwned = _liveTurns.has(sid);            // a send() in THIS tab already owns this turn's persistence
+  if (localOwned) {
+    if (!live.running) return;                        // owner is finishing — it persists + refreshes the view itself
+  } else {
+    const lastUser = [..._curT].reverse().find(m => m.role === "user");
+    if (!live.running && lastUser && lastUser.content === live.message) return;   // already saved — skip
+  }
+  reconnectChat(sid, live, localOwned);
 }
-async function reconnectChat(sid, live) {
-  if (state.busy) return;
-  state.busy = true; setSendMode(true);
-  addUser(live.message); appendT({ role: "user", content: live.message });
+// displayOnly = a local send() owns persistence (we only mirror its stream into the DOM); else this is
+// the page-reload path that re-attaches AND saves the turn. Renders only while `sid` stays the open chat.
+async function reconnectChat(sid, live, displayOnly = false) {
+  if (state.busy && !displayOnly) return;
+  if (!displayOnly) { state.busy = true; setSendMode(true); addUser(live.message); appendT({ role: "user", content: live.message }); }
   addSysNote("↻ reconnected to a reply that was still being generated…");
+  const here = () => state.session === sid;          // user may switch away again mid-replay
   let bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null;
-  const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
-  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
+  const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); if (!displayOnly) appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
+  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); if (!displayOnly) appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
   const apply = ev => {
+    if (!here()) return;
     if (ev.type === "reasoning") { flushBubble(); if (!thinkCard) thinkCard = addThinkCard(); thinkText += ev.text; appendThink(thinkCard, ev.text); }
     else if (ev.type === "token") { flushThink(); if (!bubble) bubble = addAssistant(""); acc += ev.text; renderMD(bubble, acc + " ▌"); toBottom(); }
     else if (ev.type === "tool_call") { flushThink(); flushBubble(); lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args }; maybePreviewChip(lastCard, ev.name, ev.args); }
     else if (ev.type === "tool_progress") { appendToolProgress(lastCard, ev); }
-    else if (ev.type === "tool_result") { fillTool(lastCard, ev.result); if (lastTool) { appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; } }
+    else if (ev.type === "tool_result") { fillTool(lastCard, ev.result); if (lastTool) { if (!displayOnly) appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; } }
     else if (ev.type === "answer_done") { flushThink(); if (bubble) renderMD(bubble, acc, true); }
     else if (ev.type === "answer") { flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom(); }
     else if (ev.type === "notice") { flushThink(); flushBubble(); addSysNote(escapeHtml(ev.text)); }
@@ -640,15 +680,14 @@ async function reconnectChat(sid, live) {
   };
   (live.events || []).forEach(apply);
   let since = live.total != null ? live.total : (live.events || []).length, running = live.running;
-  while (running) {
+  while (running && here()) {
     await new Promise(r => setTimeout(r, 800));
     let d; try { d = await api("/api/chat/live/" + encodeURIComponent(sid) + "?since=" + since); } catch { break; }
     (d.events || []).forEach(apply);
     since = d.total != null ? d.total : since; running = d.running;
   }
   flushThink(); flushBubble();
-  persistChat();
-  state.busy = false; setSendMode(false);
+  if (!displayOnly) { persistChat(); state.busy = false; setSendMode(false); }
 }
 
 /* ---------------- composer slash-commands (mirror Telegram, minus model selection) ---------------- */
@@ -4328,43 +4367,69 @@ async function mailLoadMessages(body) {
   const cur = body._mailAcct, folder = body._mailFolder || "INBOX";
   const q = body._mailQuery || "";
   const box = $("#mailBody", body); if (!box) return;
-  body._mailSel = new Set(); body._mailSelectAll = false;
+  body._mailSel = new Set(); body._mailSelectAll = false; body._mailUids = [];
+  body._mailOffset = 0; body._mailLoaded = 0; body._mailLoading = false; body._mailDone = false;
+  if (!body._mailPageSize) body._mailPageSize = 50;       // 50|100|150|"all" — batch size for scroll-loading
+  const reqLimit = body._mailPageSize === "all" ? 200 : body._mailPageSize;
   box.innerHTML = `<div class="empty-note">loading ${escapeHtml(folder)}…</div>`;
-  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=50${q ? "&q=" + encodeURIComponent(q) : ""}`); } catch { return; }
+  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=${reqLimit}&offset=0${q ? "&q=" + encodeURIComponent(q) : ""}`); } catch { return; }
   if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
   const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
   const canWrite = acc.policy !== "readonly";
-  body._mailTotal = r.total; body._mailLoaded = r.messages.length;
+  body._mailTotal = r.total;
   box.innerHTML = `
     <div class="mail-listhead">
-      ${canWrite ? `<input type="checkbox" class="ml-allchk" id="mailAll" title="select all on this page">` : ""}
+      ${canWrite ? `<input type="checkbox" class="ml-allchk" id="mailAll" title="select all loaded">` : ""}
       <input class="ml-search" id="mailSearch" placeholder="search ${escapeHtml(folder)}…" value="${escapeHtml(q)}" spellcheck="false">
       ${q ? `<button class="ml-clear" id="mailSearchClear" title="clear search">✕</button>` : ""}
-      <span class="ml-count">${r.messages.length} of ${r.total}</span>
+      <select class="ml-pagesize" id="mailPageSize" title="messages per batch (scroll to load more)">
+        <option value="50">50</option><option value="100">100</option>
+        <option value="150">150</option><option value="all">all</option>
+      </select>
+      <span class="ml-count" id="mailCount"></span>
     </div>
     <div class="mail-selall" id="mailSelAll" style="display:none"></div>
     <div class="mail-bulkbar" id="mailBulk" style="display:none"></div>
-    <div class="mail-list"></div>`;
+    <div class="mail-list"></div>
+    <div class="mail-more" id="mailMore" style="display:none">loading more…</div>`;
   const si = $("#mailSearch", box);
   si.onkeydown = e => {
     if (e.key === "Enter") { body._mailQuery = si.value.trim(); mailLoadMessages(body); }
     else if (e.key === "Escape" && q) { body._mailQuery = ""; mailLoadMessages(body); }
   };
   { const sc = $("#mailSearchClear", box); if (sc) sc.onclick = () => { body._mailQuery = ""; mailLoadMessages(body); }; }
+  { const ps = $("#mailPageSize", box); if (ps) { ps.value = String(body._mailPageSize); ps.onchange = () => { body._mailPageSize = ps.value === "all" ? "all" : parseInt(ps.value, 10); mailLoadMessages(body); }; } }
   const allChk = $("#mailAll", box);
   if (allChk) allChk.onchange = () => {
     const on = allChk.checked;
     body._mailSelectAll = false;
-    body._mailSel = new Set(on ? r.messages.map(m => m.uid) : []);
+    body._mailSel = new Set(on ? (body._mailUids || []) : []);
     $$(".mail-row", box).forEach(row => { const c = $(".mr-chk", row); if (c) c.checked = on; row.classList.toggle("sel", on); });
     mailUpdateSelAll(body); mailRenderBulk(body);
   };
   const list = $(".mail-list", box);
   if (!r.messages.length) {
     list.innerHTML = `<div class="empty-note">${q ? "no messages match “" + escapeHtml(q) + "”" : "(" + escapeHtml(folder) + " is empty)"}</div>`;
-    return;
+    mailUpdateCount(body); return;
   }
-  r.messages.forEach(m => {
+  mailAppendRows(body, list, r.messages, canWrite);
+  body._mailLoaded = r.messages.length; body._mailOffset = r.messages.length;
+  body._mailDone = body._mailLoaded >= r.total;
+  mailUpdateCount(body);
+  box.onscroll = () => { if (box.scrollTop + box.clientHeight >= box.scrollHeight - 140) mailLoadMore(body); };
+  if (body._mailPageSize === "all" && !body._mailDone) mailLoadMore(body);   // "all" keeps batching to the end
+  mailRenderBulk(body);
+}
+
+function mailUpdateCount(body) {
+  const c = $("#mailCount", body); if (c) c.textContent = `${body._mailLoaded || 0} of ${body._mailTotal || 0}`;
+}
+
+// Build + append message rows; shared by the initial load and scroll-loading more (issue 4).
+function mailAppendRows(body, list, messages, canWrite) {
+  const allChk = $("#mailAll", body);
+  messages.forEach(m => {
+    (body._mailUids ||= []).push(m.uid);
     const row = document.createElement("div"); row.className = "mail-row" + (m.seen ? "" : " unread");
     row.innerHTML = `<input type="checkbox" class="mr-chk" title="select">
       <div class="mr-cell">
@@ -4382,7 +4447,28 @@ async function mailLoadMessages(body) {
     $(".mr-cell", row).onclick = () => mailViewMessage(body, m.uid, m);
     list.appendChild(row);
   });
-  mailRenderBulk(body);
+}
+
+// Scroll-load (or "all"-batch) the next page of older messages and append them (issue 4).
+async function mailLoadMore(body) {
+  if (body._mailLoading || body._mailDone) return;
+  const cur = body._mailAcct, folder = body._mailFolder || "INBOX", q = body._mailQuery || "";
+  const box = $("#mailBody", body); if (!box) return;
+  const list = $(".mail-list", box); if (!list) return;
+  body._mailLoading = true;
+  const more = $("#mailMore", box); if (more) more.style.display = "block";
+  const reqLimit = body._mailPageSize === "all" ? 200 : (body._mailPageSize || 50);
+  let r; try { r = await api(`/api/mail/${cur}/messages?folder=${encodeURIComponent(folder)}&limit=${reqLimit}&offset=${body._mailOffset}${q ? "&q=" + encodeURIComponent(q) : ""}`); }
+  catch { body._mailLoading = false; if (more) more.textContent = "could not load more (tap to retry)"; return; }
+  body._mailLoading = false;
+  if (!r.ok) { if (more) more.textContent = escapeHtml(r.error || "could not load more"); return; }
+  const acc = (body._mailAccts || []).find(a => a.id === body._mailAcct) || {};
+  mailAppendRows(body, list, r.messages, acc.policy !== "readonly");
+  body._mailLoaded += r.messages.length; body._mailOffset += r.messages.length; body._mailTotal = r.total;
+  body._mailDone = body._mailLoaded >= r.total || !r.messages.length;
+  if (more) more.style.display = body._mailDone ? "none" : "none";
+  mailUpdateCount(body);
+  if (!body._mailDone && body._mailPageSize === "all") mailLoadMore(body);
 }
 
 function mailUpdateSelAll(body) {
@@ -4468,9 +4554,11 @@ async function mailViewMessage(body, uid, meta) {
   let r; try { r = await api(`/api/mail/${cur}/message?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}`); } catch { return; }
   if (!r.ok) { box.innerHTML = `<div class="empty-note">${escapeHtml(r.error || "could not load")}</div>`; return; }
   const att = (r.attachments && r.attachments.length) ? `<div class="mv-atts">` + r.attachments.map(x =>
-    `<span class="att-chip"><a class="att-dl" href="/api/mail/${cur}/attachment?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}&index=${x.index}" download="${escapeHtml(x.filename)}" title="download">📎 ${escapeHtml(x.filename)} <span class="att-sz">${fmtSize(x.size)}</span></a><button class="att-save" data-i="${x.index}" title="save to workspace">💾</button></span>`).join("") + `</div>` : "";
+    `<span class="att-chip" data-i="${x.index}" data-name="${escapeHtml(x.filename)}" tabindex="0" title="double-click to open · right-click for options (VirusTotal, save…)">📎 ${escapeHtml(x.filename)} <span class="att-sz">${fmtSize(x.size)}</span></span>`).join("") + `</div>` : "";
   const canWrite = acc.policy !== "readonly";
   const seen = meta ? meta.seen : true;
+  const hasHtml = !!(r.html && r.html.trim());
+  if (body._mvMode === undefined) body._mvMode = "html";       // default to rich HTML (clickable links)
   box.innerHTML = `
     <div class="mail-view">
       <div class="mv-bar"><button class="ed-btn" id="mvBack">← list</button>
@@ -4478,20 +4566,36 @@ async function mailViewMessage(body, uid, meta) {
         ${canWrite ? `<button class="ed-btn" id="mvReply">↩ Reply</button>` : ""}
         ${canWrite ? `<button class="ed-btn" id="mvRead">${seen ? "Mark unread" : "Mark read"}</button>` : ""}
         ${canWrite ? `<button class="ed-btn" id="mvSpam">⚑ Spam</button>` : ""}
-        ${canWrite ? `<button class="ed-btn" id="mvDel">🗑 Delete</button>` : ""}</div>
+        ${canWrite ? `<button class="ed-btn" id="mvDel">🗑 Delete</button>` : ""}
+        ${hasHtml ? `<span class="mv-bar-sp"></span><button class="ed-btn" id="mvToggle" title="switch HTML / plain text"></button>` : ""}
+        ${hasHtml ? `<button class="ed-btn" id="mvImages" title="load remote images (blocked by default for privacy)">🖼 Images</button>` : ""}</div>
       <div class="mv-hdr">
         <div class="mv-subj">${escapeHtml(r.subject) || "(no subject)"}</div>
         <div class="mv-meta">From: ${escapeHtml(r.from)}</div>
         <div class="mv-meta">To: ${escapeHtml(r.to)}</div>
         ${r.cc ? `<div class="mv-meta">Cc: ${escapeHtml(r.cc)}</div>` : ""}
         <div class="mv-meta">${escapeHtml(r.date)}</div>${att}</div>
-      <pre class="mv-body"></pre>
+      <div class="mv-body-wrap" id="mvBodyWrap"></div>
     </div>`;
-  $(".mv-body", box).textContent = r.body || "(no text body)";   // textContent — never inject raw email HTML
+  const wrap = $("#mvBodyWrap", box);
+  mailRenderBody(wrap, r, { mode: hasHtml ? body._mvMode : "plain", images: !!body._mvImages });
+  const tog = $("#mvToggle", box);
+  if (tog) {
+    const paint = () => { tog.textContent = body._mvMode === "html" ? "▤ Plain" : "❖ HTML"; };
+    paint();
+    tog.onclick = () => { body._mvMode = body._mvMode === "html" ? "plain" : "html"; paint(); mailRenderBody(wrap, r, { mode: body._mvMode, images: !!body._mvImages }); };
+  }
+  const imgBtn = $("#mvImages", box);
+  if (imgBtn) {
+    imgBtn.classList.toggle("on", !!body._mvImages);
+    imgBtn.onclick = () => { body._mvImages = !body._mvImages; imgBtn.classList.toggle("on", body._mvImages); if (body._mvMode === "html") mailRenderBody(wrap, r, { mode: "html", images: body._mvImages }); };
+  }
   $("#mvBack", box).onclick = () => mailLoadMessages(body);
-  $$(".att-save", box).forEach(btn => btn.onclick = async () => {
-    const rr = await _postJ(`/api/mail/${cur}/attachment/save`, { folder, uid, index: parseInt(btn.dataset.i, 10) });
-    toast(rr.ok ? ("💾 saved → workspace/" + rr.path) : ("✗ " + (rr.error || "save failed")), rr.ok ? "info" : "err");
+  // attachments: double-click → open · right-click → menu (open / download / save / VirusTotal) — issue 6
+  $$(".att-chip", box).forEach(chip => {
+    const i = parseInt(chip.dataset.i, 10), name = chip.dataset.name;
+    chip.ondblclick = () => window.open(`/api/mail/${cur}/attachment?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}&index=${i}&disposition=inline`, "_blank", "noopener");
+    chip.oncontextmenu = e => { e.preventDefault(); mailAttachMenu(e, cur, folder, uid, i, name); };
   });
   const dr = $("#mvDraft", box); if (dr) dr.onclick = () => mailAiDraft(body, uid, { to: r.from, subject: r.subject });
   const rep = $("#mvReply", box); if (rep) rep.onclick = () => mailCompose(body, { uid, to: r.from, subject: r.subject });
@@ -4509,6 +4613,62 @@ async function mailViewMessage(body, uid, meta) {
     const x = await _postJ(`/api/mail/${cur}/action`, { op: "delete", uid, folder });
     toast(x.ok ? "🗑 moved to Trash" : ("✗ " + (x.error || "failed")), x.ok ? "info" : "err"); if (x.ok) mailLoadMessages(body);
   };
+}
+
+// Render the message body: rich HTML in a SCRIPT-LESS sandboxed iframe (so links are clickable but
+// nothing executes), or plain text. Remote images are blocked by default (a CSP in the iframe) so a
+// tracking pixel can't phone home until the user clicks 🖼 Images. (issue 5)
+function mailRenderBody(wrap, r, opts) {
+  opts = opts || {};
+  if (opts.mode === "html" && r.html && r.html.trim()) {
+    const clean = window.DOMPurify ? DOMPurify.sanitize(r.html) : escapeHtml(r.html);
+    const imgsrc = opts.images ? "data: https: http:" : "data:";   // privacy: block remote images until asked
+    const doc = `<!doctype html><html><head><meta charset="utf-8">` +
+      `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${imgsrc}; style-src 'unsafe-inline'; font-src data:;">` +
+      `<base target="_blank">` +
+      `<style>html,body{margin:0}body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;color:#111;background:#fff;padding:14px;overflow-wrap:anywhere}` +
+      `a{color:#0a58ca}img{max-width:100%;height:auto}table{max-width:100%}</style></head>` +
+      `<body>${clean}</body></html>`;
+    // sandbox WITHOUT allow-scripts → no JS ever runs; allow-popups lets target=_blank links open a real tab.
+    wrap.innerHTML = `<iframe class="mv-frame" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>`;
+    $(".mv-frame", wrap).srcdoc = doc;
+    if (!opts.images && /<img\b/i.test(r.html)) {
+      const n = document.createElement("div"); n.className = "mv-imgnote";
+      n.textContent = "🖼 Remote images blocked for privacy — use the Images button to load them.";
+      wrap.appendChild(n);
+    }
+  } else {
+    wrap.innerHTML = `<pre class="mv-body"></pre>`;
+    $(".mv-body", wrap).textContent = r.body || "(no text body)";   // textContent — never inject raw email HTML
+  }
+}
+
+// Right-click menu for an attachment: open / download / save to workspace / VirusTotal. (issue 6)
+function mailAttachMenu(e, cur, folder, uid, index, name) {
+  const url = inline => `/api/mail/${cur}/attachment?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}&index=${index}${inline ? "&disposition=inline" : ""}`;
+  const download = () => { const a = document.createElement("a"); a.href = url(false); a.download = name || "attachment"; document.body.appendChild(a); a.click(); a.remove(); };
+  showCtx(e.clientX, e.clientY, [
+    { label: "Open", action: () => window.open(url(true), "_blank", "noopener") },
+    { label: "Download", action: download },
+    { label: "Save to workspace", action: async () => {
+        const rr = await _postJ(`/api/mail/${cur}/attachment/save`, { folder, uid, index });
+        toast(rr.ok ? ("💾 saved → workspace/" + rr.path) : ("✗ " + (rr.error || "save failed")), rr.ok ? "info" : "err");
+      } },
+    { sep: true },
+    { label: "Check SHA256 on VirusTotal", action: async () => {
+        toast("⧗ hashing attachment…", "info");
+        let rr; try { rr = await api(`/api/mail/${cur}/attachment/sha256?folder=${encodeURIComponent(folder)}&uid=${encodeURIComponent(uid)}&index=${index}`); } catch { toast("✗ hashing failed", "err"); return; }
+        if (!rr.ok) { toast("✗ " + (rr.error || "hashing failed"), "err"); return; }
+        window.open(rr.report_url, "_blank", "noopener");
+      } },
+    { label: "Upload file to VirusTotal", action: async () => {
+        if (!await confirmAction("Upload to VirusTotal?", `“${name}” will be uploaded to VirusTotal for scanning. Uploaded files can be downloaded by VirusTotal’s security partners — don’t upload anything private.`)) return;
+        toast("⧗ uploading to VirusTotal…", "info");
+        let rr; try { rr = await _postJ(`/api/mail/${cur}/attachment/virustotal`, { folder, uid, index }); } catch { toast("✗ upload failed", "err"); return; }
+        if (!rr.ok) { toast("✗ " + (rr.error || "upload failed"), "err"); return; }
+        window.open(rr.url, "_blank", "noopener");
+      } },
+  ]);
 }
 
 async function mailAiDraft(body, uid, meta) {
@@ -4667,6 +4827,28 @@ async function mailRenderAccounts(body) {
     $(".ma-del", el).onclick = async () => { if (!await confirmAction("Delete account?", `“${a.name}” will be removed from Oceano (no mail on the server is touched).`)) return; await fetch("/api/mail/" + a.id, { method: "DELETE" }); mailRenderAccounts(body); };
     list.appendChild(el);
   });
+  mailRenderVTKey(body, list);
+}
+
+// VirusTotal API key — powers right-click → "Upload file to VirusTotal" on attachments (the SHA256
+// hash check needs no key). Stored in web.json (chmod 600); the key itself is never sent back. (issue 6)
+async function mailRenderVTKey(body, list) {
+  const card = document.createElement("div"); card.className = "host-card vt-card";
+  let st; try { st = await api("/api/virustotal"); } catch { st = { has_key: false }; }
+  card.innerHTML = `
+    <div class="host-main" style="width:100%">
+      <div class="host-name">🛡 VirusTotal ${st.has_key ? `<span class="host-armed on">key set</span>` : `<span class="host-pol pol-readonly">no key</span>`}</div>
+      <div class="host-addr">Right-click an attachment to check its SHA256 (no key) or upload the file to scan (needs a free key from virustotal.com).</div>
+      <div class="vt-keyrow"><input id="vtKey" type="password" placeholder="${st.has_key ? "•••••••• (leave blank to keep)" : "paste VirusTotal API key"}" spellcheck="false">
+        <button class="ed-btn" id="vtSave">Save</button>${st.has_key ? `<button class="ed-btn" id="vtClear">Clear</button>` : ""}</div>
+    </div>`;
+  list.appendChild(card);
+  $("#vtSave", card).onclick = async () => {
+    const k = $("#vtKey", card).value.trim();
+    if (!k) { toast("paste a key first (or use Clear)", "err"); return; }
+    const r = await _postJ("/api/virustotal", { key: k }); toast(r.ok ? "🛡 VirusTotal key saved" : "✗ save failed", r.ok ? "info" : "err"); mailRenderAccounts(body);
+  };
+  const clr = $("#vtClear", card); if (clr) clr.onclick = async () => { await _postJ("/api/virustotal", { key: "" }); toast("VirusTotal key cleared", "info"); mailRenderAccounts(body); };
 }
 
 function mailRenderEditor(body, a) {
@@ -5009,24 +5191,74 @@ async function wfLoadTools() {
   try { _wfTools = (await api("/api/tools")).filter(t => t.enabled && !t.name.startsWith("mcp__")); } catch { _wfTools = []; }
   return _wfTools;
 }
-const WF_PORTS = { start: [0, 1], end: [1, 0], decision: [1, 2], tool: [1, 1], instruction: [1, 1], delegate: [1, 1] };
+// [inputs, outputs]. Action nodes get a 2nd output = the "error" branch (taken when the node fails).
+// decision: yes|no · switch: case1|case2|case3|default · loop: loop(body)|done · approval: approved|rejected
+const WF_PORTS = {
+  start: [0, 1], trigger: [0, 1], end: [1, 0],
+  decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2],
+  tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
+  http: [1, 2], subflow: [1, 2], transform: [1, 2],
+};
+// branch label for an output port (Drawflow names them output_1, output_2…), per node type
+function wfOutBranch(type, outName, node) {
+  const i = parseInt(outName.split("_")[1], 10);    // 1-based
+  if (type === "decision") return i === 2 ? "no" : "yes";
+  if (type === "loop") return i === 2 ? "done" : "loop";
+  if (type === "approval") return i === 2 ? "rejected" : "approved";
+  if (type === "switch") return i >= 4 ? "default" : (((node.cases || [])[i - 1] || {}).label || ("case" + i));
+  return i === 2 ? "error" : null;                  // action nodes: out1 = next, out2 = error
+}
+// reverse: which output port a saved edge's branch label hangs off (for rebuilding the canvas)
+function wfBranchPort(type, branch, node) {
+  if (type === "decision") return branch === "no" ? "output_2" : "output_1";
+  if (type === "loop") return branch === "done" ? "output_2" : "output_1";
+  if (type === "approval") return branch === "rejected" ? "output_2" : "output_1";
+  if (type === "switch") {
+    if (branch === "default" || !branch) return "output_4";
+    const idx = (node.cases || []).findIndex(c => c.label === branch);
+    return "output_" + (idx >= 0 ? idx + 1 : 4);
+  }
+  return branch === "error" ? "output_2" : "output_1";
+}
 function wfToolOptions(sel) {
   return (_wfTools || []).map(t => `<option value="${t.name}"${t.name === sel ? " selected" : ""}>${t.name}</option>`).join("");
 }
 function wfNodeData(n) {
   if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
-  if (n.type === "instruction") return { text: n.text || "" };
-  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default" };
-  if (n.type === "decision") return { mode: n.mode || "model", question: n.question || "", ruleOp: n.ruleOp || "contains", ruleValue: n.ruleValue || "", role: n.role || "default" };
+  if (n.type === "instruction") return { text: n.text || "", retries: String(n.retries || 0) };
+  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", retries: String(n.retries || 0) };
+  // NOTE: df-* keys must be lowercase — the DOM lowercases attribute names, so Drawflow binds to the
+  // lowercased key. Camel-cased keys here would silently lose their binding. Backend keys stay camelCase.
+  if (n.type === "decision") return { mode: n.mode || "model", question: n.question || "", ruleop: n.ruleOp || "contains", ruleval: n.ruleValue || "", role: n.role || "default" };
+  if (n.type === "trigger") return {};   // wfWireTrigger builds a preset-driven form + syncs the data
+  if (n.type === "http") return {};      // wfWireHttp builds the method/url/header-rows form + syncs
+  if (n.type === "switch") { const c = n.cases || []; const g = (i, k, d) => (c[i] || {})[k] || d;
+    return { source: n.source || "", c1op: g(0, "op", "contains"), c1val: g(0, "value", ""), c1label: g(0, "label", ""),
+      c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
+      c3op: g(2, "op", "contains"), c3val: g(2, "value", ""), c3label: g(2, "label", "") }; }
+  if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
+  if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
+  if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
+  if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
   return {};
 }
+const _WF_RETRY = `<label class="wfn-mini">retries <input df-retries type="number" min="0" max="5" class="wfn-f wfn-num" placeholder="0"></label>`;
 function wfNodeHtml(type, data) {
   if (type === "start") return `<div class="wfn wfn-start"><b>▶ Start</b></div>`;
   if (type === "end") return `<div class="wfn wfn-end"><b>■ End</b></div>`;
-  if (type === "tool") return `<div class="wfn wfn-tool"><b>🔧 Tool</b><select class="wfn-f wfn-tool-sel">${wfToolOptions(data.tool)}</select><div class="wfn-form"></div></div>`;
-  if (type === "instruction") return `<div class="wfn wfn-instruction"><b>✎ Instruction</b><textarea df-text class="wfn-f" placeholder="what should the agent do? (it may use any tool)"></textarea></div>`;
-  if (type === "delegate") return `<div class="wfn wfn-delegate"><b>↗ Delegate</b><textarea df-text class="wfn-f" placeholder="task for Claude / cloud"></textarea><select df-role class="wfn-f"><option value="default">default</option><option value="improve">improve</option></select></div>`;
-  if (type === "decision") return `<div class="wfn wfn-decision"><b>◆ Decision</b><select df-mode class="wfn-f"><option value="model">model judges</option><option value="rule">rule on prev output</option><option value="delegate">delegate judges</option></select><textarea df-question class="wfn-f" placeholder="yes/no question (model & delegate)"></textarea><div class="wfn-rule"><select df-ruleOp class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-ruleValue class="wfn-f" placeholder="value"></div><div class="wfn-branches"><span>▸ yes</span><span>▸ no</span></div></div>`;
+  if (type === "tool") return `<div class="wfn wfn-tool"><b>🔧 Tool</b><select class="wfn-f wfn-tool-sel">${wfToolOptions(data.tool)}</select><div class="wfn-form"></div><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "instruction") return `<div class="wfn wfn-instruction"><b>✎ Instruction</b><textarea df-text class="wfn-f" placeholder="what should the agent do? (it may use any tool). Use {{input}}, {{last}}, {{node.ID}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "delegate") return `<div class="wfn wfn-delegate"><b>↗ Delegate</b><textarea df-text class="wfn-f" placeholder="task for Claude / cloud"></textarea><select df-role class="wfn-f"><option value="default">default</option><option value="improve">improve</option></select>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "decision") return `<div class="wfn wfn-decision"><b>◆ Decision</b><select df-mode class="wfn-f"><option value="model">model judges</option><option value="rule">rule on prev output</option><option value="delegate">delegate judges</option></select><textarea df-question class="wfn-f" placeholder="yes/no question (model & delegate)"></textarea><div class="wfn-rule"><select df-ruleop class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-ruleval class="wfn-f" placeholder="value"></div><div class="wfn-branches"><span>▸ yes</span><span>▸ no</span></div></div>`;
+  if (type === "trigger") return `<div class="wfn wfn-trigger"><b>⚡ Trigger</b><div class="wfn-trig-form"></div></div>`;
+  if (type === "switch") return `<div class="wfn wfn-switch"><b>⤳ Switch</b><input df-source class="wfn-f" placeholder="value to test · default {{last}}">` +
+    [1, 2, 3].map(i => `<div class="wfn-rule"><select df-c${i}op class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-c${i}val class="wfn-f" placeholder="value"><input df-c${i}label class="wfn-f" placeholder="→ label (out ${i})"></div>`).join("") +
+    `<div class="wfn-branches"><span>case1</span><span>case2</span><span>case3</span><span>default</span></div></div>`;
+  if (type === "loop") return `<div class="wfn wfn-loop"><b>↻ Loop (foreach)</b><textarea df-over class="wfn-f" placeholder="list to iterate · JSON array or newline list · e.g. {{last}}"></textarea><input df-as class="wfn-f" placeholder="item name (use {{item}}, {{index}})"><div class="wfn-branches"><span>▸ loop (body)</span><span>▸ done</span></div></div>`;
+  if (type === "http") return `<div class="wfn wfn-http"><b>🌐 HTTP request</b><div class="wfn-http-form"></div><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "subflow") return `<div class="wfn wfn-subflow"><b>▣ Sub-workflow</b><input df-workflow class="wfn-f" placeholder="workflow name or id"><textarea df-wfinput class="wfn-f" placeholder="input to pass · default {{last}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "transform") return `<div class="wfn wfn-transform"><b>ƒ Transform</b><select df-mode class="wfn-f"><option value="template">template</option><option value="regex">regex extract</option><option value="jsonpath">json path</option><option value="python">python</option></select><input df-source class="wfn-f" placeholder="input · default {{last}}"><textarea df-text class="wfn-f" placeholder="template / regex / a.b.0 path / python (value holds input)"></textarea><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "approval") return `<div class="wfn wfn-approval"><b>✋ Approval</b><textarea df-prompt class="wfn-f" placeholder="what to approve?"></textarea><label class="wfn-mini">timeout (min) <input df-timeout type="number" min="1" class="wfn-f wfn-num" placeholder="60"></label><div class="wfn-branches"><span>▸ approved</span><span>▸ rejected</span></div></div>`;
   return `<div class="wfn"><b>${type}</b></div>`;
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
@@ -5182,10 +5414,98 @@ function wfWireTool(editor, dfId, toolName, argsObj) {
   build();
   sel.onchange = () => { state.tool = sel.value; state.args = {}; build(); };
 }
+// friendlier trigger node: pick a KIND, then only the relevant control(s) show — schedules use presets,
+// channel/account are dropdowns. No more a stack of empty text boxes. Data syncs into the node. (issue 8 UX)
+const WF_TRIG_KINDS = [["manual", "Manual / scheduled only"], ["schedule", "On a schedule"], ["webhook", "Webhook (HTTP POST)"], ["keyword", "Chat keyword"], ["watch", "File / folder change"], ["email", "New email"]];
+const WF_CRON_PRESETS = [["*/15 * * * *", "Every 15 minutes"], ["0 * * * *", "Every hour"], ["0 */3 * * *", "Every 3 hours"], ["0 8 * * *", "Daily · 08:00"], ["0 0 * * *", "Daily · midnight"], ["0 9 * * 1", "Weekly · Mon 09:00"], ["0 8 1 * *", "Monthly · 1st 08:00"]];
+function wfWireTrigger(editor, dfId, cfg) {
+  const el = document.getElementById("node-" + dfId); if (!el) return;
+  const form = el.querySelector(".wfn-trig-form"); if (!form) return;
+  const state = { kind: cfg.kind || "manual", cron: cfg.cron || "", pattern: cfg.pattern || "", channel: cfg.channel || "any", folder: cfg.folder || "", account: cfg.account || "", mailFolder: cfg.mailFolder || "INBOX" };
+  const sync = () => editor.updateNodeDataFromId(dfId, { ...state });
+  const render = async () => {
+    const presetMatch = WF_CRON_PRESETS.some(p => p[0] === state.cron);
+    let h = `<select class="wfn-f wt-kind">${WF_TRIG_KINDS.map(([k, l]) => `<option value="${k}"${state.kind === k ? " selected" : ""}>${l}</option>`).join("")}</select>`;
+    if (state.kind === "manual") h += `<div class="wfn-hint">runs only when you hit ▶ Run, or on a schedule.</div>`;
+    else if (state.kind === "schedule") {
+      h += `<select class="wfn-f wt-cronpreset">${WF_CRON_PRESETS.map(([c, l]) => `<option value="${c}"${state.cron === c ? " selected" : ""}>${l}</option>`).join("")}<option value="__custom"${!presetMatch ? " selected" : ""}>Custom…</option></select>`;
+      if (!presetMatch) h += `<input class="wfn-f wt-cron" placeholder="min hr day mon wkday" value="${escapeHtml(state.cron)}">`;
+    } else if (state.kind === "keyword") {
+      h += `<input class="wfn-f wt-pattern" placeholder="phrase that triggers it" value="${escapeHtml(state.pattern)}"><select class="wfn-f wt-channel">${["any", "web", "telegram"].map(c => `<option value="${c}"${state.channel === c ? " selected" : ""}>${c === "any" ? "any channel" : c}</option>`).join("")}</select>`;
+    } else if (state.kind === "watch") {
+      h += `<input class="wfn-f wt-folder" placeholder="workspace folder · e.g. brain/inbox" value="${escapeHtml(state.folder)}"><div class="wfn-hint">fires when files change under workspace/&lt;folder&gt;.</div>`;
+    } else if (state.kind === "email") {
+      h += `<select class="wfn-f wt-account"><option>loading…</option></select><input class="wfn-f wt-mailfolder" placeholder="mailbox folder" value="${escapeHtml(state.mailFolder || "INBOX")}"><div class="wfn-hint">fires for each new message.</div>`;
+    } else if (state.kind === "webhook") {
+      h += `<div class="wfn-hint">a POST URL is generated when you Save — copy it from the workflow's ⚡ list.</div>`;
+    }
+    form.innerHTML = h;
+    form.querySelector(".wt-kind").onchange = e => { state.kind = e.target.value; if (state.kind === "schedule" && !state.cron) state.cron = "0 8 * * *"; sync(); render(); };
+    const cp = form.querySelector(".wt-cronpreset"); if (cp) cp.onchange = e => { state.cron = e.target.value === "__custom" ? "" : e.target.value; sync(); render(); };
+    const cron = form.querySelector(".wt-cron"); if (cron) cron.oninput = e => { state.cron = e.target.value; sync(); };
+    const pat = form.querySelector(".wt-pattern"); if (pat) pat.oninput = e => { state.pattern = e.target.value; sync(); };
+    const ch = form.querySelector(".wt-channel"); if (ch) ch.onchange = e => { state.channel = e.target.value; sync(); };
+    const fol = form.querySelector(".wt-folder"); if (fol) fol.oninput = e => { state.folder = e.target.value; sync(); };
+    const mf = form.querySelector(".wt-mailfolder"); if (mf) mf.oninput = e => { state.mailFolder = e.target.value; sync(); };
+    const acc = form.querySelector(".wt-account");
+    if (acc) {
+      let accts = []; try { accts = await api("/api/mail"); } catch {}
+      acc.innerHTML = accts.length ? accts.map(a => `<option value="${escapeHtml(a.name)}"${state.account === a.name ? " selected" : ""}>${escapeHtml(a.name)}</option>`).join("") : `<option value="">(add a mail account in Settings)</option>`;
+      if (!state.account && accts.length) { state.account = accts[0].name; sync(); }
+      acc.onchange = e => { state.account = e.target.value; sync(); };
+    }
+  };
+  sync(); render();
+}
+function wfParseHeaders(h) {
+  if (!h) return [];
+  if (typeof h === "object") return Object.entries(h).map(([k, v]) => ({ k, v: String(v) }));
+  return String(h).split("\n").map(l => { const m = l.match(/^\s*([^:]+):\s*(.*)$/); return m ? { k: m[1].trim(), v: m[2].trim() } : null; }).filter(Boolean);
+}
+// friendlier HTTP node: method dropdown + URL, and a real add/remove header-rows editor (issue 8 UX)
+function wfWireHttp(editor, dfId, cfg) {
+  const el = document.getElementById("node-" + dfId); if (!el) return;
+  const form = el.querySelector(".wfn-http-form"); if (!form) return;
+  const state = { method: cfg.method || "GET", url: cfg.url || "", body: cfg.body || "", retries: String(cfg.retries || 0), headers: wfParseHeaders(cfg.headers) };
+  const sync = () => editor.updateNodeDataFromId(dfId, { method: state.method, url: state.url, body: state.body, retries: state.retries,
+    headers: state.headers.filter(h => h.k.trim()).map(h => h.k.trim() + ": " + h.v).join("\n") });
+  form.innerHTML = `
+    <select class="wfn-f wh-method">${["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].map(m => `<option${state.method === m ? " selected" : ""}>${m}</option>`).join("")}</select>
+    <input class="wfn-f wh-url" placeholder="https://api.example.com/… ({{input}})" value="${escapeHtml(state.url)}">
+    <div class="wfn-mini">headers</div><div class="wh-headers"></div><button type="button" class="wfn-addbtn wh-addh">+ header</button>
+    <textarea class="wfn-f wh-body" placeholder="request body (optional · {{last}} etc.)">${escapeHtml(state.body)}</textarea>
+    <label class="wfn-mini">retries <input type="number" min="0" max="5" class="wfn-f wfn-num wh-retries" value="${escapeHtml(state.retries)}"></label>`;
+  const hbox = form.querySelector(".wh-headers");
+  const renderHeaders = () => {
+    hbox.innerHTML = "";
+    state.headers.forEach((hd, i) => {
+      const row = document.createElement("div"); row.className = "wh-hrow";
+      row.innerHTML = `<input class="wfn-f wh-hk" placeholder="Header" value="${escapeHtml(hd.k)}"><input class="wfn-f wh-hv" placeholder="value" value="${escapeHtml(hd.v)}"><button type="button" class="wh-hx" title="remove">✕</button>`;
+      row.querySelector(".wh-hk").oninput = e => { hd.k = e.target.value; sync(); };
+      row.querySelector(".wh-hv").oninput = e => { hd.v = e.target.value; sync(); };
+      row.querySelector(".wh-hx").onclick = () => { state.headers.splice(i, 1); renderHeaders(); sync(); };
+      hbox.appendChild(row);
+    });
+  };
+  renderHeaders();
+  form.querySelector(".wh-method").onchange = e => { state.method = e.target.value; sync(); };
+  form.querySelector(".wh-url").oninput = e => { state.url = e.target.value; sync(); };
+  form.querySelector(".wh-body").oninput = e => { state.body = e.target.value; sync(); };
+  form.querySelector(".wh-retries").oninput = e => { state.retries = e.target.value; sync(); };
+  form.querySelector(".wh-addh").onclick = () => { state.headers.push({ k: "", v: "" }); renderHeaders(); sync(); };
+  sync();
+}
 const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
   : n.type === "instruction" ? (n.text || "instruction").slice(0, 54)
   : n.type === "delegate" ? "↗ " + (n.text || "delegate").slice(0, 48)
   : n.type === "decision" ? "◆ " + (n.question || n.mode || "decision").slice(0, 48)
+  : n.type === "trigger" ? "⚡ " + (n.kind || "trigger")
+  : n.type === "switch" ? "⤳ switch"
+  : n.type === "loop" ? "↻ loop"
+  : n.type === "http" ? "🌐 " + (n.method || "GET")
+  : n.type === "subflow" ? "▣ " + (n.workflow || "sub-workflow")
+  : n.type === "transform" ? "ƒ " + (n.mode || "transform")
+  : n.type === "approval" ? "✋ approval"
   : n.type;
 
 function openWorkflows() {
@@ -5322,18 +5642,31 @@ async function wfRenderEditor(body, w) {
       <input id="wfInpDef" class="wfn-fld wf-ic-f" placeholder="default for scheduled/auto runs" value="${escapeHtml(inp.default || "")}">
       <span class="wf-ic-hint">reference it as <code>{{input}}</code> in any node's text or args</span>
     </div>
-    <div class="wf-palette">
-      <span class="wf-pal-lbl">add:</span>
-      <button class="ed-btn" data-add="tool">🔧 Tool</button>
-      <button class="ed-btn" data-add="instruction">✎ Instruction</button>
-      <button class="ed-btn" data-add="delegate">↗ Delegate</button>
-      <button class="ed-btn" data-add="decision">◆ Decision</button>
-      <button class="ed-btn" data-add="end">■ End</button>
-      <span class="fe-spacer"></span>
-      <button class="ed-btn" id="wfZoomOut">−</button><button class="ed-btn" id="wfZoomIn">+</button>
-      <span class="wf-hint">drag from a node's right dot to another's left dot to connect</span>
-    </div>
-    <div class="wf-canvas" id="wfCanvas"></div>`;
+    <div class="wf-editor-main">
+      <div class="wf-sidebar" id="wfSidebar">
+        <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>
+          <button class="wf-pal-btn" data-add="trigger">⚡ Trigger</button></div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>
+          <button class="wf-pal-btn" data-add="tool">🔧 Tool</button>
+          <button class="wf-pal-btn" data-add="instruction">✎ Instruction</button>
+          <button class="wf-pal-btn" data-add="delegate">↗ Delegate</button>
+          <button class="wf-pal-btn" data-add="http">🌐 HTTP request</button>
+          <button class="wf-pal-btn" data-add="subflow">▣ Sub-workflow</button>
+          <button class="wf-pal-btn" data-add="transform">ƒ Transform</button></div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>
+          <button class="wf-pal-btn" data-add="decision">◆ Decision</button>
+          <button class="wf-pal-btn" data-add="switch">⤳ Switch</button>
+          <button class="wf-pal-btn" data-add="loop">↻ Loop</button>
+          <button class="wf-pal-btn" data-add="approval">✋ Approval</button></div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>
+          <button class="wf-pal-btn" data-add="end">■ End</button></div>
+        <div class="wf-pal-foot">
+          <button class="ed-btn" id="wfZoomOut">−</button><button class="ed-btn" id="wfZoomIn">+</button>
+          <div class="wf-hint">drag a node's right dot to another's left dot to connect · reference earlier values with {{input}} · {{last}} · {{node.ID}}</div>
+        </div>
+      </div>
+      <div class="wf-canvas" id="wfCanvas"></div>
+    </div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
   const syncInpCfg = () => {                          // grey out the detail fields when input is off
     const on = $("#wfInpEn", body).checked;
@@ -5353,6 +5686,8 @@ async function wfRenderEditor(body, w) {
     const data = wfNodeData(cfg);
     const dfId = editor.addNode(type, ins, outs, px, py, "wf-dfn wf-dfn-" + type, data, wfNodeHtml(type, data));
     if (type === "tool") wfWireTool(editor, dfId, data.tool, cfg.args || {});
+    else if (type === "trigger") wfWireTrigger(editor, dfId, cfg);
+    else if (type === "http") wfWireHttp(editor, dfId, cfg);
     return dfId;
   };
   // build from the saved graph, or seed a fresh start node
@@ -5362,13 +5697,13 @@ async function wfRenderEditor(body, w) {
     (w.graph.edges || []).forEach(e => {
       const from = map[e.from], to = map[e.to]; if (from == null || to == null) return;
       const src = w.graph.nodes.find(x => x.id === e.from) || {};
-      const port = src.type === "decision" ? (e.branch === "no" ? "output_2" : "output_1") : "output_1";
+      const port = wfBranchPort(src.type, e.branch, src);
       try { editor.addConnection(from, to, port, "input_1"); } catch {}
     });
   } else {
     addNode("start", 40, 80, { type: "start" });
   }
-  $$(".wf-palette [data-add]", body).forEach(b => b.onclick = () => addNode(b.dataset.add));
+  $$(".wf-sidebar [data-add]", body).forEach(b => b.onclick = () => addNode(b.dataset.add));
   $("#wfZoomIn", body).onclick = () => editor.zoom_in();
   $("#wfZoomOut", body).onclick = () => editor.zoom_out();
   $("#wfSave", body).onclick = async () => {
@@ -5388,20 +5723,35 @@ function wfReadCanvas(editor) {
   const data = editor.export().drawflow.Home.data;
   const nodes = [], edges = [];
   let error = null;
+  const intOr0 = v => { const n = parseInt(v, 10); return isNaN(n) ? 0 : n; };
   for (const k in data) {
-    const nd = data[k], id = +k, d = nd.data || {};
-    const node = { id, type: nd.name, x: Math.round(nd.pos_x), y: Math.round(nd.pos_y) };
-    if (nd.name === "tool") {
+    const nd = data[k], id = +k, d = nd.data || {}, t = nd.name;
+    const node = { id, type: t, x: Math.round(nd.pos_x), y: Math.round(nd.pos_y) };
+    if (t === "tool") {
       node.tool = d.tool || "";
       try { node.args = (d.args || "").trim() ? JSON.parse(d.args) : {}; }
       catch { error = `invalid JSON in tool node “${node.tool || id}”`; node.args = {}; }
-    } else if (nd.name === "instruction") node.text = d.text || "";
-    else if (nd.name === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; }
-    else if (nd.name === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleOp || "contains"; node.ruleValue = d.ruleValue || ""; node.role = d.role || "default"; }
+    } else if (t === "instruction") { node.text = d.text || ""; node.retries = intOr0(d.retries); }
+    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.retries = intOr0(d.retries); }
+    else if (t === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleop || "contains"; node.ruleValue = d.ruleval || ""; node.role = d.role || "default"; }
+    else if (t === "trigger") { node.kind = d.kind || "manual"; node.cron = d.cron || ""; node.pattern = d.pattern || ""; node.channel = d.channel || "any"; node.folder = d.folder || ""; node.account = d.account || ""; node.mailFolder = d.mailFolder || "INBOX"; }
+    else if (t === "switch") {
+      node.source = d.source || "";
+      node.cases = [1, 2, 3].map(i => ({ op: d["c" + i + "op"] || "contains", value: d["c" + i + "val"] || "", label: (d["c" + i + "label"] || "").trim() }))
+                            .filter(c => c.label);
+    }
+    else if (t === "loop") { node.over = d.over || ""; node.as = d.as || "item"; }
+    else if (t === "http") {
+      node.method = d.method || "GET"; node.url = d.url || ""; node.body = d.body || ""; node.retries = intOr0(d.retries);
+      node.headers = {}; (d.headers || "").split("\n").forEach(line => { const m = line.match(/^\s*([^:]+):\s*(.*)$/); if (m) node.headers[m[1].trim()] = m[2].trim(); });
+    }
+    else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
+    else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
+    else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
     nodes.push(node);
     const outs = nd.outputs || {};
     for (const oname in outs) (outs[oname].connections || []).forEach(c =>
-      edges.push({ from: id, to: +c.node, branch: nd.name === "decision" ? (oname === "output_2" ? "no" : "yes") : null }));
+      edges.push({ from: id, to: +c.node, branch: wfOutBranch(t, oname, node) }));
   }
   return { graph: { nodes, edges }, error };
 }
@@ -5442,7 +5792,7 @@ async function wfRenderRun(body, w) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith("data: ")) continue;
         let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-        if (ev.event === "node_start") addRow(ev.id, ev.label);
+        if (ev.event === "node_start") { const r = addRow(ev.id, ev.label); if (ev.type === "approval") wfShowApproval(r, w.id); }
         else if (ev.event === "tool" && rows[ev.id] && ev.text) { const t = document.createElement("div"); t.className = "wf-rs-tool"; t.textContent = ev.text; $(".wf-rs-tools", rows[ev.id]).appendChild(t); }
         else if (ev.event === "node_end" && rows[ev.id]) {
           const r = rows[ev.id]; r.className = "wf-run-step " + (ev.ok ? "ok" : "fail");
@@ -5472,6 +5822,7 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
       $(".wf-rs-out", r).textContent = (s.output || "").trim();
     });
     if (st.current && !rows[st.current.id]) addRow(st.current.id, st.current.label);  // node in flight
+    if (st.awaiting && st.current && rows[st.current.id]) wfShowApproval(rows[st.current.id], w.id, st.awaiting.token);
     host.scrollTop = host.scrollHeight;
   };
   let st = initial;
@@ -5489,6 +5840,21 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
     st = next;
   }
 }
+// Approval node (issue 8 D): show Approve/Reject on the running step; resolving it lets the run continue.
+async function wfShowApproval(row, wid, token) {
+  if (!row || $(".wf-approve", row)) return;
+  if (!token) {
+    try { token = ((await api("/api/workflows/approvals")).pending || []).find(a => a.workflow_id === wid)?.token; } catch {}
+  }
+  if (!token || $(".wf-approve", row)) return;
+  const box = document.createElement("div"); box.className = "wf-approve";
+  box.innerHTML = `<span class="wf-ap-msg">✋ awaiting your approval</span><button class="primary sm wf-ap-yes">Approve</button><button class="ed-btn wf-ap-no">Reject</button>`;
+  row.appendChild(box);
+  const done = approved => { _postJ("/api/workflows/approve", { token, approved }).catch(() => {}); box.remove(); };
+  $(".wf-ap-yes", box).onclick = () => done(true);
+  $(".wf-ap-no", box).onclick = () => done(false);
+}
+
 async function wfRenderRuns(body, w) {
   body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>History · ${escapeHtml(w.name)}</h3></div><div class="wf-runs-list" id="wfRunsList"><div class="empty-note">loading…</div></div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);

@@ -89,6 +89,30 @@ def list_all():
     return out
 
 
+def history_messages(sid, limit=400):
+    """The stored conversation as agent-ready chat messages: a list of
+    {role: 'user'|'assistant', content} so a continued chat (or any chat after a
+    restart) gets its real history back into the Agent. Thinking and tool-trace
+    entries are dropped — they're display-only, and reconstructing valid
+    tool_call/tool_result pairs from the saved shape is fragile; the user+assistant
+    turns carry the actual context. Keeps only the last `limit` turns as a backstop
+    against an enormous history blowing the prompt (the user can /compact further)."""
+    rec = get(sid)
+    if not rec:
+        return []
+    out = []
+    for m in rec.get("messages", []) or []:
+        role = m.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": m.get("content") or ""})
+        elif role == "assistant":
+            c = m.get("content")
+            if c:                                    # skip empty assistant turns (pure tool steps)
+                out.append({"role": "assistant", "content": c})
+        # 'thinking' / 'tool' / 'tools' are display-only — not part of the model's context
+    return out[-limit:]
+
+
 def transcript(sid, limit_chars=12000):
     """A readable transcript of a conversation (User / Assistant turns + brief tool traces),
     for distilling into a skill. Reasoning is dropped; tool results are truncated."""

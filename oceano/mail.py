@@ -12,6 +12,7 @@ as the Telegram token in web.json and the SSH keys under data/hosts/); they are 
 """
 import email
 import email.utils
+import hashlib
 import html
 import imaplib
 import json
@@ -33,9 +34,10 @@ STORE = config.WORKSPACE.parent / "data" / "mail.json"
 POLICIES = ("readonly", "active", "trusted")
 _ARM_TTL = 1800                 # a send-arm lasts 30 minutes
 _TIMEOUT = 25                   # IMAP/SMTP connect/op timeout (seconds)
-_BODY_CAP = 16000               # cap a fetched body like other tool outputs
+_BODY_CAP = 16000               # cap a fetched plain-text body like other tool outputs
+_BODY_HTML_CAP = 600000         # cap the (sanitized) HTML body served to the email reader UI
 _ATTACH_CAP = 25 * 1024 * 1024  # 25 MB per attachment (download + send)
-_LIST_CAP = 50                  # never list more than this many messages per call
+_LIST_CAP = 200                 # max messages a single list call returns (the UI pages with offset)
 
 _lock = threading.Lock()
 _ARM = {}                       # account id -> expiry epoch (in-memory, never persisted)
@@ -315,6 +317,39 @@ def _extract_text(msg):
     return body[:_BODY_CAP]
 
 
+def _sanitize_html(htmltext):
+    """Pre-sanitize an email HTML body: strip scripts/styles/embeds, event-handler (on*) attrs, and
+    javascript: URLs. This is defense-in-depth, NOT the only line — the client also runs it through
+    DOMPurify and renders it inside a script-less sandboxed iframe (so even a missed tag can't run).
+    Kept deliberately conservative; we keep structural tags + links so the message reads + clicks."""
+    t = htmltext or ""
+    # drop whole dangerous elements (open→close), then any stray self-closing/orphan opens
+    t = re.sub(r"(?is)<(script|style|head|title|iframe|frame|frameset|object|embed|applet|form|link|meta|base)\b[^>]*>.*?</\1\s*>", " ", t)
+    t = re.sub(r"(?is)<(script|style|iframe|frame|object|embed|applet|form|link|meta|base)\b[^>]*/?>", " ", t)
+    t = re.sub(r"(?is)\son\w+\s*=\s*\"[^\"]*\"", "", t)        # on* handlers (double-quoted)
+    t = re.sub(r"(?is)\son\w+\s*=\s*'[^']*'", "", t)           # (single-quoted)
+    t = re.sub(r"(?is)\son\w+\s*=\s*[^\s>]+", "", t)           # (unquoted)
+    t = re.sub(r"(?is)(href|src|action)\s*=\s*([\"'])\s*(?:javascript|vbscript|data):[^\"']*\2", r"\1=\2#\2", t)
+    return t[:_BODY_HTML_CAP]
+
+
+def _extract_html(msg):
+    """The message's text/html body, pre-sanitized — or '' for plain-text-only mail. Lets the reader
+    render real formatting and CLICKABLE links (the plain-text `body` strips them)."""
+    raw = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            if "attachment" in str(part.get("Content-Disposition") or "").lower():
+                continue
+            if part.get_content_type() == "text/html" and raw is None:
+                raw = _payload_text(part)
+    elif msg.get_content_type() == "text/html":
+        raw = _payload_text(msg)
+    return _sanitize_html(raw) if raw else ""
+
+
 def _payload_text(part):
     try:
         raw = part.get_payload(decode=True) or b""
@@ -407,6 +442,16 @@ def fetch_attachment(a, uid, folder, index):
         return {"ok": False, "error": _clean_err(e)}
     finally:
         _imap_close(conn)
+
+
+def attachment_sha256(a, uid, folder, index):
+    """SHA256 (+ name/type/size) of ONE attachment, without saving it — powers the reader's
+    'check this file on VirusTotal' (a hash reputation lookup leaks nothing, needs no API key)."""
+    res = fetch_attachment(a, uid, folder, index)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "filename": res["filename"], "content_type": res["content_type"],
+            "size": len(res["data"]), "sha256": hashlib.sha256(res["data"]).hexdigest()}
 
 
 def save_attachment(a, uid, folder, index, subdir="mail-attachments"):
@@ -698,9 +743,11 @@ def _search_uids(conn, query=None, unread_only=False):
     return data[0].split()
 
 
-def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
-    """Newest-first list of message headers in `folder`. Returns {ok, folder, total, messages:[...]}."""
+def imap_list(a, folder="INBOX", query=None, limit=20, offset=0, unread_only=False):
+    """Newest-first page of message headers in `folder`. `offset` skips the N newest (so the UI can
+    scroll-load older messages in batches). Returns {ok, folder, total, offset, limit, messages:[...]}."""
     limit = max(1, min(int(limit or 20), _LIST_CAP))
+    offset = max(0, int(offset or 0))
     try:
         conn = _imap(a)
     except Exception as e:
@@ -711,7 +758,7 @@ def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
             return {"ok": False, "error": f"no such folder {folder!r}"}
         uids = _search_uids(conn, query, unread_only)
         total = len(uids)
-        chosen = uids[-limit:][::-1]                         # newest first
+        chosen = uids[::-1][offset:offset + limit]           # newest first, then the requested page
         msgs = []
         if chosen:
             uid_set = b",".join(chosen)
@@ -737,7 +784,8 @@ def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
                 msgs.append({"uid": u, "from": _dh(hdr.get("From")), "subject": _dh(hdr.get("Subject")),
                              "date": _dh(hdr.get("Date")), "seen": "\\Seen" in fl,
                              "flagged": "\\Flagged" in fl})
-        return {"ok": True, "folder": folder, "total": total, "messages": msgs}
+        return {"ok": True, "folder": folder, "total": total, "offset": offset,
+                "limit": limit, "messages": msgs}
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:
@@ -761,7 +809,8 @@ def imap_read(a, uid, folder="INBOX"):
         return {"ok": True, "uid": str(uid), "folder": folder,
                 "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
                 "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
-                "attachments": list_attachments(msg), "body": _extract_text(msg)}
+                "attachments": list_attachments(msg),
+                "body": _extract_text(msg), "html": _extract_html(msg)}
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:

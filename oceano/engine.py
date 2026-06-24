@@ -120,13 +120,16 @@ async def scheduler_loop(stop):
     log(f"[scheduler] watching for due tasks (every {SCHED_INTERVAL}s)")
     while not stop.is_set():
         try:
-            ran = await asyncio.to_thread(scheduler.run_due_once)  # blocking → worker thread
+            ran = await asyncio.to_thread(scheduler.run_due_once)  # fast: stamps + enqueues due tasks
             if ran:
-                log(f"[scheduler] ran {ran} task(s)")
+                log(f"[scheduler] queued {ran} due task(s)")
             from oceano import workflows
             fired = await asyncio.to_thread(workflows.poll_watch_triggers)   # file/folder-watch triggers
             if fired:
                 log(f"[triggers] {fired} watch-trigger run(s) fired")
+            mailed = await asyncio.to_thread(workflows.poll_email_triggers)  # email-received triggers
+            if mailed:
+                log(f"[triggers] {mailed} email-trigger run(s) fired")
         except Exception as e:
             log(f"[scheduler] tick error: {e}")
         await _sleep_or_stop(stop, SCHED_INTERVAL)
