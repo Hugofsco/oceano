@@ -1268,6 +1268,11 @@ const SETTINGS_PAGES = {
         <label class="dg-prov"><input type="radio" name="oc-mind" value="local"><span><b>Local model</b><i>fully offline, on your box — the model you serve in Rivers</i></span></label>
         <label class="dg-prov"><input type="radio" name="oc-mind" value="claude"><span><b>Claude (your subscription)</b><i>Claude Code as the resident mind — Oceano's persona, memory & workspace, no API key</i></span></label>
       </div>
+      <div class="dg-claude-model" id="claudeModelRow" style="display:none">
+        <label class="field-label">Claude model <span class="lbl-sub">used by the Claude mind <b>and</b> Claude-Code delegation</span></label>
+        <select id="claudeModelSel"></select>
+        <div class="dg-hint">Sonnet is usually the sweet spot for the agent — fast and capable. Switch to Opus for the hardest reasoning. Aliases always track the latest of each tier.</div>
+      </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
     <div class="drawer-section">
@@ -1417,7 +1422,19 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+async function loadClaudeModel() {
+  const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
+  let d; try { d = await api("/api/claude-model"); } catch { return; }
+  row.style.display = d.available ? "" : "none";       // only relevant when Claude Code is installed
+  if (!d.available) return;
+  sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+  sel.onchange = async () => {
+    try { const r = await _postJ("/api/claude-model", { model: sel.value });
+      toast("Claude model → " + (r.model || "default"), "info"); }
+    catch { toast("couldn't set the Claude model", "err"); }
+  };
+}
 async function loadMind() {
   let d; try { d = await api("/api/mind"); } catch { return; }
   const radios = $$('input[name="oc-mind"]'), note = $("#mindNote");

@@ -929,6 +929,21 @@ async def mind_set(req: Request):
     return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
 
 
+@app.get("/api/claude-model")
+def claude_model_get():
+    """Which Claude model the CLI uses (the Claude mind + Claude-Code delegation). '' = CLI default."""
+    from oceano import delegate
+    return {"model": delegate.get_claude_model(), "options": list(delegate.CLAUDE_MODELS),
+            "available": delegate.available()}
+
+
+@app.post("/api/claude-model")
+async def claude_model_set(req: Request):
+    from oceano import delegate
+    model = (await req.json()).get("model", "")
+    return {"ok": True, "model": delegate.set_claude_model(model)}
+
+
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
 #     (mindbridge.token()), localhost; exempt from the session middleware above. The token rides in a
 #     header (never the URL/body, so it can't leak into access logs) and is compared constant-time. ---
