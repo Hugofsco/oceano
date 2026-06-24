@@ -114,7 +114,7 @@ from a web UI or Telegram.
 
 | Port | Service | Notes |
 |------|---------|-------|
-| `8800` | Oceano web UI | localhost-only; reach via SSH tunnel / Tailscale |
+| `8800` | Oceano web UI | binds all interfaces (`0.0.0.0`) — login + optional 2FA gate it; keep on a trusted LAN/Tailscale (or set `OCEANO_WEB_HOST=127.0.0.1`) |
 | `8081` | `llama-swap` | OpenAI-compatible; chat models, one resident at a time |
 | `8082` | embedding server | `nomic-embed-text` (CPU), used by memory + RAG |
 | `8080` | SearXNG | web search backend (`?format=json`) |
@@ -377,8 +377,11 @@ Browse and provision local models from the UI (Brain → Rivers):
 
 ## Web UI
 
-Served at `http://127.0.0.1:8800` (login required — default **admin / admin**, change
-it in Settings → Account). It's a single-page app with:
+Served on **all interfaces** at port `8800` — reach it from any device on your trusted
+network at `http://<this-machine-ip>:8800` (or `http://127.0.0.1:8800` on the box itself).
+Login required — default **admin / admin**, **change it** in Settings → Account, and ideally
+enable 2FA. To restrict it back to this machine only, set `OCEANO_WEB_HOST=127.0.0.1`.
+It's a single-page app with:
 
 - **Auth** — cookie session, password hashed (PBKDF2) in `data/web.json`; all `/api`
   routes gated. **Optional TOTP 2FA** (Settings → Account): scan a QR with any authenticator
@@ -420,8 +423,12 @@ it in Settings → Account). It's a single-page app with:
   restart** where it's safe — reload a voice model, respawn the embedding child, restart Telegram,
   or restart `llama-swap` (via a scoped polkit rule, no password).
 
-> Bound to localhost on purpose — the agent can run shell commands. Reach it over an
-> SSH tunnel or Tailscale; do **not** expose `0.0.0.0` without additional auth.
+> ⚠️ **Binds `0.0.0.0` (all interfaces)** for easy reach across a trusted LAN/Tailscale.
+> The agent can run shell commands, so the UI is gated by **login + optional TOTP 2FA** — but
+> that only protects you if you **change the default `admin/admin` password** and keep Oceano on
+> a **trusted network**. Do **not** put it on an untrusted network or expose it to the public
+> internet. To lock it to this machine, set `OCEANO_WEB_HOST=127.0.0.1` and reach it via an SSH
+> tunnel or `tailscale serve`.
 
 ---
 
@@ -528,8 +535,10 @@ docker compose -f docker-compose.yml -f docker-compose.nvidia.yml ps      # stat
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml logs -f # logs
 ```
 
-Either way, open `http://127.0.0.1:8800` (published localhost-only — same posture as
-baremetal; the other services stay on the internal network).
+Either way, open `http://<host>:8800` (the `oceano` service publishes `8800` on all
+interfaces — same posture as baremetal, gated by login + optional 2FA; the other services
+stay on the internal network). Edit the `ports:` mapping in `deploy/docker/docker-compose.yml`
+to `127.0.0.1:8800:8800` if you'd rather keep it host-local.
 
 ---
 
@@ -540,6 +549,8 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `OCEANO_WEB_HOST` | `0.0.0.0` | web UI bind interface; set `127.0.0.1` for loopback-only |
+| `OCEANO_WEB_PORT` | `8800` | web UI port |
 | `OCEANO_LLM_URL` | `http://127.0.0.1:8081/v1` | chat model endpoint (llama-swap) |
 | `OCEANO_MODEL` | _(unset)_ | pin a model; unset → Oceano uses your primary (Settings → Delegation) or a model served in Brain → Rivers |
 | `OCEANO_WORKSPACE` | `./workspace` | the agent's working folder |
@@ -573,8 +584,12 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
   unit from the UI — `NoNewPrivileges` stays intact (no escalation; systemd does the work over D-Bus).
   The installer also offers to add the service user to the `systemd-journal` group so the Logs window's
   **System** tab can read the journal (read-only; skipped if already in `systemd-journal`/`adm`).
-- **Localhost binding** + **login auth** on the web UI, with **optional TOTP 2FA** (RFC 6238 —
-  authenticator app + QR; secret stays in the hardened `data/web.json`).
+- **Network binding** — the web UI binds all interfaces (`0.0.0.0`) by default for easy reach
+  across a trusted LAN/Tailscale, gated by **login auth** + **optional TOTP 2FA** (RFC 6238 —
+  authenticator app + QR; secret stays in the hardened `data/web.json`). The agent runs shell
+  commands, so this is **trusted-network-only**: change the default `admin/admin` password,
+  enable 2FA, and never expose it to the public internet. Set `OCEANO_WEB_HOST=127.0.0.1` to
+  bind loopback-only (reach it via SSH tunnel or `tailscale serve`).
 - **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API
   keys) is written atomically, so a crash can't corrupt it and lock you out; session cookies and
   the sandboxed-preview capability tokens are HMAC domain-separated, so one can't be replayed as

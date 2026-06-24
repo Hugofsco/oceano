@@ -137,7 +137,10 @@ async def scheduler_loop(stop):
 
 
 async def run():
-    host = os.environ.get("OCEANO_WEB_HOST", "127.0.0.1")
+    # Bind all interfaces by default so the UI is reachable across a trusted LAN/Tailscale without a
+    # tunnel. The web UI is gated by login + optional TOTP 2FA — KEEP IT ON A TRUSTED NETWORK and change
+    # the default password (the agent runs shell commands). Set OCEANO_WEB_HOST=127.0.0.1 for loopback-only.
+    host = os.environ.get("OCEANO_WEB_HOST", "0.0.0.0")
     port = int(os.environ.get("OCEANO_WEB_PORT", "8800"))
     server = uvicorn.Server(uvicorn.Config(
         app, host=host, port=port, log_level="warning", timeout_graceful_shutdown=15))
@@ -158,6 +161,10 @@ async def run():
           asyncio.create_task(calendar_loop(stop), name="calendar")]
 
     log(f"⚓ Oceano engine — web http://{host}:{port} · telegram + scheduler + embeddings in-process")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        log(f"[web] bound to {host} — reachable across the network. Keep it on a TRUSTED network, "
+            f"change the default admin password, and enable 2FA (Settings → Account). "
+            f"Set OCEANO_WEB_HOST=127.0.0.1 to restrict to this machine.")
     try:
         # Runs the app lifespan (which starts the Telegram bot), then serves until
         # request_stop() fires; on the way out the lifespan stops the bot.

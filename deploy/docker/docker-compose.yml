@@ -7,8 +7,8 @@
 #
 # The image (oceano:local) is built once by the installer with the matching backend and
 # shared by the three compute services. Models live in a host-mounted ../../models (kept
-# out of the image); secrets in ../../oceano.env. Everything is reachable only via the
-# oceano service's localhost-published :8800 — the rest is an internal network.
+# out of the image); secrets in ../../oceano.env. The oceano service publishes :8800 on all
+# interfaces (login + optional 2FA gate it — keep it on a trusted network); the rest is internal.
 name: oceano
 
 services:
@@ -28,7 +28,7 @@ services:
       OCEANO_EMBED_MANAGED: "0"
       OCEANO_SEARXNG: "http://searxng:8080"
     ports:
-      - "127.0.0.1:8800:8800"     # localhost only — same posture as baremetal
+      - "8800:8800"               # all interfaces — same posture as baremetal (auth + 2FA gate it; trusted network only)
     volumes:
       - ../../data:/app/data
       - ../../workspace:/app/workspace
