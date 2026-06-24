@@ -25,7 +25,7 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **63 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **64 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
   HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
@@ -52,8 +52,8 @@ from a web UI or Telegram.
   straight into the workspace.
 - **Visual workflows + triggers.** Draw branching, multi-step recipes on a node canvas
   (tool · instruction · delegate · decision); fire them manually, on a cron, or on an
-  **event** — a watched folder changing, a webhook, a chat keyword, or another workflow
-  finishing. Watch each node execute live. See [Workflows](#workflows).
+  **event** — a watched folder changing, a webhook, a chat keyword, an incoming email, or
+  another workflow finishing. Watch each node execute live. See [Workflows](#workflows).
 - **Survives a refresh.** Open app windows reopen where you left them, and a chat reply
   (or workflow) still generating when you reload **reconnects** instead of being lost.
 - **Configurable delegation + any model as primary.** Hand a heavy subtask to a stronger
@@ -121,7 +121,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (63)
+## The agent's tools (64)
 
 | Group | Tools |
 |-------|-------|
@@ -138,7 +138,7 @@ from a web UI or Telegram.
 | **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server), `sftp` (list / get / put files — gated; see [Hosts](#hosts--ssh-keychain)) |
-| **Mail (IMAP/SMTP)** | `mail_accounts`, `mail_folders` (counts + which are empty), `mail_list`, `mail_read`, `mail_move`, `mail_delete` (→ Trash), `mail_flag` (read/unread/flag/spam), `mail_send`, `mail_reply`, `mail_folder` (create/rename/delete) — multi-account, gated; see [Mail](#mail--imap--smtp) |
+| **Mail (IMAP/SMTP)** | `mail_accounts`, `mail_folders` (counts + which are empty), `mail_list`, `mail_read`, `mail_move`, `mail_delete` (→ Trash), `mail_flag` (read/unread/flag/spam), `mail_send`, `mail_reply` (both can attach workspace files), `mail_save_attachment` (save an incoming attachment to the workspace), `mail_folder` (create/rename/delete) — multi-account, gated; see [Mail](#mail--imap--smtp) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
@@ -208,15 +208,25 @@ is a directed graph; execution walks it from a **start** node, following edges:
 - **delegate** — hand the step to the configured delegate (Claude Code / a cloud model)
 - **decision** — routes **yes / no** down different edges, judged by a **rule** over the
   previous step's output, the **local model**, or a **delegate**
+- **switch** — multi-branch routing (more than a yes/no — pick an edge by matching a value)
+- **loop** — foreach over a list, running its body once per element (`{{item}}` / `{{index}}`)
+- **http** — an HTTP/REST call (SSRF-guarded: private/link-local targets blocked, redirects
+  re-validated per hop)
+- **sub-workflow** — run another saved workflow as a single step
+- **transform** — reshape the data flowing between nodes (no agent turn)
+- **approval** — pause for **human-in-the-loop** sign-off before continuing
 - **start / end**
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
-runaway loops.
+runaway loops. A node can also declare **retries** and an **on-error** edge, so a flaky step
+re-tries or routes to a recovery branch instead of failing the whole run.
 
 **Inputs (a workflow as a reusable skeleton).** A workflow can declare it takes **one input
 value** (Editor → *Takes an input*). Reference it as `{{input}}` anywhere — a node's
 instruction text, a delegate prompt, or a tool's arguments — and it's also seeded into the
-agent's context. The same graph then processes a different value each run: ▶ Run prompts for
+agent's context. Nodes also pass data **between** each other: `{{last}}` (the previous step's
+output), `{{node.<id>}}` (any earlier node's output by id), and inside a **loop** `{{item}}` /
+`{{index}}`. The same graph then processes a different value each run: ▶ Run prompts for
 it, the agent can pass it via `run_workflow(name, input=…)`, a **webhook** body carries it
 (`{"input": …}` or raw text), a **chat keyword** hands the whole message in, and a **chain**
 passes the upstream workflow's output down as the next one's input. A stored **default** feeds
@@ -225,7 +235,8 @@ unattended (scheduled) runs.
 **Triggers** (the ⚡ panel) decide *when* a workflow fires: manually (▶ Run),
 on a **cron** (managed in the Scheduler), or on an **event** — a watched workspace folder
 changing, an incoming **webhook** (a secret-token URL), a **chat keyword** (web / Telegram),
-or **another workflow finishing** (chaining, loop-guarded). Every run is recorded (live,
+an incoming **email** (new mail in a watched account/folder), or **another workflow finishing**
+(chaining, loop-guarded). Every run is recorded (live,
 node-by-node over SSE), and a run still in progress when you **refresh the browser reconnects**
 to its live state. The agent can also trigger saved workflows with `run_workflow`, but you
 author them in the UI. Stored in `data/workflows.json`; the canvas is a vendored
@@ -267,10 +278,18 @@ another by name, and it asks when a request is ambiguous). The window is a full 
 sidebar with unread counts**, a message list with **multi-select** bulk **move / delete / mark-read**,
 a reader, **folder management** (create · rename · delete, with system folders protected), and a
 **compose/reply editor** with a rich-text toolbar and a **✨ AI-draft-reply** button (the configured
-model drafts a reply you review and edit before sending — never auto-sent).
+model drafts a reply you review and edit before sending — never auto-sent). Each folder has a
+**server-side search box** and a **"select all N in this folder"** expansion, so a bulk
+move / delete / mark-read runs as **one IMAP command** over the whole folder or search result. The
+list **pages** at **50 / 100 / 150 / all** (scroll-loaded, newest first by date), the reader renders
+the message as **sanitized HTML in a script-less sandboxed iframe** (remote images blocked by default,
+toggleable), and **attachments** are listed with forced-download / save-to-workspace plus a right-click
+**VirusTotal** SHA-256 check or upload (VT key set in Settings, stored `0600`). The composer can
+**attach workspace files** on send/reply.
 
-The agent gets the same power through ten tools (`mail_accounts`, `mail_folders`, `mail_list`,
-`mail_read`, `mail_move`, `mail_delete`, `mail_flag`, `mail_send`, `mail_reply`, `mail_folder`),
+The agent gets the same power through eleven tools (`mail_accounts`, `mail_folders`, `mail_list`,
+`mail_read`, `mail_move`, `mail_delete`, `mail_flag`, `mail_send`, `mail_reply`, `mail_save_attachment`,
+`mail_folder`),
 under the same layered gates as the SSH keychain — because email is the classic prompt-injection
 vector:
 
@@ -298,7 +317,10 @@ Oceano can hand a self-contained subtask to a stronger assistant via the `delega
 Anthropic API key:
 
 - **Claude Code** (default) — runs headless via the `claude` CLI inside the workspace,
-  with its own tools (uses your existing CLI login, no key passed by Oceano).
+  with its own tools (uses your existing CLI login, no key passed by Oceano). You can pick
+  **which Claude model** the CLI uses (Sonnet / Opus / Haiku / CLI default) in
+  **Settings → Delegation**; the choice (`claude_model` in `data/delegation.json`) applies to
+  the Claude mind, Claude-Code delegation, and Claude-pinned scheduled tasks.
 - **A cloud model** — any configured OpenAI-compatible endpoint, run through Oceano's
   *own* agent loop with *our* tools, so it can read, write, and run things — not just reason.
 
@@ -342,7 +364,9 @@ Claude subscription, **no API key**), while **Oceano stays the body**:
 - Memory is the continuity: Claude's intelligence **+** Oceano's memory = a presence that remembers you.
 
 The bridge is **localhost-only and token-gated** (a header token, constant-time compared), the mind
-can't delegate to itself, and tool calls execute *inside* the daemon (so windows actually open). Flip
+can't delegate to itself, and tool calls execute *inside* the daemon (so windows actually open — for
+an interactive turn). For a Claude-pinned **scheduled** task, the bridged tools run on the
+**background channel** instead, so a job no one is watching can't drive the live browser or UI windows. Flip
 back to a **local model** anytime for fully-offline operation — that's the trade-off: Claude is
 sharper, the local model keeps Oceano sovereign and offline. A common setup is Claude as the
 interactive mind with the local model still running the background/scheduled work.
@@ -441,10 +465,13 @@ It's a single-page app with:
   via [ntfy](https://ntfy.sh). Manage in the Scheduler window, or hit **▶ Run** to fire
   any job on demand (locked jobs and workflows included).
 - **Locked maintenance jobs** — schedulable/toggleable (but not deletable) entries keep
-  Oceano healthy: a skills review, the eval suite, memory hygiene, and a nightly
-  **`[ INDEX ]` reindex** that re-syncs the doc / memory / skill / chat embeddings to disk
-  (pruning what's gone, re-embedding what changed). The self-improving jobs are judged by
-  the configured `improve` delegate, never the local model.
+  Oceano healthy: a skills review, a **skills-distillation feeder** (mines recently-active
+  chats into `learning` skills that flow into the review/publish pipeline), the eval suite,
+  memory hygiene, a nightly **`[ INDEX ]` reindex** that re-syncs the doc / memory / skill /
+  chat embeddings to disk (pruning what's gone, re-embedding what changed), and a nightly
+  **`[ SELF ]` self-reflection** that digests the day's runs and writes
+  `workspace/journal/<date>.md`. The self-improving jobs are judged by the configured
+  `improve` delegate, never the local model.
 - **Background jobs & the queue** — every unattended job (workflows, scheduled tasks,
   research, evals, memory & index upkeep) registers in a live registry shown by a topbar
   indicator. **Settings → Tools → Execution** can *serialize* them through one gate —
@@ -502,6 +529,12 @@ sudo systemctl restart oceano  # restart everything
 ```
 
 Then open `http://127.0.0.1:8800` and log in with **admin / admin**.
+
+If only the **systemd unit** is broken (e.g. a wrong `WorkingDirectory` makes the engine fail with
+*"No module named 'oceano'"*), `scripts/install-daemon.sh` re-renders and reinstalls just the unit —
+without re-running the full installer. It validates the render before writing (refuses a unit that
+can't import the package), then reloads + restarts + reports; `--dry-run` previews, `--no-start`
+installs without (re)starting.
 
 The install also drops an **`oceano`** terminal client on your PATH — the rich, streamed
 `cli.py` with rendered markdown + colored diffs, a slash-command **palette** (type `/`),
@@ -641,6 +674,7 @@ config.py            central, env-overridable config
 scripts/
   install.sh         host bootstrapper (GPU detect → build → services; --docker for containers)
   install-cli.sh     installs the `oceano` terminal command (a cli.py launcher)
+  install-daemon.sh  re-renders + reinstalls just the systemd unit (repair tool)
   serve-embeddings.sh  the embedding server launcher
 systemd/             oceano.service + oceano-llama-swap.service + oceano-polkit.rules
 deploy/searxng/      bundled SearXNG compose + settings
