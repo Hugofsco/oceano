@@ -8,11 +8,14 @@ Type=simple
 # scripts/install.sh templates the __OCEANO_USER__ / __OCEANO_ROOT__ tokens below
 # to the real service user and install directory.
 User=__OCEANO_USER__
+# Repo root — must hold the `oceano` package so `python -m oceano.engine` imports.
+# (Do NOT point this at workspace/; that's the agent's scratch dir, not the package.)
 WorkingDirectory=__OCEANO_ROOT__
 EnvironmentFile=-__OCEANO_ROOT__/oceano.env
-# Web UI binds localhost only. The agent can run shell commands — reach it over an
-# SSH tunnel or Tailscale; do NOT bind 0.0.0.0 without adding auth.
-Environment=OCEANO_WEB_HOST=127.0.0.1
+# Binds 0.0.0.0 so the web UI is reachable across a trusted LAN/Tailscale. The UI is
+# gated by login + optional TOTP 2FA — safe ONLY on a trusted network with the default
+# admin password changed. Set OCEANO_WEB_HOST=127.0.0.1 to restrict to this machine.
+Environment=OCEANO_WEB_HOST=0.0.0.0
 Environment=OCEANO_WEB_PORT=8800
 Environment=PYTHONUNBUFFERED=1
 # Put the user's local bin on PATH so delegate_to_claude finds the `claude` CLI
