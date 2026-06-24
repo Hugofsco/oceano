@@ -38,6 +38,8 @@ _BODY_CAP = 16000               # cap a fetched plain-text body like other tool 
 _BODY_HTML_CAP = 600000         # cap the (sanitized) HTML body served to the email reader UI
 _ATTACH_CAP = 25 * 1024 * 1024  # 25 MB per attachment (download + send)
 _LIST_CAP = 200                 # max messages a single list call returns (the UI pages with offset)
+_SORT_SCAN_CAP = 5000           # folders bigger than this skip the client-side date sort (too many
+                                # headers to fetch per page) and fall back to UID order — see _ordered_uids
 
 _lock = threading.Lock()
 _ARM = {}                       # account id -> expiry epoch (in-memory, never persisted)
@@ -729,23 +731,83 @@ def imap_delete_folder(a, name):
         _imap_close(conn)
 
 
-def _search_uids(conn, query=None, unread_only=False):
+def _search_crit(query=None, unread_only=False):
+    """IMAP SEARCH/SORT criteria for a folder query. Shared by _search_uids (plain SEARCH) and
+    _ordered_uids (SORT), so the two can't drift apart."""
     crit = []
     if unread_only:
         crit.append("UNSEEN")
     if query:
         crit += ["TEXT", '"%s"' % str(query).replace('"', "")]
-    if not crit:
-        crit = ["ALL"]
-    typ, data = conn.uid("SEARCH", None, *crit)
+    return crit or ["ALL"]
+
+
+def _search_uids(conn, query=None, unread_only=False):
+    """Matching UIDs in SEARCH order (ascending UID). Caller decides ordering."""
+    typ, data = conn.uid("SEARCH", None, *_search_crit(query, unread_only))
     if typ != "OK" or not data:
         return []
     return data[0].split()
 
 
+def _uids_by_date(conn, uids):
+    """Sort `uids` (bytes, ascending UID) NEWEST-FIRST by their Date: header — the client-side
+    fallback when the server can't SORT (e.g. Gmail). One FETCH pulls every Date header; messages
+    with a missing/unparseable Date sink to the bottom in UID order. On FETCH failure, UID-desc."""
+    pos = {u: i for i, u in enumerate(uids)}                 # ascending-UID index → stable tiebreak
+    dates = {}
+    try:
+        typ, data = conn.uid("FETCH", b",".join(uids), "(BODY.PEEK[HEADER.FIELDS (DATE)])")
+        if typ != "OK":
+            return uids[::-1]
+        for item in data or []:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            m = re.search(r"UID (\d+)", item[0].decode("utf-8", "replace"))  # UID FETCH always echoes UID
+            if not m:
+                continue
+            raw = email.message_from_bytes(item[1]).get("Date")
+            dt = None
+            try:
+                if raw:
+                    dt = email.utils.parsedate_to_datetime(raw)
+                    if dt is not None and dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)   # naive → assume UTC so all keys compare
+            except Exception:
+                dt = None
+            dates[m.group(1).encode()] = dt
+    except Exception:
+        return uids[::-1]
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    # newest first; unparseable/missing Date → epoch (sinks); same date → higher UID first.
+    return sorted(uids, key=lambda u: (dates.get(u) or epoch, pos.get(u, 0)), reverse=True)
+
+
+def _ordered_uids(conn, query=None, unread_only=False):
+    """Matching UIDs ordered NEWEST-FIRST by date, so the listing reads recent → old regardless of
+    UID (append) order — fixes messages moved/imported into a folder showing up out of order.
+
+    Order of preference: (1) server-side IMAP SORT (REVERSE DATE) — true Date-header order, paged by
+    the server, any folder size; (2) for a folder under _SORT_SCAN_CAP with no SORT support, a
+    client-side Date-header sort; (3) plain UID-descending — for huge no-SORT folders (bounded cost)
+    or if everything above fails."""
+    if "SORT" in _capabilities(conn):
+        try:
+            typ, data = conn.uid("SORT", "(REVERSE DATE)", "UTF-8", *_search_crit(query, unread_only))
+            if typ == "OK":
+                return data[0].split() if (data and data[0]) else []
+        except Exception:
+            pass                                             # advertised SORT but it choked → fall back
+    uids = _search_uids(conn, query, unread_only)
+    if len(uids) > _SORT_SCAN_CAP:
+        return uids[::-1]                                    # too big to date-sort client-side
+    return _uids_by_date(conn, uids)
+
+
 def imap_list(a, folder="INBOX", query=None, limit=20, offset=0, unread_only=False):
-    """Newest-first page of message headers in `folder`. `offset` skips the N newest (so the UI can
-    scroll-load older messages in batches). Returns {ok, folder, total, offset, limit, messages:[...]}."""
+    """Newest-first (by date) page of message headers in `folder` — see _ordered_uids for how the
+    date ordering is obtained. `offset` skips the N newest (so the UI can scroll-load older messages
+    in batches). Returns {ok, folder, total, offset, limit, messages:[...]}."""
     limit = max(1, min(int(limit or 20), _LIST_CAP))
     offset = max(0, int(offset or 0))
     try:
@@ -756,9 +818,9 @@ def imap_list(a, folder="INBOX", query=None, limit=20, offset=0, unread_only=Fal
         typ, _ = conn.select(_q(folder), readonly=True)
         if typ != "OK":
             return {"ok": False, "error": f"no such folder {folder!r}"}
-        uids = _search_uids(conn, query, unread_only)
+        uids = _ordered_uids(conn, query, unread_only)       # newest-first by date (SORT, else client-side)
         total = len(uids)
-        chosen = uids[::-1][offset:offset + limit]           # newest first, then the requested page
+        chosen = uids[offset:offset + limit]                 # already newest-first; take the requested page
         msgs = []
         if chosen:
             uid_set = b",".join(chosen)
