@@ -507,6 +507,10 @@ class Agent:
         history + post-turn learning. Oceano is the body; Claude is the mind."""
         import queue
         from oceano import delegate, mindbridge
+        # Is this an UNATTENDED turn (a scheduled task pinned to the Claude mind)? If so, the tools
+        # Claude calls back through the bridge must run in the background channel — no live browser /
+        # UI windows for a job no one is watching. Interactive (web) turns keep full UI access.
+        bg = tools.is_background()
         self._prepare_turn(user_message, voice=voice)          # system msg now carries persona + memory + context
         self.messages.append({"role": "user", "content": user_message})
         sys_prompt = self.messages[0]["content"] + (
@@ -563,6 +567,8 @@ class Agent:
                 q.put(("toolres", str(ev.get("text", ""))))
 
         def work():
+            if bg:
+                mindbridge.begin_background_turn()             # bridged tools run 'background' for the whole turn
             try:
                 mcp_path = mindbridge.mcp_config_path()        # the body: Oceano's own tools, executed in the daemon
                 # Claude keeps its native tools for files/shell; Oceano's BODY (memory, calendar, windows,
@@ -579,6 +585,8 @@ class Agent:
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
+                if bg:
+                    mindbridge.end_background_turn()
                 q.put(("done", None))
 
         threading.Thread(target=work, daemon=True).start()
