@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 import config
-from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills, uibridge
+from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, rerank, safety, scheduler, skills, uibridge
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -679,12 +679,25 @@ def _searxng_reachable():
         return False
 
 
+def _rerank_status():
+    """Reranker (:8084) — OPTIONAL. {enabled: model present, ok: server reachable}. When no model is
+    installed, reranking is off and RAG stays dense (enabled=False)."""
+    if not config.RERANK_MODEL.exists():
+        return {"enabled": False, "ok": False}
+    try:
+        requests.get(rerank.RERANK_URL.rstrip("/") + "/health", timeout=2)
+        return {"enabled": True, "ok": True}
+    except requests.RequestException:
+        return {"enabled": True, "ok": False}
+
+
 @app.get("/api/status")
 def system_status():
     """Live state of the consolidated daemons, for the Settings → Services panel."""
     from oceano import voice
     beat = scheduler.last_beat()
     return {"embed": _embed_reachable(),
+            "rerank": _rerank_status(),
             "scheduler_beat_ago": (time.time() - beat) if beat else None,
             "telegram": telegram_runtime.status(),
             "llamaswap": _llamaswap_status(),
@@ -702,6 +715,11 @@ async def services_restart(request: Request):
         ok = engine.restart_embed()
         return {"ok": ok, "msg": "embedding server restarting…" if ok
                 else "embedding server isn't managed by the daemon here"}
+    if name in ("rerank", "reranker"):
+        from oceano import engine
+        ok = engine.restart_rerank()
+        return {"ok": ok, "msg": "reranker restarting…" if ok
+                else "reranker isn't running here (no model installed, or unmanaged)"}
     if name == "telegram":
         await telegram_runtime.stop()
         st = await _apply_telegram()                      # re-reads saved settings, starts if enabled

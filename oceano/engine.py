@@ -34,12 +34,26 @@ RERANK_SCRIPT = ROOT / "scripts" / "serve-rerank.sh"
 SCHED_INTERVAL = 30      # seconds between due-task checks
 
 _embed_proc = None       # the current embedding child, so the UI can restart it on demand
+_rerank_proc = None      # the current reranker child (if any), for the same
 
 
 def restart_embed():
     """Terminate the current embedding child; embed_supervisor() then respawns it. Returns True if a
     live child was signalled. Call from the event loop (it touches the asyncio subprocess transport)."""
     p = _embed_proc
+    if p is None or p.returncode is not None:
+        return False
+    try:
+        p.terminate()
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def restart_rerank():
+    """Terminate the current reranker child; rerank_supervisor() then respawns it. Returns True if a
+    live child was signalled (False when reranking is off / unmanaged here)."""
+    p = _rerank_proc
     if p is None or p.returncode is not None:
         return False
     try:
@@ -116,9 +130,11 @@ async def rerank_supervisor(stop):
         log(f"[rerank] launcher missing: {RERANK_SCRIPT} — not starting reranker")
         return
 
+    global _rerank_proc
     backoff = 2
     while not stop.is_set():
         proc = await asyncio.create_subprocess_exec("bash", str(RERANK_SCRIPT))
+        _rerank_proc = proc
         log(f"[rerank] reranker server up (pid {proc.pid})")
 
         waiter = asyncio.ensure_future(proc.wait())
