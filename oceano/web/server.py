@@ -1393,6 +1393,26 @@ def end_session(sid: str):
     return {"ok": True}
 
 
+@app.post("/api/chat/{sid}/truncate")
+async def chat_truncate(sid: str, req: Request):
+    """Edit-and-regenerate support: drop the persisted chat to its first `keep` messages, then rebuild
+    the in-memory Agent from that truncated history — so the follow-up turn re-runs from the edit point
+    with a correct context (no stale reply, and no double-added message on the rehydrate path)."""
+    from oceano import chats
+    if _chat_live.get(sid, {}).get("running"):
+        return {"ok": False, "error": "a reply is still streaming — stop it first"}
+    keep = max(0, int((await req.json()).get("keep", 0)))
+    rec = chats.get(sid)
+    if not rec:
+        return {"ok": False, "error": "no such chat"}
+    msgs = (rec.get("messages") or [])[:keep]
+    chats.save(sid, rec.get("title"), msgs, rec.get("created"))
+    _drop_session_state(sid)     # forget the live Agent…
+    _agent(sid)                  # …and rebuild it from the truncated history NOW (while the file has no
+                                 # trailing user msg) so the next /api/chat turn hits the warm, correct path
+    return {"ok": True, "kept": len(msgs)}
+
+
 # ---------------- chat composer slash-commands (mirror Telegram /context /compact /status) ----------------
 def _ctx_payload(sid):
     ag = _agent(sid)

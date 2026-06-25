@@ -203,7 +203,7 @@ body{
 /* messages */
 .msg{margin:0 auto 22px;max-width:760px;padding:0 24px;animation:fadeUp .4s both}
 .msg .bubble{padding:14px 17px;border-radius:14px;line-height:1.62;font-size:15px}
-.msg.user{display:flex;justify-content:flex-end}
+.msg.user{display:flex;flex-direction:column;align-items:flex-end}
 .msg.user .bubble{
   background:linear-gradient(160deg, rgba(var(--biolum-rgb),.16), rgba(var(--biolum-2-rgb),.10));
   border:1px solid var(--line-strong);max-width:80%;color:var(--foam);
@@ -225,6 +225,21 @@ body{
 .caret{display:inline-block;width:8px;height:16px;background:var(--biolum);vertical-align:text-bottom;margin-left:2px;animation:blink 1s step-end infinite;border-radius:1px}
 .msg.assistant .msg-meta{font-family:var(--font-mono);font-size:10.5px;color:var(--faint);margin-top:8px;letter-spacing:.4px;opacity:.85}
 .msg.assistant .msg-meta::before{content:"⌁ ";color:var(--biolum);opacity:.7}
+/* per-message footer: timestamp (always faintly visible) + copy/edit actions (revealed on hover) */
+.msg-actions{display:flex;gap:8px;align-items:center;margin-top:5px;font-size:11px}
+.msg.user .msg-actions{justify-content:flex-end}
+.msg-time{font-family:var(--font-mono);color:var(--faint);letter-spacing:.3px;opacity:.7}
+.msg-act-btn{background:none;border:none;color:var(--faint);cursor:pointer;font-size:11px;
+  padding:2px 6px;border-radius:6px;font-family:inherit;opacity:.6;transition:opacity .12s,color .12s,background .12s}
+.msg:hover .msg-act-btn,.msg-act-btn:focus-visible{opacity:.85}
+.msg-act-btn:hover{color:var(--foam);background:rgba(var(--biolum-rgb),.12);opacity:1}
+/* inline edit of an already-sent message */
+.msg.user.editing .bubble{width:min(560px,80%);background:rgba(var(--biolum-rgb),.06);border-color:rgba(var(--biolum-rgb),.3)}
+.msg-edit-ta{width:100%;box-sizing:border-box;background:transparent;border:none;color:var(--foam);font:inherit;line-height:1.5;resize:none;outline:none;min-height:1.4em}
+.msg-edit-bar{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+.msg-edit-bar button{font-size:12px;padding:4px 10px;border-radius:8px;cursor:pointer;font-family:inherit;border:1px solid var(--line)}
+.msg-edit-save{background:var(--biolum);color:var(--abyss-0);border-color:transparent;font-weight:600}
+.msg-edit-cancel{background:transparent;color:var(--faint)}
 @keyframes blink{50%{opacity:0}}
 
 /* thinking toast (collapsible reasoning) */

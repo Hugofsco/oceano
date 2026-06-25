@@ -119,15 +119,7 @@ async function openVoyage(id) {
   state.session = id; localStorage.setItem("oceano.active", id);
   let data; try { data = await api("/api/chats/" + encodeURIComponent(id)); } catch { data = { messages: [] }; }
   _curT = data.messages || []; _curTitle = data.title || "New voyage";
-  const thread = $("#thread"); thread.innerHTML = "";
-  if (!_curT.length) thread.appendChild(welcomeNode());
-  else _curT.forEach(m => {
-    if (m.role === "user") addUser(m.content, false);
-    else if (m.role === "thinking") { const c = addThinkCard(); appendThink(c, m.text); finalizeThink(c); }
-    else if (m.role === "tool") { const tc = addTool(m.name, m.args); fillTool(tc, m.result); maybePreviewChip(tc, m.name, m.args); }
-    else if (m.role === "tools") m.items.forEach(it => fillTool(addTool(it.name, it.args), it.result));  // old format
-    else { const bb = addAssistant(m.content, true); if (m.meta) renderMeta(bb, m.meta); }
-  });
+  renderThread();
   renderSessions(); $("#input").focus();
   refreshViewBusy();                 // does the chat we just opened have a live turn? (Stop vs Send)
   maybeReconnectChat();              // re-attach to an in-flight reply (display-only if a local turn owns it)
@@ -230,11 +222,13 @@ function welcomeNode() {
 }
 const clearWelcome = () => { const w = $(".welcome"); if (w) w.remove(); };
 
-function addUser(text, scroll = true) {
+function addUser(text, scroll = true, ts = null, index = null) {
   clearWelcome();
   const el = document.createElement("div"); el.className = "msg user";
   const b = document.createElement("div"); b.className = "bubble"; b.textContent = text;
-  el.appendChild(b); $("#thread").appendChild(el); if (scroll) toBottom(); return el;
+  el.appendChild(b); $("#thread").appendChild(el);
+  attachMsgActions(el, { role: "user", raw: text, ts, index });
+  if (scroll) toBottom(); return el;
 }
 function addThinking() {
   clearWelcome();
@@ -243,12 +237,14 @@ function addThinking() {
     <div class="bubble"><span class="sounding"><i></i><i></i><i></i></span></div>`;
   $("#thread").appendChild(el); toBottom(); return el;
 }
-function addAssistant(text = "", done = false) {
+function addAssistant(text = "", done = false, ts = null) {
   clearWelcome();
   const el = document.createElement("div"); el.className = "msg assistant";
   el.innerHTML = `<div class="who"><span class="orb"></span><span>Oceano</span></div><div class="bubble"></div>`;
   renderMD($(".bubble", el), text, done);
-  $("#thread").appendChild(el); toBottom(); return $(".bubble", el);
+  $("#thread").appendChild(el); toBottom();
+  if (done) attachMsgActions(el, { role: "assistant", raw: text, ts });
+  return $(".bubble", el);
 }
 function renderMeta(bubble, s) {
   const msg = bubble.closest(".msg"); if (!msg) return;
@@ -309,6 +305,77 @@ function appendThink(card, text) {
 }
 function finalizeThink(card) { if (!card) return; const st = $(".tk-stat", card); st.classList.remove("run"); st.textContent = ""; }
 
+const _nowISO = () => new Date().toISOString();
+function _fmtMsgTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso); if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const t = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  if (d.toDateString() === now.toDateString()) return "Today " + t;            // day + time, even for today
+  const opts = { weekday: "short", month: "short", day: "numeric" };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString(undefined, opts) + " " + t;                      // e.g. "Wed, Jun 25 14:32"
+}
+// Footer under a message: timestamp (always) + copy (always) + edit (user messages only). `raw` is the
+// exact text to copy/edit; `index` is the message's position in _curT (used to truncate on edit). Only
+// the (escaped) timestamp is ever interpolated into innerHTML — raw text goes via clipboard/.value.
+function attachMsgActions(msgEl, { role, raw, ts, index }) {
+  if (!msgEl) return;
+  const old = msgEl.querySelector(":scope > .msg-actions"); if (old) old.remove();
+  const bar = document.createElement("div"); bar.className = "msg-actions";
+  const tstr = _fmtMsgTime(ts);
+  let html = tstr ? `<span class="msg-time" title="${escapeHtml(new Date(ts).toLocaleString())}">${escapeHtml(tstr)}</span>` : "";
+  if (role === "user" && index != null) html += `<button class="msg-act-btn msg-edit" title="edit & regenerate">✎ edit</button>`;
+  html += `<button class="msg-act-btn msg-copy" title="copy message">⧉ copy</button>`;
+  bar.innerHTML = html;
+  msgEl.appendChild(bar);
+  const cp = $(".msg-copy", bar);
+  cp.onclick = async () => { try { await navigator.clipboard.writeText(raw); cp.textContent = "✓ copied"; setTimeout(() => cp.textContent = "⧉ copy", 1200); } catch { toast("copy failed", "err"); } };
+  const ed = $(".msg-edit", bar); if (ed) ed.onclick = () => startEditUser(msgEl, index, raw);
+  return bar;
+}
+// Rebuild the whole thread DOM from _curT — shared by openVoyage (load) and the edit-truncate flow.
+function renderThread() {
+  const thread = $("#thread"); thread.innerHTML = "";
+  if (!_curT.length) { thread.appendChild(welcomeNode()); return; }
+  _curT.forEach((m, i) => {
+    if (m.role === "user") addUser(m.content, false, m.ts, i);
+    else if (m.role === "thinking") { const c = addThinkCard(); appendThink(c, m.text); finalizeThink(c); }
+    else if (m.role === "tool") { const tc = addTool(m.name, m.args); fillTool(tc, m.result); maybePreviewChip(tc, m.name, m.args); }
+    else if (m.role === "tools") m.items.forEach(it => fillTool(addTool(it.name, it.args), it.result));  // old format
+    else { const bb = addAssistant(m.content, true, m.ts); if (m.meta) renderMeta(bb, m.meta); }
+  });
+}
+// Inline-edit a sent user message, then regenerate from it (drops the old reply + everything after).
+function startEditUser(msgEl, index, original) {
+  if (state.busy) { toast("Wait for the current reply to finish.", "info"); return; }
+  const bubble = $(".bubble", msgEl);
+  msgEl.classList.add("editing");
+  bubble.innerHTML = `<textarea class="msg-edit-ta" spellcheck="false"></textarea>
+    <div class="msg-edit-bar"><button class="msg-edit-cancel">Cancel</button><button class="msg-edit-save">Save &amp; regenerate</button></div>`;
+  const ta = $(".msg-edit-ta", bubble); ta.value = original; autosize(ta); ta.focus();
+  ta.selectionStart = ta.selectionEnd = ta.value.length;
+  const restore = () => { msgEl.classList.remove("editing"); bubble.textContent = original; };
+  const save = () => { const v = ta.value.trim(); if (!v) { toast("Message can't be empty.", "info"); return; } applyEdit(index, v); };
+  $(".msg-edit-cancel", bubble).onclick = restore;
+  $(".msg-edit-save", bubble).onclick = save;
+  ta.onkeydown = e => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(); }
+    else if (e.key === "Escape") { e.preventDefault(); restore(); }
+  };
+  ta.oninput = () => autosize(ta);
+}
+async function applyEdit(index, text) {
+  if (state.busy) return;
+  const sid = state.session;
+  let r; try { r = await _postJ(`/api/chat/${encodeURIComponent(sid)}/truncate`, { keep: index }); } catch { r = null; }
+  if (!r || !r.ok) { toast((r && r.error) || "couldn't edit (server)", "err"); return; }
+  _curT.splice(index);          // drop the edited message + everything after it (client transcript)
+  renderThread();               // rebuild the thread from the truncated transcript
+  const input = $("#input"); input.value = text; autosize(input);
+  send();                       // re-run from the edit: appends a fresh user turn + a new reply
+}
+
 /* ---------- chat attachments (drag & drop · paste · 📎) ---------- */
 let _pendingAttachments = [];
 const _rawURL = p => "/api/raw?path=" + encodeURIComponent(p);
@@ -342,7 +409,8 @@ function renderMsgAttachments(el, atts) {
     if (a.kind === "image") c.onclick = () => openFileWindow(a.path);
     box.appendChild(c);
   });
-  el.appendChild(box);
+  const bar = el.querySelector(":scope > .msg-actions");   // keep attachments above the actions footer
+  if (bar) el.insertBefore(box, bar); else el.appendChild(box);
 }
 function wireAttach() {
   const btn = $("#attachBtn"), inp = $("#attachInput"); if (!btn || !inp) return;
@@ -384,10 +452,11 @@ async function send() {
   $("#send").classList.add("ping"); setTimeout(() => $("#send").classList.remove("ping"), 600);
   input.value = ""; autosize(input);
   const atts = _pendingAttachments.slice(); clearAttachments();   // capture + reset the tray
-  const ue = addUser(text); if (atts.length) renderMsgAttachments(ue, atts);
+  const uTs = _nowISO();
+  const ue = addUser(text, true, uTs, myT.length); if (atts.length) renderMsgAttachments(ue, atts);
   touchTitle(text || (atts[0] && atts[0].name) || "attachment");
   const myTitle = _curTitle;
-  myT.push({ role: "user", content: text });
+  myT.push({ role: "user", content: text, ts: uTs });
   persistChat(mySession, myT, myTitle);            // save the user turn immediately → a chat you don't return to keeps it
 
   const payload = { session: mySession, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
@@ -401,7 +470,7 @@ async function send() {
   // transcript pushes always go to myT (this chat); DOM writes are gated by renderable()
   const flushThink = () => { if (thinkText) myT.push({ role: "thinking", text: thinkText }); if (thinkCard) finalizeThink(thinkCard); thinkCard = null; thinkText = ""; };
   // close the current answer bubble so the next segment (tool/think) doesn't slot UNDER it
-  const flushBubble = () => { if (acc) { myT.push({ role: "assistant", content: acc }); if (renderable() && bubble) renderMD(bubble, acc, true); } bubble = null; acc = ""; };
+  const flushBubble = () => { if (acc) { const aTs = _nowISO(); myT.push({ role: "assistant", content: acc, ts: aTs }); if (renderable() && bubble) { renderMD(bubble, acc, true); attachMsgActions(bubble.closest(".msg"), { role: "assistant", raw: acc, ts: aTs }); } } bubble = null; acc = ""; };
 
   const myAbort = new AbortController(); _chatAborts[mySession] = myAbort;
   try {
@@ -463,7 +532,7 @@ async function send() {
     else { acc = "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + (e.message || "") + "`"; if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc); } }
   }
   if (renderable() && stats && bubble) renderMeta(bubble, stats);
-  if (acc) myT.push({ role: "assistant", content: acc, meta: stats });
+  if (acc) { const aTs = _nowISO(); myT.push({ role: "assistant", content: acc, meta: stats, ts: aTs }); if (renderable() && bubble) attachMsgActions(bubble.closest(".msg"), { role: "assistant", raw: acc, ts: aTs }); }
   persistChat(mySession, myT, myTitle);            // save the whole turn to its chat (dated folder)
   _busy.delete(mySession); _liveTurns.delete(mySession); delete _chatAborts[mySession];
   if (viewing()) { _curT = myT; refreshViewBusy(); input.focus(); }   // keep the active view's transcript authoritative
@@ -660,12 +729,12 @@ async function maybeReconnectChat() {
 // the page-reload path that re-attaches AND saves the turn. Renders only while `sid` stays the open chat.
 async function reconnectChat(sid, live, displayOnly = false) {
   if (state.busy && !displayOnly) return;
-  if (!displayOnly) { state.busy = true; setSendMode(true); addUser(live.message); appendT({ role: "user", content: live.message }); }
+  if (!displayOnly) { state.busy = true; setSendMode(true); const uTs = _nowISO(); addUser(live.message, true, uTs); appendT({ role: "user", content: live.message, ts: uTs }); }
   addSysNote("↻ reconnected to a reply that was still being generated…");
   const here = () => state.session === sid;          // user may switch away again mid-replay
   let bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null;
   const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); if (!displayOnly) appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
-  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); if (!displayOnly) appendT({ role: "assistant", content: acc }); bubble = null; acc = ""; } };
+  const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); if (!displayOnly) appendT({ role: "assistant", content: acc, ts: _nowISO() }); bubble = null; acc = ""; } };
   const apply = ev => {
     if (!here()) return;
     if (ev.type === "reasoning") { flushBubble(); if (!thinkCard) thinkCard = addThinkCard(); thinkText += ev.text; appendThink(thinkCard, ev.text); }
@@ -5779,7 +5848,10 @@ async function wfRenderRun(body, w) {
   // Reconnect to an already-running run (after a refresh) rather than starting a new one — check
   // BEFORE prompting, so we don't ask for an input we won't use.
   let liveState = null;
-  try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id); } catch {}
+  // Only reconnect to a run that's ACTUALLY still running — finished runs linger in the live
+  // registry for ~180s (workflows._LIVE_KEEP), and without the status filter a second ▶ Run within
+  // that window would re-display the old finished run instead of starting a new one.
+  try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id && x.status === "running"); } catch {}
   // A fresh run of an input-taking workflow: ask for the value first.
   let inp = "";
   if (!liveState && w.input && w.input.enabled) {
@@ -5961,7 +6033,6 @@ function wire() {
   $("#openSettings").onclick = openSettings;
   $("#toggleSidebar").onclick = () => $("#sidebar").classList.toggle("open");
   $("#liveBtn").onclick = openLiveView;
-  { const vb = $("#voiceBtn"); if (vb) vb.onclick = openVoice; }
   { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
   wireAttach();
   { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
