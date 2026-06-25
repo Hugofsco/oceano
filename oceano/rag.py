@@ -6,10 +6,12 @@ import sqlite3
 from pathlib import Path
 
 import config
-from oceano import embeddings
+from oceano import embeddings, rerank
 
 DB_PATH = config.WORKSPACE.parent / "data" / "rag.db"
 CHUNK_WORDS = 250
+RERANK_POOL = 10            # dense candidates handed to the cross-encoder reranker (eval favoured ~8-10;
+                           # a wider pool of short near-neighbours hurt). No-op if the reranker is off.
 TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".rst"}
 RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes its living docs
 
@@ -133,8 +135,20 @@ def reembed_all():
     return f"re-embedded {done}/{len(rows)} chunks"
 
 
+def _rerank_top(query, scored, k):
+    """Given dense-scored [(cosine, path, chunk)] best-first, re-order the top RERANK_POOL with the
+    cross-encoder reranker (when it's up) and return the top-k. Falls back to the dense order if the
+    reranker is unavailable. The cosine score is carried through unchanged (for display)."""
+    pool = scored[:max(k, RERANK_POOL)]
+    idx = rerank.order(query, [c for _, _, c in pool])
+    if idx is not None:
+        pool = [pool[i] for i in idx]
+    return pool[:k]
+
+
 def search_docs(query, k=4):
-    """Return the k most relevant document chunks for a question."""
+    """The k most relevant document chunks for a question — dense recall, then cross-encoder rerank
+    of the top pool (when the reranker is up; dense order otherwise). Returns the chunk text."""
     con = _db()
     rows = con.execute("SELECT path, chunk, embedding FROM chunks").fetchall()
     con.close()
@@ -148,8 +162,8 @@ def search_docs(query, k=4):
         v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
         if v:
             scored.append((embeddings.cosine(qvec, v), path, chunk))
-    scored.sort(reverse=True)
-    return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in scored[:k])
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in _rerank_top(query, scored, k))
 
 
 def wipe():
@@ -216,7 +230,7 @@ def search(query, k=6):
             scored.append((embeddings.cosine(qvec, v), path, chunk))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
-            for s, p, c in scored[:k]]
+            for s, p, c in _rerank_top(query, scored, k)]
 
 
 def prune_orphans():

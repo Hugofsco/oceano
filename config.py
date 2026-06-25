@@ -44,6 +44,9 @@ def _default_llama_dir():
 LLAMA_DIR = _default_llama_dir()
 MODELS_DIR = Path(os.environ.get("OCEANO_MODELS_DIR", LLAMA_DIR / "models"))
 EMBED_MODEL = Path(os.environ.get("OCEANO_EMBED_MODEL", MODELS_DIR / "nomic-embed-text-v1.5.Q8_0.gguf"))
+# Optional cross-encoder reranker for RAG (re-orders dense candidates). If this model isn't present,
+# the engine skips its server and RAG stays dense — so it's a no-op on installs that didn't fetch it.
+RERANK_MODEL = Path(os.environ.get("OCEANO_RERANK_MODEL", MODELS_DIR / "bge-reranker-v2-m3-Q8_0.gguf"))
 LLAMA_SERVER_BIN = os.environ.get("OCEANO_LLAMA_SERVER_BIN", str(LLAMA_DIR / "build/bin/llama-server"))
 LLAMA_SWAP_CFG = Path(os.environ.get("OCEANO_LLAMA_SWAP_CFG", LLAMA_DIR / "llama-swap.yaml"))
 # Optional Hugging Face token — only needed to list/download gated repos.

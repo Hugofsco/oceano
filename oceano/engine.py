@@ -24,11 +24,13 @@ from pathlib import Path
 
 import uvicorn
 
+import config
 from oceano import scheduler
 from oceano.web.server import app
 
 ROOT = Path(__file__).resolve().parent.parent
 EMBED_SCRIPT = ROOT / "scripts" / "serve-embeddings.sh"
+RERANK_SCRIPT = ROOT / "scripts" / "serve-rerank.sh"
 SCHED_INTERVAL = 30      # seconds between due-task checks
 
 _embed_proc = None       # the current embedding child, so the UI can restart it on demand
@@ -100,6 +102,48 @@ async def embed_supervisor(stop):
         backoff = min(backoff * 2, 30)         # back off on a crash-loop, cap at 30s
 
 
+async def rerank_supervisor(stop):
+    """Run the OPTIONAL cross-encoder reranker as a child process; restart it if it dies, and
+    terminate it cleanly when `stop` is set. Skipped entirely if the reranker model isn't present —
+    RAG then stays dense (search still works, just without the rerank stage)."""
+    if os.environ.get("OCEANO_RERANK_MANAGED", "1") != "1":
+        log("[rerank] unmanaged (OCEANO_RERANK_MANAGED=0) — assuming it runs elsewhere")
+        return
+    if not config.RERANK_MODEL.exists():
+        log(f"[rerank] no reranker model at {config.RERANK_MODEL} — RAG reranking off (dense only)")
+        return
+    if not RERANK_SCRIPT.exists():
+        log(f"[rerank] launcher missing: {RERANK_SCRIPT} — not starting reranker")
+        return
+
+    backoff = 2
+    while not stop.is_set():
+        proc = await asyncio.create_subprocess_exec("bash", str(RERANK_SCRIPT))
+        log(f"[rerank] reranker server up (pid {proc.pid})")
+
+        waiter = asyncio.ensure_future(proc.wait())
+        stopper = asyncio.ensure_future(stop.wait())
+        await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+
+        if stop.is_set():
+            if proc.returncode is None:            # shutting down → take the child with us
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            for f in (waiter, stopper):
+                f.cancel()
+            log("[rerank] reranker server stopped")
+            return
+
+        stopper.cancel()                           # child died on its own → restart it
+        log(f"[rerank] exited (rc={proc.returncode}); restarting in {backoff}s")
+        await _sleep_or_stop(stop, backoff)
+        backoff = min(backoff * 2, 30)
+
+
 async def calendar_loop(stop):
     """Refresh calendar feeds that are due for a sync (calsync decides which)."""
     from oceano import calsync
@@ -157,6 +201,7 @@ async def run():
         loop.add_signal_handler(sig, request_stop)
 
     bg = [asyncio.create_task(embed_supervisor(stop), name="embed"),
+          asyncio.create_task(rerank_supervisor(stop), name="rerank"),
           asyncio.create_task(scheduler_loop(stop), name="scheduler"),
           asyncio.create_task(calendar_loop(stop), name="calendar")]
 

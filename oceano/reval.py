@@ -14,10 +14,15 @@ Two case sets, scored against ONE shared corpus (all docs are mutual distractors
                appears in the target, with same-topic distractors → tests *exact match* (BM25's home turf).
 A good hybrid should win KEYWORD clearly and not regress PARAPHRASE — i.e. be best overall.
 """
+import json
+import os
 import re
 import sqlite3
+import urllib.request
 
 from oceano import embeddings
+
+RERANK_URL = os.environ.get("OCEANO_RERANK_URL", "http://127.0.0.1:8084")
 
 
 def _fts_match(query):
@@ -142,6 +147,45 @@ def hybrid(pool=50):
     return build
 
 
+def _rerank_scores(query, docs, url=None):
+    """Cross-encoder relevance scores for each doc vs query, via a llama.cpp --reranking server
+    (/rerank). Returns a list aligned with `docs` (higher = more relevant), or None if unreachable."""
+    url = (url or RERANK_URL).rstrip("/")
+    body = json.dumps({"query": query, "documents": list(docs)}).encode()
+    req = urllib.request.Request(url + "/rerank", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return None
+    scores = [float("-inf")] * len(docs)
+    for item in data.get("results", []):
+        scores[item["index"]] = item.get("relevance_score", item.get("score", 0.0))
+    return scores
+
+
+def rerank(top_n=10):
+    """dense → take the top_n candidates → reorder them by cross-encoder relevance. Falls back to the
+    plain dense order if the rerank server is down. The dense tail (beyond top_n) is appended so
+    recall@k for k>top_n is unaffected."""
+    dbuild = dense()
+    def build(corpus):
+        drank = dbuild(corpus)
+        def rank(q):
+            full = drank(q)
+            cand = full[:top_n]
+            if not cand:
+                return full
+            scores = _rerank_scores(q, [corpus[i] for i in cand])
+            if scores is None:
+                return full
+            order = sorted(range(len(cand)), key=lambda j: scores[j], reverse=True)
+            seen = set(cand)
+            return [cand[j] for j in order] + [i for i in full if i not in seen]
+        return rank
+    return build
+
+
 def _score(rank, cases, which, ks=(1, 3, 5)):
     ranks = []
     for i in which:
@@ -170,5 +214,24 @@ def compare():
             print(f"{st:<9}{m['r@1']:>8.3f}{m['r@3']:>8.3f}{m['r@5']:>8.3f}{m['mrr']:>8.3f}")
 
 
+def compare_rerank(top_n=10):
+    """dense vs dense→cross-encoder rerank, on one shared corpus, per query-type and overall.
+    Needs a llama.cpp --reranking server at RERANK_URL (default :8084)."""
+    cases = PARAPHRASE + KEYWORD
+    corpus = [d for _, d in cases]
+    npar = len(PARAPHRASE)
+    subsets = {"paraphrase": list(range(npar)),
+               "keyword": list(range(npar, len(cases))),
+               "ALL": list(range(len(cases)))}
+    built = {"dense": dense()(corpus), f"rerank(top{top_n})": rerank(top_n)(corpus)}
+    for sname, which in subsets.items():
+        print(f"\n== {sname} (n={len(which)}, corpus={len(corpus)}) ==")
+        print(f"{'strategy':<16}{'r@1':>8}{'r@3':>8}{'r@5':>8}{'MRR':>8}")
+        for st, rk in built.items():
+            m = _score(rk, cases, which)
+            print(f"{st:<16}{m['r@1']:>8.3f}{m['r@3']:>8.3f}{m['r@5']:>8.3f}{m['mrr']:>8.3f}")
+
+
 if __name__ == "__main__":
-    compare()
+    import sys
+    compare_rerank() if "--rerank" in sys.argv else compare()
