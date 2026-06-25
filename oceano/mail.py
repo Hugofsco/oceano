@@ -854,25 +854,35 @@ def imap_list(a, folder="INBOX", query=None, limit=20, offset=0, unread_only=Fal
         _imap_close(conn)
 
 
-def imap_read(a, uid, folder="INBOX"):
-    """Fetch one message's headers + plain-text body WITHOUT marking it read (BODY.PEEK)."""
+def imap_read(a, uid, folder="INBOX", mark_seen=False):
+    """Fetch one message's headers + plain-text body. Read-only (BODY.PEEK) by default; pass
+    mark_seen=True to also set the \\Seen flag, so opening a message in the web reader marks it read
+    like a normal mail client. The agent's mail_read leaves it untouched (mark_seen=False), keeping
+    reads side-effect-free for the injection-taint model."""
     try:
         conn = _imap(a)
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     try:
-        typ, _ = conn.select(_q(folder), readonly=True)
+        typ, _ = conn.select(_q(folder), readonly=not mark_seen)   # writable only when we'll set \Seen
         if typ != "OK":
             return {"ok": False, "error": f"no such folder {folder!r}"}
         typ, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
         if typ != "OK" or not data or not isinstance(data[0], tuple):
             return {"ok": False, "error": f"message uid {uid} not found in {folder}"}
         msg = email.message_from_bytes(data[0][1])
-        return {"ok": True, "uid": str(uid), "folder": folder,
-                "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
-                "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
-                "attachments": list_attachments(msg),
-                "body": _extract_text(msg), "html": _extract_html(msg)}
+        out = {"ok": True, "uid": str(uid), "folder": folder,
+               "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
+               "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
+               "attachments": list_attachments(msg),
+               "body": _extract_text(msg), "html": _extract_html(msg)}
+        if mark_seen:
+            try:
+                conn.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")  # mark read; harmless if already \Seen
+                out["seen"] = True
+            except Exception:
+                pass                                               # best-effort — never fail a read over this
+        return out
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:

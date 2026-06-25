@@ -4573,7 +4573,10 @@ async function mailViewMessage(body, uid, meta) {
   const att = (r.attachments && r.attachments.length) ? `<div class="mv-atts">` + r.attachments.map(x =>
     `<span class="att-chip" data-i="${x.index}" data-name="${escapeHtml(x.filename)}" tabindex="0" title="double-click to open · right-click for options (VirusTotal, save…)">📎 ${escapeHtml(x.filename)} <span class="att-sz">${fmtSize(x.size)}</span></span>`).join("") + `</div>` : "";
   const canWrite = acc.policy !== "readonly";
-  const seen = meta ? meta.seen : true;
+  // opening marks the message read server-side (non-readonly accounts) — reflect it in the toolbar
+  // ("Mark unread") and refresh the folder unread badges immediately
+  if (meta && r.seen && meta.seen === false) { meta.seen = true; mailLoadUnreads(body); }
+  const seen = (r.seen !== undefined) ? r.seen : (meta ? meta.seen : true);
   const hasHtml = !!(r.html && r.html.trim());
   if (body._mvMode === undefined) body._mvMode = "html";       // default to rich HTML (clickable links)
   box.innerHTML = `

@@ -2745,7 +2745,10 @@ async def mail_get_message(aid: int, uid: str, folder: str = "INBOX"):
     a = mail._raw(aid)
     if not a:
         return {"ok": False, "error": "no such account"}
-    return await asyncio.to_thread(mail.imap_read, a, uid, folder)
+    # Opening a message in the reader marks it read (like a normal client) — but only on accounts
+    # that allow in-mailbox organizing; a 'readonly' account is left untouched.
+    mark = mail.check_policy(a, "organize") is None
+    return await asyncio.to_thread(mail.imap_read, a, uid, folder, mark)
 
 
 # content types we'll serve INLINE (for double-click "open"): a browser renders these in its own
