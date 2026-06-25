@@ -132,7 +132,7 @@ def relevant(query, k=6):
     pubs = _published()
     if len(pubs) <= k:
         return "\n".join(f"- {s['name']}: {s['description']}" for s in pubs)
-    qv = embeddings.embed(query)
+    qv = embeddings.embed(query, "query")
     if not qv:
         return catalog()
     scored = []

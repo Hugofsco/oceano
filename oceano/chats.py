@@ -272,16 +272,17 @@ def _chat_text(rec):
     return "\n".join(p for p in ([title] + users + others) if p)
 
 
-def reindex():
-    """Embed conversations whose content changed since last index; prune deleted ones.
-    Returns how many were (re)embedded. No-op cost when nothing changed."""
+def reindex(force=False):
+    """Embed conversations whose content changed since last index; prune deleted ones. Returns how
+    many were (re)embedded. No-op cost when nothing changed — unless force=True re-embeds EVERY
+    conversation (used after an embedding model/convention change)."""
     con = _vdb()
     have = {r[0]: r[1] for r in con.execute("SELECT id, updated FROM chatvec").fetchall()}
     done, seen = 0, set()
     for meta in list_all():                              # newest first; {id, title, date, updated, count}
         sid = meta["id"]
         seen.add(sid)
-        if have.get(sid) == meta["updated"]:
+        if not force and have.get(sid) == meta["updated"]:
             continue                                     # unchanged since last index
         rec = get(sid)
         if not rec:
@@ -312,7 +313,7 @@ def search(query, k=8):
     con.close()
     if not rows:
         return []
-    qv = embeddings.embed(query)
+    qv = embeddings.embed(query, "query")
     scored = []
     if qv:
         for sid, title, date, snip, emb in rows:

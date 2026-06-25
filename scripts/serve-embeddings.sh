@@ -30,8 +30,11 @@ fi
 # relocated build (its RUNPATH is baked at build time) still resolves them.
 export LD_LIBRARY_PATH="$(dirname "$LLAMA_BIN")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# -b/-ub 2048: a pooled embedding needs the WHOLE input in one (u)batch, so the default 512 silently
+# fails on long memories/docs. 2048 = nomic's native context — covers any single memory or chunk.
 exec "$LLAMA_BIN" \
   -m "$MODEL" \
   --embedding --pooling mean \
   -ngl 0 -c 8192 \
+  -b 2048 -ub 2048 \
   --host 127.0.0.1 --port 8082

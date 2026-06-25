@@ -116,6 +116,23 @@ def index_docs(folder, only=None):
     return f"indexed {n_chunks} chunks from {n_files} changed file(s); {skipped} unchanged"
 
 
+def reembed_all():
+    """Re-embed every stored chunk IN PLACE (the chunk text is unchanged) — for after an embedding
+    model or convention change, so the document vectors match new queries again. Returns a summary."""
+    con = _db()
+    rows = con.execute("SELECT id, chunk FROM chunks").fetchall()
+    done = 0
+    for cid, chunk in rows:
+        vec = embeddings.embed(chunk)                    # 'document' by default
+        if not vec:
+            con.commit(); con.close()
+            return f"re-embedded {done}/{len(rows)} chunks (embed server went down — rerun to finish)"
+        con.execute("UPDATE chunks SET embedding=? WHERE id=?", (json.dumps(vec), cid))
+        done += 1
+    con.commit(); con.close()
+    return f"re-embedded {done}/{len(rows)} chunks"
+
+
 def search_docs(query, k=4):
     """Return the k most relevant document chunks for a question."""
     con = _db()
@@ -123,7 +140,7 @@ def search_docs(query, k=4):
     con.close()
     if not rows:
         return "(no documents indexed yet — run index_docs first)"
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return "ERROR: embed server down"
     scored = []
@@ -158,7 +175,7 @@ def research_context(query, k=3, threshold=0.55):
     con.close()
     if not rows:
         return []
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return []
     scored = []
@@ -189,7 +206,7 @@ def search(query, k=6):
     con.close()
     if not rows:
         return []
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return []
     scored = []

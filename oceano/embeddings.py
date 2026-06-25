@@ -12,10 +12,18 @@ EMBED_MODEL = os.environ.get("OCEANO_EMBED_MODEL", "nomic-embed-text")
 _client = OpenAI(base_url=EMBED_URL, api_key="sk-no-key-needed")
 
 
-def embed(text):
-    """text -> embedding vector, or None if the embed server is down."""
+# nomic-embed-text-v1.5 is trained with task-instruction prefixes; matching them on the two sides is
+# what makes query↔document retrieval work (measured in oceano/reval.py). 'document' for anything we
+# STORE/index, 'query' for a SEARCH query. Both stores and queries MUST use the same convention, so a
+# convention change means re-embedding the stores — see reindex.rebuild_embeddings().
+_PREFIX = {"query": "search_query: ", "document": "search_document: "}
+
+
+def embed(text, kind="document"):
+    """text -> embedding vector, or None if the embed server is down. `kind` is 'document' (stored/
+    indexed content, the default) or 'query' (a search query) — it selects the nomic prefix above."""
     try:
-        r = _client.embeddings.create(model=EMBED_MODEL, input=text)
+        r = _client.embeddings.create(model=EMBED_MODEL, input=_PREFIX.get(kind, _PREFIX["document"]) + text)
         return r.data[0].embedding
     except Exception:
         return None
