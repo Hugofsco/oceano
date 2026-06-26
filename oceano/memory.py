@@ -32,6 +32,11 @@ _cosine = embeddings.cosine
 #   relevant = inject only when semantically related to the prompt (default)
 #   off      = never inject
 # Pinned memories are ALWAYS injected, whatever their category's policy says.
+# 'identity' is the agent's OWN sense of self — who I am, my continuity, my
+# responsibilities, and the core facts about my user and our relationship. It is written
+# in the FIRST PERSON ("I…" / "my user…"), injected every turn, and read by the agent as
+# itself — so a fact about the human is phrased "my user" / "Hugo", never a bare "User
+# does X" (which the agent would misread as something IT does).
 # 'knowledge' is the agent's OWN learned facts (not about the user) — e.g. things it
 # worked out from research or reading. These usually carry a `source` (the URL/file they
 # came from) so the agent can reopen it to dig deeper. Injected 'relevant' so they surface
@@ -396,6 +401,11 @@ YOUR JOB: keep the store clean, non-redundant, and accurate. Look for:
 
 'knowledge' = facts the agent learned for itself (from research/reading), not facts about the user;
 they often cite a source — keep distinct knowledge entries even if their topics are related.
+
+'identity' is the agent's OWN sense of self, written in the FIRST PERSON ("I…"). An identity
+memory may mention the human, but always as "my user" / "Hugo" — rewrite any bare "User does X"
+in an identity memory into that voice (e.g. "User is Hugo" -> "My user is Hugo"), since the agent
+reads its identity block as itself and would otherwise take "User does X" to mean it does X.
 
 RULES:
 - NEVER delete a memory marked 📌 pinned — the user chose to keep it. You MAY rewrite a pinned one for clarity.

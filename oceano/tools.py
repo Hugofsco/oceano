@@ -479,8 +479,11 @@ def python_exec(code):
         "name": "remember",
         "description": "Save a durable fact, preference, or note to long-term memory "
                        "so you recall it in future conversations. Pick the category that "
-                       "fits best: identity (who the user is), preference (what they like/"
-                       "want/prefer), project (ongoing work or goals), task (something to "
+                       "fits best: identity (who I am — my own sense of self, continuity, "
+                       "responsibilities, and the core facts about my user and our "
+                       "relationship; write it in the FIRST PERSON, \"I…\" / \"my user…\", "
+                       "never a bare \"User does X\"), preference (what my user likes/wants/"
+                       "prefers), project (their ongoing work or goals), task (something to "
                        "do), knowledge (a durable, checkable fact YOU learned — from "
                        "research, a page you read, or working through a problem — worth "
                        "reusing later), fact (anything else durable). For a 'knowledge' "

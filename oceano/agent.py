@@ -42,8 +42,8 @@ def _relevant_memories(user_message, k=5):
             src = (h.get("source") or "").strip()
             return (f"- {h['text']}" + (f"  [{tag}]" if tag else "")
                     + (f"  ↪ {src}" if src else "") + ("  📌" if h.get("pinned") else ""))
-        return ("WHAT YOU KNOW (facts about the user, and things you've learned — use if "
-                "helpful, ignore if not). A `↪ source` is a pointer you can reopen with "
+        return ("WHAT YOU KNOW (about yourself, your user Hugo, and things you've learned "
+                "— use if helpful, ignore if not). A `↪ source` is a pointer you can reopen with "
                 "fetch_url / read_file to dig deeper:\n"
                 + "\n".join(label(h) for h in hits))
     except Exception:
@@ -127,6 +127,8 @@ _LEARN_SYSTEM = (
     "From the USER'S MESSAGE below, extract durable facts the user reveals ABOUT THEMSELVES "
     "— their identity, preferences, situation, ongoing projects, goals, or decisions — "
     "stated in the first person (\"I…\", \"my…\", \"we…\", \"remember that I…\").\n"
+    "You are Oceano, writing these into your OWN memory, so phrase every fact FROM YOUR "
+    "PERSPECTIVE: refer to the human as \"my user\" or \"Hugo\", never a bare \"User does X\".\n"
     "STRICT RULES:\n"
     "- Save a fact ONLY if it is about the user themselves.\n"
     "- NEVER save facts about other people, companies, social handles, or any subject the "
@@ -134,11 +136,12 @@ _LEARN_SYSTEM = (
     "request ABOUT someone/something (e.g. \"who is X?\", \"research Y\", \"summarize Z\"), that "
     "subject is NOT the user — output [].\n"
     "- A message with no first-person self-disclosure → output [].\n"
-    "Output ONLY a JSON array of objects, each {\"text\": short third-person fact, "
-    "\"category\": one of \"identity\" (who the user is), \"preference\" (what they like/want/"
-    "prefer), \"project\" (ongoing work or goals), \"task\" (something to do), \"fact\" (anything "
-    "else durable)}. Example: [{\"text\": \"User is vegetarian\", \"category\": \"preference\"}, "
-    "{\"text\": \"User is building a trading bot in Rust\", \"category\": \"project\"}]. Nothing else.")
+    "Output ONLY a JSON array of objects, each {\"text\": short fact in YOUR voice (\"My user…\" "
+    "/ \"Hugo…\"), \"category\": one of \"identity\" (the core of who my user is and our "
+    "relationship), \"preference\" (what my user likes/wants/prefers), \"project\" (their "
+    "ongoing work or goals), \"task\" (something to do), \"fact\" (anything else durable)}. "
+    "Example: [{\"text\": \"My user is vegetarian\", \"category\": \"preference\"}, "
+    "{\"text\": \"Hugo is building a trading bot in Rust\", \"category\": \"project\"}]. Nothing else.")
 
 
 def _parse_facts(text):
@@ -219,6 +222,9 @@ if a search isn't enough, open a result with fetch_url or refine the query.
 MEMORY: you have long-term memory across conversations; relevant memories are shown
 to you automatically. When the user shares a durable fact about themselves (a
 preference, who they are, an ongoing project, a decision), save it with remember().
+Memory is YOUR record, so write it in your own voice: file your own sense of self under
+`identity` in the first person ("I…"), and speak of the human as "my user" / "Hugo" —
+never a bare "User does X", which you'd later read back as something YOU do.
 If something you know becomes wrong or out of date, fix it with update_memory or drop
 it with forget_memory. (Routine facts are also captured automatically in the background.)
 
