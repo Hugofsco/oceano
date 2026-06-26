@@ -700,9 +700,10 @@ class Agent:
             if bg:
                 mindbridge.begin_background_turn()
             try:
+                from oceano import delegate
                 holder["res"] = codex_mind.run_stream(
                     prompt, session_key=self.mind_session_key or "", cwd=config.WORKSPACE,
-                    cancel=cancel, on_event=on_ev)
+                    cancel=cancel, on_event=on_ev, model=delegate.get_codex_model())
             except Exception as e:
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:

@@ -965,6 +965,21 @@ async def claude_model_set(req: Request):
     return {"ok": True, "model": delegate.set_claude_model(model)}
 
 
+@app.get("/api/codex-model")
+def codex_model_get():
+    """Which Codex model the CLI uses for the resident Codex mind. '' = CLI default."""
+    from oceano import delegate
+    return {"model": delegate.get_codex_model(), "options": list(delegate.CODEX_MODELS),
+            "available": delegate.codex_available()}
+
+
+@app.post("/api/codex-model")
+async def codex_model_set(req: Request):
+    from oceano import delegate
+    model = (await req.json()).get("model", "")
+    return {"ok": True, "model": delegate.set_codex_model(model)}
+
+
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
 #     (mindbridge.token()), localhost; exempt from the session middleware above. The token rides in a
 #     header (never the URL/body, so it can't leak into access logs) and is compared constant-time. ---

@@ -48,8 +48,9 @@ _BASE_KEY = "oceano_default_base_url"      # its endpoint (empty = the default l
 _KEY_KEY = "oceano_default_api_key"        # api key for that endpoint (empty = config default)
 _ENABLED_KEY = "delegation_enabled"        # master on/off for delegation (run + delegate tool)
 _CLAUDE_MODEL_KEY = "claude_model"         # which Claude model the CLI uses (alias/id); "" = CLI default
+_CODEX_MODEL_KEY = "codex_model"           # which Codex model the CLI uses (alias/id); "" = CLI default
 _RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key",
-             "delegation_enabled", "claude_model")
+             "delegation_enabled", "claude_model", "codex_model")
 # Claude models the user can pick for the CLI (mind + delegation). Aliases track the latest of each
 # tier, so they stay valid across releases; "" means don't pass --model (use the CLI's own default).
 CLAUDE_MODELS = (
@@ -57,6 +58,12 @@ CLAUDE_MODELS = (
     {"id": "sonnet", "label": "Sonnet — balanced, recommended for the agent"},
     {"id": "opus", "label": "Opus — most capable, slower/costlier"},
     {"id": "haiku", "label": "Haiku — fastest, lightest"},
+)
+CODEX_MODELS = (
+    {"id": "", "label": "Default (Codex's recommended default)"},
+    {"id": "gpt-5.5", "label": "GPT-5.5 — strongest for complex coding and research"},
+    {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini — faster and lower cost"},
+    {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark — near-instant coding iteration (preview)"},
 )
 # 'default' = the agent's delegate tool · 'improve' = self-improving jobs · 'vision' = image
 # recognition (the local chat model is text-only, so images are routed to this target).
@@ -163,6 +170,22 @@ def set_claude_model(model):
     except OSError:
         pass
     return get_claude_model()
+
+
+def get_codex_model():
+    """The Codex model id the CLI should use for the resident Codex mind. '' = CLI default."""
+    return (_raw().get(_CODEX_MODEL_KEY) or "").strip()
+
+
+def set_codex_model(model):
+    """Persist which model the Codex CLI runs for the resident mind. '' clears it."""
+    d = _raw()
+    d[_CODEX_MODEL_KEY] = (model or "").strip()
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_codex_model()
 
 
 def _claude_model_args():

@@ -1356,6 +1356,11 @@ const SETTINGS_PAGES = {
         <select id="claudeModelSel"></select>
         <div class="dg-hint">Sonnet is usually the sweet spot for the agent — fast and capable. Switch to Opus for the hardest reasoning. Aliases always track the latest of each tier.</div>
       </div>
+      <div class="dg-claude-model" id="codexModelRow" style="display:none">
+        <label class="field-label">Codex model <span class="lbl-sub">used by the resident Codex mind</span></label>
+        <select id="codexModelSel"></select>
+        <div class="dg-hint">OpenAI's current Codex docs recommend GPT-5.5 for most work and GPT-5.4 mini when you want a faster, cheaper option.</div>
+      </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
     <div class="drawer-section">
@@ -1505,7 +1510,7 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
 async function loadClaudeModel() {
   const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
   let d; try { d = await api("/api/claude-model"); } catch { return; }
@@ -1516,6 +1521,18 @@ async function loadClaudeModel() {
     try { const r = await _postJ("/api/claude-model", { model: sel.value });
       toast("Claude model → " + (r.model || "default"), "info"); }
     catch { toast("couldn't set the Claude model", "err"); }
+  };
+}
+async function loadCodexModel() {
+  const row = $("#codexModelRow"), sel = $("#codexModelSel"); if (!row || !sel) return;
+  let d; try { d = await api("/api/codex-model"); } catch { return; }
+  row.style.display = d.available ? "" : "none";
+  if (!d.available) return;
+  sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+  sel.onchange = async () => {
+    try { const r = await _postJ("/api/codex-model", { model: sel.value });
+      toast("Codex model → " + (r.model || "default"), "info"); }
+    catch { toast("couldn't set the Codex model", "err"); }
   };
 }
 async function loadMind() {
