@@ -84,7 +84,7 @@ def _load_all():
     for role in ROLES:
         c = d.get(role) or {}
         prov = c.get("provider") or ("claude_cli" if role == "default" else "inherit")
-        valid = ("claude_cli", "api") + (("inherit",) if role != "default" else ())
+        valid = ("claude_cli", "codex_cli", "api") + (("inherit",) if role != "default" else ())
         out[role] = {"provider": prov if prov in valid else ("claude_cli" if role == "default" else "inherit"),
                      "base_url": c.get("base_url", "") or "", "model": c.get("model", "") or ""}
     return out
@@ -108,7 +108,7 @@ def set_config(d, role="default"):
     allcfg = _load_all()
     cur = allcfg.get(role, {})
     prov = d.get("provider", cur.get("provider"))
-    valid = ("claude_cli", "api") + (("inherit",) if role != "default" else ())
+    valid = ("claude_cli", "codex_cli", "api") + (("inherit",) if role != "default" else ())
     allcfg[role] = {"provider": prov if prov in valid else ("claude_cli" if role == "default" else "inherit"),
                     "base_url": (d.get("base_url", cur.get("base_url", "")) or "").strip(),
                     "model": (d.get("model", cur.get("model", "")) or "").strip()}
@@ -191,6 +191,14 @@ def set_codex_model(model):
 def _claude_model_args():
     """`--model <m>` for the claude CLI when the user pinned one, else [] (CLI default)."""
     m = get_claude_model()
+    return ["--model", m] if m else []
+
+
+def _codex_model_args():
+    """`--model <m>` for the codex CLI when the user pinned one, else [] (CLI default).
+    Codex delegation reuses the same global model pin as the Codex mind, just as Claude
+    delegation reuses the global Claude model pin."""
+    m = get_codex_model()
     return ["--model", m] if m else []
 
 
@@ -506,6 +514,73 @@ def claude_version():
         return None
 
 
+# --- Codex CLI provider (delegate + vision) --------------------------------
+def _codex_sandbox(tools_spec):
+    """Map a Claude-CLI --allowedTools spec onto a Codex sandbox mode — Codex's containment
+    is the sandbox, not a per-tool allowlist. Anything that writes (Write/Edit) or runs shell
+    (Bash) needs workspace-write; a pure-read task (or none) stays read-only."""
+    spec = tools_spec or ""
+    if any(t in spec for t in ("Write", "Edit", "Bash")):
+        return "workspace-write"
+    return "read-only"
+
+
+def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=None):
+    """Run one headless Codex task as a CONTAINED worker, mirroring to_claude. `--ignore-user-config`
+    means it loads only the user's auth from our CODEX_HOME, NOT the resident mind's MCP-bridge config
+    — so a delegate gets Codex's own file/shell tools (confined by the sandbox mapped from `tools`),
+    never Oceano's body (memory/mail/ssh). `images` attaches files to the prompt for vision (-i).
+    Returns {ok, output, error}."""
+    import tempfile
+    from oceano import codex_mind
+    binary = find_codex()
+    if not binary:
+        return {"ok": False, "output": "",
+                "error": "codex CLI not found — install Codex, or set OCEANO_CODEX_BIN"}
+    ok, err = codex_mind.ensure_auth()
+    if not ok:
+        return {"ok": False, "output": "", "error": err}
+    sandbox = _codex_sandbox(tools)
+    fd, out_path = tempfile.mkstemp(prefix="codex-deleg-", suffix=".txt")
+    os.close(fd)
+    cmd = [binary, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",
+           "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{sandbox}"',
+           "-o", out_path] + _codex_model_args()
+    for img in (images or []):
+        cmd += ["-i", str(img)]
+    if cwd:
+        cmd += ["--cd", str(cwd)]
+    # Pass the prompt on stdin, NOT as a positional: `-i <FILE>...` is greedy and would otherwise
+    # swallow a trailing prompt argument. Codex reads instructions from stdin when none is given.
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(codex_mind.HOME)
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE), env=env, input=instructions,
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _unlink_quiet(out_path)
+        return {"ok": False, "output": "", "error": f"codex timed out after {timeout}s"}
+    except OSError as e:
+        _unlink_quiet(out_path)
+        return {"ok": False, "output": "", "error": f"could not launch codex: {e}"}
+    try:
+        out = Path(out_path).read_text().strip()        # the agent's final message (-o)
+    except OSError:
+        out = ""
+    _unlink_quiet(out_path)
+    if not out and r.returncode != 0:
+        return {"ok": False, "output": "",
+                "error": (r.stderr or f"codex exited {r.returncode}").strip()[:400]}
+    return {"ok": bool(out), "output": out, "error": "" if out else "codex returned no output"}
+
+
+def _unlink_quiet(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
 # --- cloud API provider ----------------------------------------------------
 # How a Claude-CLI --allowedTools spec maps onto OUR tool names, so the api provider
 # honours the same containment callers ask of the CLI. Grep has no local tool —
@@ -609,9 +684,12 @@ def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=None, max_turns=Non
     `timeout` is the absolute cap (None → the generous default); idle is handled internally."""
     if not enabled():
         return {"ok": False, "output": "", "error": "Delegation is turned off (Settings → Delegation)."}
-    if resolve(role)["provider"] == "api":
+    prov = resolve(role)["provider"]
+    if prov == "api":
         return to_api(instructions, cwd=cwd, role=role, tools=tools,
                       timeout=timeout or _DELEGATE_MAX, on_progress=on_progress)
+    if prov == "codex_cli":                       # contained Codex worker (no live progress yet → blocking)
+        return to_codex(instructions, cwd=cwd, tools=tools, timeout=timeout or _DELEGATE_MAX)
     return to_claude_stream(instructions, cwd=cwd, tools=tools, max_total=timeout,
                             max_turns=max_turns, on_progress=on_progress)
 
@@ -655,6 +733,12 @@ def describe_image(image_path, question="", role="vision"):
     q = (f"{q}\n\nDescribe only what is actually visible, concisely and factually.")
     if cfg["provider"] == "api":
         return _vision_api(image_path, q, cfg)
+    if cfg["provider"] == "codex_cli":
+        if not find_codex():
+            return {"ok": False, "output": "",
+                    "error": "codex CLI not found — install Codex or configure a cloud vision model in Settings → Delegation"}
+        # Codex is multimodal: attach the image to the prompt directly (-i), no file-reading turns.
+        return to_codex(q, cwd=config.WORKSPACE, tools="Read", timeout=300, images=[image_path])
     if not find_claude():
         return {"ok": False, "output": "",
                 "error": "claude CLI not found — install Claude Code or configure a cloud vision model in Settings → Delegation"}
@@ -666,20 +750,28 @@ def describe_image(image_path, question="", role="vision"):
 
 # --- readiness (Settings → Delegation) -------------------------------------
 def status_all():
-    """Claude Code readiness (shared) plus per-role provider + readiness, for the UI.
+    """Claude Code + Codex readiness (shared) plus per-role provider + readiness, for the UI.
     Auth is only proven by probe(role)."""
     binary = find_claude()
+    cbin = find_codex()
     claude = {"installed": bool(binary), "path": binary or "",
               "version": claude_version() if binary else None}
+    codex = {"installed": bool(cbin), "path": cbin or "",
+             "version": codex_version() if cbin else None}
 
     def role_status(role):
         raw, eff = get_config(role), resolve(role)
         inherits = role != "default" and raw["provider"] == "inherit"
-        ready = bool(eff["base_url"] and eff["model"]) if eff["provider"] == "api" else bool(binary)
+        if eff["provider"] == "api":
+            ready = bool(eff["base_url"] and eff["model"])
+        elif eff["provider"] == "codex_cli":
+            ready = bool(cbin)
+        else:                                          # claude_cli
+            ready = bool(binary)
         return {"provider": raw["provider"], "base_url": raw["base_url"], "model": raw["model"],
                 "effective_provider": eff["provider"], "inherits": inherits, "ready": ready}
 
-    return {"claude": claude, "default": role_status("default"),
+    return {"claude": claude, "codex": codex, "default": role_status("default"),
             "improve": role_status("improve"), "vision": role_status("vision")}
 
 
@@ -690,6 +782,16 @@ def probe(role="default"):
     if cfg["provider"] == "api":
         r = _api_ping(role)
         return {"ok": r["ok"], "provider": "api", "detail": r["detail"]}
+    if cfg["provider"] == "codex_cli":
+        if not find_codex():
+            return {"ok": False, "provider": "codex_cli",
+                    "detail": "codex CLI not found — install Codex, or set OCEANO_CODEX_BIN to its path, "
+                              "then restart Oceano."}
+        r = to_codex("Reply with the single word: READY", tools="", timeout=60)
+        if r["ok"] and "ready" in (r["output"] or "").lower():
+            return {"ok": True, "provider": "codex_cli", "detail": codex_version() or "authenticated"}
+        return {"ok": False, "provider": "codex_cli",
+                "detail": (r["error"] or r["output"] or "not authenticated").strip()[:300]}
     if not find_claude():
         return {"ok": False, "provider": "claude_cli",
                 "detail": "claude CLI not found — install Claude Code (npm i -g @anthropic-ai/claude-code), "

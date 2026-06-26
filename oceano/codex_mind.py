@@ -81,6 +81,25 @@ def ensure_home():
     return {"ok": True, "home": str(_HOME)}
 
 
+# The CODEX_HOME our headless callers point at. The mind uses ensure_home() (auth + the MCP-bridge
+# config.toml); contained delegates use ensure_auth() + `codex exec --ignore-user-config`, so they
+# get the auth from here but NOT the mind's body tools.
+HOME = _HOME
+
+
+def ensure_auth():
+    """Sync the user's Codex auth into our CODEX_HOME and return (ok, error). For headless callers
+    (delegate/vision) that run with --ignore-user-config: they need the auth but not the mind's
+    MCP config, so they skip _write_config()."""
+    ok, err = _sync_auth()
+    if ok:
+        try:
+            _HOME.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return False, f"could not prepare Codex home: {e}"
+    return ok, err
+
+
 def _agent_text(item):
     if not isinstance(item, dict):
         return ""

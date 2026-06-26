@@ -1384,6 +1384,7 @@ const SETTINGS_PAGES = {
         <div class="dg-h">General <span class="lbl-sub">— the agent's “delegate” tool</span></div>
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-default" value="claude_cli"><span><b>Claude Code</b><i>CLI agent · your subscription (no API key)</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-default" value="codex_cli"><span><b>Codex</b><i>CLI agent · your Codex auth (no API key)</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-default" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-default" style="display:none"></select>
@@ -1395,6 +1396,7 @@ const SETTINGS_PAGES = {
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-improve" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-improve" value="claude_cli"><span><b>Claude Code</b></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-improve" value="codex_cli"><span><b>Codex</b></span></label>
           <label class="dg-prov"><input type="radio" name="dg-improve" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-improve" style="display:none"></select>
@@ -1406,6 +1408,7 @@ const SETTINGS_PAGES = {
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-vision" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-vision" value="claude_cli"><span><b>Claude Code</b><i>reads the image file directly</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-vision" value="codex_cli"><span><b>Codex</b><i>multimodal · sees the image directly</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-vision" value="api"><span><b>Cloud model</b><i>a vision-capable endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-vision" style="display:none"></select>
@@ -1828,10 +1831,14 @@ function dgSyncRole(role) {                                    // show the model
 }
 function dgRenderStatus(d) {
   const box = $("#dgStatus"); if (!box) return;
-  const c = d.claude || {};
-  box.innerHTML = (c.installed
+  const c = d.claude || {}, x = d.codex || {};
+  const claudeLine = c.installed
     ? `<div class="dg-line ok">✓ Claude Code installed · <code>${escapeHtml(c.version || "")}</code></div>`
-    : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`)
+    : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`;
+  const codexLine = x.installed
+    ? `<div class="dg-line ok">✓ Codex installed · <code>${escapeHtml(x.version || "")}</code></div>`
+    : `<div class="dg-line err">✗ Codex not found</div><div class="dg-hint">Install Codex (or set <code>OCEANO_CODEX_BIN</code>) and run <code>codex login</code>, then restart Oceano.</div>`;
+  box.innerHTML = claudeLine + codexLine
     + `<div class="dg-hint">Authentication is confirmed only when you press <b>Test / Re-check</b> in a section below.</div>`;
 }
 const DG_LABELS = { improve: "self-improvement", vision: "image-recognition" };
@@ -1864,11 +1871,15 @@ async function testDelegation(role) {
   if (!box) return;
   if (r.ok) {
     box.className = "dg-probe ok";
-    box.innerHTML = `✓ ${escapeHtml(r.provider === "api" ? "cloud model responded" : "Claude Code authenticated")}`;
+    const okLabel = r.provider === "api" ? "cloud model responded"
+      : r.provider === "codex_cli" ? "Codex authenticated" : "Claude Code authenticated";
+    box.innerHTML = `✓ ${escapeHtml(okLabel)}`;
   } else {
     box.className = "dg-probe err";
     const fix = r.provider === "claude_cli"
       ? ` — run <code>claude login</code> on the host (as the Oceano user), then re-check`
+      : r.provider === "codex_cli"
+      ? ` — run <code>codex login</code> on the host (as the Oceano user), then re-check`
       : ` — check the endpoint/model/key under Endpoints`;
     box.innerHTML = `✗ ${escapeHtml(r.detail || "not ready")}${fix}`;
   }
