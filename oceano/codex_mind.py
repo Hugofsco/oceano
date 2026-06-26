@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -17,7 +18,6 @@ from oceano import atomicio, mindbridge
 
 _HOME = config.WORKSPACE.parent / "data" / "codex-home"
 _CONFIG = _HOME / "config.toml"
-_SESSIONS = _HOME / "mind-sessions.json"
 
 
 def _j(s):
@@ -79,43 +79,6 @@ def ensure_home():
     except OSError as e:
         return {"ok": False, "error": f"could not prepare Codex home: {e}"}
     return {"ok": True, "home": str(_HOME)}
-
-
-def _load_sessions():
-    try:
-        d = json.loads(_SESSIONS.read_text())
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_sessions(d):
-    try:
-        _SESSIONS.parent.mkdir(parents=True, exist_ok=True)
-        atomicio.write_text(_SESSIONS, json.dumps(d, indent=2))
-    except OSError:
-        pass
-
-
-def session_for(key):
-    return (_load_sessions().get(key) or "").strip() if key else ""
-
-
-def remember_session(key, sid):
-    if not (key and sid):
-        return
-    d = _load_sessions()
-    d[key] = sid
-    _save_sessions(d)
-
-
-def clear_session(key):
-    if not key:
-        return
-    d = _load_sessions()
-    if key in d:
-        d.pop(key, None)
-        _save_sessions(d)
 
 
 def _agent_text(item):
@@ -188,28 +151,25 @@ def _tool_result(item):
     return ""
 
 
-def run_stream(prompt, session_key="", cwd=None, cancel=None, model="", on_event=None):
+def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
+    """Run one stateless Codex turn. The caller passes the WHOLE conversation in `prompt` (Oceano's
+    self.messages is the single source of truth, mirroring the Claude mind), so every turn is a fresh
+    ephemeral `codex exec` — no server-side thread to resume, drift, or lose."""
     from oceano import delegate
     binary = delegate.find_codex()
     if not binary:
-        return {"ok": False, "output": "", "error": "codex CLI not found — install Codex or set OCEANO_CODEX_BIN", "session_id": ""}
+        return {"ok": False, "output": "", "error": "codex CLI not found — install Codex or set OCEANO_CODEX_BIN"}
     prep = ensure_home()
     if not prep.get("ok"):
-        return {"ok": False, "output": "", "error": prep.get("error") or "could not prepare Codex", "session_id": ""}
+        return {"ok": False, "output": "", "error": prep.get("error") or "could not prepare Codex"}
 
-    sid = session_for(session_key)
     cmd = [binary, "exec"]
     if model:
         cmd += ["--model", str(model)]
-    cmd += ["--json", "--sandbox", "workspace-write", "-c", 'approval_policy="never"']
-    if not session_key:
-        cmd.append("--ephemeral")
+    cmd += ["--json", "--sandbox", "workspace-write", "-c", 'approval_policy="never"', "--ephemeral"]
     if cwd:
         cmd += ["--cd", str(cwd)]
-    if sid:
-        cmd += ["resume", sid, prompt]
-    else:
-        cmd.append(prompt)
+    cmd.append(prompt)
 
     env = dict(os.environ)
     env["CODEX_HOME"] = str(_HOME)
@@ -222,10 +182,14 @@ def run_stream(prompt, session_key="", cwd=None, cancel=None, model="", on_event
                 pass
 
     try:
+        # Own session/process group so a stall/cancel can take down the WHOLE tree (codex + the MCP
+        # bridge + any shells it spawned), not just the parent — otherwise a lingering grandchild
+        # keeps the stdio pipes open and a teardown read would block.
         proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE), env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                start_new_session=True)
     except OSError as e:
-        return {"ok": False, "output": "", "error": f"could not launch codex: {e}", "session_id": sid}
+        return {"ok": False, "output": "", "error": f"could not launch codex: {e}"}
 
     q = queue.Queue()
 
@@ -240,16 +204,32 @@ def run_stream(prompt, session_key="", cwd=None, cancel=None, model="", on_event
 
     pending = {}
     parts = []
-    cancelled = False
+    cancelled = stalled = capped = False
+    # Stall guards, mirroring the Claude mind (delegate.to_claude_stream): an IDLE timeout that
+    # resets on every event (a busy run is never killed) plus an absolute wall-clock cap. Codex's
+    # own tool_timeout_sec only bounds a single tool call, not a wedged/looping turn. Poll the queue
+    # so a user Stop is honoured within 0.5s even when no output is flowing (a bare q.get() would
+    # block until the next line, which may never come on a stall).
+    idle_timeout = delegate._DELEGATE_IDLE
+    max_total = delegate._DELEGATE_MAX
+    started = last_evt = time.monotonic()
+    poll = 0.5 if cancel is not None else idle_timeout
     while True:
+        now = time.monotonic()
         if cancel is not None and cancel.is_set():
             cancelled = True
-            try:
-                proc.kill()
-            except Exception:
-                pass
             break
-        line = q.get()
+        if now - started > max_total:
+            capped = True
+            break
+        if now - last_evt > idle_timeout:
+            stalled = True
+            break
+        try:
+            line = q.get(timeout=poll)
+        except queue.Empty:
+            continue                                 # re-check cancel / cap / idle
+        last_evt = time.monotonic()
         if line is None:
             break
         line = line.strip()
@@ -260,10 +240,7 @@ def run_stream(prompt, session_key="", cwd=None, cancel=None, model="", on_event
         except ValueError:
             continue
         typ = ev.get("type") or ""
-        if typ == "thread.started":
-            sid = ev.get("thread_id") or sid
-            remember_session(session_key, sid)
-        elif typ == "item.started":
+        if typ == "item.started":
             item = ev.get("item") or {}
             call = _tool_call(item)
             if call:
@@ -295,17 +272,33 @@ def run_stream(prompt, session_key="", cwd=None, cancel=None, model="", on_event
         elif typ == "turn.failed":
             break
 
+    killed = cancelled or stalled or capped
+    if killed:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # whole tree, not just the parent
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     try:
         proc.wait(timeout=5)
     except Exception:
         pass
-    err = (proc.stderr.read() or "").strip()[:1000] if proc.stderr else ""
+    # Read stderr only on a NATURAL exit. After a kill, reading the pipe can block on a grandchild
+    # that briefly outlives the group; we already synthesize a definitive error below, so skip it.
+    err = "" if killed else ((proc.stderr.read() or "").strip()[:1000] if proc.stderr else "")
     answer = ''.join(parts).strip()
-    ok = bool(answer) and not cancelled and proc.returncode == 0
+    ok = bool(answer) and not cancelled and not stalled and not capped and proc.returncode == 0
     if ok and err.startswith("Reading additional input from stdin"):
         err = ""
-    if not ok and not err and cancelled:
-        err = "stopped by the user"
-    if not ok and not err and not answer:
-        err = f"codex exited {proc.returncode}"
-    return {"ok": ok, "output": answer, "error": err, "session_id": sid}
+    if not ok and not err:
+        if cancelled:
+            err = "stopped by the user"
+        elif stalled:
+            err = f"codex produced no output for {idle_timeout}s and was stopped (looked stalled)"
+        elif capped:
+            err = f"codex hit the {max_total}s time cap and was stopped"
+        elif not answer:
+            err = f"codex exited {proc.returncode}"
+    return {"ok": ok, "output": answer, "error": err}

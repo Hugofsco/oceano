@@ -59,7 +59,6 @@ BOT_COMMANDS = [
 def _agent_for(chat_id):
     if chat_id not in _agents:
         _agents[chat_id] = Agent()
-        _agents[chat_id].mind_session_key = f"telegram:{chat_id}"
         _started_at[chat_id] = time.time()
     return _agents[chat_id]
 

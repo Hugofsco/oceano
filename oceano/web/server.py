@@ -455,7 +455,6 @@ def _agent(sid):
                 ag.messages.extend(hist)
         except Exception:
             pass
-        ag.mind_session_key = f"web:{sid}"
         _sessions[sid] = ag
     return _sessions[sid]
 
