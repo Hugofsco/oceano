@@ -58,7 +58,7 @@ def _write_config():
         'required = true',
         'startup_timeout_sec = 15',
         'tool_timeout_sec = 600',
-        'default_tools_approval_mode = "auto"',
+        'default_tools_approval_mode = "approve"',
         '',
         '[mcp_servers.oceano.env]',
         f'OCEANO_MCP_URL = {_j(mindbridge.daemon_url())}',
@@ -142,7 +142,7 @@ def _tool_call(item):
     if t == "command_execution":
         return (item.get("command") and "shell", str(item.get("command") or ""))
     if t in ("mcp_tool_call", "mcp_tool_use"):
-        name = item.get("tool_name") or item.get("name") or "tool"
+        name = item.get("tool_name") or item.get("tool") or item.get("name") or "tool"
         server = item.get("server_name") or item.get("server") or ""
         detail = item.get("arguments") or item.get("input") or ""
         if not isinstance(detail, str):
@@ -150,8 +150,7 @@ def _tool_call(item):
                 detail = json.dumps(detail, ensure_ascii=False)
             except Exception:
                 detail = str(detail)
-        label = f"{server}:{name}" if server else str(name)
-        return (label, detail[:400])
+        return (str(name), detail[:400])
     if t == "web_search":
         return ("web_search", str(item.get("query") or ""))
     return None
@@ -160,6 +159,28 @@ def _tool_call(item):
 def _tool_result(item):
     if not isinstance(item, dict):
         return ""
+    err = item.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()[:2000]
+    if isinstance(err, str) and err.strip():
+        return err.strip()[:2000]
+    nested = item.get("result")
+    if isinstance(nested, dict):
+        content = nested.get("content")
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    texts.append(part["text"].strip())
+            txt = "\n".join(t for t in texts if t)
+            if txt:
+                return txt[:2000]
+        for k in ("text", "summary", "result"):
+            v = nested.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:2000]
     for k in ("output", "text", "summary", "result"):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
