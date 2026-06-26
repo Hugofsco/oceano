@@ -39,8 +39,12 @@ def _relevant_memories(user_message, k=5):
             return ""
         def label(h):
             tag = h.get("category") or h.get("tags") or ""
-            return f"- {h['text']}" + (f"  [{tag}]" if tag else "") + ("  📌" if h.get("pinned") else "")
-        return ("WHAT YOU KNOW ABOUT THE USER (use if helpful, ignore if not):\n"
+            src = (h.get("source") or "").strip()
+            return (f"- {h['text']}" + (f"  [{tag}]" if tag else "")
+                    + (f"  ↪ {src}" if src else "") + ("  📌" if h.get("pinned") else ""))
+        return ("WHAT YOU KNOW (facts about the user, and things you've learned — use if "
+                "helpful, ignore if not). A `↪ source` is a pointer you can reopen with "
+                "fetch_url / read_file to dig deeper:\n"
                 + "\n".join(label(h) for h in hits))
     except Exception:
         return ""
@@ -217,6 +221,17 @@ to you automatically. When the user shares a durable fact about themselves (a
 preference, who they are, an ongoing project, a decision), save it with remember().
 If something you know becomes wrong or out of date, fix it with update_memory or drop
 it with forget_memory. (Routine facts are also captured automatically in the background.)
+
+KNOWLEDGE — build your own awareness: memory is not only for facts about the user;
+it's also where YOU accumulate what you learn. When research, a page you read, or
+working through a problem yields a durable, checkable fact worth reusing — a figure, an
+API quirk, where something lives, how a thing works — save it with
+remember(text, category="knowledge", source=<the URL or workspace path it came from>).
+The source matters: a knowledge memory is a pointer back to where you can dig deeper, so
+next time you both recall the fact AND can reopen the source (fetch_url / read_file) for
+fuller detail. Relevant knowledge is surfaced to you automatically on later turns — so a
+thing learned once need not be re-researched. Save the genuinely reusable, not the trivial
+or one-off; keep each entry a single clean fact.
 
 SELF-IMPROVEMENT: when you finish a task where you worked out a non-obvious,
 REUSABLE approach (a workflow, a tricky integration, a search strategy that paid

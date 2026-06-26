@@ -1700,7 +1700,8 @@ def get_memories():
 @app.post("/api/memories")
 async def post_memory(req: Request):
     b = await req.json()
-    memory.remember(b["text"], b.get("tags", ""), b.get("category", "fact"), bool(b.get("pinned")))
+    memory.remember(b["text"], b.get("tags", ""), b.get("category", "fact"),
+                    bool(b.get("pinned")), b.get("source", ""))
     return {"ok": True}
 
 

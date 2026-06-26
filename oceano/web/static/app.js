@@ -2677,12 +2677,13 @@ async function loadBrainMem() {
   const list = $("#bMemList"); if (!list) return;
   const mems = await api("/api/memories"); list.innerHTML = "";
   if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
-  const CATS = ["identity", "preference", "project", "fact", "task"];
+  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
   mems.forEach(m => {
     const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
     const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
+    const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
     row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
-      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
+      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
     $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); loadBrainMem(); };
     $(".mr-cat", row).onchange = e => fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) });
     $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadBrainMem(); };
@@ -3976,7 +3977,7 @@ async function editResearch(t) {
    Nodes are memories (colored by category); edges link memories that are
    strongly semantically similar or share a tag. Pure-canvas, no libs.
    ==================================================================== */
-const MEM_CAT_COLORS = { identity: "#e0a86b", preference: "#7ec8a9", project: "#6ba3e0", fact: "#9b8fd6", task: "#d67f9b" };
+const MEM_CAT_COLORS = { identity: "#e0a86b", preference: "#7ec8a9", project: "#6ba3e0", fact: "#9b8fd6", task: "#d67f9b", knowledge: "#4fb8c9" };
 let _mgRaf = null;
 function openMemoryGraph() {
   const { body, reused } = createWindow({ id: "win-memgraph", title: "Memory graph", icon: "❄", width: 780, height: 600,
