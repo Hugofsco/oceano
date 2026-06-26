@@ -155,12 +155,16 @@ fallback. It's designed to feel like the agent actually *remembers* you:
 - **Passive recall** — each turn, the memories relevant to your message are injected
   into context automatically (no need for the model to call `recall`).
 - **Self-learning** — after each turn a background pass reads *your* message and
-  extracts durable, first-person facts, saving the new ones (deduped). It never
-  attributes facts about people/things you merely researched to you.
+  extracts durable facts, saving the new ones (deduped) in Oceano's own voice (the
+  human is "my user" / "Hugo"). It never attributes facts about people/things you
+  merely researched to you.
 - **Pinning** — pin core facts (Brain → Memory, the 📌) so they're always injected.
 - **Typed injection policy** — every memory has a category (identity / preference /
   project / fact / task), and **Settings → Memory** controls how each type reaches
   the model: **Always**, **When relevant**, or **Off**. Pinned memories override.
+  `identity` is Oceano's *own* first-person sense of self (written in its voice —
+  "I…", with the human as "my user" / "Hugo"), so the always-on identity block reads
+  as the agent, never as a third-person "User does X".
 - **Self-correction** — the agent can `update_memory` / `forget_memory` when something
   becomes wrong or outdated.
 - **Maintenance + graph** — a locked weekly job hands the whole store to the configured
