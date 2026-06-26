@@ -103,7 +103,8 @@ from a web UI or Telegram.
 
 - **`oceano/engine.py`** — the single entry point. Runs `uvicorn` (web), starts the
   Telegram bot via the app lifespan, runs the scheduler as a background task, and
-  spawns/supervises the `llama.cpp` embedding server (auto-restart, unified logs).
+  spawns/supervises the `llama.cpp` embedding server — and the optional reranker — as
+  child processes (auto-restart, unified logs).
 - **`oceano/agent.py`** — the agent loop. Each turn it rebuilds a context block
   (current date, the workspace path, relevant memories, the skills catalog), calls
   the model with tools, executes tool calls, and streams the result. After the turn
@@ -118,6 +119,7 @@ from a web UI or Telegram.
 | `8800` | Oceano web UI | binds all interfaces (`0.0.0.0`) — login + optional 2FA gate it; keep on a trusted LAN/Tailscale (or set `OCEANO_WEB_HOST=127.0.0.1`) |
 | `8081` | `llama-swap` | OpenAI-compatible; chat models, one resident at a time |
 | `8082` | embedding server | `nomic-embed-text` (CPU), used by memory + RAG |
+| `8084` | reranker *(optional)* | llama.cpp `--reranking` cross-encoder; re-orders RAG candidates, skipped if the model is absent |
 | `8080` | SearXNG | web search backend (`?format=json`) |
 
 ---
@@ -175,6 +177,12 @@ fallback. It's designed to feel like the agent actually *remembers* you:
 - **Conversation recall** — past chats are embedded incrementally, so semantic
   **Search → Conversations** and the agent's `search_chats` tool can surface what you
   discussed in earlier sessions, not just stored facts.
+- **Two-stage document retrieval** — `search_docs` and the research-note RAG do dense
+  recall on the embedding server, then re-order the top candidates with an **optional
+  cross-encoder reranker** (a dedicated llama.cpp `--reranking` server on `:8084`) that
+  scores each (query, passage) pair *jointly* — more accurate than cosine alone. It
+  degrades gracefully: with no reranker model present, retrieval stays dense-only and
+  search still works. Status + restart live in **Settings → Services**.
 
 ---
 
