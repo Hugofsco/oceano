@@ -1359,7 +1359,7 @@ const SETTINGS_PAGES = {
       <div class="dg-claude-model" id="codexModelRow" style="display:none">
         <label class="field-label">Codex model <span class="lbl-sub">used by the resident Codex mind</span></label>
         <select id="codexModelSel"></select>
-        <div class="dg-hint">OpenAI's current Codex docs recommend GPT-5.5 for most work and GPT-5.4 mini when you want a faster, cheaper option.</div>
+        <div class="dg-hint">Recommended default: GPT-5.5. Use GPT-5.4 mini when you want a faster, cheaper option.</div>
       </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
@@ -1531,7 +1531,7 @@ async function loadCodexModel() {
   sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
   sel.onchange = async () => {
     try { const r = await _postJ("/api/codex-model", { model: sel.value });
-      toast("Codex model → " + (r.model || "default"), "info"); }
+      toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info"); }
     catch { toast("couldn't set the Codex model", "err"); }
   };
 }

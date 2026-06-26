@@ -60,7 +60,7 @@ CLAUDE_MODELS = (
     {"id": "haiku", "label": "Haiku — fastest, lightest"},
 )
 CODEX_MODELS = (
-    {"id": "", "label": "Default (Codex's recommended default)"},
+    {"id": "", "label": "Recommended default (currently GPT-5.5)"},
     {"id": "gpt-5.5", "label": "GPT-5.5 — strongest for complex coding and research"},
     {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini — faster and lower cost"},
     {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark — near-instant coding iteration (preview)"},
