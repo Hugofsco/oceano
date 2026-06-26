@@ -43,6 +43,29 @@ def reindex_all():
     return " · ".join(parts)
 
 
+def rebuild_embeddings():
+    """Re-embed every stored vector (memories · docs · chats) IN PLACE — for after an embedding
+    MODEL or CONVENTION change (e.g. adding nomic's search_query/search_document prefixes), where
+    the source text is unchanged but the vectors must be recomputed so queries and documents share
+    one space again. Skills embed lazily into an in-memory cache, so they refresh on the next
+    restart / use — nothing to rebuild there. Returns a one-line summary."""
+    from oceano import memory, rag, chats
+    parts = []
+    try:
+        parts.append("memories: " + memory.reindex(force=True))
+    except Exception as e:
+        parts.append(f"memories: error ({type(e).__name__}: {e})")
+    try:
+        parts.append("docs: " + rag.reembed_all())
+    except Exception as e:
+        parts.append(f"docs: error ({type(e).__name__}: {e})")
+    try:
+        parts.append(f"chats: {chats.reindex(force=True)} re-embedded")
+    except Exception as e:
+        parts.append(f"chats: error ({type(e).__name__}: {e})")
+    return " · ".join(parts)
+
+
 def ensure_task():
     """Make sure the locked '[ INDEX ]' reindex schedule exists (visible + retimable +
     toggleable in the Scheduler, but not deletable)."""

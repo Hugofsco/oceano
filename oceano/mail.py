@@ -12,9 +12,11 @@ as the Telegram token in web.json and the SSH keys under data/hosts/); they are 
 """
 import email
 import email.utils
+import hashlib
 import html
 import imaplib
 import json
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -32,8 +34,12 @@ STORE = config.WORKSPACE.parent / "data" / "mail.json"
 POLICIES = ("readonly", "active", "trusted")
 _ARM_TTL = 1800                 # a send-arm lasts 30 minutes
 _TIMEOUT = 25                   # IMAP/SMTP connect/op timeout (seconds)
-_BODY_CAP = 16000               # cap a fetched body like other tool outputs
-_LIST_CAP = 50                  # never list more than this many messages per call
+_BODY_CAP = 16000               # cap a fetched plain-text body like other tool outputs
+_BODY_HTML_CAP = 600000         # cap the (sanitized) HTML body served to the email reader UI
+_ATTACH_CAP = 25 * 1024 * 1024  # 25 MB per attachment (download + send)
+_LIST_CAP = 200                 # max messages a single list call returns (the UI pages with offset)
+_SORT_SCAN_CAP = 5000           # folders bigger than this skip the client-side date sort (too many
+                                # headers to fetch per page) and fall back to UID order — see _ordered_uids
 
 _lock = threading.Lock()
 _ARM = {}                       # account id -> expiry epoch (in-memory, never persisted)
@@ -117,7 +123,7 @@ def names():
 
 
 def resolve_target(account=None):
-    """The mailbox an agent action should act on, honouring Hugo's segregation rule:
+    """The mailbox an agent action should act on, honouring the user's segregation rule:
       explicit name → that account; else the PRIMARY; else (single account) it; else AMBIGUOUS.
     Returns (raw_record | None, error_message | None). The error is a string the tool relays to the
     user so the agent asks which mailbox to use instead of guessing."""
@@ -313,6 +319,39 @@ def _extract_text(msg):
     return body[:_BODY_CAP]
 
 
+def _sanitize_html(htmltext):
+    """Pre-sanitize an email HTML body: strip scripts/styles/embeds, event-handler (on*) attrs, and
+    javascript: URLs. This is defense-in-depth, NOT the only line — the client also runs it through
+    DOMPurify and renders it inside a script-less sandboxed iframe (so even a missed tag can't run).
+    Kept deliberately conservative; we keep structural tags + links so the message reads + clicks."""
+    t = htmltext or ""
+    # drop whole dangerous elements (open→close), then any stray self-closing/orphan opens
+    t = re.sub(r"(?is)<(script|style|head|title|iframe|frame|frameset|object|embed|applet|form|link|meta|base)\b[^>]*>.*?</\1\s*>", " ", t)
+    t = re.sub(r"(?is)<(script|style|iframe|frame|object|embed|applet|form|link|meta|base)\b[^>]*/?>", " ", t)
+    t = re.sub(r"(?is)\son\w+\s*=\s*\"[^\"]*\"", "", t)        # on* handlers (double-quoted)
+    t = re.sub(r"(?is)\son\w+\s*=\s*'[^']*'", "", t)           # (single-quoted)
+    t = re.sub(r"(?is)\son\w+\s*=\s*[^\s>]+", "", t)           # (unquoted)
+    t = re.sub(r"(?is)(href|src|action)\s*=\s*([\"'])\s*(?:javascript|vbscript|data):[^\"']*\2", r"\1=\2#\2", t)
+    return t[:_BODY_HTML_CAP]
+
+
+def _extract_html(msg):
+    """The message's text/html body, pre-sanitized — or '' for plain-text-only mail. Lets the reader
+    render real formatting and CLICKABLE links (the plain-text `body` strips them)."""
+    raw = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            if "attachment" in str(part.get("Content-Disposition") or "").lower():
+                continue
+            if part.get_content_type() == "text/html" and raw is None:
+                raw = _payload_text(part)
+    elif msg.get_content_type() == "text/html":
+        raw = _payload_text(msg)
+    return _sanitize_html(raw) if raw else ""
+
+
 def _payload_text(part):
     try:
         raw = part.get_payload(decode=True) or b""
@@ -322,14 +361,134 @@ def _payload_text(part):
         return ""
 
 
-def _attachment_names(msg):
-    names_ = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            disp = str(part.get("Content-Disposition") or "")
-            if "attachment" in disp.lower():
-                names_.append(_dh(part.get_filename()) or "(unnamed)")
-    return names_
+def _safe_filename(name):
+    """A safe download filename from an UNTRUSTED attachment name: basename only (no path traversal),
+    no control/path chars, no leading dots, length-capped."""
+    base = Path((name or "").replace("\x00", "")).name      # drop any directory components
+    base = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", base).strip().strip(".")
+    return base[:200] or "attachment"
+
+
+def _ws_path(rel):
+    """Resolve a workspace-relative path and refuse anything that escapes the workspace."""
+    root = config.WORKSPACE.resolve()
+    p = (config.WORKSPACE / (rel or "")).resolve()
+    if not p.is_relative_to(root):
+        raise ValueError("path escapes the workspace")
+    return p
+
+
+def _dedupe(path):
+    """If `path` exists, append ' (1)', ' (2)'… so a download never overwrites an existing file."""
+    if not path.exists():
+        return path
+    stem, suf, i = path.stem, path.suffix, 1
+    while True:
+        cand = path.with_name(f"{stem} ({i}){suf}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _iter_attachments(msg):
+    """Yield (index, part, filename) for each real attachment — disposition=attachment, or a named
+    part that isn't an inline (cid) body image. Indices are stable for list ↔ fetch."""
+    if not msg.is_multipart():
+        return
+    i = 0
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disp = str(part.get("Content-Disposition") or "").lower()
+        fname = _dh(part.get_filename())
+        if "attachment" in disp or (fname and "inline" not in disp):
+            yield i, part, (fname or f"part-{i}")
+            i += 1
+
+
+def list_attachments(msg):
+    """[{index, filename, content_type, size}] for an already-parsed message (no extra fetch)."""
+    out = []
+    for i, part, fname in _iter_attachments(msg):
+        try:
+            n = len(part.get_payload(decode=True) or b"")
+        except Exception:
+            n = 0
+        out.append({"index": i, "filename": _safe_filename(fname),
+                    "content_type": part.get_content_type(), "size": n})
+    return out
+
+
+def fetch_attachment(a, uid, folder, index):
+    """Fetch ONE attachment's bytes (size-capped). Returns {ok, filename, content_type, data} or error."""
+    try:
+        conn = _imap(a)
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    try:
+        if conn.select(_q(folder), readonly=True)[0] != "OK":
+            return {"ok": False, "error": f"no such folder {folder!r}"}
+        typ, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return {"ok": False, "error": f"message uid {uid} not found"}
+        msg = email.message_from_bytes(data[0][1])
+        for i, part, fname in _iter_attachments(msg):
+            if i == int(index):
+                raw = part.get_payload(decode=True) or b""
+                if len(raw) > _ATTACH_CAP:
+                    return {"ok": False, "error": f"attachment is {len(raw)//1048576} MB (cap 25 MB)"}
+                return {"ok": True, "filename": _safe_filename(fname),
+                        "content_type": part.get_content_type(), "data": raw}
+        return {"ok": False, "error": f"no attachment #{index} on this message"}
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    finally:
+        _imap_close(conn)
+
+
+def attachment_sha256(a, uid, folder, index):
+    """SHA256 (+ name/type/size) of ONE attachment, without saving it — powers the reader's
+    'check this file on VirusTotal' (a hash reputation lookup leaks nothing, needs no API key)."""
+    res = fetch_attachment(a, uid, folder, index)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "filename": res["filename"], "content_type": res["content_type"],
+            "size": len(res["data"]), "sha256": hashlib.sha256(res["data"]).hexdigest()}
+
+
+def save_attachment(a, uid, folder, index, subdir="mail-attachments"):
+    """Download attachment #index and save it UNDER the workspace (confined, sanitized name, no
+    overwrite). Returns {ok, path (workspace-relative), filename, size, content_type}."""
+    res = fetch_attachment(a, uid, folder, index)
+    if not res.get("ok"):
+        return res
+    try:
+        sub = _safe_filename(subdir) or "mail-attachments"
+        dest = _dedupe(_ws_path(f"{sub}/{res['filename']}"))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(res["data"])
+    except Exception as e:
+        return {"ok": False, "error": f"could not save: {str(e)[:120]}"}
+    return {"ok": True, "path": str(dest.relative_to(config.WORKSPACE)),
+            "filename": dest.name, "size": len(res["data"]), "content_type": res["content_type"]}
+
+
+def workspace_attachments(paths):
+    """Build outgoing-attachment dicts from workspace-relative file paths (CONFINED) — used when the
+    agent attaches workspace files to an outgoing message. Returns (attachments, error)."""
+    atts = []
+    for p in (paths or []):
+        try:
+            fp = _ws_path(p)
+        except Exception:
+            return None, f"attachment path {p!r} escapes the workspace"
+        if not fp.is_file():
+            return None, f"no such workspace file to attach: {p}"
+        data = fp.read_bytes()
+        if len(data) > _ATTACH_CAP:
+            return None, f"{p} is too large to attach (cap 25 MB)"
+        atts.append({"filename": fp.name, "data": data, "content_type": None})
+    return atts, None
 
 
 # ---------------- IMAP ----------------
@@ -342,8 +501,13 @@ def _imap(a):
         conn = imaplib.IMAP4(a["imap_host"], int(a.get("imap_port", 143)), timeout=_TIMEOUT)
         try:
             conn.starttls(ssl_context=ssl.create_default_context())
-        except Exception:
-            pass
+        except Exception as e:                   # STARTTLS failed → do NOT fall back to plaintext auth
+            try:
+                conn.shutdown()
+            except Exception:
+                pass
+            raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
+                             f"unencrypted connection. Use the SSL port (993), or fix the server's TLS.")
     conn.login(a.get("user") or a["email"], a.get("password") or "")
     return conn
 
@@ -567,23 +731,85 @@ def imap_delete_folder(a, name):
         _imap_close(conn)
 
 
-def _search_uids(conn, query=None, unread_only=False):
+def _search_crit(query=None, unread_only=False):
+    """IMAP SEARCH/SORT criteria for a folder query. Shared by _search_uids (plain SEARCH) and
+    _ordered_uids (SORT), so the two can't drift apart."""
     crit = []
     if unread_only:
         crit.append("UNSEEN")
     if query:
         crit += ["TEXT", '"%s"' % str(query).replace('"', "")]
-    if not crit:
-        crit = ["ALL"]
-    typ, data = conn.uid("SEARCH", None, *crit)
+    return crit or ["ALL"]
+
+
+def _search_uids(conn, query=None, unread_only=False):
+    """Matching UIDs in SEARCH order (ascending UID). Caller decides ordering."""
+    typ, data = conn.uid("SEARCH", None, *_search_crit(query, unread_only))
     if typ != "OK" or not data:
         return []
     return data[0].split()
 
 
-def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
-    """Newest-first list of message headers in `folder`. Returns {ok, folder, total, messages:[...]}."""
+def _uids_by_date(conn, uids):
+    """Sort `uids` (bytes, ascending UID) NEWEST-FIRST by their Date: header — the client-side
+    fallback when the server can't SORT (e.g. Gmail). One FETCH pulls every Date header; messages
+    with a missing/unparseable Date sink to the bottom in UID order. On FETCH failure, UID-desc."""
+    pos = {u: i for i, u in enumerate(uids)}                 # ascending-UID index → stable tiebreak
+    dates = {}
+    try:
+        typ, data = conn.uid("FETCH", b",".join(uids), "(BODY.PEEK[HEADER.FIELDS (DATE)])")
+        if typ != "OK":
+            return uids[::-1]
+        for item in data or []:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            m = re.search(r"UID (\d+)", item[0].decode("utf-8", "replace"))  # UID FETCH always echoes UID
+            if not m:
+                continue
+            raw = email.message_from_bytes(item[1]).get("Date")
+            dt = None
+            try:
+                if raw:
+                    dt = email.utils.parsedate_to_datetime(raw)
+                    if dt is not None and dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)   # naive → assume UTC so all keys compare
+            except Exception:
+                dt = None
+            dates[m.group(1).encode()] = dt
+    except Exception:
+        return uids[::-1]
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    # newest first; unparseable/missing Date → epoch (sinks); same date → higher UID first.
+    return sorted(uids, key=lambda u: (dates.get(u) or epoch, pos.get(u, 0)), reverse=True)
+
+
+def _ordered_uids(conn, query=None, unread_only=False):
+    """Matching UIDs ordered NEWEST-FIRST by date, so the listing reads recent → old regardless of
+    UID (append) order — fixes messages moved/imported into a folder showing up out of order.
+
+    Order of preference: (1) server-side IMAP SORT (REVERSE DATE) — true Date-header order, paged by
+    the server, any folder size; (2) for a folder under _SORT_SCAN_CAP with no SORT support, a
+    client-side Date-header sort; (3) plain UID-descending — for huge no-SORT folders (bounded cost)
+    or if everything above fails."""
+    if "SORT" in _capabilities(conn):
+        try:
+            typ, data = conn.uid("SORT", "(REVERSE DATE)", "UTF-8", *_search_crit(query, unread_only))
+            if typ == "OK":
+                return data[0].split() if (data and data[0]) else []
+        except Exception:
+            pass                                             # advertised SORT but it choked → fall back
+    uids = _search_uids(conn, query, unread_only)
+    if len(uids) > _SORT_SCAN_CAP:
+        return uids[::-1]                                    # too big to date-sort client-side
+    return _uids_by_date(conn, uids)
+
+
+def imap_list(a, folder="INBOX", query=None, limit=20, offset=0, unread_only=False):
+    """Newest-first (by date) page of message headers in `folder` — see _ordered_uids for how the
+    date ordering is obtained. `offset` skips the N newest (so the UI can scroll-load older messages
+    in batches). Returns {ok, folder, total, offset, limit, messages:[...]}."""
     limit = max(1, min(int(limit or 20), _LIST_CAP))
+    offset = max(0, int(offset or 0))
     try:
         conn = _imap(a)
     except Exception as e:
@@ -592,9 +818,9 @@ def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
         typ, _ = conn.select(_q(folder), readonly=True)
         if typ != "OK":
             return {"ok": False, "error": f"no such folder {folder!r}"}
-        uids = _search_uids(conn, query, unread_only)
+        uids = _ordered_uids(conn, query, unread_only)       # newest-first by date (SORT, else client-side)
         total = len(uids)
-        chosen = uids[-limit:][::-1]                         # newest first
+        chosen = uids[offset:offset + limit]                 # already newest-first; take the requested page
         msgs = []
         if chosen:
             uid_set = b",".join(chosen)
@@ -620,31 +846,43 @@ def imap_list(a, folder="INBOX", query=None, limit=20, unread_only=False):
                 msgs.append({"uid": u, "from": _dh(hdr.get("From")), "subject": _dh(hdr.get("Subject")),
                              "date": _dh(hdr.get("Date")), "seen": "\\Seen" in fl,
                              "flagged": "\\Flagged" in fl})
-        return {"ok": True, "folder": folder, "total": total, "messages": msgs}
+        return {"ok": True, "folder": folder, "total": total, "offset": offset,
+                "limit": limit, "messages": msgs}
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:
         _imap_close(conn)
 
 
-def imap_read(a, uid, folder="INBOX"):
-    """Fetch one message's headers + plain-text body WITHOUT marking it read (BODY.PEEK)."""
+def imap_read(a, uid, folder="INBOX", mark_seen=False):
+    """Fetch one message's headers + plain-text body. Read-only (BODY.PEEK) by default; pass
+    mark_seen=True to also set the \\Seen flag, so opening a message in the web reader marks it read
+    like a normal mail client. The agent's mail_read leaves it untouched (mark_seen=False), keeping
+    reads side-effect-free for the injection-taint model."""
     try:
         conn = _imap(a)
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     try:
-        typ, _ = conn.select(_q(folder), readonly=True)
+        typ, _ = conn.select(_q(folder), readonly=not mark_seen)   # writable only when we'll set \Seen
         if typ != "OK":
             return {"ok": False, "error": f"no such folder {folder!r}"}
         typ, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
         if typ != "OK" or not data or not isinstance(data[0], tuple):
             return {"ok": False, "error": f"message uid {uid} not found in {folder}"}
         msg = email.message_from_bytes(data[0][1])
-        return {"ok": True, "uid": str(uid), "folder": folder,
-                "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
-                "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
-                "attachments": _attachment_names(msg), "body": _extract_text(msg)}
+        out = {"ok": True, "uid": str(uid), "folder": folder,
+               "from": _dh(msg.get("From")), "to": _dh(msg.get("To")), "cc": _dh(msg.get("Cc")),
+               "subject": _dh(msg.get("Subject")), "date": _dh(msg.get("Date")),
+               "attachments": list_attachments(msg),
+               "body": _extract_text(msg), "html": _extract_html(msg)}
+        if mark_seen:
+            try:
+                conn.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")  # mark read; harmless if already \Seen
+                out["seen"] = True
+            except Exception:
+                pass                                               # best-effort — never fail a read over this
+        return out
     except Exception as e:
         return {"ok": False, "error": _clean_err(e)}
     finally:
@@ -754,8 +992,73 @@ def imap_flag(a, uid, flag, folder="INBOX"):
         _imap_close(conn)
 
 
+def _bulk_move(conn, uid_set, dest):
+    if "MOVE" in _capabilities(conn):
+        conn.uid("MOVE", uid_set, _q(dest))
+    else:
+        conn.uid("COPY", uid_set, _q(dest))
+        conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
+def imap_bulk(a, op, folder="INBOX", uids=None, query=None, select_all=False, dest=None, flag=None):
+    """Apply ONE op to MANY messages in a single connection (one IMAP command for the whole set, not
+    one-per-message). select_all=True acts on every message matching `query` (or the whole folder);
+    otherwise pass an explicit `uids` list. op: 'move' (needs dest) | 'delete' (→ Trash) | 'flag'
+    (flag: read|unread|flagged|unflagged|spam). Returns {ok, count, text}."""
+    op = (op or "").strip().lower()
+    if op not in ("move", "delete", "flag"):
+        return {"ok": False, "error": "op must be move, delete, or flag"}
+    try:
+        conn = _imap(a)
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    try:
+        if conn.select(_q(folder))[0] != "OK":
+            return {"ok": False, "error": f"no such folder {folder!r}"}
+        if select_all:
+            uid_list = [u.decode() if isinstance(u, bytes) else str(u) for u in _search_uids(conn, query or None)]
+        else:
+            uid_list = [str(u) for u in (uids or []) if str(u).strip()]
+        if not uid_list:
+            return {"ok": True, "count": 0, "text": "no messages matched"}
+        uid_set = ",".join(uid_list)
+        n = len(uid_list)
+        if op == "flag":
+            f = (flag or "").strip().lower()
+            if f == "spam":
+                target = _special_folder(conn, "\\Junk", _JUNK_NAMES)
+                _bulk_move(conn, uid_set, target)
+                _stamp_used(a["id"])
+                return {"ok": True, "count": n, "text": f"moved {n} message(s) to {target}"}
+            op_map = {"read": ("+FLAGS", "\\Seen"), "unread": ("-FLAGS", "\\Seen"),
+                      "flagged": ("+FLAGS", "\\Flagged"), "unflagged": ("-FLAGS", "\\Flagged")}
+            if f not in op_map:
+                return {"ok": False, "error": f"unknown flag {f!r}"}
+            sign, fl = op_map[f]
+            conn.uid("STORE", uid_set, sign, f"({fl})")
+            _stamp_used(a["id"])
+            return {"ok": True, "count": n, "text": f"marked {n} message(s) {f}"}
+        if op == "delete":
+            target = _special_folder(conn, "\\Trash", _TRASH_NAMES)
+            if (folder or "").strip().lower() == target.lower():
+                return {"ok": False, "error": f"already in {target}; permanent delete is disabled"}
+            _bulk_move(conn, uid_set, target)
+            _stamp_used(a["id"])
+            return {"ok": True, "count": n, "text": f"deleted {n} message(s) (→ {target})"}
+        if not (dest or "").strip():                 # move
+            return {"ok": False, "error": "move needs a destination folder"}
+        _bulk_move(conn, uid_set, dest)
+        _stamp_used(a["id"])
+        return {"ok": True, "count": n, "text": f"moved {n} message(s) → {dest}"}
+    except Exception as e:
+        return {"ok": False, "error": _clean_err(e)}
+    finally:
+        _imap_close(conn)
+
+
 # ---------------- SMTP ----------------
-def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="", html=None):
+def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="", html=None, attachments=None):
     msg = EmailMessage()
     from_name = a.get("name") or ""
     msg["From"] = email.utils.formataddr((from_name, a["email"])) if from_name else a["email"]
@@ -769,6 +1072,12 @@ def _build_message(a, to, subject, body, cc=None, in_reply_to="", references="",
     msg.set_content(body or "")                  # text/plain (the fallback)
     if html:
         msg.add_alternative(html, subtype="html")  # multipart/alternative: clients prefer the HTML part
+    for att in (attachments or []):
+        fname = _safe_filename(att.get("filename") or "attachment")
+        ctype = att.get("content_type") or mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        maintype, _, subtype = ctype.partition("/")
+        msg.add_attachment(att.get("data") or b"", maintype=maintype or "application",
+                           subtype=subtype or "octet-stream", filename=fname)
     return msg
 
 
@@ -782,8 +1091,13 @@ def _smtp_send_msg(a, msg, recipients):
         try:
             srv.starttls(context=ssl.create_default_context())
             srv.ehlo()
-        except Exception:
-            pass
+        except Exception as e:                   # STARTTLS failed → do NOT fall back to plaintext auth
+            try:
+                srv.quit()
+            except Exception:
+                pass
+            raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
+                             f"unencrypted connection. Use the SSL port (465), or fix the server's TLS.")
     try:
         srv.login(a.get("user") or a["email"], a.get("password") or "")
         srv.send_message(msg, from_addr=a["email"], to_addrs=recipients)
@@ -801,11 +1115,11 @@ def _recipients(to, cc=None):
     return out
 
 
-def smtp_send(a, to, subject, body, cc=None, html=None):
+def smtp_send(a, to, subject, body, cc=None, html=None, attachments=None):
     recips = _recipients(to, cc)
     if not recips:
         return {"ok": False, "error": "no valid recipient address"}
-    msg = _build_message(a, to, subject, body, cc=cc, html=html)
+    msg = _build_message(a, to, subject, body, cc=cc, html=html, attachments=attachments)
     try:
         _smtp_send_msg(a, msg, recips)
     except Exception as e:
@@ -814,7 +1128,7 @@ def smtp_send(a, to, subject, body, cc=None, html=None):
     return {"ok": True, "text": f"sent '{subject or '(no subject)'}' to {', '.join(recips)}"}
 
 
-def smtp_reply(a, uid, body, folder="INBOX", html=None):
+def smtp_reply(a, uid, body, folder="INBOX", html=None, attachments=None):
     """Reply to message `uid`: pulls the thread headers over IMAP, then sends via SMTP."""
     try:
         conn = _imap(a)
@@ -835,7 +1149,8 @@ def smtp_reply(a, uid, body, folder="INBOX", html=None):
     if not recips:
         return {"ok": False, "error": "original message had no replyable address"}
     msg = _build_message(a, ctx["to"], ctx["subject"], body,
-                         in_reply_to=ctx["message_id"], references=ctx["references"], html=html)
+                         in_reply_to=ctx["message_id"], references=ctx["references"], html=html,
+                         attachments=attachments)
     try:
         _smtp_send_msg(a, msg, recips)
     except Exception as e:
@@ -865,8 +1180,13 @@ def test(a):
             try:
                 srv.starttls(context=ssl.create_default_context())
                 srv.ehlo()
-            except Exception:
-                pass
+            except Exception as e:               # STARTTLS failed → do NOT fall back to plaintext auth
+                try:
+                    srv.quit()
+                except Exception:
+                    pass
+                raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over "
+                                 f"an unencrypted connection. Use the SSL port (465), or fix the TLS.")
         try:
             srv.login(a.get("user") or a["email"], a.get("password") or "")
         finally:

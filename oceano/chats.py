@@ -8,7 +8,7 @@ import json
 import re
 import shutil
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 from oceano import atomicio, embeddings
@@ -27,6 +27,78 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")   # local time → folders match the user's day
 
 
+def _to_utc(s):
+    """Parse a stored ISO timestamp to an aware UTC datetime (created/updated are local-naive; a
+    message `ts` is UTC). Returns None if unparseable."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc)  # naive → local → UTC
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_ts(messages, lo, hi, start, end):
+    """Give every user/assistant message in [lo, hi) that lacks a `ts` an interpolated UTC timestamp,
+    spread evenly between `start` and `end` by position — so each message gets its OWN, monotonic
+    time rather than all sharing one. Idempotent: messages that already have a ts are untouched."""
+    span, denom = (end - start), max(1, hi - lo - 1)
+    for j in range(max(0, lo), min(hi, len(messages))):
+        m = messages[j]
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and not m.get("ts"):
+            m["ts"] = (start + span * ((j - lo) / denom)).isoformat(timespec="seconds")
+
+
+def _stamp(messages, prev_n, created, prev_updated):
+    """Ensure every displayed (user/assistant) message carries an individual `ts`. Messages newly
+    appended in THIS save get the current time; pre-existing un-stamped history is spread across the
+    chat's real active window [created, prev_updated] so each old message gets a plausible, distinct
+    time. The browser stamps its own messages, but turns from the scheduler, Telegram, the Claude
+    mind, a reconnected stream — and the whole backlog from before timestamps existed — flow here."""
+    now = datetime.now(timezone.utc)
+    c = _to_utc(created) or now
+    pu = _to_utc(prev_updated) or c
+    if pu < c:
+        pu = c
+    _fill_ts(messages, 0, prev_n, c, pu)                 # historical: within [created, last activity]
+    nowiso = now.isoformat(timespec="seconds")
+    for j in range(max(0, prev_n), len(messages)):       # appended this save → now
+        m = messages[j]
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and not m.get("ts"):
+            m["ts"] = nowiso
+    return messages
+
+
+def backfill_timestamps():
+    """One-time migration: give every existing user/assistant message a `ts`. For chats from before
+    per-message timestamps existed (all ts missing), spread each message's time across the chat's real
+    [created, updated] window so every message shows an individual, plausible time. Idempotent —
+    re-running only touches messages still lacking a ts, and preserves created/updated."""
+    if not CHATS_DIR.exists():
+        return {"chats": 0, "stamped": 0}
+    n_chats = n_stamped = 0
+    for f in sorted(CHATS_DIR.glob("*/*.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        msgs = rec.get("messages") or []
+        missing = sum(1 for m in msgs if isinstance(m, dict)
+                      and m.get("role") in ("user", "assistant") and not m.get("ts"))
+        if not missing:
+            continue
+        c = _to_utc(rec.get("created")) or _to_utc(rec.get("updated")) or datetime.now(timezone.utc)
+        u = _to_utc(rec.get("updated")) or c
+        if u < c:
+            u = c
+        _fill_ts(msgs, 0, len(msgs), c, u)
+        rec["messages"] = msgs
+        atomicio.write_text(f, json.dumps(rec))          # preserve created/updated; only fill ts
+        n_chats += 1
+        n_stamped += missing
+    return {"chats": n_chats, "stamped": n_stamped}
+
+
 def _find(sid):
     """Path of an existing session file (searched across all dated folders), or None."""
     if not _safe_id(sid):
@@ -40,9 +112,14 @@ def save(sid, title, messages, created=None):
         return False
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     existing = _find(sid)
+    prev_n = 0                                            # how many messages were already on disk
+    prev_updated = None                                   # the chat's last-activity time before this save
     if existing is not None:
         try:
-            created = (json.loads(existing.read_text()).get("created")) or created or _now()
+            old = json.loads(existing.read_text())
+            created = old.get("created") or created or _now()
+            prev_n = len(old.get("messages") or [])
+            prev_updated = old.get("updated")
         except (OSError, json.JSONDecodeError):
             created = created or _now()
         path = existing
@@ -57,7 +134,7 @@ def save(sid, title, messages, created=None):
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{sid}.json"
     rec = {"id": sid, "title": (title or "New voyage")[:120], "created": created,
-           "updated": _now(), "messages": messages or []}
+           "updated": _now(), "messages": _stamp(messages or [], prev_n, created, prev_updated)}
     atomicio.write_text(path, json.dumps(rec))   # atomic: a torn write can't lose the conversation
     return True
 
@@ -87,6 +164,30 @@ def list_all():
                     "date": (d.get("created") or "")[:10], "count": len(d.get("messages") or [])})
     out.sort(key=lambda c: c.get("updated") or "", reverse=True)
     return out
+
+
+def history_messages(sid, limit=400):
+    """The stored conversation as agent-ready chat messages: a list of
+    {role: 'user'|'assistant', content} so a continued chat (or any chat after a
+    restart) gets its real history back into the Agent. Thinking and tool-trace
+    entries are dropped — they're display-only, and reconstructing valid
+    tool_call/tool_result pairs from the saved shape is fragile; the user+assistant
+    turns carry the actual context. Keeps only the last `limit` turns as a backstop
+    against an enormous history blowing the prompt (the user can /compact further)."""
+    rec = get(sid)
+    if not rec:
+        return []
+    out = []
+    for m in rec.get("messages", []) or []:
+        role = m.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": m.get("content") or ""})
+        elif role == "assistant":
+            c = m.get("content")
+            if c:                                    # skip empty assistant turns (pure tool steps)
+                out.append({"role": "assistant", "content": c})
+        # 'thinking' / 'tool' / 'tools' are display-only — not part of the model's context
+    return out[-limit:]
 
 
 def transcript(sid, limit_chars=12000):
@@ -171,16 +272,17 @@ def _chat_text(rec):
     return "\n".join(p for p in ([title] + users + others) if p)
 
 
-def reindex():
-    """Embed conversations whose content changed since last index; prune deleted ones.
-    Returns how many were (re)embedded. No-op cost when nothing changed."""
+def reindex(force=False):
+    """Embed conversations whose content changed since last index; prune deleted ones. Returns how
+    many were (re)embedded. No-op cost when nothing changed — unless force=True re-embeds EVERY
+    conversation (used after an embedding model/convention change)."""
     con = _vdb()
     have = {r[0]: r[1] for r in con.execute("SELECT id, updated FROM chatvec").fetchall()}
     done, seen = 0, set()
     for meta in list_all():                              # newest first; {id, title, date, updated, count}
         sid = meta["id"]
         seen.add(sid)
-        if have.get(sid) == meta["updated"]:
+        if not force and have.get(sid) == meta["updated"]:
             continue                                     # unchanged since last index
         rec = get(sid)
         if not rec:
@@ -211,7 +313,7 @@ def search(query, k=8):
     con.close()
     if not rows:
         return []
-    qv = embeddings.embed(query)
+    qv = embeddings.embed(query, "query")
     scored = []
     if qv:
         for sid, title, date, snip, emb in rows:

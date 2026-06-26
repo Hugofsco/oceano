@@ -6,10 +6,12 @@ import sqlite3
 from pathlib import Path
 
 import config
-from oceano import embeddings
+from oceano import embeddings, rerank
 
 DB_PATH = config.WORKSPACE.parent / "data" / "rag.db"
 CHUNK_WORDS = 250
+RERANK_POOL = 10            # dense candidates handed to the cross-encoder reranker (eval favoured ~8-10;
+                           # a wider pool of short near-neighbours hurt). No-op if the reranker is off.
 TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".rst"}
 RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes its living docs
 
@@ -116,14 +118,43 @@ def index_docs(folder, only=None):
     return f"indexed {n_chunks} chunks from {n_files} changed file(s); {skipped} unchanged"
 
 
+def reembed_all():
+    """Re-embed every stored chunk IN PLACE (the chunk text is unchanged) — for after an embedding
+    model or convention change, so the document vectors match new queries again. Returns a summary."""
+    con = _db()
+    rows = con.execute("SELECT id, chunk FROM chunks").fetchall()
+    done = 0
+    for cid, chunk in rows:
+        vec = embeddings.embed(chunk)                    # 'document' by default
+        if not vec:
+            con.commit(); con.close()
+            return f"re-embedded {done}/{len(rows)} chunks (embed server went down — rerun to finish)"
+        con.execute("UPDATE chunks SET embedding=? WHERE id=?", (json.dumps(vec), cid))
+        done += 1
+    con.commit(); con.close()
+    return f"re-embedded {done}/{len(rows)} chunks"
+
+
+def _rerank_top(query, scored, k):
+    """Given dense-scored [(cosine, path, chunk)] best-first, re-order the top RERANK_POOL with the
+    cross-encoder reranker (when it's up) and return the top-k. Falls back to the dense order if the
+    reranker is unavailable. The cosine score is carried through unchanged (for display)."""
+    pool = scored[:max(k, RERANK_POOL)]
+    idx = rerank.order(query, [c for _, _, c in pool])
+    if idx is not None:
+        pool = [pool[i] for i in idx]
+    return pool[:k]
+
+
 def search_docs(query, k=4):
-    """Return the k most relevant document chunks for a question."""
+    """The k most relevant document chunks for a question — dense recall, then cross-encoder rerank
+    of the top pool (when the reranker is up; dense order otherwise). Returns the chunk text."""
     con = _db()
     rows = con.execute("SELECT path, chunk, embedding FROM chunks").fetchall()
     con.close()
     if not rows:
         return "(no documents indexed yet — run index_docs first)"
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return "ERROR: embed server down"
     scored = []
@@ -131,8 +162,8 @@ def search_docs(query, k=4):
         v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
         if v:
             scored.append((embeddings.cosine(qvec, v), path, chunk))
-    scored.sort(reverse=True)
-    return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in scored[:k])
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in _rerank_top(query, scored, k))
 
 
 def wipe():
@@ -158,7 +189,7 @@ def research_context(query, k=3, threshold=0.55):
     con.close()
     if not rows:
         return []
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return []
     scored = []
@@ -189,7 +220,7 @@ def search(query, k=6):
     con.close()
     if not rows:
         return []
-    qvec = embeddings.embed(query)
+    qvec = embeddings.embed(query, "query")
     if not qvec:
         return []
     scored = []
@@ -199,7 +230,7 @@ def search(query, k=6):
             scored.append((embeddings.cosine(qvec, v), path, chunk))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
-            for s, p, c in scored[:k]]
+            for s, p, c in _rerank_top(query, scored, k)]
 
 
 def prune_orphans():

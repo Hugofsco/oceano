@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 import config
-from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, safety, scheduler, skills, uibridge
+from oceano import atomicio, browser, calsync, chats, evals, researcher, rivers, embeddings, livebrowser, mcp_client, memory, rag, rerank, safety, scheduler, skills, uibridge
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -187,6 +187,7 @@ async def lifespan(_app):
         traceback.print_exc()
     try:
         skills.ensure_eval_task()    # the locked '[ SKILLS ] evaluate' schedule must exist
+        skills.ensure_distill_task()  # …and its feeder: distill recent chats into learning skills
     except Exception:
         traceback.print_exc()
     try:
@@ -201,6 +202,11 @@ async def lifespan(_app):
     try:
         from oceano import reindex
         reindex.ensure_task()              # the locked '[ INDEX ]' reindex schedule
+    except Exception:
+        traceback.print_exc()
+    try:
+        from oceano import reflect
+        reflect.ensure_task()              # the locked '[ SELF ]' nightly-reflection schedule
     except Exception:
         traceback.print_exc()
     yield
@@ -439,7 +445,17 @@ async def twofa_disable(req: Request):
 
 def _agent(sid):
     if sid not in _sessions:
-        _sessions[sid] = Agent()
+        ag = Agent()
+        # Rehydrate the conversation so continuing an existing chat — or any chat after a
+        # server restart — has its real history, not a blank slate. (Bare Agent() starts with
+        # only the system message; without this the model has no memory of the chat it's in.)
+        try:
+            hist = chats.history_messages(sid)
+            if hist:
+                ag.messages.extend(hist)
+        except Exception:
+            pass
+        _sessions[sid] = ag
     return _sessions[sid]
 
 
@@ -663,12 +679,25 @@ def _searxng_reachable():
         return False
 
 
+def _rerank_status():
+    """Reranker (:8084) — OPTIONAL. {enabled: model present, ok: server reachable}. When no model is
+    installed, reranking is off and RAG stays dense (enabled=False)."""
+    if not config.RERANK_MODEL.exists():
+        return {"enabled": False, "ok": False}
+    try:
+        requests.get(rerank.RERANK_URL.rstrip("/") + "/health", timeout=2)
+        return {"enabled": True, "ok": True}
+    except requests.RequestException:
+        return {"enabled": True, "ok": False}
+
+
 @app.get("/api/status")
 def system_status():
     """Live state of the consolidated daemons, for the Settings → Services panel."""
     from oceano import voice
     beat = scheduler.last_beat()
     return {"embed": _embed_reachable(),
+            "rerank": _rerank_status(),
             "scheduler_beat_ago": (time.time() - beat) if beat else None,
             "telegram": telegram_runtime.status(),
             "llamaswap": _llamaswap_status(),
@@ -686,6 +715,11 @@ async def services_restart(request: Request):
         ok = engine.restart_embed()
         return {"ok": ok, "msg": "embedding server restarting…" if ok
                 else "embedding server isn't managed by the daemon here"}
+    if name in ("rerank", "reranker"):
+        from oceano import engine
+        ok = engine.restart_rerank()
+        return {"ok": ok, "msg": "reranker restarting…" if ok
+                else "reranker isn't running here (no model installed, or unmanaged)"}
     if name == "telegram":
         await telegram_runtime.stop()
         st = await _apply_telegram()                      # re-reads saved settings, starts if enabled
@@ -911,6 +945,21 @@ async def mind_set(req: Request):
     from oceano import delegate
     mind = (await req.json()).get("mind", "local")
     return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
+
+
+@app.get("/api/claude-model")
+def claude_model_get():
+    """Which Claude model the CLI uses (the Claude mind + Claude-Code delegation). '' = CLI default."""
+    from oceano import delegate
+    return {"model": delegate.get_claude_model(), "options": list(delegate.CLAUDE_MODELS),
+            "available": delegate.available()}
+
+
+@app.post("/api/claude-model")
+async def claude_model_set(req: Request):
+    from oceano import delegate
+    model = (await req.json()).get("model", "")
+    return {"ok": True, "model": delegate.set_claude_model(model)}
 
 
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
@@ -1360,6 +1409,26 @@ def chat_live(sid: str, since: int = 0):
 def end_session(sid: str):
     _drop_session_state(sid)
     return {"ok": True}
+
+
+@app.post("/api/chat/{sid}/truncate")
+async def chat_truncate(sid: str, req: Request):
+    """Edit-and-regenerate support: drop the persisted chat to its first `keep` messages, then rebuild
+    the in-memory Agent from that truncated history — so the follow-up turn re-runs from the edit point
+    with a correct context (no stale reply, and no double-added message on the rehydrate path)."""
+    from oceano import chats
+    if _chat_live.get(sid, {}).get("running"):
+        return {"ok": False, "error": "a reply is still streaming — stop it first"}
+    keep = max(0, int((await req.json()).get("keep", 0)))
+    rec = chats.get(sid)
+    if not rec:
+        return {"ok": False, "error": "no such chat"}
+    msgs = (rec.get("messages") or [])[:keep]
+    chats.save(sid, rec.get("title"), msgs, rec.get("created"))
+    _drop_session_state(sid)     # forget the live Agent…
+    _agent(sid)                  # …and rebuild it from the truncated history NOW (while the file has no
+                                 # trailing user msg) so the next /api/chat turn hits the warm, correct path
+    return {"ok": True, "kept": len(msgs)}
 
 
 # ---------------- chat composer slash-commands (mirror Telegram /context /compact /status) ----------------
@@ -1878,6 +1947,23 @@ async def workflows_schedule(wid: int, req: Request):
 def workflows_runs(wid: int):
     from oceano import workflows
     return workflows.runs(wid)
+
+
+@app.get("/api/workflows/approvals")
+def workflows_approvals():
+    """Approval-node pauses waiting on a human decision (issue 8 D)."""
+    from oceano import workflows
+    return {"pending": workflows.pending_approvals()}
+
+
+@app.post("/api/workflows/approve")
+async def workflows_approve(req: Request):
+    """Resolve an approval-node pause: {token, approved: bool} → the run continues down the
+    approved/rejected branch."""
+    from oceano import workflows
+    b = await req.json()
+    ok = workflows.resolve_approval(b.get("token", ""), bool(b.get("approved")))
+    return {"ok": ok}
 
 
 @app.post("/api/workflows/{wid}/run")
@@ -2682,12 +2768,13 @@ async def mail_folder_op(aid: int, req: Request):
 
 
 @app.get("/api/mail/{aid}/messages")
-async def mail_get_messages(aid: int, folder: str = "INBOX", q: str = "", limit: int = 30, unread: bool = False):
+async def mail_get_messages(aid: int, folder: str = "INBOX", q: str = "", limit: int = 30,
+                            offset: int = 0, unread: bool = False):
     from oceano import mail
     a = mail._raw(aid)
     if not a:
         return {"ok": False, "error": "no such account"}
-    return await asyncio.to_thread(mail.imap_list, a, folder, q or None, limit, unread)
+    return await asyncio.to_thread(mail.imap_list, a, folder, q or None, limit, offset, unread)
 
 
 @app.get("/api/mail/{aid}/message")
@@ -2696,7 +2783,106 @@ async def mail_get_message(aid: int, uid: str, folder: str = "INBOX"):
     a = mail._raw(aid)
     if not a:
         return {"ok": False, "error": "no such account"}
-    return await asyncio.to_thread(mail.imap_read, a, uid, folder)
+    # Opening a message in the reader marks it read (like a normal client) — but only on accounts
+    # that allow in-mailbox organizing; a 'readonly' account is left untouched.
+    mark = mail.check_policy(a, "organize") is None
+    return await asyncio.to_thread(mail.imap_read, a, uid, folder, mark)
+
+
+# content types we'll serve INLINE (for double-click "open"): a browser renders these in its own
+# viewer, and we still sandbox the response so even a crafted one can't reach the app's origin.
+# Anything else (HTML/SVG/scripts/unknown) always falls back to a forced download.
+_INLINE_OK = ("image/", "application/pdf", "text/plain")
+
+
+@app.get("/api/mail/{aid}/attachment")
+async def mail_get_attachment(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0,
+                              disposition: str = "attachment"):
+    """Stream ONE attachment. Default: FORCED download (octet-stream + nosniff) so an HTML/SVG/script
+    attachment can never render or execute in the app's origin. disposition=inline opens safe types
+    (images/PDF/text) in the browser's own viewer, served sandboxed (unique origin, no script) — every
+    other type still downloads. The bytes are untrusted email content."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return JSONResponse({"ok": False, "error": "no such account"}, status_code=404)
+    res = await asyncio.to_thread(mail.fetch_attachment, a, uid, folder, index)
+    if not res.get("ok"):
+        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=404)
+    fn = res["filename"].replace('"', "").replace("\n", "").replace("\r", "")
+    ctype = res.get("content_type") or ""
+    if disposition == "inline" and any(ctype.startswith(p) for p in _INLINE_OK):
+        # sandbox CSP → the resource gets a unique origin, so even a crafted PDF/image viewer
+        # context can't touch the app's cookies/DOM; nosniff stops content-type confusion.
+        return Response(content=res["data"], media_type=ctype,
+                        headers={"Content-Disposition": f'inline; filename="{fn}"',
+                                 "X-Content-Type-Options": "nosniff",
+                                 "Content-Security-Policy": "sandbox; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'",
+                                 "Cache-Control": "no-store"})
+    return Response(content=res["data"], media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"',
+                             "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
+@app.get("/api/mail/{aid}/attachment/sha256")
+async def mail_attachment_sha256(aid: int, folder: str = "INBOX", uid: str = "", index: int = 0):
+    """SHA256 of one attachment (computed server-side from the bytes) for a keyless VirusTotal lookup."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    res = await asyncio.to_thread(mail.attachment_sha256, a, uid, folder, index)
+    if res.get("ok"):
+        from oceano import virustotal
+        res["report_url"] = virustotal.file_report_url(res["sha256"])
+    return res
+
+
+@app.post("/api/mail/{aid}/attachment/virustotal")
+async def mail_attachment_virustotal(aid: int, req: Request):
+    """Upload one attachment to VirusTotal for scanning (needs an API key in Settings → Mail).
+    Returns {ok, url} pointing at the analysis page."""
+    from oceano import mail, virustotal
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    key = (load().get("virustotal_key") or "").strip()
+    if not key:
+        return {"ok": False, "error": "no VirusTotal API key set — add one in Settings → Mail"}
+    b = await req.json()
+    fetched = await asyncio.to_thread(mail.fetch_attachment, a, b.get("uid"),
+                                      b.get("folder", "INBOX"), int(b.get("index", 0)))
+    if not fetched.get("ok"):
+        return fetched
+    return await asyncio.to_thread(virustotal.upload, key, fetched["data"], fetched["filename"])
+
+
+@app.get("/api/virustotal")
+def virustotal_key_get():
+    """Whether a VirusTotal API key is configured (never returns the key itself)."""
+    return {"has_key": bool((load().get("virustotal_key") or "").strip())}
+
+
+@app.post("/api/virustotal")
+async def virustotal_key_set(req: Request):
+    """Set or clear the VirusTotal API key (stored in web.json, chmod 600 like the other secrets)."""
+    b = await req.json()
+    data = load()
+    data["virustotal_key"] = (b.get("key") or "").strip()
+    save(data)
+    return {"ok": True, "has_key": bool(data["virustotal_key"])}
+
+
+@app.post("/api/mail/{aid}/attachment/save")
+async def mail_save_attachment_human(aid: int, req: Request):
+    """Save an incoming attachment into the workspace (confined, sanitized name, no overwrite)."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    b = await req.json()
+    return await asyncio.to_thread(mail.save_attachment, a, b.get("uid"), b.get("folder", "INBOX"),
+                                   int(b.get("index", 0)))
 
 
 @app.post("/api/mail/{aid}/send")
@@ -2717,6 +2903,29 @@ async def mail_send_human(aid: int, req: Request):
                                    b.get("body", ""), b.get("cc") or None, b.get("html") or None)
 
 
+@app.post("/api/mail/{aid}/compose")
+async def mail_compose_send(aid: int, to: str = Form(""), cc: str = Form(""), subject: str = Form(""),
+                            body: str = Form(""), html: str = Form(""), reply_uid: str = Form(""),
+                            folder: str = Form("INBOX"), files: list[UploadFile] = File(default=[])):
+    """Human send/reply WITH attachments (multipart). Files are read in memory and size-capped."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    atts, total = [], 0
+    for f in (files or []):
+        data = await f.read()
+        total += len(data)
+        if len(data) > 25 * 1024 * 1024 or total > 30 * 1024 * 1024:
+            return {"ok": False, "error": "attachments too large (25 MB each, 30 MB total)"}
+        atts.append({"filename": f.filename, "data": data, "content_type": f.content_type})
+    if reply_uid:
+        return await asyncio.to_thread(mail.smtp_reply, a, reply_uid, body, folder, html or None, atts)
+    if not to.strip():
+        return {"ok": False, "error": "recipient required"}
+    return await asyncio.to_thread(mail.smtp_send, a, to, subject, body, cc or None, html or None, atts)
+
+
 @app.post("/api/mail/{aid}/action")
 async def mail_action_human(aid: int, req: Request):
     """Human-driven organize from the Mail window: op = move | delete | flag."""
@@ -2735,6 +2944,20 @@ async def mail_action_human(aid: int, req: Request):
     if op == "flag":
         return await asyncio.to_thread(mail.imap_flag, a, uid, b.get("flag", ""), folder)
     return {"ok": False, "error": f"unknown op {op!r}"}
+
+
+@app.post("/api/mail/{aid}/bulk")
+async def mail_bulk_human(aid: int, req: Request):
+    """Human-driven bulk organize in one connection: act on many messages at once — an explicit `uids`
+    list, or all=True to act on every message matching the optional search `q`. op = move | delete | flag."""
+    from oceano import mail
+    a = mail._raw(aid)
+    if not a:
+        return {"ok": False, "error": "no such account"}
+    b = await req.json()
+    return await asyncio.to_thread(mail.imap_bulk, a, b.get("op"), b.get("folder", "INBOX"),
+                                   b.get("uids"), b.get("q") or None, bool(b.get("all")),
+                                   b.get("dest"), b.get("flag"))
 
 
 @app.post("/api/mail/{aid}/ai-draft")

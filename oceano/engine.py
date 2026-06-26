@@ -24,20 +24,36 @@ from pathlib import Path
 
 import uvicorn
 
+import config
 from oceano import scheduler
 from oceano.web.server import app
 
 ROOT = Path(__file__).resolve().parent.parent
 EMBED_SCRIPT = ROOT / "scripts" / "serve-embeddings.sh"
+RERANK_SCRIPT = ROOT / "scripts" / "serve-rerank.sh"
 SCHED_INTERVAL = 30      # seconds between due-task checks
 
 _embed_proc = None       # the current embedding child, so the UI can restart it on demand
+_rerank_proc = None      # the current reranker child (if any), for the same
 
 
 def restart_embed():
     """Terminate the current embedding child; embed_supervisor() then respawns it. Returns True if a
     live child was signalled. Call from the event loop (it touches the asyncio subprocess transport)."""
     p = _embed_proc
+    if p is None or p.returncode is not None:
+        return False
+    try:
+        p.terminate()
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def restart_rerank():
+    """Terminate the current reranker child; rerank_supervisor() then respawns it. Returns True if a
+    live child was signalled (False when reranking is off / unmanaged here)."""
+    p = _rerank_proc
     if p is None or p.returncode is not None:
         return False
     try:
@@ -100,6 +116,50 @@ async def embed_supervisor(stop):
         backoff = min(backoff * 2, 30)         # back off on a crash-loop, cap at 30s
 
 
+async def rerank_supervisor(stop):
+    """Run the OPTIONAL cross-encoder reranker as a child process; restart it if it dies, and
+    terminate it cleanly when `stop` is set. Skipped entirely if the reranker model isn't present —
+    RAG then stays dense (search still works, just without the rerank stage)."""
+    if os.environ.get("OCEANO_RERANK_MANAGED", "1") != "1":
+        log("[rerank] unmanaged (OCEANO_RERANK_MANAGED=0) — assuming it runs elsewhere")
+        return
+    if not config.RERANK_MODEL.exists():
+        log(f"[rerank] no reranker model at {config.RERANK_MODEL} — RAG reranking off (dense only)")
+        return
+    if not RERANK_SCRIPT.exists():
+        log(f"[rerank] launcher missing: {RERANK_SCRIPT} — not starting reranker")
+        return
+
+    global _rerank_proc
+    backoff = 2
+    while not stop.is_set():
+        proc = await asyncio.create_subprocess_exec("bash", str(RERANK_SCRIPT))
+        _rerank_proc = proc
+        log(f"[rerank] reranker server up (pid {proc.pid})")
+
+        waiter = asyncio.ensure_future(proc.wait())
+        stopper = asyncio.ensure_future(stop.wait())
+        await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+
+        if stop.is_set():
+            if proc.returncode is None:            # shutting down → take the child with us
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            for f in (waiter, stopper):
+                f.cancel()
+            log("[rerank] reranker server stopped")
+            return
+
+        stopper.cancel()                           # child died on its own → restart it
+        log(f"[rerank] exited (rc={proc.returncode}); restarting in {backoff}s")
+        await _sleep_or_stop(stop, backoff)
+        backoff = min(backoff * 2, 30)
+
+
 async def calendar_loop(stop):
     """Refresh calendar feeds that are due for a sync (calsync decides which)."""
     from oceano import calsync
@@ -120,13 +180,16 @@ async def scheduler_loop(stop):
     log(f"[scheduler] watching for due tasks (every {SCHED_INTERVAL}s)")
     while not stop.is_set():
         try:
-            ran = await asyncio.to_thread(scheduler.run_due_once)  # blocking → worker thread
+            ran = await asyncio.to_thread(scheduler.run_due_once)  # fast: stamps + enqueues due tasks
             if ran:
-                log(f"[scheduler] ran {ran} task(s)")
+                log(f"[scheduler] queued {ran} due task(s)")
             from oceano import workflows
             fired = await asyncio.to_thread(workflows.poll_watch_triggers)   # file/folder-watch triggers
             if fired:
                 log(f"[triggers] {fired} watch-trigger run(s) fired")
+            mailed = await asyncio.to_thread(workflows.poll_email_triggers)  # email-received triggers
+            if mailed:
+                log(f"[triggers] {mailed} email-trigger run(s) fired")
         except Exception as e:
             log(f"[scheduler] tick error: {e}")
         await _sleep_or_stop(stop, SCHED_INTERVAL)
@@ -134,7 +197,10 @@ async def scheduler_loop(stop):
 
 
 async def run():
-    host = os.environ.get("OCEANO_WEB_HOST", "127.0.0.1")
+    # Bind all interfaces by default so the UI is reachable across a trusted LAN/Tailscale without a
+    # tunnel. The web UI is gated by login + optional TOTP 2FA — KEEP IT ON A TRUSTED NETWORK and change
+    # the default password (the agent runs shell commands). Set OCEANO_WEB_HOST=127.0.0.1 for loopback-only.
+    host = os.environ.get("OCEANO_WEB_HOST", "0.0.0.0")
     port = int(os.environ.get("OCEANO_WEB_PORT", "8800"))
     server = uvicorn.Server(uvicorn.Config(
         app, host=host, port=port, log_level="warning", timeout_graceful_shutdown=15))
@@ -151,10 +217,15 @@ async def run():
         loop.add_signal_handler(sig, request_stop)
 
     bg = [asyncio.create_task(embed_supervisor(stop), name="embed"),
+          asyncio.create_task(rerank_supervisor(stop), name="rerank"),
           asyncio.create_task(scheduler_loop(stop), name="scheduler"),
           asyncio.create_task(calendar_loop(stop), name="calendar")]
 
     log(f"⚓ Oceano engine — web http://{host}:{port} · telegram + scheduler + embeddings in-process")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        log(f"[web] bound to {host} — reachable across the network. Keep it on a TRUSTED network, "
+            f"change the default admin password, and enable 2FA (Settings → Account). "
+            f"Set OCEANO_WEB_HOST=127.0.0.1 to restrict to this machine.")
     try:
         # Runs the app lifespan (which starts the Telegram bot), then serves until
         # request_stop() fires; on the way out the lifespan stops the bot.

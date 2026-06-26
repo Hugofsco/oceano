@@ -8,7 +8,9 @@ ntfy: set OCEANO_NTFY_TOPIC to a private, hard-to-guess topic. Defaults to the
 public ntfy.sh server; point OCEANO_NTFY_URL at a self-hosted ntfy for privacy.
 """
 import os
+import queue
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -34,6 +36,11 @@ def _db():
     for col in ("source", "model", "base_url"):      # migrate older DBs in place (column names are literals)
         if col not in cols:
             con.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+    # Bootstrap legacy rows that never ran: a NULL last_run made is_due() compute a base of
+    # 'now', so croniter's next fire was always in the future and the task NEVER triggered.
+    # Seed it to now so they start firing at their next scheduled time (no mass catch-up).
+    con.execute("UPDATE tasks SET last_run=? WHERE last_run IS NULL OR last_run=''",
+                (datetime.now(timezone.utc).isoformat(),))
     con.commit()
     return con
 
@@ -54,7 +61,10 @@ def schedule_task(cron, instruction):
     except ImportError:
         pass
     con = _db()
-    con.execute("INSERT INTO tasks (cron, instruction) VALUES (?,?)", (cron, instruction))
+    # Seed last_run = now so the task bootstraps from creation time (fires at the NEXT cron
+    # occurrence). A NULL here used to make is_due() never fire it. See _db()/is_due().
+    con.execute("INSERT INTO tasks (cron, instruction, last_run) VALUES (?,?,?)",
+                (cron, instruction, datetime.now(timezone.utc).isoformat()))
     con.commit()
     con.close()
     return f"scheduled '{instruction}' on cron '{cron}'"
@@ -135,8 +145,12 @@ def add_task(cron, instruction, source=None, model=None, base_url=None):
     except ImportError:
         pass
     con = _db()
-    cur = con.execute("INSERT INTO tasks (cron, instruction, source, model, base_url) VALUES (?,?,?,?,?)",
-                      (cron, instruction, source, model or None, base_url or None))
+    # Seed last_run = now (creation baseline) so the task fires at its NEXT cron occurrence
+    # instead of never — a NULL last_run made is_due() always look one interval into the future.
+    cur = con.execute("INSERT INTO tasks (cron, instruction, source, model, base_url, last_run) "
+                      "VALUES (?,?,?,?,?,?)",
+                      (cron, instruction, source, model or None, base_url or None,
+                       datetime.now(timezone.utc).isoformat()))
     con.commit()
     tid = cur.lastrowid
     con.close()
@@ -204,11 +218,50 @@ def delete_task(tid, allow_managed=False):
 
 # --- the actual runner (driven by the engine's loop) ----------------------
 def is_due(cron, last_run, now=None):
-    """True if a task on `cron` whose last run was `last_run` should run by now."""
+    """True if a task on `cron` whose last run was `last_run` should run by now.
+
+    `last_run` is normally seeded at creation (see add_task/_db), so the usual path is:
+    next fire AFTER the last run has already passed → due. The None branch is a defensive
+    backstop: base it on the PREVIOUS scheduled time (get_prev, always ≤ now) so a task that
+    somehow has no baseline still fires on the next tick rather than never — the old code based
+    it on `now`, whose get_next() is always in the future, which is why such tasks never ran."""
     from croniter import croniter
     now = now or datetime.now(timezone.utc)
-    base = datetime.fromisoformat(last_run) if last_run else now
-    return croniter(cron, base).get_next(datetime) <= now
+    if last_run:
+        return croniter(cron, datetime.fromisoformat(last_run)).get_next(datetime) <= now
+    return croniter(cron, now).get_prev(datetime) <= now
+
+
+# --- background drainer: scheduled tasks run OFF the engine's tick thread -------------------
+# run_due_once() used to execute every due task inline, so one slow agent task (minutes) blocked
+# the whole loop — no heartbeat, no new due-checks → the Scheduler looked dead/sluggish. Now the
+# tick only STAMPS + ENQUEUES due tasks and returns instantly (so it beats every interval); a
+# single daemon worker drains the queue serially (no local-model thrash) however long each takes.
+_TASK_Q = queue.Queue()
+_worker_started = False
+_worker_lock = threading.Lock()
+
+
+def _ensure_worker():
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        _worker_started = True
+        threading.Thread(target=_drain_loop, name="sched-drain", daemon=True).start()
+
+
+def _drain_loop():
+    while True:
+        source, instruction, ref, model, base_url = _TASK_Q.get()
+        try:
+            print(f"[scheduler] running {ref}: {instruction}")
+            answer = _dispatch(source, instruction, ref=ref, model=model, base_url=base_url)
+            notify(f"{instruction}\n\n{answer}", title="Oceano task")   # full report; notify() chunks per channel
+        except Exception as e:                                          # noqa: BLE001
+            print(f"[scheduler] task {ref} failed: {e}")
+        finally:
+            _TASK_Q.task_done()
 
 
 def _dispatch(source, instruction, ref=None, model=None, base_url=None):
@@ -229,6 +282,9 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
         if source == "skills:eval":                          # locked skills-evaluation entry
             from oceano import skills
             return skills.evaluate_all()
+        if source == "skills:distill":                       # locked feeder: mine recent chats → learning skills
+            from oceano import skills
+            return skills.distill_recent()
         if source == "evals:run":                            # locked model-eval suite
             from oceano import evals
             evals.run_all_bg()                               # long → background, don't wedge the caller
@@ -236,6 +292,9 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
         if source == "memory:maintain":                      # locked memory-hygiene job
             from oceano import memory
             return memory.maintain()                         # delegates to the configured reviewer, applies the plan
+        if source == "self:reflect":                         # locked nightly self-reflection
+            from oceano import reflect
+            return reflect.reflect()
         if source == "reindex:all":                          # locked index re-sync (docs/memories/skills/chats)
             from oceano import reindex
             return reindex.reindex_all()
@@ -266,31 +325,30 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
 
 
 def run_due_once():
-    """Stamp the heartbeat, run every task that's due, push each result. Blocking.
+    """Stamp the heartbeat, then ENQUEUE every due task for the background drainer. Returns
+    fast (just a DB scan + enqueue) so the engine's tick keeps beating on schedule even while a
+    long task runs. Returns the number of tasks queued.
 
-    Returns the number of tasks run. A failing task is logged + skipped (its
-    last_run still advances) so one bad task can't wedge the whole loop.
+    last_run is advanced HERE, before the task runs, so a slow task can't be re-queued on the
+    next tick while it's still in flight (and a failing task won't retry until its next cron) —
+    same 'one bad task can't wedge the loop' guarantee as before, now without blocking.
     """
     beat()                                  # tell the UI we're alive
+    _ensure_worker()
     con = _db()
     rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source, model, base_url "
                        "FROM tasks").fetchall()
     now = datetime.now(timezone.utc)
-    ran = 0
+    queued = 0
     for tid, cron, instruction, last_run, enabled, source, model, base_url in rows:
         if not (enabled and is_due(cron, last_run, now)):
             continue
-        print(f"[scheduler] running #{tid}: {instruction}")
-        try:
-            answer = _dispatch(source, instruction, ref=source or f"task:{tid}", model=model, base_url=base_url)
-            notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task")
-        except Exception as e:
-            print(f"[scheduler] task #{tid} failed: {e}")
-        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (now.isoformat(), tid))
-        ran += 1
-    con.commit()
+        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (now.isoformat(), tid))  # claim it before dispatch
+        con.commit()
+        _TASK_Q.put((source, instruction, source or f"task:{tid}", model, base_url))
+        queued += 1
     con.close()
-    return ran
+    return queued
 
 
 def run_task(tid, advance=True):
@@ -314,5 +372,5 @@ def run_task(tid, advance=True):
         con.execute("UPDATE tasks SET last_run=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), tid))
         con.commit()
         con.close()
-    notify(f"{instruction}\n\n{answer[:600]}", title="Oceano task (manual)")
+    notify(f"{instruction}\n\n{answer}", title="Oceano task (manual)")  # full report; notify() chunks per channel
     return {"ok": True, "result": answer}

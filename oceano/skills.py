@@ -31,6 +31,8 @@ from oceano import embeddings
 SKILLS_DIR = config.WORKSPACE.parent / "skills"
 STATUSES = ("learning", "staged", "published")
 EVAL_SOURCE = "skills:eval"            # the locked scheduler entry's source tag
+DISTILL_SOURCE = "skills:distill"      # the locked feeder that mines recent chats into learning skills
+_DISTILL_STATE = config.WORKSPACE.parent / "data" / "skills_distilled.json"   # sid -> updated stamp already mined
 
 _VEC_CACHE = {}                        # dir -> (mtime, embedding) for relevant()
 
@@ -130,7 +132,7 @@ def relevant(query, k=6):
     pubs = _published()
     if len(pubs) <= k:
         return "\n".join(f"- {s['name']}: {s['description']}" for s in pubs)
-    qv = embeddings.embed(query)
+    qv = embeddings.embed(query, "query")
     if not qv:
         return catalog()
     scored = []
@@ -435,3 +437,65 @@ def ensure_eval_task():
     scheduler.add_task("0 5 * * *",
                        "[ SKILLS ] Evaluate learning skills (independent review → staging → publish)",
                        source=EVAL_SOURCE)
+
+
+def distill_recent(max_chats=6, min_msgs=4):
+    """Feed the skills pipeline: mine recently-active conversations into LEARNING skills.
+
+    Each conversation is distilled by the strong improve-delegate (from_conversation) — the local
+    model never authors its own skills — so this only PROPOSES; the 05:00 skills:eval review then
+    independently judges/edits and the local model does the final publish gate. A small state file
+    remembers which chats were already mined at their current `updated` stamp, so each run only
+    chews on new or changed conversations (and re-mines a chat that gained new turns). Bounded to
+    `max_chats` per run to cap delegate calls. Returns a human-readable summary."""
+    from oceano import chats, jobs, atomicio
+    try:
+        seen = json.loads(_DISTILL_STATE.read_text()) if _DISTILL_STATE.exists() else {}
+    except (OSError, ValueError):
+        seen = {}
+    todo = [c for c in chats.list_all()
+            if (c.get("count") or 0) >= min_msgs and seen.get(c["id"]) != c.get("updated")][:max_chats]
+    if not todo:
+        return "no new conversations to distill"
+    saved = nothing = failed = 0
+    names = []
+    with jobs.job("skills", "skill distillation", ref=DISTILL_SOURCE):
+        for c in todo:
+            tr = chats.transcript(c["id"])
+            if not tr.strip():
+                seen[c["id"]] = c.get("updated")        # empty/unreadable → don't revisit
+                continue
+            r = from_conversation(tr)
+            if not r.get("ok"):
+                failed += 1
+                continue                                # delegate down → leave unseen, retry next run
+            if r.get("saved"):
+                saved += 1
+                names.append(r.get("name"))
+            else:
+                nothing += 1
+            seen[c["id"]] = c.get("updated")            # mined at this stamp → skip until it changes
+    try:
+        atomicio.write_text(_DISTILL_STATE, json.dumps(seen))
+    except OSError:
+        pass
+    parts = [f"{len(todo)} conversation(s) examined"]
+    if saved:
+        parts.append(f"{saved} new learning skill(s): " + ", ".join(n for n in names if n))
+    if nothing:
+        parts.append(f"{nothing} had nothing reusable")
+    if failed:
+        parts.append(f"{failed} failed (delegate unavailable)")
+    return "; ".join(parts)
+
+
+def ensure_distill_task():
+    """Make sure the locked '[ SKILLS ] distill' feeder schedule exists (visible in the Scheduler,
+    not editable/removable there). Daily at 03:00 — ahead of the 05:00 review, so a skill distilled
+    overnight is reviewed and (maybe) published the same night."""
+    from oceano import scheduler
+    if any(t.get("source") == DISTILL_SOURCE for t in scheduler.all_tasks()):
+        return
+    scheduler.add_task("0 3 * * *",
+                       "[ SKILLS ] Distill reusable skills from recent conversations (→ learning)",
+                       source=DISTILL_SOURCE)

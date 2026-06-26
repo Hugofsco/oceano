@@ -47,7 +47,17 @@ _MODEL_KEY = "oceano_default_model"        # primary model id the agent uses eve
 _BASE_KEY = "oceano_default_base_url"      # its endpoint (empty = the default local endpoint)
 _KEY_KEY = "oceano_default_api_key"        # api key for that endpoint (empty = config default)
 _ENABLED_KEY = "delegation_enabled"        # master on/off for delegation (run + delegate tool)
-_RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key", "delegation_enabled")
+_CLAUDE_MODEL_KEY = "claude_model"         # which Claude model the CLI uses (alias/id); "" = CLI default
+_RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key",
+             "delegation_enabled", "claude_model")
+# Claude models the user can pick for the CLI (mind + delegation). Aliases track the latest of each
+# tier, so they stay valid across releases; "" means don't pass --model (use the CLI's own default).
+CLAUDE_MODELS = (
+    {"id": "", "label": "Default (subscription's default)"},
+    {"id": "sonnet", "label": "Sonnet — balanced, recommended for the agent"},
+    {"id": "opus", "label": "Opus — most capable, slower/costlier"},
+    {"id": "haiku", "label": "Haiku — fastest, lightest"},
+)
 # 'default' = the agent's delegate tool · 'improve' = self-improving jobs · 'vision' = image
 # recognition (the local chat model is text-only, so images are routed to this target).
 ROLES = ("default", "improve", "vision")
@@ -137,6 +147,28 @@ def set_primary(model, base_url="", api_key=""):
     except OSError:
         pass
     return get_primary()
+
+
+def get_claude_model():
+    """The Claude model id/alias the CLI should use (mind + delegation). '' = the CLI's own default."""
+    return (_raw().get(_CLAUDE_MODEL_KEY) or "").strip()
+
+
+def set_claude_model(model):
+    """Persist which Claude model the CLI runs (e.g. 'sonnet', 'opus', or a full id). '' clears it."""
+    d = _raw()
+    d[_CLAUDE_MODEL_KEY] = (model or "").strip()
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_claude_model()
+
+
+def _claude_model_args():
+    """`--model <m>` for the claude CLI when the user pinned one, else [] (CLI default)."""
+    m = get_claude_model()
+    return ["--model", m] if m else []
 
 
 def served_models():
@@ -241,7 +273,7 @@ def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turn
         return {"ok": False, "output": "",
                 "error": "claude CLI not found — install Claude Code, or set OCEANO_CLAUDE_BIN"}
     cmd = [binary, "-p", instructions, "--output-format", "text",
-           "--max-turns", str(int(max_turns))]
+           "--max-turns", str(int(max_turns))] + _claude_model_args()
     if tools:
         cmd += ["--allowedTools", tools]
     try:
@@ -291,7 +323,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
                 "or set OCEANO_CLAUDE_BIN", "partial": False, "turns": 0, "cost": 0.0}
     cmd = [binary, "-p", instructions, "--output-format", "stream-json", "--verbose",
-           "--max-turns", str(int(max_turns))]
+           "--max-turns", str(int(max_turns))] + _claude_model_args()
     if tools:
         cmd += ["--allowedTools", tools]
     if append_system:

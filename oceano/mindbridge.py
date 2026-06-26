@@ -11,8 +11,35 @@ Flow:  Claude  →(stdio MCP)→  mcp_bridge_server  →(HTTP + token)→  /api/
 import json
 import os
 import secrets
+import threading
 
 from oceano import tools
+
+# How many UNATTENDED (background) Claude-mind turns are running. The bridge proxy executes tools in
+# the DAEMON, where the request thread defaults to the 'web' channel — fine for interactive chat (the
+# user is watching the shared browser / windows), but a scheduled task pinned to the Claude mind must
+# NOT drive them. The turn-driving thread brackets a background turn with begin/end_background_turn();
+# while one is active, bridged tools run in 'background' so every channel gate (live browser, ui_*,
+# fetch_url→plain HTTP) applies — exactly as for local-model background jobs.
+_bg_lock = threading.Lock()
+_bg_mind_turns = 0
+
+
+def begin_background_turn():
+    global _bg_mind_turns
+    with _bg_lock:
+        _bg_mind_turns += 1
+
+
+def end_background_turn():
+    global _bg_mind_turns
+    with _bg_lock:
+        _bg_mind_turns = max(0, _bg_mind_turns - 1)
+
+
+def _bridge_channel():
+    with _bg_lock:
+        return "background" if _bg_mind_turns else "web"
 
 # The mind's BODY: Oceano's own tools, so the mind acts THROUGH Oceano (and the user can see it).
 # Its native Read/Write/Bash cover files+shell, but the WEB is routed here on purpose — Oceano's
@@ -29,7 +56,7 @@ _ALLOW = {
     "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
     "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
     "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)
-    "mail_folder",                                                       # create/rename/delete folders (gated; delete needs arming)
+    "mail_folder", "mail_save_attachment",                              # folders (gated) + save an email attachment to the workspace
 }
 
 _TOKEN = None
@@ -75,8 +102,10 @@ def tool_names():
 
 
 def run_tool(name, args):
-    """Execute an Oceano tool IN THE DAEMON (web channel, so ui_* reach the live browser). Returns
-    the tool's string result. Re-checks the denylist so the proxy can't reach a withheld tool.
+    """Execute an Oceano tool IN THE DAEMON. Interactive mind turns run on the 'web' channel (so ui_*
+    reach the live browser the user is watching); an UNATTENDED (background) mind turn runs on the
+    'background' channel instead — see _bridge_channel() — so it can't drive the live browser or UI.
+    Returns the tool's string result. Re-checks the denylist so the proxy can't reach a withheld tool.
 
     Carries the injection taint across the bridge: each call runs in its own request thread, so we
     reset the thread-local taint, run, and if the tool read untrusted content (web page / email /
@@ -84,7 +113,7 @@ def run_tool(name, args):
     if name not in _ALLOW:
         return f"ERROR: tool {name!r} is not available to the mind"
     from oceano import safety
-    with tools.channel("web"):
+    with tools.channel(_bridge_channel()):
         safety.reset_untrusted()                       # clean slate for this per-call thread
         result = tools.run(name, json.dumps(args or {}))
         if safety.untrusted_seen():                    # this tool ingested untrusted content → taint the turn

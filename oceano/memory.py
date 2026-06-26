@@ -14,7 +14,17 @@ from oceano import embeddings, atomicio
 DB_PATH = config.WORKSPACE.parent / "data" / "memory.db"
 POLICY_PATH = config.WORKSPACE.parent / "data" / "memory_policy.json"
 
-_embed = embeddings.embed     # shared with RAG — see oceano/embeddings.py
+_EMBED_CLIP = 5000            # backstop: keep 'search_document: '+text within the embed server's
+                              # 2048-token batch (see scripts/serve-embeddings.sh) so a very long
+                              # memory still embeds (truncated) instead of silently failing.
+
+
+def _embed(text, kind="document"):
+    """Embed a memory's text (as a document) or a query, clipped to a safe length and None-safe.
+    `kind` is 'document' (stored, the default) or 'query' — picks the nomic prefix."""
+    return embeddings.embed((text or "")[:_EMBED_CLIP], kind)
+
+
 _cosine = embeddings.cosine
 
 # Memory types + how each is injected into the agent's context:
@@ -122,7 +132,7 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
     relevant = {c for c, p in policy.items() if p == "relevant"}
     pool = [r for r in rows if r[0] not in chosen and (r[3] or "fact") in relevant]
     if pool:                                         # 3. semantic top-k from 'relevant'
-        qv = _embed(query)
+        qv = _embed(query, "query")
         if qv:
             scored = []
             for r in pool:                           # skip rows with a missing/corrupt vector
@@ -138,11 +148,13 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
     return list(chosen.values())
 
 
-def reindex():
-    """Backfill embeddings for memories stored before the embed server existed.
-    Safe to run repeatedly — only touches rows still missing an embedding."""
+def reindex(force=False):
+    """Backfill embeddings for memories stored before the embed server existed. Safe to run
+    repeatedly — only touches rows still missing an embedding, unless force=True re-embeds EVERY
+    row (used after an embedding model/convention change — see reindex.rebuild_embeddings())."""
     con = _db()
-    rows = con.execute("SELECT id, text FROM memories WHERE embedding IS NULL").fetchall()
+    q = "SELECT id, text FROM memories" + ("" if force else " WHERE embedding IS NULL")
+    rows = con.execute(q).fetchall()
     done = 0
     for mid, text in rows:
         vec = _embed(text)
@@ -330,7 +342,7 @@ def best_match(query):
     con.close()
     if not rows:
         return None
-    qv = _embed(query)
+    qv = _embed(query, "query")
     if qv:
         scored = []
         for i, t, e in rows:                          # corrupt/missing vector → -1.0 (sorts last)
