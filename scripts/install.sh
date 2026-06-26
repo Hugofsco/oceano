@@ -6,7 +6,7 @@
 #      (NVIDIA→CUDA, AMD/Intel→Vulkan, ROCm, or CPU; installs the NVIDIA driver if absent)
 #   2. apt deps (build tools incl. libcurl, the backend's dev/runtime libs, python)
 #   3. build llama.cpp with that backend (skips if already built to match)
-#   4. fetch the embedding model if missing
+#   4. fetch the embedding + RAG reranker models if missing
 #   5. python venv + requirements + playwright chromium (+ system libs via install-deps)
 #   6. ensure oceano.env exists
 #   7. SearXNG (:8080): install Docker + bring up the bundled compose if down
@@ -42,6 +42,9 @@ LLAMA_BUILD="$LLAMA_DIR/build"
 MODELS_DIR="${OCEANO_MODELS_DIR:-$LLAMA_DIR/models}"
 EMBED_MODEL="${EMBED_MODEL:-$MODELS_DIR/nomic-embed-text-v1.5.Q8_0.gguf}"
 EMBED_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
+# RAG cross-encoder reranker (:8084) — small, fetched by default; RAG degrades to dense-only without it.
+RERANK_MODEL="${OCEANO_RERANK_MODEL:-$MODELS_DIR/bge-reranker-v2-m3-Q8_0.gguf}"
+RERANK_MODEL_URL="https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf"
 # Kokoro neural TTS voice (~120 MB total; the natural default voice). Falls back to Piper if absent.
 KOKORO_DIR="${OCEANO_KOKORO_DIR:-$ROOT/assets/kokoro}"
 KOKORO_REL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
@@ -181,6 +184,7 @@ fetch_model() {  # $1=path $2=url
 models() {
   say "Models"
   fetch_model "$EMBED_MODEL" "$EMBED_MODEL_URL"
+  fetch_model "$RERANK_MODEL" "$RERANK_MODEL_URL"   # RAG reranker (:8084); ~607 MB
   fetch_model "$KOKORO_DIR/kokoro-v1.0.int8.onnx" "$KOKORO_REL/kokoro-v1.0.int8.onnx"
   fetch_model "$KOKORO_DIR/voices-v1.0.bin" "$KOKORO_REL/voices-v1.0.bin"
   if [ "$WITH_MODELS" = 1 ]; then for m in "${!CHAT_MODELS[@]}"; do fetch_model "$m" "${CHAT_MODELS[$m]}"; done
@@ -381,7 +385,11 @@ summary() {
   port_up 8800        && ok "web UI        :8800  up" || warn "web UI        :8800  DOWN"
   port_up 8082 "/v1/models" && ok "embeddings    :8082  up" || warn "embeddings    :8082  DOWN"
   port_up 8081 "/v1/models" && ok "llama-swap    :8081  up" || warn "llama-swap    :8081  DOWN"
+  port_up 8084 "/v1/models" && ok "reranker      :8084  up" \
+    || { [ -f "$RERANK_MODEL" ] && warn "reranker      :8084  DOWN" || skip "reranker      :8084  off (no model — RAG stays dense)"; }
   port_up 8080        && ok "SearXNG       :8080  up" || warn "SearXNG       :8080  DOWN"
+  command -v claude >/dev/null && ok "Claude CLI    present (optional mind/delegate)" || skip "Claude CLI    absent (optional mind/delegate)"
+  command -v codex  >/dev/null && ok "Codex CLI     present (optional mind/delegate)" || skip "Codex CLI     absent (optional mind/delegate)"
   echo
   say "Open the web UI at http://127.0.0.1:8800  (default login: admin / admin)"
   command -v oceano >/dev/null && say "Or chat from the terminal:  oceano" \
@@ -417,6 +425,7 @@ docker_models() {           # models live OUTSIDE the image, in a host-mounted .
   say "Models (host-mounted ./models)"
   mkdir -p "$DOCKER_MODELS"
   fetch_model "$DOCKER_MODELS/nomic-embed-text-v1.5.Q8_0.gguf" "$EMBED_MODEL_URL"
+  fetch_model "$DOCKER_MODELS/bge-reranker-v2-m3-Q8_0.gguf" "$RERANK_MODEL_URL"   # RAG reranker (:8084)
   if [ "$WITH_MODELS" = 1 ]; then
     fetch_model "$DOCKER_MODELS/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
       "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
@@ -480,9 +489,11 @@ main() {
   if [ "$CHECK" = 1 ]; then
     detect_gpu
     say "Probing services (--check: no changes will be made; mode=$MODE)"
-    for pp in "8800 web" "8082 embeddings" "8081 llama-swap" "8080 searxng"; do
+    for pp in "8800 web" "8082 embeddings" "8081 llama-swap" "8084 reranker" "8080 searxng"; do
       set -- $pp; port_up "$1" "/v1/models" || port_up "$1" && ok "$2 (:$1) up" || warn "$2 (:$1) down"
     done
+    command -v claude >/dev/null && ok "claude CLI present (optional mind/delegate)" || skip "claude CLI absent (optional)"
+    command -v codex  >/dev/null && ok "codex CLI present (optional mind/delegate)"  || skip "codex CLI absent (optional)"
     say "Would build llama.cpp with: ${CMAKE_GPU:-CPU-only}; apt: ${APT_GPU[*]:-none extra}"
     exit 0
   fi

@@ -96,8 +96,9 @@ from a web UI or Telegram.
                           │        ▼                              ├─► llama-swap :8081  (chat models)         │
                           │   per-turn context:                   ├─► SearXNG :8080     (web search)          │
                           │   date · workspace · memory · skills  ├─► livebrowser       (headless Chromium)   │
-                          │                                       ├─► memory / RAG  ──► embeddings :8082 ◄─────┤ (spawned + supervised
-                          │                                       └─► MCP servers (optional, data/mcp.json)   │  as a child process)
+                          │                                       ├─► memory / RAG ─┬► embeddings :8082 ◄─────┤ (spawned + supervised
+                          │                                       │                 └► reranker :8084  ◄──────┤  as a child process)
+                          │                                       └─► MCP servers (optional, data/mcp.json)   │
                           └───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
