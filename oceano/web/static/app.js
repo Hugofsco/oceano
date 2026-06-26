@@ -915,37 +915,50 @@ async function loadPrefs() {
 }
 async function loadModels() {
   state.models = await api("/api/models");
-  try { const md = await api("/api/mind"); state.claudeAvailable = !!md.claude_available; state.mind = md.mind; }
-  catch { state.claudeAvailable = false; }
+  try {
+    const md = await api("/api/mind");
+    state.claudeAvailable = !!md.claude_available;
+    state.codexAvailable = !!md.codex_available;
+    state.mind = md.mind;
+  } catch {
+    state.claudeAvailable = false;
+    state.codexAvailable = false;
+  }
   buildModelMenu();
   setStatus(state.models.some(m => m.base_url.includes("8081") && !m.error));
-  // Auto-pick only when nothing is chosen yet (or a chosen Claude has vanished) — never override
-  // the user's live selection on the 30s refresh (that caused a mid-chat revert to Claude).
-  if (!state.model || (state.model === "claude" && !state.claudeAvailable)) {
-    if (state.mind === "claude" && state.claudeAvailable) selectClaude(false);
+  const missingMind = (state.model === "claude" && !state.claudeAvailable) || (state.model === "codex" && !state.codexAvailable);
+  if (!state.model || missingMind) {
+    if (state.mind === "claude" && state.claudeAvailable) selectMind("claude", false);
+    else if (state.mind === "codex" && state.codexAvailable) selectMind("codex", false);
     else await selectDefaultModel();
   }
 }
 async function selectDefaultModel() {
-  if (state.mind === "claude" && state.claudeAvailable) { selectClaude(false); return; }   // Claude is the chosen mind → stays the default everywhere
+  if (state.mind === "claude" && state.claudeAvailable) { selectMind("claude", false); return; }
+  if (state.mind === "codex" && state.codexAvailable) { selectMind("codex", false); return; }
   const ok = (state.models || []).filter(m => !m.error);
   if (!ok.length) return;
-  let d = {}; try { d = await api("/api/default-model"); } catch {}   // the configured primary
+  let d = {}; try { d = await api("/api/default-model"); } catch {}
   const want = d.model || d.current || "", wantBase = d.base_url || "";
   const pick = (want && ok.find(m => m.id === want && (!wantBase || m.base_url === wantBase)))
-            || (want && ok.find(m => m.id === want))                  // primary by id, any endpoint
-            || ok[0];          // nothing configured → first available model (no hardcoded default)
+            || (want && ok.find(m => m.id === want))
+            || ok[0];
   if (pick) selectModel(pick);
 }
 function buildModelMenu() {
   const menu = $("#modelMenu"); menu.innerHTML = "";
-  if (state.claudeAvailable) {                         // Claude Code as the resident mind (your subscription)
+  const minds = [];
+  if (state.claudeAvailable) minds.push({ id: "claude", label: "🧠 Claude", sub: "your subscription · Oceano's body", cls: "mm-claude" });
+  if (state.codexAvailable) minds.push({ id: "codex", label: "🧠 Codex", sub: "your Codex auth · Oceano's body", cls: "mm-codex" });
+  if (minds.length) {
     const g = document.createElement("div"); g.className = "mm-group"; g.textContent = "mind"; menu.appendChild(g);
-    const it = document.createElement("div");
-    it.className = "mm-item mm-claude" + (state.model === "claude" ? " sel" : "");
-    it.innerHTML = `<span class="mp-dot"></span>🧠 Claude <span class="mm-sub">your subscription · Oceano's body</span>`;
-    it.onclick = () => { selectClaude(); $("#modelMenu").classList.remove("open"); };
-    menu.appendChild(it);
+    minds.forEach(m => {
+      const it = document.createElement("div");
+      it.className = `mm-item ${m.cls}` + (state.model === m.id ? " sel" : "");
+      it.innerHTML = `<span class="mp-dot"></span>${m.label} <span class="mm-sub">${m.sub}</span>`;
+      it.onclick = () => { selectMind(m.id); $("#modelMenu").classList.remove("open"); };
+      menu.appendChild(it);
+    });
   }
   const groups = {}; state.models.forEach(m => (groups[m.endpoint] ||= []).push(m));
   for (const [ep, list] of Object.entries(groups)) {
@@ -962,19 +975,17 @@ function buildModelMenu() {
 function selectModel(m) {
   state.model = m.id; state.baseUrl = m.base_url;
   $("#modelLabel").textContent = m.id; $("#depthReadout").textContent = `${m.endpoint} · ${m.id}`;
-  if (state.mind === "claude") {                       // picking a real model → hand the mind back to local
+  if (state.mind !== "local") {
     state.mind = "local";
     api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: "local" }) }).catch(() => {});
   }
   buildModelMenu();
 }
-// Claude as the mind: persists mind=claude so the turn routes to Claude Code (Oceano's persona +
-// memory + workspace). state.model="claude" is a sentinel so send() proceeds even with no local model.
-function selectClaude(persist = true) {
-  state.model = "claude"; state.baseUrl = ""; state.mind = "claude";
-  $("#modelLabel").textContent = "🧠 Claude";
-  $("#depthReadout").textContent = "mind · Claude (your subscription)";
-  if (persist) api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: "claude" }) }).catch(() => {});
+function selectMind(kind, persist = true) {
+  state.model = kind; state.baseUrl = ""; state.mind = kind;
+  $("#modelLabel").textContent = kind === "claude" ? "🧠 Claude" : "🧠 Codex";
+  $("#depthReadout").textContent = kind === "claude" ? "mind · Claude (your subscription)" : "mind · Codex (your auth)";
+  if (persist) api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: kind }) }).catch(() => {});
   buildModelMenu();
 }
 function flashModel() { const p = $("#modelPill"); p.style.borderColor = "var(--coral)"; setTimeout(() => p.style.borderColor = "", 700); $("#modelMenu").classList.add("open"); }
@@ -1338,11 +1349,17 @@ const SETTINGS_PAGES = {
       <div class="dg-providers" id="mindPick">
         <label class="dg-prov"><input type="radio" name="oc-mind" value="local"><span><b>Local model</b><i>fully offline, on your box — the model you serve in Rivers</i></span></label>
         <label class="dg-prov"><input type="radio" name="oc-mind" value="claude"><span><b>Claude (your subscription)</b><i>Claude Code as the resident mind — Oceano's persona, memory & workspace, no API key</i></span></label>
+        <label class="dg-prov"><input type="radio" name="oc-mind" value="codex"><span><b>Codex (your auth)</b><i>Codex CLI as the resident mind — Oceano's persona, memory & workspace, using your Codex/OpenAI login</i></span></label>
       </div>
       <div class="dg-claude-model" id="claudeModelRow" style="display:none">
         <label class="field-label">Claude model <span class="lbl-sub">used by the Claude mind <b>and</b> Claude-Code delegation</span></label>
         <select id="claudeModelSel"></select>
         <div class="dg-hint">Sonnet is usually the sweet spot for the agent — fast and capable. Switch to Opus for the hardest reasoning. Aliases always track the latest of each tier.</div>
+      </div>
+      <div class="dg-claude-model" id="codexModelRow" style="display:none">
+        <label class="field-label">Codex model <span class="lbl-sub">used by the resident Codex mind</span></label>
+        <select id="codexModelSel"></select>
+        <div class="dg-hint">Recommended default: GPT-5.5. Use GPT-5.4 mini when you want a faster, cheaper option.</div>
       </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
@@ -1367,6 +1384,7 @@ const SETTINGS_PAGES = {
         <div class="dg-h">General <span class="lbl-sub">— the agent's “delegate” tool</span></div>
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-default" value="claude_cli"><span><b>Claude Code</b><i>CLI agent · your subscription (no API key)</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-default" value="codex_cli"><span><b>Codex</b><i>CLI agent · your Codex auth (no API key)</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-default" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-default" style="display:none"></select>
@@ -1378,6 +1396,7 @@ const SETTINGS_PAGES = {
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-improve" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-improve" value="claude_cli"><span><b>Claude Code</b></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-improve" value="codex_cli"><span><b>Codex</b></span></label>
           <label class="dg-prov"><input type="radio" name="dg-improve" value="api"><span><b>Cloud model</b><i>an endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-improve" style="display:none"></select>
@@ -1389,6 +1408,7 @@ const SETTINGS_PAGES = {
         <div class="dg-providers">
           <label class="dg-prov"><input type="radio" name="dg-vision" value="inherit"><span><b>Same as general</b><i>follow whatever the general delegate is set to</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-vision" value="claude_cli"><span><b>Claude Code</b><i>reads the image file directly</i></span></label>
+          <label class="dg-prov"><input type="radio" name="dg-vision" value="codex_cli"><span><b>Codex</b><i>multimodal · sees the image directly</i></span></label>
           <label class="dg-prov"><input type="radio" name="dg-vision" value="api"><span><b>Cloud model</b><i>a vision-capable endpoint you configured</i></span></label>
         </div>
         <select class="dg-model" id="dgModel-vision" style="display:none"></select>
@@ -1493,7 +1513,7 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
 async function loadClaudeModel() {
   const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
   let d; try { d = await api("/api/claude-model"); } catch { return; }
@@ -1506,24 +1526,47 @@ async function loadClaudeModel() {
     catch { toast("couldn't set the Claude model", "err"); }
   };
 }
+async function loadCodexModel() {
+  const row = $("#codexModelRow"), sel = $("#codexModelSel"); if (!row || !sel) return;
+  let d; try { d = await api("/api/codex-model"); } catch { return; }
+  row.style.display = d.available ? "" : "none";
+  if (!d.available) return;
+  sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+  sel.onchange = async () => {
+    try { const r = await _postJ("/api/codex-model", { model: sel.value });
+      toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info"); }
+    catch { toast("couldn't set the Codex model", "err"); }
+  };
+}
 async function loadMind() {
   let d; try { d = await api("/api/mind"); } catch { return; }
   const radios = $$('input[name="oc-mind"]'), note = $("#mindNote");
   const sel = radios.find(x => x.value === (d.mind || "local")); if (sel) sel.checked = true;
   const claudeR = radios.find(x => x.value === "claude");
-  if (!d.claude_available) {
-    if (claudeR) claudeR.disabled = true;
-    if (note) { note.textContent = "Claude Code isn't detected on this box — install it (or set OCEANO_CLAUDE_BIN) to use Claude as the mind."; note.className = "dg-hint warn"; }
-  } else if (note) {
-    note.textContent = d.mind === "claude"
-      ? "Claude is driving your chats — Oceano's memory + workspace, on your subscription (no API key, but it uses your Claude quota)."
-      : "The local model drives your chats — fully offline. Switch to Claude for a sharper mind.";
-    note.className = "dg-hint";
+  const codexR = radios.find(x => x.value === "codex");
+  if (claudeR) claudeR.disabled = !d.claude_available;
+  if (codexR) codexR.disabled = !d.codex_available;
+  if (note) {
+    if (d.mind === "claude" && d.claude_available) {
+      note.textContent = "Claude is driving your chats — Oceano's memory + workspace, on your subscription (no API key, but it uses your Claude quota).";
+      note.className = "dg-hint";
+    } else if (d.mind === "codex" && d.codex_available) {
+      note.textContent = "Codex is driving your chats — Oceano's memory + workspace, using your Codex/OpenAI auth on this machine.";
+      note.className = "dg-hint";
+    } else if (!d.claude_available && !d.codex_available) {
+      note.textContent = "Neither Claude Code nor the Codex CLI is detected on this box — install one to use an external mind.";
+      note.className = "dg-hint warn";
+    } else {
+      const opts = [d.claude_available ? "Claude" : "", d.codex_available ? "Codex" : ""].filter(Boolean).join(" or ");
+      note.textContent = `The local model drives your chats — fully offline. Switch to ${opts} for a stronger external mind.`;
+      note.className = "dg-hint";
+    }
   }
   radios.forEach(x => x.onchange = async () => {
     if (!x.checked) return;
     try { const r = await api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: x.value }) });
-      toast("primary intelligence → " + (r.mind === "claude" ? "Claude" : "local model"), "info"); loadMind(); }
+      const label = r.mind === "claude" ? "Claude" : (r.mind === "codex" ? "Codex" : "local model");
+      toast("primary intelligence → " + label, "info"); loadMind(); }
     catch { toast("couldn't change the mind", "err"); }
   });
 }
@@ -1788,10 +1831,14 @@ function dgSyncRole(role) {                                    // show the model
 }
 function dgRenderStatus(d) {
   const box = $("#dgStatus"); if (!box) return;
-  const c = d.claude || {};
-  box.innerHTML = (c.installed
+  const c = d.claude || {}, x = d.codex || {};
+  const claudeLine = c.installed
     ? `<div class="dg-line ok">✓ Claude Code installed · <code>${escapeHtml(c.version || "")}</code></div>`
-    : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`)
+    : `<div class="dg-line err">✗ Claude Code not found</div><div class="dg-hint">Install — <code>npm i -g @anthropic-ai/claude-code</code> (or set <code>OCEANO_CLAUDE_BIN</code>), then restart Oceano.</div>`;
+  const codexLine = x.installed
+    ? `<div class="dg-line ok">✓ Codex installed · <code>${escapeHtml(x.version || "")}</code></div>`
+    : `<div class="dg-line err">✗ Codex not found</div><div class="dg-hint">Install Codex (or set <code>OCEANO_CODEX_BIN</code>) and run <code>codex login</code>, then restart Oceano.</div>`;
+  box.innerHTML = claudeLine + codexLine
     + `<div class="dg-hint">Authentication is confirmed only when you press <b>Test / Re-check</b> in a section below.</div>`;
 }
 const DG_LABELS = { improve: "self-improvement", vision: "image-recognition" };
@@ -1824,11 +1871,15 @@ async function testDelegation(role) {
   if (!box) return;
   if (r.ok) {
     box.className = "dg-probe ok";
-    box.innerHTML = `✓ ${escapeHtml(r.provider === "api" ? "cloud model responded" : "Claude Code authenticated")}`;
+    const okLabel = r.provider === "api" ? "cloud model responded"
+      : r.provider === "codex_cli" ? "Codex authenticated" : "Claude Code authenticated";
+    box.innerHTML = `✓ ${escapeHtml(okLabel)}`;
   } else {
     box.className = "dg-probe err";
     const fix = r.provider === "claude_cli"
       ? ` — run <code>claude login</code> on the host (as the Oceano user), then re-check`
+      : r.provider === "codex_cli"
+      ? ` — run <code>codex login</code> on the host (as the Oceano user), then re-check`
       : ` — check the endpoint/model/key under Endpoints`;
     box.innerHTML = `✗ ${escapeHtml(r.detail || "not ready")}${fix}`;
   }
@@ -2677,12 +2728,13 @@ async function loadBrainMem() {
   const list = $("#bMemList"); if (!list) return;
   const mems = await api("/api/memories"); list.innerHTML = "";
   if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
-  const CATS = ["identity", "preference", "project", "fact", "task"];
+  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
   mems.forEach(m => {
     const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
     const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
+    const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
     row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
-      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
+      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
     $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); loadBrainMem(); };
     $(".mr-cat", row).onchange = e => fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) });
     $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadBrainMem(); };
@@ -3184,9 +3236,13 @@ const SCHED_PRESETS = { "every 5 min": "*/5 * * * *", "every 15 min": "*/15 * * 
 // saved model selectable so editing a task doesn't silently drop it.
 function _schedModelOpts(models, selected, selBase) {
   let html = `<option value="">default model</option>`, found = false;
-  if (state.claudeAvailable || selected === "claude") {       // run the task via the Claude mind (subscription)
+  if (state.claudeAvailable || selected === "claude") {
     const sel = selected === "claude"; if (sel) found = true;
     html += `<option value="claude"${sel ? " selected" : ""}>🧠 Claude (mind)</option>`;
+  }
+  if (state.codexAvailable || selected === "codex") {
+    const sel = selected === "codex"; if (sel) found = true;
+    html += `<option value="codex"${sel ? " selected" : ""}>🧠 Codex (mind)</option>`;
   }
   for (const m of (models || [])) {
     if (m.error) continue;
@@ -3243,7 +3299,7 @@ async function loadScheduler() {
     // change here; the instruction is owned by the manager and it can't be deleted.
     const lock = t.managed ? ` · <span class="sr-lock" title="created by ${mgrName} — schedule & on/off are editable here; managed there">🔒 ${mgrName}</span>` : "";
     const modelTag = (!t.managed && t.model)
-      ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : escapeHtml(t.model)}</span>` : "";
+      ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : (t.model === "codex" ? "Codex" : escapeHtml(t.model))}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
       <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${modelTag}${lock}</div></div>` +
       `<button class="sr-btn sr-run" title="run now, ignoring the schedule">▶ Run</button>` +
@@ -3976,7 +4032,7 @@ async function editResearch(t) {
    Nodes are memories (colored by category); edges link memories that are
    strongly semantically similar or share a tag. Pure-canvas, no libs.
    ==================================================================== */
-const MEM_CAT_COLORS = { identity: "#e0a86b", preference: "#7ec8a9", project: "#6ba3e0", fact: "#9b8fd6", task: "#d67f9b" };
+const MEM_CAT_COLORS = { identity: "#e0a86b", preference: "#7ec8a9", project: "#6ba3e0", fact: "#9b8fd6", task: "#d67f9b", knowledge: "#4fb8c9" };
 let _mgRaf = null;
 function openMemoryGraph() {
   const { body, reused } = createWindow({ id: "win-memgraph", title: "Memory graph", icon: "❄", width: 780, height: 600,

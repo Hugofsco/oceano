@@ -934,17 +934,19 @@ async def chat_tools_set(req: Request):
 # ---------------- delegation (Claude Code readiness + per-role provider config) ----------------
 @app.get("/api/mind")
 def mind_get():
-    """Which mind drives the primary chat: 'local' (served model, offline) or 'claude' (Claude Code
-    via the user's subscription, with Oceano's persona/memory/workspace). + whether Claude is present."""
+    """Which mind drives the primary chat: local, Claude Code, or Codex CLI. Returns the current
+    selection plus which external mind binaries are available on this host."""
     from oceano import delegate
-    return {"mind": delegate.get_mind(), "claude_available": delegate.available()}
+    return {"mind": delegate.get_mind(), "claude_available": delegate.available(),
+            "codex_available": delegate.codex_available()}
 
 
 @app.post("/api/mind")
 async def mind_set(req: Request):
     from oceano import delegate
     mind = (await req.json()).get("mind", "local")
-    return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
+    return {"mind": delegate.set_mind(mind), "claude_available": delegate.available(),
+            "codex_available": delegate.codex_available()}
 
 
 @app.get("/api/claude-model")
@@ -960,6 +962,21 @@ async def claude_model_set(req: Request):
     from oceano import delegate
     model = (await req.json()).get("model", "")
     return {"ok": True, "model": delegate.set_claude_model(model)}
+
+
+@app.get("/api/codex-model")
+def codex_model_get():
+    """Which Codex model the CLI uses for the resident Codex mind. '' = CLI default."""
+    from oceano import delegate
+    return {"model": delegate.get_codex_model(), "options": list(delegate.CODEX_MODELS),
+            "available": delegate.codex_available()}
+
+
+@app.post("/api/codex-model")
+async def codex_model_set(req: Request):
+    from oceano import delegate
+    model = (await req.json()).get("model", "")
+    return {"ok": True, "model": delegate.set_codex_model(model)}
 
 
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
@@ -1700,7 +1717,8 @@ def get_memories():
 @app.post("/api/memories")
 async def post_memory(req: Request):
     b = await req.json()
-    memory.remember(b["text"], b.get("tags", ""), b.get("category", "fact"), bool(b.get("pinned")))
+    memory.remember(b["text"], b.get("tags", ""), b.get("category", "fact"),
+                    bool(b.get("pinned")), b.get("source", ""))
     return {"ok": True}
 
 

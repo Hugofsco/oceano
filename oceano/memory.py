@@ -32,9 +32,19 @@ _cosine = embeddings.cosine
 #   relevant = inject only when semantically related to the prompt (default)
 #   off      = never inject
 # Pinned memories are ALWAYS injected, whatever their category's policy says.
-CATEGORIES = ["identity", "preference", "project", "fact", "task"]
+# 'identity' is the agent's OWN sense of self — who I am, my continuity, my
+# responsibilities, and the core facts about my user and our relationship. It is written
+# in the FIRST PERSON ("I…" / "my user…"), injected every turn, and read by the agent as
+# itself — so a fact about the human is phrased "my user", never a bare "User does X"
+# (which the agent would misread as something IT does).
+# 'knowledge' is the agent's OWN learned facts (not about the user) — e.g. things it
+# worked out from research or reading. These usually carry a `source` (the URL/file they
+# came from) so the agent can reopen it to dig deeper. Injected 'relevant' so they surface
+# only when on-topic — never as always-on truth.
+CATEGORIES = ["identity", "preference", "project", "fact", "task", "knowledge"]
 _DEFAULT_POLICY = {"identity": "always", "preference": "always",
-                   "project": "relevant", "fact": "relevant", "task": "relevant"}
+                   "project": "relevant", "fact": "relevant", "task": "relevant",
+                   "knowledge": "relevant"}
 
 
 def _db():
@@ -45,7 +55,7 @@ def _db():
     con.execute(
         "CREATE TABLE IF NOT EXISTS memories ("
         "id INTEGER PRIMARY KEY, ts TEXT, text TEXT, tags TEXT, embedding TEXT, "
-        "category TEXT DEFAULT 'fact', pinned INTEGER DEFAULT 0)"
+        "category TEXT DEFAULT 'fact', pinned INTEGER DEFAULT 0, source TEXT)"
     )
     cols = {r[1] for r in con.execute("PRAGMA table_info(memories)").fetchall()}
     if "category" not in cols:                       # migrate an older DB in place
@@ -57,6 +67,9 @@ def _db():
         con.execute("UPDATE memories SET category='project'    WHERE category IS NULL AND (lower(tags) LIKE '%project%' OR lower(tags) LIKE '%goal%')")
         con.execute("UPDATE memories SET category='fact'       WHERE category IS NULL")
         con.commit()
+    if "source" not in cols:                         # 'knowledge' memories point back to a URL/file
+        con.execute("ALTER TABLE memories ADD COLUMN source TEXT")
+        con.commit()
     return con
 
 
@@ -64,14 +77,16 @@ def _norm_cat(category):
     return category if category in CATEGORIES else "fact"
 
 
-def remember(text, tags="", category="fact", pinned=False):
-    """Store a durable fact/preference/note the agent should keep."""
+def remember(text, tags="", category="fact", pinned=False, source=""):
+    """Store a durable fact/preference/note the agent should keep. `source` is an optional
+    URL or workspace file path the fact came from — mainly for 'knowledge' memories, so the
+    agent can reopen it later (fetch_url / read_file) to investigate further."""
     vec = _embed(text)
     con = _db()
     con.execute(
-        "INSERT INTO memories (ts, text, tags, embedding, category, pinned) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO memories (ts, text, tags, embedding, category, pinned, source) VALUES (?,?,?,?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(), text, tags,
-         json.dumps(vec) if vec else None, _norm_cat(category), 1 if pinned else 0),
+         json.dumps(vec) if vec else None, _norm_cat(category), 1 if pinned else 0, (source or "").strip()),
     )
     con.commit()
     con.close()
@@ -111,7 +126,7 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
     Returns [{id, text, tags, category, pinned}], deduped."""
     policy = get_policy()
     con = _db()
-    rows = con.execute("SELECT id, text, tags, category, pinned, embedding FROM memories").fetchall()
+    rows = con.execute("SELECT id, text, tags, category, pinned, embedding, source FROM memories").fetchall()
     con.close()
     if not rows:
         return []
@@ -119,7 +134,7 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
 
     def take(r):
         chosen[r[0]] = {"id": r[0], "text": r[1], "tags": r[2],
-                        "category": r[3] or "fact", "pinned": bool(r[4])}
+                        "category": r[3] or "fact", "pinned": bool(r[4]), "source": r[6] or ""}
 
     for r in rows:                                   # 1. pinned — always
         if r[4]:
@@ -169,7 +184,7 @@ def reindex(force=False):
 def recall(query, k=5):
     """Return the k most relevant stored memories for a query."""
     con = _db()
-    rows = con.execute("SELECT text, tags, embedding FROM memories").fetchall()
+    rows = con.execute("SELECT text, tags, embedding, source FROM memories").fetchall()
     con.close()
     if not rows:
         return "(no memories yet)"
@@ -177,30 +192,31 @@ def recall(query, k=5):
     qvec = _embed(query)
     if qvec:  # semantic path
         scored = []
-        for text, tags, emb in rows:
+        for text, tags, emb, src in rows:
             v = embeddings.loads_vec(emb)             # skip a missing/corrupt embedding row
             if v:
-                scored.append((_cosine(qvec, v), text, tags))
+                scored.append((_cosine(qvec, v), text, tags, src))
         scored.sort(reverse=True)
         top = scored[:k]
     else:     # keyword fallback
         words = set(query.lower().split())
-        scored = [(sum(w in text.lower() for w in words), text, tags)
-                  for text, tags, _ in rows]
+        scored = [(sum(w in text.lower() for w in words), text, tags, src)
+                  for text, tags, _, src in rows]
         scored.sort(reverse=True)
         top = [s for s in scored[:k] if s[0] > 0] or scored[:k]
 
-    return "\n".join(f"- {text}" + (f"  [{tags}]" if tags else "") for _, text, tags in top)
+    return "\n".join(f"- {text}" + (f"  [{tags}]" if tags else "")
+                     + (f"  ↪ source: {src}" if src else "") for _, text, tags, src in top)
 
 
 def list_all(limit=300):
     """All stored memories, newest first (for the UI)."""
     con = _db()
-    rows = con.execute("SELECT id, ts, text, tags, category, pinned FROM memories "
+    rows = con.execute("SELECT id, ts, text, tags, category, pinned, source FROM memories "
                        "ORDER BY pinned DESC, id DESC LIMIT ?", (limit,)).fetchall()
     con.close()
     return [{"id": r[0], "ts": r[1], "text": r[2], "tags": r[3],
-             "category": r[4] or "fact", "pinned": bool(r[5])} for r in rows]
+             "category": r[4] or "fact", "pinned": bool(r[5]), "source": r[6] or ""} for r in rows]
 
 
 def forget(mid):
@@ -309,7 +325,7 @@ def graph(threshold=0.62, max_nodes=140, max_edges=500):
             "threshold": threshold, "categories": CATEGORIES}
 
 
-def add_if_new(text, tags="", category="fact", threshold=0.86):
+def add_if_new(text, tags="", category="fact", threshold=0.86, source=""):
     """Save a memory only if it isn't a near-duplicate of an existing one (semantic
     when the embed server is up, exact-text otherwise). Used by auto-learning so
     repeated facts don't pile up. Returns True if saved."""
@@ -328,9 +344,9 @@ def add_if_new(text, tags="", category="fact", threshold=0.86):
         low = text.lower()
         if any(t.strip().lower() == low for t, _ in rows):
             con.close(); return False
-    con.execute("INSERT INTO memories (ts, text, tags, embedding, category, pinned) VALUES (?,?,?,?,?,0)",
+    con.execute("INSERT INTO memories (ts, text, tags, embedding, category, pinned, source) VALUES (?,?,?,?,?,0,?)",
                 (datetime.now(timezone.utc).isoformat(), text, tags,
-                 json.dumps(vec) if vec else None, _norm_cat(category)))
+                 json.dumps(vec) if vec else None, _norm_cat(category), (source or "").strip()))
     con.commit(); con.close()
     return True
 
@@ -381,7 +397,15 @@ YOUR JOB: keep the store clean, non-redundant, and accurate. Look for:
 - exact or near duplicates (keep ONE; delete the rest);
 - facts fully subsumed by a more complete memory (delete the weaker one);
 - stale facts contradicted by a newer memory (delete the outdated one);
-- memories filed under the wrong category (categories: identity, preference, project, fact, task).
+- memories filed under the wrong category (categories: identity, preference, project, fact, task, knowledge).
+
+'knowledge' = facts the agent learned for itself (from research/reading), not facts about the user;
+they often cite a source — keep distinct knowledge entries even if their topics are related.
+
+'identity' is the agent's OWN sense of self, written in the FIRST PERSON ("I…"). An identity
+memory may mention the human, but always as "my user" — rewrite any bare "User does X"
+in an identity memory into that voice (e.g. "User is a trader" -> "My user is a trader"), since the agent
+reads its identity block as itself and would otherwise take "User does X" to mean it does X.
 
 RULES:
 - NEVER delete a memory marked 📌 pinned — the user chose to keep it. You MAY rewrite a pinned one for clarity.

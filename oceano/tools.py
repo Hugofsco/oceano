@@ -479,19 +479,28 @@ def python_exec(code):
         "name": "remember",
         "description": "Save a durable fact, preference, or note to long-term memory "
                        "so you recall it in future conversations. Pick the category that "
-                       "fits best: identity (who the user is), preference (what they like/"
-                       "want/prefer), project (ongoing work or goals), task (something to "
-                       "do), fact (anything else durable).",
+                       "fits best: identity (who I am — my own sense of self, continuity, "
+                       "responsibilities, and the core facts about my user and our "
+                       "relationship; write it in the FIRST PERSON, \"I…\" / \"my user…\", "
+                       "never a bare \"User does X\"), preference (what my user likes/wants/"
+                       "prefers), project (their ongoing work or goals), task (something to "
+                       "do), knowledge (a durable, checkable fact YOU learned — from "
+                       "research, a page you read, or working through a problem — worth "
+                       "reusing later), fact (anything else durable). For a 'knowledge' "
+                       "memory, pass `source` (the URL or workspace file path it came from) "
+                       "so you can reopen it later to dig deeper.",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"},
             "category": {"type": "string", "enum": memory.CATEGORIES,
                          "description": "memory category — controls when it is injected"},
             "tags": {"type": "string", "description": "optional comma-separated tags"},
+            "source": {"type": "string", "description": "optional URL or workspace file path "
+                       "this came from — lets you reopen it later to investigate further"},
         }, "required": ["text", "category"]},
     },
 })
-def remember(text, category="fact", tags=""):
-    return memory.remember(text, tags, category=category)
+def remember(text, category="fact", tags="", source=""):
+    return memory.remember(text, tags, category=category, source=source)
 
 
 @tool({
