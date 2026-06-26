@@ -59,6 +59,7 @@ BOT_COMMANDS = [
 def _agent_for(chat_id):
     if chat_id not in _agents:
         _agents[chat_id] = Agent()
+        _agents[chat_id].mind_session_key = f"telegram:{chat_id}"
         _started_at[chat_id] = time.time()
     return _agents[chat_id]
 
@@ -110,8 +111,8 @@ def _apply_model(agent, m):
     any real model hands the mind back to the local/cloud provider. The mind is honoured by
     Agent.run_stream, so this turns Claude on/off for Telegram too."""
     from oceano import delegate
-    if m.get("mind") == "claude":
-        delegate.set_mind("claude")
+    if m.get("mind") in ("claude", "codex"):
+        delegate.set_mind(m.get("mind"))
         return
     delegate.set_mind("local")
     from oceano.web import server
@@ -121,13 +122,14 @@ def _apply_model(agent, m):
 
 
 def _menu_models():
-    """The /model picker entries — '🧠 Claude' (the resident mind) first when the Claude CLI
-    is present, then every reachable endpoint model. The Claude row is a sentinel ({mind:'claude'}),
-    not a real model."""
+    """The /model picker entries — external minds first when present, then every reachable
+    endpoint model. Mind rows are sentinels ({mind:...}), not real model ids."""
     from oceano import delegate
     entries = []
     if delegate.available():
         entries.append({"id": "🧠 Claude", "endpoint": "your subscription", "mind": "claude"})
+    if delegate.codex_available():
+        entries.append({"id": "🧠 Codex", "endpoint": "your Codex auth", "mind": "codex"})
     return entries + _models()
 
 
@@ -140,15 +142,21 @@ async def model_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     entries = await asyncio.to_thread(_menu_models)
     if not entries:
         await update.message.reply_text("No reachable models. Add an endpoint in Settings → Endpoints "
-                                        "(or install Claude Code for the 🧠 Claude mind)."); return
+                                        "(or install Claude Code / Codex CLI for the resident mind options)."); return
 
-    if ctx.args:                                   # /model <name> → set directly by id/substring (or 'claude')
+    if ctx.args:                                   # /model <name> → set directly by id/substring (or a mind)
         q = " ".join(ctx.args).strip().lower()
         if q in ("claude", "🧠 claude", "claude code", "mind"):
             if not await asyncio.to_thread(delegate.available):
                 await update.message.reply_text("🧠 Claude isn't available — install Claude Code (the `claude` CLI) first."); return
             _apply_model(agent, {"mind": "claude"})
             await update.message.reply_text("✅ Mind set to *🧠 Claude* — your subscription, wearing "
+                                            "Oceano's persona + memory.", parse_mode="Markdown"); return
+        if q in ("codex", "🧠 codex"):
+            if not await asyncio.to_thread(delegate.codex_available):
+                await update.message.reply_text("🧠 Codex isn't available — install the `codex` CLI and run `codex login` first."); return
+            _apply_model(agent, {"mind": "codex"})
+            await update.message.reply_text("✅ Mind set to *🧠 Codex* — your Codex/OpenAI auth, wearing "
                                             "Oceano's persona + memory.", parse_mode="Markdown"); return
         match = next((m for m in entries if not m.get("mind") and m["id"].lower() == q), None) \
             or next((m for m in entries if not m.get("mind") and q in m["id"].lower()), None)
@@ -158,14 +166,14 @@ async def model_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Model set to `{match['id']}` — via `{match['endpoint']}`",
                                         parse_mode="Markdown"); return
 
-    claude_mind = await asyncio.to_thread(delegate.mind_is_claude)
+    mind = await asyncio.to_thread(delegate.get_mind)
     _model_menu[chat_id] = entries[:24]            # back the keyboard; cap so it stays tappable
-    def _is_cur(m):                                # the current pick: Claude when it's the mind, else the per-chat model
-        return (m.get("mind") == "claude") if claude_mind else (not m.get("mind") and m["id"] == agent.model)
+    def _is_cur(m):                                # the current pick: the active mind, else the per-chat model
+        return (m.get("mind") == mind) if mind in ("claude", "codex") else (not m.get("mind") and m["id"] == agent.model)
     rows = [[InlineKeyboardButton(("✅ " if _is_cur(m) else "🔹 ") + m["id"][:46],
                                   callback_data=f"tgmodel:{i}")]
             for i, m in enumerate(_model_menu[chat_id])]
-    cur = "🧠 Claude" if claude_mind else f"`{agent.model}`"
+    cur = ("🧠 Claude" if mind == "claude" else ("🧠 Codex" if mind == "codex" else f"`{agent.model}`"))
     await update.message.reply_text(f"🧠 Current: {cur}\nTap one for this chat:",
                                     parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -184,6 +192,10 @@ async def model_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if m.get("mind") == "claude":
         await q.answer("mind: 🧠 Claude")
         await q.edit_message_text("✅ Mind set to *🧠 Claude* — your subscription, wearing Oceano's "
+                                  "persona + memory.", parse_mode="Markdown")
+    elif m.get("mind") == "codex":
+        await q.answer("mind: 🧠 Codex")
+        await q.edit_message_text("✅ Mind set to *🧠 Codex* — your Codex/OpenAI auth, wearing Oceano's "
                                   "persona + memory.", parse_mode="Markdown")
     else:
         await q.answer(f"model: {m['id']}")
@@ -262,7 +274,9 @@ def _fmt_age(secs):
 def _status_text(chat_id):
     from oceano import tools, memory, rag, delegate
     agent = _agent_for(chat_id)
-    claude_mind = delegate.mind_is_claude() and delegate.available()
+    mind = delegate.get_mind()
+    claude_mind = mind == "claude" and delegate.available()
+    codex_mind = mind == "codex" and delegate.codex_available()
     n, approx = _ctx_metrics(agent)
     st = _last_stats.get(chat_id, {})
     try:
@@ -289,7 +303,7 @@ def _status_text(chat_id):
     tts_name = f" (`{vs['tts_voice']}`)" if vs.get("tts") and vs.get("tts_voice") else ""
     lines = [
         "🌊 *Oceano — status*",
-        ("🧠 *mind* · Claude (your subscription)" if claude_mind else f"🧠 *model* · `{agent.model}`"),
+        ("🧠 *mind* · Claude (your subscription)" if claude_mind else ("🧠 *mind* · Codex (your auth)" if codex_mind else f"🧠 *model* · `{agent.model}`")),
         f"📜 *context* · {n} msgs · {ctx_size}{cap}",
         f"🗜 *compactions* · {_compactions.get(chat_id, 0)} this session",
         f"⚡ *last turn* · {last}",

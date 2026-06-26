@@ -455,6 +455,7 @@ def _agent(sid):
                 ag.messages.extend(hist)
         except Exception:
             pass
+        ag.mind_session_key = f"web:{sid}"
         _sessions[sid] = ag
     return _sessions[sid]
 
@@ -934,17 +935,19 @@ async def chat_tools_set(req: Request):
 # ---------------- delegation (Claude Code readiness + per-role provider config) ----------------
 @app.get("/api/mind")
 def mind_get():
-    """Which mind drives the primary chat: 'local' (served model, offline) or 'claude' (Claude Code
-    via the user's subscription, with Oceano's persona/memory/workspace). + whether Claude is present."""
+    """Which mind drives the primary chat: local, Claude Code, or Codex CLI. Returns the current
+    selection plus which external mind binaries are available on this host."""
     from oceano import delegate
-    return {"mind": delegate.get_mind(), "claude_available": delegate.available()}
+    return {"mind": delegate.get_mind(), "claude_available": delegate.available(),
+            "codex_available": delegate.codex_available()}
 
 
 @app.post("/api/mind")
 async def mind_set(req: Request):
     from oceano import delegate
     mind = (await req.json()).get("mind", "local")
-    return {"mind": delegate.set_mind(mind), "claude_available": delegate.available()}
+    return {"mind": delegate.set_mind(mind), "claude_available": delegate.available(),
+            "codex_available": delegate.codex_available()}
 
 
 @app.get("/api/claude-model")

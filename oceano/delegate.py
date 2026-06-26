@@ -225,15 +225,16 @@ def set_enabled(on):
 
 def get_mind():
     """Which mind drives the PRIMARY chat turn: 'local' (the served local model — fully offline,
-    default) or 'claude' (Claude Code via the user's subscription, wearing Oceano's persona + memory
-    and working in the workspace). Oceano is the body; this picks the mind."""
+    default), 'claude' (Claude Code via the user's subscription), or 'codex' (the Codex CLI via
+    the user's OpenAI/Codex auth). Oceano is the body; this picks the mind."""
     m = (_raw().get("mind") or "local").strip().lower()
-    return m if m in ("local", "claude") else "local"
+    return m if m in ("local", "claude", "codex") else "local"
 
 
 def set_mind(mind):
     d = _raw()
-    d["mind"] = "claude" if str(mind).strip().lower() == "claude" else "local"
+    want = str(mind).strip().lower()
+    d["mind"] = want if want in ("claude", "codex") else "local"
     try:
         atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
     except OSError:
@@ -243,7 +244,10 @@ def set_mind(mind):
 
 def mind_is_claude():
     return get_mind() == "claude"
-    return bool(on)
+
+
+def mind_is_codex():
+    return get_mind() == "codex"
 
 
 def find_claude():
@@ -264,6 +268,36 @@ def find_claude():
 
 def available():
     return find_claude() is not None
+
+
+def find_codex():
+    """Locate the `codex` binary. PATH first, then common install dirs — mirroring the Claude
+    lookup because the daemon may run under systemd with a reduced PATH."""
+    found = shutil.which("codex") or (os.environ.get("OCEANO_CODEX_BIN") or None)
+    if found and os.access(found, os.X_OK):
+        return found
+    home = Path.home()
+    for c in (home / ".local/bin/codex", Path("/usr/local/bin/codex"),
+              Path("/usr/bin/codex"), home / ".npm-global/bin/codex",
+              home / ".local/share/codex/bin/codex"):
+        if c.exists() and os.access(c, os.X_OK):
+            return str(c)
+    return None
+
+
+def codex_available():
+    return find_codex() is not None
+
+
+def codex_version():
+    binary = find_codex()
+    if not binary:
+        return None
+    try:
+        r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10)
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
 
 
 def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turns=30):

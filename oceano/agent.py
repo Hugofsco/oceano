@@ -347,6 +347,7 @@ class Agent:
         # but NOT the user's personal memories/research/skills — a delegate gets a self-contained
         # task, and we shouldn't ship personal data to it (esp. a cloud delegate).
         self.inject_context = inject_context
+        self.mind_session_key = None
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + _date_note()}]
 
     def _prepare_turn(self, user_message, voice=False):
@@ -514,6 +515,15 @@ class Agent:
                 parts.append(ev.get("text", ""))
         return "".join(parts).strip() or "(Claude returned no output)"
 
+    def run_codex(self, user_message: str) -> str:
+        """Run one turn through the Codex mind (the local Codex CLI, via the user's auth) and return
+        the collected answer. Blocking helper for unattended callers that explicitly target Codex."""
+        parts = []
+        for ev in self._codex_mind_stream(user_message):
+            if ev.get("type") == "token":
+                parts.append(ev.get("text", ""))
+        return "".join(parts).strip() or "(Codex returned no output)"
+
     # --- streaming: agent mode (reasoning + tools + streamed final answer) ---
     def _claude_mind_stream(self, user_message: str, cancel=None, voice=False):
         """Drive this turn with Claude Code (the user's subscription) as the resident mind: Oceano's
@@ -648,6 +658,84 @@ class Agent:
         self._learn(user_message, answer)
         yield {"type": "answer_done"}
 
+    def _codex_mind_stream(self, user_message: str, cancel=None, voice=False):
+        """Drive this turn with the Codex CLI as the resident mind. v1 uses `codex exec --json`
+        plus session resume, with Oceano's MCP bridge as the body tools."""
+        import queue
+        from oceano import codex_mind, mindbridge
+        bg = tools.is_background()
+        self._prepare_turn(user_message, voice=voice)
+        self.messages.append({"role": "user", "content": user_message})
+        first = not codex_mind.session_for(self.mind_session_key)
+        body = (
+            "OCEANO'S BODY — you have Oceano's MCP server tools for memory, the web, browser control, "
+            "calendar, windows, notifications, hosts, and mail. Prefer those tools over any private "
+            "memory or invisible browsing. MEMORY: use Oceano's `remember`, `recall`, `update_memory`, "
+            "and `forget_memory` so the user sees the same memory you do. WEB: use Oceano's `web_search`, "
+            "`fetch_url`, `browser_open`, `browser_click`, `browser_scroll`, and `browser_screenshot` so "
+            "the user can watch the shared browser. Use `calendar_events`, `manage_calendar`, and "
+            "`find_free_slots` for scheduling; `ui_open`, `ui_close`, and `ui_arrange` to show things in "
+            "the UI; `notify` to ping the user; and the hosts/mail tools when needed. Keep your file and "
+            "shell work inside the workspace. Reply as Oceano."
+        )
+        if first:
+            convo = []
+            for m in self.messages[1:]:
+                c = (m.get("content") or "").strip()
+                if c:
+                    convo.append(("Oceano" if m.get("role") == "assistant" else "User") + ": " + c)
+            prompt = (self.messages[0]["content"] + "\n\n" + body + "\n\nConversation so far:\n"
+                      + "\n\n".join(convo) + "\n\nReply as Oceano to the user's latest message.")
+        else:
+            prompt = (self.messages[0]["content"] + "\n\n" + body + "\n\nContinue the existing Oceano "
+                      "conversation. The user's new message is:\n" + user_message)
+
+        q = queue.Queue()
+        holder = {}
+
+        def on_ev(ev):
+            q.put(ev)
+
+        def work():
+            if bg:
+                mindbridge.begin_background_turn()
+            try:
+                holder["res"] = codex_mind.run_stream(
+                    prompt, session_key=self.mind_session_key or "", cwd=config.WORKSPACE,
+                    cancel=cancel, on_event=on_ev)
+            except Exception as e:
+                holder["res"] = {"ok": False, "error": str(e), "output": ""}
+            finally:
+                if bg:
+                    mindbridge.end_background_turn()
+                q.put({"type": "done"})
+
+        threading.Thread(target=work, daemon=True).start()
+        parts = []
+        while True:
+            ev = q.get()
+            if ev.get("type") == "done":
+                break
+            if ev.get("type") == "token":
+                parts.append(ev.get("text", ""))
+                yield ev
+            elif ev.get("type") in ("tool_call", "tool_result"):
+                yield ev
+
+        res = holder.get("res") or {}
+        answer = "".join(parts).strip() or (res.get("output") or "").strip()
+        if cancel is not None and cancel.is_set():
+            return
+        if not parts and answer:
+            yield {"type": "token", "text": answer}
+        if not answer:
+            yield {"type": "token", "text": res.get("error") or "(Codex returned no response)"}
+            yield {"type": "answer_done"}
+            return
+        self.messages.append({"role": "assistant", "content": answer})
+        self._learn(user_message, answer)
+        yield {"type": "answer_done"}
+
     def run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat
         mode passes MEMORY_TOOLS so the model can still recall/remember without full agent
@@ -660,6 +748,9 @@ class Agent:
             from oceano import delegate
             if delegate.mind_is_claude() and delegate.available():
                 yield from self._claude_mind_stream(user_message, cancel=cancel, voice=voice)
+                return
+            if delegate.mind_is_codex() and delegate.codex_available():
+                yield from self._codex_mind_stream(user_message, cancel=cancel, voice=voice)
                 return
         if not self.model:                         # nothing served/configured → guide, don't 400
             # stream it as the answer so every frontend (CLI, web SSE, Telegram) shows it

@@ -308,6 +308,12 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
                     answer = Agent().run_claude(instruction)
                 else:
                     answer = "⚠️ This task is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
+            elif model == "codex":             # run this task via the Codex mind (its own auth/session)
+                from oceano import delegate
+                if delegate.codex_available():
+                    answer = Agent().run_codex(instruction)
+                else:
+                    answer = "⚠️ This task is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
             else:
                 ag = Agent()
                 if model:                      # per-task model override (else Agent's configured default)
