@@ -57,15 +57,16 @@ from a web UI or Telegram.
 - **Survives a refresh.** Open app windows reopen where you left them, and a chat reply
   (or workflow) still generating when you reload **reconnects** instead of being lost.
 - **Configurable delegation + any model as primary.** Hand a heavy subtask to a stronger
-  assistant — Claude Code (no API key) or a cloud model run as a full agent — *who* chosen
+  assistant — Claude Code or Codex (no API key) or a cloud model run as a full agent — *who* chosen
   in Settings, with separate targets for the self-improving jobs. Pick **any model from any
   endpoint** as Oceano's primary (local-first is opt-in), or turn delegation **fully off**.
-- **Oceano as body, Claude as mind (optional).** Pick **🧠 Claude** in the model picker and the
-  whole conversation is driven by Claude Code (your subscription, no API key) wearing Oceano's
-  persona, memory, and history — and reaching for *Oceano's own tools* (memory, calendar, windows,
-  notify) over an in-process **MCP bridge**, so it acts as the resident mind of the local body
-  (its tool use shows as chips in the chat, just like the local model). Flip back to the local
-  model for fully-offline. See [Claude as the mind](#claude-as-the-mind).
+- **Oceano as body, Claude *or* Codex as mind (optional).** Pick **🧠 Claude** or **🧠 Codex** in
+  the model picker and the whole conversation is driven by that CLI (your Claude subscription or your
+  Codex auth — no API key) wearing Oceano's persona, memory, and history — and reaching for
+  *Oceano's own tools* (memory, calendar, windows, notify) over an in-process **MCP bridge**, so it
+  acts as the resident mind of the local body (its tool use shows as chips in the chat, just like the
+  local model). Flip back to the local model for fully-offline. See
+  [Claude or Codex as the mind](#claude-or-codex-as-the-mind).
 - **Watch it browse.** A multi-tab live browser streams what the agent sees; a web
   search spins up a tab per source so you can see exactly what it read.
 - **Run-aware + optional queue.** A live indicator shows every background job
@@ -325,15 +326,20 @@ Anthropic API key:
   **which Claude model** the CLI uses (Sonnet / Opus / Haiku / CLI default) in
   **Settings → Delegation**; the choice (`claude_model` in `data/delegation.json`) applies to
   the Claude mind, Claude-Code delegation, and Claude-pinned scheduled tasks.
+- **Codex** — runs headless via OpenAI's `codex` CLI (`codex exec --json`, sandboxed to the
+  workspace), again with **no API key stored by Oceano**: it uses your `codex login` auth, synced
+  into an isolated `data/codex-home/`. Pick the **Codex model** — GPT-5.5 (recommended default) /
+  GPT-5.4 mini / GPT-5.3 Codex Spark — in **Settings → Delegation**. Install the `codex` CLI first
+  (or set `OCEANO_CODEX_BIN` to its path).
 - **A cloud model** — any configured OpenAI-compatible endpoint, run through Oceano's
   *own* agent loop with *our* tools, so it can read, write, and run things — not just reason.
 
 Three independent **roles** let you point different work at different models: **default**
 (the agent's `delegate` tool), **improve** (the self-improving jobs — skills review, eval
 judging, memory maintenance), and **vision** (image recognition — the local chat model is
-text-only, so files dropped into chat get routed here; Claude Code reads the image file
-directly, or point it at a cloud vision model). The local model never grades its own work,
-nor sees images itself. Live readiness + a one-click test sit in each section.
+text-only, so files dropped into chat get routed here; Claude Code or Codex reads the image
+directly — both are multimodal — or point it at a cloud vision model). The local model never
+grades its own work, nor sees images itself. Live readiness + a one-click test sit in each section.
 
 Delegation **streams**: the delegate's live work (its narration and tool uses) surfaces under
 the `delegate` tool card in chat (and dim in the CLI), so a long build shows progress instead
@@ -351,12 +357,13 @@ chat, Telegram, the CLI, and background jobs). A master toggle turns **delegatio
 
 ---
 
-## Claude as the mind
+## Claude or Codex as the mind
 
-Delegation hands *subtasks* to Claude. The inverse is also possible: make **Claude the resident
-mind** of the whole assistant. Pick **🧠 Claude** in the chat model picker (or Settings → Delegation
-→ *Primary intelligence*) and every turn — chat **and** voice — is driven by the `claude` CLI (your
-Claude subscription, **no API key**), while **Oceano stays the body**:
+Delegation hands *subtasks* to Claude or Codex. The inverse is also possible: make one of them the
+**resident mind** of the whole assistant. Pick **🧠 Claude** (or **🧠 Codex**) in the chat model
+picker (or Settings → Delegation → *Primary intelligence*) and every turn — chat **and** voice — is
+driven by that CLI (your Claude subscription or Codex auth, **no API key**), while **Oceano stays
+the body**:
 
 - It wears Oceano's **persona**, your **memory**, and the **conversation history** — so it knows you
   and the thread — and its reply streams into the chat as usual.
@@ -365,7 +372,7 @@ Claude subscription, **no API key**), while **Oceano stays the body**:
   the mind drives the real body: it pops your Calendar, saves to *Oceano's* memory (not its own), and
   so on. Its tool use shows as **chips in the chat**, and its strong native tools (files, shell, web)
   stay available too.
-- Memory is the continuity: Claude's intelligence **+** Oceano's memory = a presence that remembers you.
+- Memory is the continuity: the mind's intelligence **+** Oceano's memory = a presence that remembers you.
 
 The bridge is **localhost-only and token-gated** (a header token, constant-time compared), the mind
 can't delegate to itself, and tool calls execute *inside* the daemon (so windows actually open — for
@@ -374,6 +381,13 @@ an interactive turn). For a Claude-pinned **scheduled** task, the bridged tools 
 back to a **local model** anytime for fully-offline operation — that's the trade-off: Claude is
 sharper, the local model keeps Oceano sovereign and offline. A common setup is Claude as the
 interactive mind with the local model still running the background/scheduled work.
+
+**Codex works the same way.** Pick **🧠 Codex** and the turn is driven by `codex exec --json`
+(sandboxed to the workspace) over the *same* MCP bridge, so it wears Oceano's body identically — and
+being multimodal, it can also see images dropped into chat. It's **stateless** like the Claude mind
+(every turn replays Oceano's history, so `/compact`, `/truncate`, and edits take effect), runs from
+an isolated `data/codex-home/`, and needs the `codex` CLI installed plus a one-time `codex login`.
+Pick the Codex model (GPT-5.5 recommended) in **Settings → Delegation**.
 
 ---
 
@@ -442,8 +456,8 @@ It's a single-page app with:
   diagram, a Chart.js spec, or a `.slides` deck, a chip opens it rendered in an
   origin-isolated sandbox iframe (device presets + live reload).
 - **Multiple endpoints** — local `llama.cpp` plus remote providers; models from all of
-  them appear in the composer's picker — alongside **🧠 Claude** (when the CLI is present), which
-  makes Claude the mind ([above](#claude-as-the-mind)).
+  them appear in the composer's picker — alongside **🧠 Claude** and **🧠 Codex** (when the
+  respective CLI is present), which make that assistant the mind ([above](#claude-or-codex-as-the-mind)).
 - **Settings, deepened** — a **Voice** tab (pick the speak-out engine — Kokoro / Piper / auto —
   plus voice, speed, and wake word, and **browse & download Piper voices** from the Hugging Face
   catalog straight into `assets/voice/`), and a **Services** panel listing every piece (chat
