@@ -458,6 +458,7 @@ async function send() {
   const myTitle = _curTitle;
   myT.push({ role: "user", content: text, ts: uTs });
   persistChat(mySession, myT, myTitle);            // save the user turn immediately → a chat you don't return to keeps it
+  const turnBase = myT.length;                     // assistant-side entries start here — a drop-recovery rewinds to this point
 
   const payload = { session: mySession, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
                     voice: !!_voiceSpeak,            // hands-free converse turn → ask for a short, spoken reply
@@ -472,6 +473,73 @@ async function send() {
   // close the current answer bubble so the next segment (tool/think) doesn't slot UNDER it
   const flushBubble = () => { if (acc) { const aTs = _nowISO(); myT.push({ role: "assistant", content: acc, ts: aTs }); if (renderable() && bubble) { renderMD(bubble, acc, true); attachMsgActions(bubble.closest(".msg"), { role: "assistant", raw: acc, ts: aTs }); } } bubble = null; acc = ""; };
 
+  // One streamed event → DOM + transcript. Shared by the live SSE loop and the drop-recovery replay
+  // below, so both render a turn identically. DOM writes self-gate on renderable(); myT/acc always update.
+  const applyEvent = (ev) => {
+    if (ev.type === "reasoning") {
+      killSounding(); flushBubble();
+      thinkText += ev.text;
+      if (renderable()) { if (!thinkCard) thinkCard = addThinkCard(); appendThink(thinkCard, ev.text); }
+    } else if (ev.type === "token") {
+      killSounding(); flushThink();
+      acc += ev.text; if (_voiceSpeak) _voiceSpeak.push(ev.text);   // conversation mode: stream to TTS
+      if (renderable() && !bubble) bubble = addAssistant("");
+      draw();                                                        // throttled internally; final render catches the tail
+    } else if (ev.type === "tool_call") {
+      killSounding(); flushThink(); flushBubble();
+      lastTool = { name: ev.name, args: ev.args };
+      if (renderable()) {
+        if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
+        lastCard = addTool(ev.name, ev.args);
+        maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
+      }
+    } else if (ev.type === "tool_progress") {
+      killSounding(); if (renderable()) appendToolProgress(lastCard, ev);
+    } else if (ev.type === "tool_result") {
+      if (renderable()) fillTool(lastCard, ev.result);
+      if (lastTool) { myT.push({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
+      if (renderable()) sounding = addThinking();       // keep a "working" cue during the next step
+    } else if (ev.type === "answer_done") {
+      killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
+    } else if (ev.type === "answer") {                 // fallback (max steps)
+      killSounding(); flushThink(); acc = ev.text;
+      if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc, true); toBottom(); }
+    } else if (ev.type === "stats") {
+      stats = ev;
+    } else if (ev.type === "notice") {
+      killSounding(); flushThink(); flushBubble(); if (renderable()) addSysNote(escapeHtml(ev.text));
+    } else if (ev.type === "error") {
+      killSounding(); flushThink(); acc = "⚠️ " + ev.message;
+      if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc); }
+    }
+  };
+
+  // An unexpected drop (not a user Stop) doesn't mean the turn died — the server keeps it running and
+  // buffers every event (server.py _chat_live), the same way it does for a page reload. Reattach to that
+  // buffer, replay this turn from the start, and poll to the end, so a Tailscale/LAN blip during a long,
+  // silent codex turn recovers instead of surfacing as "(stream interrupted)". Returns false when there's
+  // nothing buffered to recover, so the caller falls back to the old error display.
+  async function recoverDroppedTurn() {
+    let live; try { live = await api("/api/chat/live/" + encodeURIComponent(mySession)); } catch { return false; }
+    if (!live || (!live.running && !(live.events || []).length)) return false;
+    try {
+      if (renderable()) { while (ue.nextSibling) ue.nextSibling.remove(); addSysNote("↻ reconnecting — the reply is still being generated…"); }
+      myT.length = turnBase;                              // rewind: drop the partial assistant side, we replay it from the buffer
+      acc = ""; bubble = null; thinkCard = null; thinkText = ""; lastCard = null; lastTool = null; stats = null; livePopped = true;
+      const pull = list => (list || []).forEach(ev => { try { applyEvent(ev); } catch {} });
+      pull(live.events);
+      let since = live.total != null ? live.total : (live.events || []).length, running = live.running;
+      while (running) {
+        await new Promise(r => setTimeout(r, 800));
+        if (!viewing()) handedOff = true;   // switched away mid-recovery → keep persisting, but let reconnectChat own the display
+        let d; try { d = await api("/api/chat/live/" + encodeURIComponent(mySession) + "?since=" + since); } catch { break; }
+        pull(d.events); since = d.total != null ? d.total : since; running = d.running;
+      }
+      killSounding(); if (renderable() && bubble) renderMD(bubble, acc, true);
+    } catch { /* already reattached — fall through and let the normal finalize persist what we have */ }
+    return true;
+  }
+
   const myAbort = new AbortController(); _chatAborts[mySession] = myAbort;
   try {
     const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: myAbort.signal });
@@ -484,42 +552,7 @@ async function send() {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith("data: ")) continue;
         let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-        if (ev.type === "reasoning") {
-          killSounding(); flushBubble();
-          thinkText += ev.text;
-          if (renderable()) { if (!thinkCard) thinkCard = addThinkCard(); appendThink(thinkCard, ev.text); }
-        } else if (ev.type === "token") {
-          killSounding(); flushThink();
-          acc += ev.text; if (_voiceSpeak) _voiceSpeak.push(ev.text);   // conversation mode: stream to TTS
-          if (renderable() && !bubble) bubble = addAssistant("");
-          draw();                                                        // throttled internally; final render catches the tail
-        } else if (ev.type === "tool_call") {
-          killSounding(); flushThink(); flushBubble();
-          lastTool = { name: ev.name, args: ev.args };
-          if (renderable()) {
-            if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
-            lastCard = addTool(ev.name, ev.args);
-            maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
-          }
-        } else if (ev.type === "tool_progress") {
-          killSounding(); if (renderable()) appendToolProgress(lastCard, ev);
-        } else if (ev.type === "tool_result") {
-          if (renderable()) fillTool(lastCard, ev.result);
-          if (lastTool) { myT.push({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
-          if (renderable()) sounding = addThinking();       // keep a "working" cue during the next step
-        } else if (ev.type === "answer_done") {
-          killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
-        } else if (ev.type === "answer") {                 // fallback (max steps)
-          killSounding(); flushThink(); acc = ev.text;
-          if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc, true); toBottom(); }
-        } else if (ev.type === "stats") {
-          stats = ev;
-        } else if (ev.type === "notice") {
-          killSounding(); flushThink(); flushBubble(); if (renderable()) addSysNote(escapeHtml(ev.text));
-        } else if (ev.type === "error") {
-          killSounding(); flushThink(); acc = "⚠️ " + ev.message;
-          if (renderable()) { if (!bubble) bubble = addAssistant(""); renderMD(bubble, acc); }
-        }
+        applyEvent(ev);
       }
     }
     killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
@@ -528,8 +561,10 @@ async function send() {
     if (e.name === "AbortError") {                                   // user hit Stop
       if (acc) { acc += "\n\n*(stopped)*"; } else { acc = "_(stopped)_"; }
       if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc, true); }
-    } else if (acc) { acc += "\n\n*(stream interrupted)*"; if (renderable() && bubble) renderMD(bubble, acc, true); }   // keep partial answer
-    else { acc = "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + (e.message || "") + "`"; if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc); } }
+    } else if (!(await recoverDroppedTurn())) {                      // transport dropped → reattach to the still-running turn first
+      if (acc) { acc += "\n\n*(stream interrupted)*"; if (renderable() && bubble) renderMD(bubble, acc, true); }   // keep partial answer
+      else { acc = "⚠️ Stream interrupted — tap send to retry.\n\n`" + (e.name || "Error") + ": " + (e.message || "") + "`"; if (renderable()) { bubble = bubble || addAssistant(""); renderMD(bubble, acc); } }
+    }
   }
   if (renderable() && stats && bubble) renderMeta(bubble, stats);
   if (acc) { const aTs = _nowISO(); myT.push({ role: "assistant", content: acc, meta: stats, ts: aTs }); if (renderable() && bubble) attachMsgActions(bubble.closest(".msg"), { role: "assistant", raw: acc, ts: aTs }); }

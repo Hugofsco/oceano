@@ -525,6 +525,51 @@ def _codex_sandbox(tools_spec):
     return "read-only"
 
 
+# Codex sandboxes its file/shell tools with bubblewrap. On hosts that lock down unprivileged
+# user namespaces — a non-setuid bwrap + kernel.apparmor_restrict_unprivileged_userns=1, the
+# Ubuntu 24.04+/recent-kernel default — bwrap can't set up ANY namespace, so EVERY Codex sandbox
+# mode dies before the command runs ("setting up uid map: Permission denied" / "loopback: Failed
+# RTM_NEWADDR"). That breaks Codex's native read/shell tools (the MCP-bridge tools are unaffected).
+# Probe once; if bwrap is broken, run Codex un-sandboxed and lean on Oceano's OWN confinement —
+# the systemd unit's ProtectHome=read-only + ReadWritePaths, exactly like the Claude mind.
+_BWRAP_OK = None
+
+
+def _bwrap_works():
+    global _BWRAP_OK
+    if _BWRAP_OK is None:
+        bw = shutil.which("bwrap")
+        if not bw:
+            _BWRAP_OK = True                 # no bwrap → Codex uses its own landlock path; let it try
+        else:
+            try:
+                r = subprocess.run([bw, "--ro-bind", "/", "/", "--unshare-net", "true"],
+                                   capture_output=True, timeout=10)
+                _BWRAP_OK = (r.returncode == 0)
+            except Exception:
+                _BWRAP_OK = False
+    return _BWRAP_OK
+
+
+def codex_sandbox_mode(desired="workspace-write"):
+    """The Codex `sandbox_mode` to actually use. Honours an explicit OCEANO_CODEX_SANDBOX override
+    (read-only / workspace-write / danger-full-access); otherwise returns `desired` when bwrap can
+    sandbox here, or falls back to 'danger-full-access' (no nested sandbox — relies on Oceano's
+    external systemd confinement) when bwrap is broken on this host."""
+    forced = (os.environ.get("OCEANO_CODEX_SANDBOX") or "").strip()
+    if forced in ("read-only", "workspace-write", "danger-full-access"):
+        return forced
+    if _bwrap_works():
+        return desired
+    if not getattr(codex_sandbox_mode, "_warned", False):
+        codex_sandbox_mode._warned = True
+        import sys
+        print("[codex] bubblewrap can't create a sandbox on this host (restricted unprivileged user "
+              "namespaces) — running Codex un-sandboxed under Oceano's own confinement (systemd "
+              "ProtectHome/ReadWritePaths). Set OCEANO_CODEX_SANDBOX to override.", file=sys.stderr, flush=True)
+    return "danger-full-access"
+
+
 def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=None):
     """Run one headless Codex task as a CONTAINED worker, mirroring to_claude. `--ignore-user-config`
     means it loads only the user's auth from our CODEX_HOME, NOT the resident mind's MCP-bridge config
@@ -540,7 +585,7 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     ok, err = codex_mind.ensure_auth()
     if not ok:
         return {"ok": False, "output": "", "error": err}
-    sandbox = _codex_sandbox(tools)
+    sandbox = codex_sandbox_mode(_codex_sandbox(tools))
     fd, out_path = tempfile.mkstemp(prefix="codex-deleg-", suffix=".txt")
     os.close(fd)
     cmd = [binary, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",

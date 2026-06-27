@@ -185,7 +185,8 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
     cmd = [binary, "exec"]
     if model:
         cmd += ["--model", str(model)]
-    cmd += ["--json", "--sandbox", "workspace-write", "-c", 'approval_policy="never"', "--ephemeral"]
+    sandbox = delegate.codex_sandbox_mode("workspace-write")    # falls back off bwrap if it can't sandbox here
+    cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
     if cwd:
         cmd += ["--cd", str(cwd)]
     cmd.append(prompt)
