@@ -29,6 +29,22 @@ def _date_note():
             "older year to the query unless the user explicitly asks for that year.")
 
 
+def _memory_age(ts):
+    """(human age string, is_old) for an injected memory's ISO timestamp. is_old marks
+    memories noted more than ~3 months ago — the ones a world-fact may have outgrown."""
+    try:
+        when = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return "", False
+    days = (datetime.now(when.tzinfo) - when).days
+    old = days >= 90
+    if days < 1:
+        return "today", old
+    if days < 60:
+        return f"{days}d ago", old
+    return f"~{days // 30}mo ago", old
+
+
 def _relevant_memories(user_message, k=5):
     """Memories to inject this turn, per the user's pinning + per-category injection
     policy (always / when-relevant / off). Passive — the model needn't call recall()."""
@@ -40,8 +56,15 @@ def _relevant_memories(user_message, k=5):
         def label(h):
             tag = h.get("category") or h.get("tags") or ""
             src = (h.get("source") or "").strip()
+            age, old = _memory_age(h.get("ts") or "")
+            # Flag staleness only on world-facts — you re-confirm what you know about your
+            # user with them, not by fact-checking the web.
+            stale = old and (h.get("category") in ("fact", "knowledge"))
+            age_tag = ((f"  (noted {age}" + (" — may be out of date" if stale else "") + ")")
+                       if age else "")
             return (f"- {h['text']}" + (f"  [{tag}]" if tag else "")
-                    + (f"  ↪ {src}" if src else "") + ("  📌" if h.get("pinned") else ""))
+                    + (f"  ↪ {src}" if src else "") + age_tag
+                    + ("  📌" if h.get("pinned") else ""))
         return ("WHAT YOU KNOW (about yourself, your user, and things you've learned "
                 "— use if helpful, ignore if not). A `↪ source` is a pointer you can reopen with "
                 "fetch_url / read_file to dig deeper:\n"
@@ -220,13 +243,20 @@ browser view so they can watch. Never repeat the same web_search again and again
 if a search isn't enough, open a result with fetch_url or refine the query.
 
 MEMORY: you have long-term memory across conversations; relevant memories are shown
-to you automatically. When the user shares a durable fact about themselves (a
-preference, who they are, an ongoing project, a decision), save it with remember().
-Memory is YOUR record, so write it in your own voice: file your own sense of self under
-`identity` in the first person ("I…"), and speak of the human as "my user" — never a
-bare "User does X", which you'd later read back as something YOU do.
-If something you know becomes wrong or out of date, fix it with update_memory or drop
-it with forget_memory. (Routine facts are also captured automatically in the background.)
+to you automatically, each tagged with when you noted it. When a question or task
+touches a topic, FIRST consult what you already know about it — lean on the surfaced
+memories instead of answering cold, and call recall() if you need more than what was
+shown. When the user shares a durable fact about themselves (a preference, who they
+are, an ongoing project, a decision), save it with remember(). Memory is YOUR record,
+so write it in your own voice: file your own sense of self under `identity` in the
+first person ("I…"), and speak of the human as "my user" — never a bare "User does X",
+which you'd later read back as something YOU do.
+STALENESS: each memory shows the date you noted it. Before relying on a world-fact — a
+figure, version, price, status, anything that drifts — that you noted more than ~3 months
+ago, treat it as possibly out of date: verify it with a quick web_search / fetch_url,
+then update_memory if it has changed or forget_memory if it's no longer true. Settled
+facts about your user (identity, preferences) don't expire this way — re-confirm those
+with them, not the web. (Routine facts are also captured automatically in the background.)
 
 KNOWLEDGE — build your own awareness: memory is not only for facts about the user;
 it's also where YOU accumulate what you learn. When research, a page you read, or
@@ -383,17 +413,41 @@ class Agent:
                  for m in self.messages[1:] if m.get("content")]
         if not convo:
             return 0
-        resp = llm.chat(
-            [{"role": "system", "content": "Summarize this conversation concisely for the assistant "
-              "to continue later. Preserve facts about the user, decisions made, open tasks, and any "
-              "important state. Compact bullet points, no preamble."},
-             {"role": "user", "content": "\n".join(convo)[:12000]}],
-            model=self.model, base_url=self.base_url, api_key=self.api_key)
-        summary = (getattr(resp, "content", "") or "").strip() or "(nothing notable)"
+        summary = self._summarize_convo("\n".join(convo)[:12000])
         before = len(self.messages)
         self.messages = [self.messages[0],
                          {"role": "assistant", "content": "📋 Summary of our earlier conversation:\n" + summary}]
         return before - len(self.messages)
+
+    _COMPACT_INSTR = ("Summarize this conversation concisely for the assistant to continue later. "
+                      "Preserve facts about the user, decisions made, open tasks, and any important state. "
+                      "Compact bullet points, no preamble.")
+
+    def _summarize_convo(self, convo_text):
+        """Summarize the conversation through whatever mind is driving it — the resident Codex/Claude
+        mind if one is set, else the local OpenAI-compatible model. Compaction used to ALWAYS go to the
+        local model (self.model via llama-swap); with Codex/Claude as the mind that model often isn't
+        served, so /compact died with a 404 'no router for requested model' exactly when you needed it.
+        The summary prompt is tiny, so a contained, tool-less delegate is the right, always-available
+        path. Raises on failure so the caller leaves the history untouched rather than dropping it."""
+        from oceano import delegate
+        if delegate.mind_is_codex() and delegate.codex_available():
+            r = delegate.to_codex(self._COMPACT_INSTR + "\n\n--- CONVERSATION ---\n" + convo_text,
+                                  tools="", timeout=180)
+            if not r.get("ok"):
+                raise RuntimeError(r.get("error") or "codex could not summarize the conversation")
+            return (r.get("output") or "").strip() or "(nothing notable)"
+        if delegate.mind_is_claude() and delegate.available():
+            r = delegate.to_claude(self._COMPACT_INSTR + "\n\n--- CONVERSATION ---\n" + convo_text,
+                                   tools="", timeout=180)
+            if not r.get("ok"):
+                raise RuntimeError(r.get("error") or "claude could not summarize the conversation")
+            return (r.get("output") or "").strip() or "(nothing notable)"
+        resp = llm.chat(
+            [{"role": "system", "content": self._COMPACT_INSTR},
+             {"role": "user", "content": convo_text}],
+            model=self.model, base_url=self.base_url, api_key=self.api_key)
+        return (getattr(resp, "content", "") or "").strip() or "(nothing notable)"
 
     def _learn(self, user_message, answer):
         """Kick off background fact-extraction from the user's message (non-blocking).

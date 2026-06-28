@@ -123,18 +123,19 @@ def set_category(mid, category):
 def for_prompt(query, k=5, max_always=20, threshold=0.28):
     """The memories to inject this turn, applying the policy: all pinned, all from
     'always' categories, plus the top semantically-relevant from 'relevant' ones.
-    Returns [{id, text, tags, category, pinned}], deduped."""
+    Returns [{id, text, tags, category, pinned, source, ts}], deduped. `ts` lets the
+    caller show each memory's age so the model can spot ones that may have gone stale."""
     policy = get_policy()
     con = _db()
-    rows = con.execute("SELECT id, text, tags, category, pinned, embedding, source FROM memories").fetchall()
+    rows = con.execute("SELECT id, text, tags, category, pinned, embedding, source, ts FROM memories").fetchall()
     con.close()
     if not rows:
         return []
     chosen = {}
 
     def take(r):
-        chosen[r[0]] = {"id": r[0], "text": r[1], "tags": r[2],
-                        "category": r[3] or "fact", "pinned": bool(r[4]), "source": r[6] or ""}
+        chosen[r[0]] = {"id": r[0], "text": r[1], "tags": r[2], "category": r[3] or "fact",
+                        "pinned": bool(r[4]), "source": r[6] or "", "ts": r[7]}
 
     for r in rows:                                   # 1. pinned — always
         if r[4]:

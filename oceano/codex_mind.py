@@ -189,7 +189,10 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
     cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
     if cwd:
         cmd += ["--cd", str(cwd)]
-    cmd.append(prompt)
+    # Feed the WHOLE conversation on stdin, NOT as a positional argument: Linux caps a single argv
+    # string at MAX_ARG_STRLEN (128 KB), so once the chat grows past that, execve fails with E2BIG
+    # ("Argument list too long") and the mind can't launch at all. Codex reads instructions from
+    # stdin when no prompt argument is given — the same pattern delegate.to_codex already uses.
 
     env = dict(os.environ)
     env["CODEX_HOME"] = str(_HOME)
@@ -206,10 +209,26 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
         # bridge + any shells it spawned), not just the parent — otherwise a lingering grandchild
         # keeps the stdio pipes open and a teardown read would block.
         proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE), env=env,
+                                stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                                 start_new_session=True)
     except OSError as e:
         return {"ok": False, "output": "", "error": f"could not launch codex: {e}"}
+
+    # Write the prompt on its own thread and close stdin: a multi-hundred-KB transcript can exceed the
+    # OS pipe buffer, and a single blocking write here would deadlock against codex (which interleaves
+    # reading stdin with writing the stdout we drain below). A daemon thread keeps both pipes flowing.
+    def feed():
+        try:
+            proc.stdin.write(prompt)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+    threading.Thread(target=feed, daemon=True).start()
 
     q = queue.Queue()
 
