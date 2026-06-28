@@ -2595,7 +2595,7 @@ async def update_task_api(tid: int, req: Request):
 @app.delete("/api/tasks/{tid}")
 def delete_task_api(tid: int):
     ok = scheduler.delete_task(tid)
-    return {"ok": ok, **({} if ok else {"error": "this entry is managed by the Researcher — delete the topic there"})}
+    return {"ok": ok, **({} if ok else {"error": "could not delete task"})}
 
 
 @app.post("/api/tasks/{tid}/run")

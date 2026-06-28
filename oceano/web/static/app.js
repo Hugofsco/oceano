@@ -3328,19 +3328,13 @@ async function loadScheduler() {
     const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
     row.dataset.tid = t.id; row.dataset.src = t.source || "";
     const nxt = t.next_run ? t.next_run.slice(0, 16).replace("T", " ") : "—";
-    const isSkills = (t.source || "").startsWith("skills");
-    const mgrName = isSkills ? "Skills" : "Researcher";
-    // Locked jobs (managed by Researcher/Skills): the schedule + on/off are yours to
-    // change here; the instruction is owned by the manager and it can't be deleted.
-    const lock = t.managed ? ` · <span class="sr-lock" title="created by ${mgrName} — schedule & on/off are editable here; managed there">🔒 ${mgrName}</span>` : "";
-    const modelTag = (!t.managed && t.model)
+    const modelTag = t.model
       ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : (t.model === "codex" ? "Codex" : escapeHtml(t.model))}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
-      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${modelTag}${lock}</div></div>` +
+      <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${modelTag}</div></div>` +
       `<button class="sr-btn sr-run" title="run now, ignoring the schedule">▶ Run</button>` +
-      `<button class="sr-btn sr-edit">${t.managed ? "schedule" : "edit"}</button>` +
-      (t.managed ? `<button class="sr-btn sr-res" title="manage in ${mgrName}">${mgrName.toLowerCase()}</button>`
-                 : `<button class="sr-btn sr-del">✕</button>`);
+      `<button class="sr-btn sr-edit">edit</button>` +
+      `<button class="sr-btn sr-del">✕</button>`;
     $("input", row).onchange = async e => { await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadScheduler(); };
     $(".sr-run", row).onclick = async ev => {
       const b = ev.currentTarget; if (b.disabled) return;
@@ -3353,11 +3347,7 @@ async function loadScheduler() {
       row.classList.remove("running"); loadScheduler();
     };
     $(".sr-edit", row).onclick = () => openTaskEditor(t);
-    if (t.managed) {
-      $(".sr-res", row).onclick = isSkills ? () => openBrain("skills") : openResearcher;
-    } else {
-      $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return; await fetch("/api/tasks/" + t.id, { method: "DELETE" }); loadScheduler(); };
-    }
+    $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return; await fetch("/api/tasks/" + t.id, { method: "DELETE" }); loadScheduler(); };
     list.appendChild(row);
   });
 }
@@ -3369,31 +3359,25 @@ function renderBeat(ago) {
   else { if (dot) dot.classList.remove("on"); txt.textContent = `⚠ scheduler stale · last beat ${Math.round(ago)}s ago`; }
 }
 // A proper editor window for a scheduled task — multi-line instruction, a preset+cron field
-// with a LIVE "next runs" preview, and an enabled toggle. Replaces the old stacked prompt
-// dialogs. Managed jobs (Researcher/Skills own the instruction) show it read-only and let you
-// retime + toggle only — exactly what the backend permits.
+// with a LIVE "next runs" preview, a model picker, and an enabled toggle. Every task is fully
+// editable here, including the built-in ones (research/skills/evals/memory/reflect/reindex).
 function openTaskEditor(t) {
-  const managed = !!t.managed;
-  const mgr = (t.source || "").startsWith("skills") ? "Skills" : "Researcher";
-  const { body } = createWindow({ id: "win-taskedit", title: managed ? "Edit schedule" : "Edit scheduled task",
+  const { body } = createWindow({ id: "win-taskedit", title: "Edit scheduled task",
     icon: "✎", width: 540, height: 500 });
   body.classList.add("set-win");
   const presets = `<option value="">preset…</option>`
     + Object.entries(SCHED_PRESETS).map(([k, v]) => `<option value="${escapeHtml(v)}">${escapeHtml(k)}</option>`).join("");
   body.innerHTML = `<div class="drawer-section">
     <label class="field-label">Instruction <span class="lbl-sub">what the agent does when this fires</span></label>
-    ${managed
-      ? `<div class="te-managed">${escapeHtml(t.instruction)}</div>
-         <div class="te-note">🔒 owned by ${mgr} — edit the text in its panel. Schedule &amp; on/off are yours.</div>`
-      : `<textarea id="teInstr" spellcheck="false" placeholder="e.g. summarize my unread email and post it to Notes">${escapeHtml(t.instruction)}</textarea>`}
+    <textarea id="teInstr" spellcheck="false" placeholder="e.g. summarize my unread email and post it to Notes">${escapeHtml(t.instruction)}</textarea>
     <label class="field-label">Schedule <span class="lbl-sub">cron · min hr day mon wkday</span></label>
     <div class="te-cron-row">
       <select id="tePreset" class="sched-preset">${presets}</select>
       <input id="teCron" class="sched-cron" value="${escapeHtml(t.cron)}" placeholder="0 8 * * *">
     </div>
     <div id="tePreview" class="te-preview">…</div>
-    ${managed ? "" : `<label class="field-label">Model <span class="lbl-sub">which model runs this task — default uses your primary</span></label>
-      <select id="teModel" class="te-model"><option value="">default model</option></select>`}
+    <label class="field-label">Model <span class="lbl-sub">which model runs this task — default uses your primary</span></label>
+    <select id="teModel" class="te-model"><option value="">default model</option></select>
     <label class="te-enabled"><span class="sw sm"><input type="checkbox" id="teEnabled" ${t.enabled ? "checked" : ""}><span></span></span> Enabled</label>
     <div class="acct-actions"><span class="acct-msg" id="teMsg"></span>
       <span class="te-btns"><button class="ghost-btn sm te-cancel" id="teCancel">Cancel</button>
@@ -3418,20 +3402,17 @@ function openTaskEditor(t) {
   cronEl.oninput = () => { clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); };
   $("#tePreset", body).onchange = e => { if (e.target.value) { cronEl.value = e.target.value; refreshPreview(); } };
   refreshPreview();
-  if (!managed) api("/api/models").then(ms => { const sel = $("#teModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, t.model || "", t.base_url || ""); }).catch(() => {});
+  api("/api/models").then(ms => { const sel = $("#teModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, t.model || "", t.base_url || ""); }).catch(() => {});
   const close = () => { const w = body.closest(".win"); if (w) w.remove(); };
   $("#teCancel", body).onclick = close;
   $("#teSave", body).onclick = async () => {
     const msg = $("#teMsg", body), cron = cronEl.value.trim();
     if (!cron) { msg.textContent = "schedule required"; msg.className = "acct-msg err"; return; }
-    const payload = { cron, enabled: $("#teEnabled", body).checked };
-    if (!managed) {
-      const instr = $("#teInstr", body).value.trim();
-      if (!instr) { msg.textContent = "instruction required"; msg.className = "acct-msg err"; return; }
-      payload.instruction = instr;
-      const pick = _schedModelPick($("#teModel", body));   // "" = system default
-      payload.model = pick.model; payload.base_url = pick.base_url;
-    }
+    const instr = $("#teInstr", body).value.trim();
+    if (!instr) { msg.textContent = "instruction required"; msg.className = "acct-msg err"; return; }
+    const pick = _schedModelPick($("#teModel", body));   // "" = system default
+    const payload = { cron, enabled: $("#teEnabled", body).checked, instruction: instr,
+                      model: pick.model, base_url: pick.base_url };
     const r = await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload) }).then(x => x.json()).catch(() => ({ ok: false }));
     if (!r.ok) { msg.textContent = r.error || "save failed — check the cron"; msg.className = "acct-msg err"; return; }

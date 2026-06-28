@@ -45,13 +45,6 @@ def _db():
     return con
 
 
-def _managed(con, tid):
-    """A task with a source (e.g. 'research:3') is owned by another module — the
-    Scheduler shows it but must not edit it."""
-    row = con.execute("SELECT source FROM tasks WHERE id=?", (tid,)).fetchone()
-    return bool(row and row[0])
-
-
 def schedule_task(cron, instruction):
     """Schedule an instruction to run on a cron expression, e.g. '0 8 * * *'."""
     try:
@@ -167,22 +160,22 @@ def _cron_ok(cron):
 
 def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=False,
                 model=None, base_url=None):
-    """Edit a task. A LOCKED job (one with a `source`, owned by the Researcher or the
-    skills evaluator) can't be deleted and its instruction is owned by its manager —
-    but the user may still retime it (cron) and toggle it on/off from the Scheduler.
-    `allow_managed=True` is the owner's full-control path (used internally). `model`
-    (pass "" to clear → system default) only applies to plain agent tasks."""
+    """Edit a task. Every field is editable from the Scheduler — schedule, instruction,
+    which model runs it, and on/off — for ALL tasks, including the built-in ones (research,
+    skills, evals, memory, reflect, reindex). Note those built-ins dispatch by their `source`
+    tag, not by their instruction text, so editing the wording is cosmetic (and the bootstrap
+    may re-canonicalize it on the next restart); the schedule, model, on/off and existence are
+    what actually take effect. `model` (pass "" to clear → system default) applies to plain
+    agent tasks. `allow_managed` is the owner module's own write path (researcher/skills/etc.
+    syncing their generated label); it now only suppresses the research mirror-back below, so an
+    owner-originated edit doesn't echo back to itself."""
     if cron is not None and not _cron_ok(cron):
         return False
     con = _db()
-    managed = _managed(con, tid)
     row = con.execute("SELECT source FROM tasks WHERE id=?", (tid,)).fetchone()
     if not row:
         con.close()
         return False
-    if managed and not allow_managed:
-        instruction = None                       # instruction is owned by the manager
-        model = base_url = None                  # so is which model runs it (e.g. evals run a whole matrix)
     if cron is not None:
         con.execute("UPDATE tasks SET cron=? WHERE id=?", (cron, tid))
     if instruction is not None:
@@ -193,10 +186,11 @@ def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=Fa
         con.execute("UPDATE tasks SET model=?, base_url=? WHERE id=?", (model or None, base_url or None, tid))
     con.commit()
     con.close()
-    # user retimed/toggled a research job from the Scheduler → mirror it into the
-    # topic record so the Researcher view stays in sync (skip on the owner's own path)
+    # A research job retimed/toggled from the Scheduler mirrors back into its topic record so the
+    # Researcher view stays in sync. Skip when the Researcher itself is the caller (allow_managed)
+    # — it already wrote the topic record, so an echo would be redundant.
     src = row[0]
-    if managed and not allow_managed and src and src.startswith("research:"):
+    if not allow_managed and src and src.startswith("research:"):
         try:
             from oceano import researcher
             researcher.note_schedule(int(src.split(":", 1)[1]), cron=cron, enabled=enabled)
@@ -206,10 +200,11 @@ def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=Fa
 
 
 def delete_task(tid, allow_managed=False):
+    """Delete a task — any task can be removed from the Scheduler now. The built-in jobs
+    (skills/evals/memory/reflect/reindex) are recreated on the next server start by their
+    ensure_*() bootstrap, so deleting one only clears it until restart; toggle it OFF instead
+    to keep it gone for good. `allow_managed` is retained for the owner modules' delete path."""
     con = _db()
-    if not allow_managed and _managed(con, tid):
-        con.close()
-        return False
     con.execute("DELETE FROM tasks WHERE id=?", (tid,))
     con.commit()
     con.close()

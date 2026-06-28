@@ -337,12 +337,16 @@ def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turn
     if not binary:
         return {"ok": False, "output": "",
                 "error": "claude CLI not found — install Claude Code, or set OCEANO_CLAUDE_BIN"}
-    cmd = [binary, "-p", instructions, "--output-format", "text",
+    cmd = [binary, "-p", "--output-format", "text",
            "--max-turns", str(int(max_turns))] + _claude_model_args()
     if tools:
         cmd += ["--allowedTools", tools]
     try:
-        r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE),
+        # Feed the prompt on stdin, NOT as a positional arg: Linux caps a single argv string at
+        # MAX_ARG_STRLEN (128 KB), so a long prompt (e.g. continuing a big chat) overflows it and
+        # execve fails with E2BIG ("Argument list too long"). `claude -p` reads the prompt from stdin
+        # when none is given — the same reason codex_mind / to_codex feed stdin.
+        r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE), input=instructions,
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "", "error": f"claude timed out after {timeout}s"}
@@ -387,7 +391,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
     if not binary:
         return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
                 "or set OCEANO_CLAUDE_BIN", "partial": False, "turns": 0, "cost": 0.0}
-    cmd = [binary, "-p", instructions, "--output-format", "stream-json", "--verbose",
+    cmd = [binary, "-p", "--output-format", "stream-json", "--verbose",
            "--max-turns", str(int(max_turns))] + _claude_model_args()
     if tools:
         cmd += ["--allowedTools", tools]
@@ -406,11 +410,30 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
                 pass
 
     try:
-        proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE),
+        # Feed the prompt on stdin, NOT as a positional arg: Linux caps a single argv string at
+        # MAX_ARG_STRLEN (128 KB), so a long transcript (e.g. continuing a big chat, or one grown
+        # under the Codex mind before switching to Claude) overflows it and execve fails with E2BIG
+        # ("Argument list too long"). `claude -p` reads the prompt from stdin when none is given.
+        proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE), stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
     except OSError as e:
         return {"ok": False, "output": "", "error": f"could not launch claude: {e}",
                 "partial": False, "turns": 0, "cost": 0.0}
+
+    # Write the prompt on its own thread, then close stdin: a multi-hundred-KB transcript can exceed
+    # the OS pipe buffer, and a single blocking write here would deadlock against claude (which
+    # interleaves reading stdin with writing the stdout the reader below drains). Mirrors codex_mind.
+    def feed():
+        try:
+            proc.stdin.write(instructions)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+    threading.Thread(target=feed, daemon=True).start()
 
     q = queue.Queue()
 
