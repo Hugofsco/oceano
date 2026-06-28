@@ -78,8 +78,10 @@ DIGEST:
 
 
 def reflect():
-    """Run one nightly reflection. Writes workspace/journal/<date>.md and returns a one-line
-    summary (the scheduler notifies it). Blocking; meant to run in the background channel."""
+    """Run one nightly reflection. Writes workspace/journal/<date>.md and returns the full
+    reflection plus a pointer to that file (the scheduler notifies it). The reflection is
+    ~150-300 words by design, so it reports in full rather than cropped. Blocking; meant to
+    run in the background channel."""
     from oceano import delegate, jobs
     digest = _digest()
     with jobs.job("self", "nightly reflection", ref=SOURCE):
@@ -96,8 +98,7 @@ def reflect():
         prior = path.read_text(encoding="utf-8") if path.exists() else ""
         head = prior + "\n\n---\n\n" if prior else f"# Reflection — {day}\n\n"
         atomicio.write_text(path, (head + body).strip() + "\n")
-        summary = " ".join(body.split())[:200]
-        return f"journaled → workspace/journal/{day}.md — {summary}"
+        return f"📓 Reflection journaled → workspace/journal/{day}.md\n\n{body}"
 
 
 def ensure_task():
