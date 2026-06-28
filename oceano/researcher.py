@@ -195,17 +195,22 @@ def _run_topic(rid):
             rag.index_docs(DOC_DIR, only=doc)
         except Exception:
             pass
-        result = (answer or "").strip()[:500]
+        # The agent's final answer IS the run summary (the prompt tells it to end with one), and the
+        # full findings already live in the doc. So report that summary in FULL plus a pointer to the
+        # doc — don't crop the notification. Only the copy kept as last_result (the compact status line
+        # in the Researcher UI list) is truncated.
+        summary = (answer or "").strip()
+        report = f"🔬 {topic} → workspace/{doc}\n\n{summary}" if summary else f"🔬 {topic} — (no summary produced)"
     except Exception as e:
-        result = f"run failed: {type(e).__name__}: {e}"
+        summary = report = f"run failed: {type(e).__name__}: {e}"
     finally:
         _RUNNING.discard(rid)
     con = _db()
     con.execute("UPDATE topics SET last_run=?, last_result=? WHERE id=?",
-                (datetime.now(timezone.utc).isoformat(), result, rid))
+                (datetime.now(timezone.utc).isoformat(), summary[:500], rid))   # cap only the UI status
     con.commit()
     con.close()
-    return result
+    return report
 
 
 def run_topic_bg(rid):
