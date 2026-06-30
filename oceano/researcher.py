@@ -141,26 +141,41 @@ def delete_topic(rid):
 
 
 # ============================ running ============================
-_RUN_PROMPT = """You are running a scheduled RESEARCH job. Work autonomously.
+_RUN_PROMPT = """You are running a RECURRING research job whose whole purpose is to DEEPEN a body of
+knowledge over many runs — to DRILL DOWN, not to re-summarize the same overview each time. Work
+autonomously.
 
 TOPIC: {topic}
 {focus_block}
 You maintain a living research document at the workspace path: {doc}
 
 Do this, in order:
-1. read_file {doc} to see what is already documented (if it doesn't exist yet, you will create it).
-2. Research the topic NOW: use web_search with 2-4 different queries, then OPEN the
-   most relevant results with fetch_url and read the actual pages. Prefer recent sources.
-3. Update the document with write_file (create the {doc_dir}/ folder first if needed). Structure:
+1. read_file {doc} to see what is ALREADY known (if it doesn't exist yet, you will create it). Look
+   especially at its "Open questions / Next to investigate" list — that backlog is what drives this run.
+2. CHOOSE ONE SPECIFIC ANGLE to drill into this run. Do NOT re-research the whole topic broadly. Pick
+   the single most valuable under-explored thread: an item from the Open-questions list, a gap in the
+   current coverage, a claim worth verifying, or a genuinely new development. Rotate the angle across
+   runs so different facets get deep coverage over time — do not repeat the angle of the last run.
+3. Research THAT angle deeply: web_search with specific, narrow queries (not generic overview ones),
+   then OPEN the best results with fetch_url and read the actual pages; follow citations toward primary
+   sources. Aim for new specifics — mechanisms, numbers, caveats, concrete examples — depth over breadth.
+4. Update the document so it GROWS richer (create the {doc_dir}/ folder first if needed). NEVER lose
+   earlier content — for a long doc, prefer edit_file to amend it in place rather than rewriting the
+   whole file. Keep this structure:
    # <Topic>
-   ## Summary  (a current, comprehensive overview — rewrite it to stay accurate)
-   ## Findings — <today's date>  (what's new or changed since the last run)
-   ...keep all previous dated "Findings" sections — never delete prior knowledge...
-   ## Sources  (URLs you used, append new ones)
-4. Keep it comprehensive, factual, and well-organized — it is documentation that will
-   be consulted later, both by the user and by you in future conversations.
+   ## Summary  — a tight current synthesis; revise it to fold in what you just learned.
+   ## Open questions / Next to investigate
+       a live bullet list that steers future runs: REMOVE questions you answered this run, and ADD the
+       new questions and threads this run opened. Never leave it empty — good research always raises
+       new questions, and this list is the memory that lets the next run go deeper instead of repeating.
+   ## Deep dives
+       an accumulating set of dated, focused subsections. ADD one for the angle you drilled into today
+       ("### Deep dive — <today's date>: <angle>"). This is where the depth accumulates over time.
+   ## Sources  — append the new URLs you actually read.
+5. Keep it accurate, specific, and well-cited — it is documentation consulted later by you and the user.
 
-Finish with a 2-3 line summary of what you added or changed this run."""
+Finish with a 2-3 line summary: which angle you drilled into, the key new specifics you learned, and
+what open questions you recorded for next time."""
 
 
 def run_topic(rid):
