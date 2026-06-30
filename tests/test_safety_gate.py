@@ -40,3 +40,18 @@ def test_bridge_taint_also_blocks():
     assert tools.run_shell("echo x") == tools._SHELL_TAINTED
     safety.reset_bridge_untrusted()
     assert tools._shell_blocked() is None
+
+
+def test_sandbox_disabled_returns_inner(monkeypatch):
+    monkeypatch.setenv("OCEANO_SHELL_SANDBOX", "0")                # force off → command runs unwrapped
+    assert tools._sandbox_wrap(["bash", "-c", "echo x"]) == ["bash", "-c", "echo x"]
+
+
+def test_sandbox_wraps_when_available(monkeypatch):
+    monkeypatch.delenv("OCEANO_SHELL_SANDBOX", raising=False)
+    monkeypatch.setattr(tools, "_sandbox_ok", lambda: True)        # pretend bwrap works
+    argv = tools._sandbox_wrap(["bash", "-c", "echo x"])
+    assert argv[0] == "bwrap"
+    assert argv[-4:] == ["--", "bash", "-c", "echo x"]            # the real command, after the separator
+    assert "--tmpfs" in argv                                       # data/ (and home creds) are masked
+

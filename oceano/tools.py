@@ -359,6 +359,48 @@ def _shell_blocked():
     return _SHELL_TAINTED if (safety.untrusted_seen() or safety.bridge_untrusted_seen()) else None
 
 
+# Defense-in-depth filesystem confinement for the agent's shell (run_shell / python_exec). The
+# daemon needs data/ (mail passwords, SSH keys, the mind token), but the agent's shell never does —
+# so run it in a bubblewrap sandbox that HIDES data/ and the user's own credential stores, makes the
+# rest of the filesystem read-only, keeps the workspace writable, and leaves the network intact. So
+# even a shell call that slips past the taint gate can't read secrets to exfiltrate. The sandbox is
+# probe-gated: if bwrap is absent or unprivileged user namespaces are blocked on the host, we fall
+# back to running the command directly (never break the shell). Force off with OCEANO_SHELL_SANDBOX=0.
+_sandbox_probe = None
+
+
+def _bwrap_base():
+    ws = str(config.WORKSPACE)
+    data = str(config.WORKSPACE.parent / "data")
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+            "--bind", ws, ws, "--tmpfs", data, "--chdir", ws, "--unshare-pid", "--die-with-parent"]
+    home = os.path.expanduser("~")
+    for sub in (".ssh", ".aws", ".gnupg", ".config/gcloud"):     # mask the user's own credential stores too
+        p = os.path.join(home, sub)
+        if os.path.exists(p):
+            args += ["--tmpfs", p]
+    return args
+
+
+def _sandbox_ok():
+    """True if the bwrap sandbox (with our exact bind set) actually works on this host. Probed once."""
+    global _sandbox_probe
+    if _sandbox_probe is None:
+        try:
+            r = subprocess.run(_bwrap_base() + ["--", "true"], capture_output=True, timeout=10)
+            _sandbox_probe = (r.returncode == 0)
+        except Exception:                            # bwrap absent / userns blocked / any setup error
+            _sandbox_probe = False
+    return _sandbox_probe
+
+
+def _sandbox_wrap(inner):
+    """Wrap a command argv in the sandbox when it's available; otherwise return it unchanged."""
+    if os.environ.get("OCEANO_SHELL_SANDBOX", "auto") == "0" or not _sandbox_ok():
+        return inner
+    return _bwrap_base() + ["--", *inner]
+
+
 @tool({
     "type": "function",
     "function": {
@@ -378,7 +420,7 @@ def run_shell(command):
     if refusal:
         return refusal
     r = subprocess.run(
-        command, shell=True, cwd=str(_ws()),
+        _sandbox_wrap(["bash", "-c", command]), cwd=str(_ws()),   # confined: data/ + home creds hidden
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
@@ -488,7 +530,7 @@ def python_exec(code):
     if refusal:
         return refusal
     r = subprocess.run(
-        [sys.executable, "-"], input=code, cwd=str(_ws()),
+        _sandbox_wrap([sys.executable, "-"]), input=code, cwd=str(_ws()),   # same confinement as run_shell
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
