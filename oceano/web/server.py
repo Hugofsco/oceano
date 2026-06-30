@@ -874,6 +874,10 @@ _TOOL_CATEGORY = {
     "git": "dev", "code_search": "dev", "run_tests": "dev",
     "http_request": "web", "rss": "web", "sql_query": "data",
     "ui_open": "ui", "ui_close": "ui", "ui_arrange": "ui",
+    "mail_accounts": "mail", "mail_folders": "mail", "mail_list": "mail", "mail_read": "mail",
+    "mail_move": "mail", "mail_delete": "mail", "mail_flag": "mail", "mail_send": "mail",
+    "mail_reply": "mail", "mail_folder": "mail", "mail_save_attachment": "mail",
+    "list_hosts": "servers", "ssh_run": "servers", "sftp": "servers",
 }
 
 
@@ -1081,7 +1085,7 @@ async def set_default_model_api(req: Request):
 async def set_delegation_enabled(req: Request):
     """Master delegation switch. Off → run() refuses (background jobs + the tool) and the
     delegate tool is withheld from the agent. (Also toggleable per-tool under Settings → Tools.)"""
-    from oceano import delegate
+    from oceano import delegate, tools
     b = await req.json()
     on = bool(b.get("enabled", True))
     delegate.set_enabled(on)

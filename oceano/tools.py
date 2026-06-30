@@ -6,8 +6,10 @@ work, without roaming the whole disk. Set OCEANO_CONFINE=0 to lift the fence.
 """
 import contextlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 

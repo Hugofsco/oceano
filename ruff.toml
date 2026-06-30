@@ -1,0 +1,17 @@
+# Conservative, bug-focused lint for CI. The goal right now is to catch real
+# breakage (syntax errors, undefined names, broken comprehensions) across the
+# codebase WITHOUT enforcing whole-repo style — so CI is a meaningful gate from
+# day one instead of a wall of pre-existing style warnings. Widen `select` later
+# (e.g. add "F401" for unused imports, "I" for import sorting) once the codebase
+# is clean for them.
+target-version = "py312"
+line-length = 120
+extend-exclude = ["venv", "llama.cpp", "workspace", "data", "assets", "deploy"]
+
+[lint]
+# E9   — syntax / indentation errors
+# F63  — invalid use in comprehensions / `==` vs `is` mistakes
+# F7   — statement misuse (e.g. `break` outside a loop)
+# F82  — undefined name (the classic "renamed it in one place" bug)
+# This is the well-known "stop the build for real errors only" subset.
+select = ["E9", "F63", "F7", "F82"]
