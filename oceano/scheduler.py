@@ -24,6 +24,42 @@ NTFY_URL = os.environ.get("OCEANO_NTFY_URL", "https://ntfy.sh")
 NTFY_TOPIC = os.environ.get("OCEANO_NTFY_TOPIC", "")
 
 
+# --- timezone: cron is evaluated in the host's LOCAL time, like system cron ---------------
+# So '0 8 * * *' means 8am where the user is, not 8am UTC (the old behaviour, which silently
+# offset every "run at 8am" by the host's UTC delta). Override with OCEANO_TZ (an IANA name
+# like 'America/New_York') for exact DST handling.
+def _tz():
+    name = os.environ.get("OCEANO_TZ", "").strip()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc).astimezone().tzinfo   # host-local offset (re-read each call → tracks DST)
+
+
+def _now():
+    return datetime.now(_tz())
+
+
+def _as_local(dt):
+    """Interpret a stored timestamp (older UTC-ISO rows, or newer local-ISO ones) in the schedule tz."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_tz())
+
+
+def _parse_when(s):
+    """Parse a one-shot date/time (e.g. '2026-07-01 15:00' or full ISO). A bare time with no
+    offset is read in the schedule tz. Returns an aware datetime, or None if unparseable."""
+    try:
+        dt = datetime.fromisoformat((s or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=_tz())
+
+
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
@@ -33,7 +69,9 @@ def _db():
                 "id INTEGER PRIMARY KEY, cron TEXT, instruction TEXT, "
                 "last_run TEXT, enabled INTEGER DEFAULT 1, source TEXT)")
     cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)").fetchall()}
-    for col in ("source", "model", "base_url"):      # migrate older DBs in place (column names are literals)
+    # migrate older DBs in place (column names are literals): run_once_at = one-shot fire time
+    # (cron empty); last_status/last_summary = the outcome of the most recent run.
+    for col in ("source", "model", "base_url", "run_once_at", "last_status", "last_summary"):
         if col not in cols:
             con.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
     # Bootstrap legacy rows that never ran: a NULL last_run made is_due() compute a base of
@@ -45,31 +83,33 @@ def _db():
     return con
 
 
-def schedule_task(cron, instruction):
-    """Schedule an instruction to run on a cron expression, e.g. '0 8 * * *'."""
-    try:
-        from croniter import croniter
-        if not croniter.is_valid(cron):
-            return f"invalid cron expression: {cron!r} (format: 'min hour day month weekday')"
-    except ImportError:
-        pass
-    con = _db()
-    # Seed last_run = now so the task bootstraps from creation time (fires at the NEXT cron
-    # occurrence). A NULL here used to make is_due() never fire it. See _db()/is_due().
-    con.execute("INSERT INTO tasks (cron, instruction, last_run) VALUES (?,?,?)",
-                (cron, instruction, datetime.now(timezone.utc).isoformat()))
-    con.commit()
-    con.close()
+def schedule_task(cron, instruction, run_once_at=None):
+    """Schedule an instruction to run on a cron expression ('0 8 * * *'), or ONCE at a given
+    date/time when `run_once_at` is set (cron is then ignored). Times are host-local."""
+    if run_once_at:
+        when = _parse_when(run_once_at)
+        if not when:
+            return f"invalid date/time: {run_once_at!r} (use e.g. '2026-07-01 15:00')"
+        add_task("", instruction, run_once_at=when.isoformat())
+        return f"scheduled one-shot '{instruction}' for {when.isoformat()}"
+    if not _cron_ok(cron):
+        return f"invalid cron expression: {cron!r} (format: 'min hour day month weekday')"
+    add_task(cron, instruction)
     return f"scheduled '{instruction}' on cron '{cron}'"
 
 
 def list_tasks():
     con = _db()
-    rows = con.execute("SELECT id, cron, instruction, enabled FROM tasks").fetchall()
+    rows = con.execute("SELECT id, cron, instruction, enabled, run_once_at, last_status FROM tasks").fetchall()
     con.close()
     if not rows:
         return "(no scheduled tasks)"
-    return "\n".join(f"#{i} [{c}] {'on' if en else 'off'}: {ins}" for i, c, ins, en in rows)
+    out = []
+    for i, c, ins, en, once, status in rows:
+        when = f"once @ {once}" if once else f"[{c}]"
+        flag = "  ⚠️ last run FAILED" if status == "error" else ""
+        out.append(f"#{i} {when} {'on' if en else 'off'}: {ins}{flag}")
+    return "\n".join(out)
 
 
 def notify(message, title="Oceano"):
@@ -92,10 +132,12 @@ def last_beat():
 
 
 # --- structured task CRUD for the UI --------------------------------------
-def _next_run(cron, last_run):
+def _next_run(cron, last_run, run_once_at=None):
+    if run_once_at:
+        return run_once_at
     try:
         from croniter import croniter
-        base = datetime.fromisoformat(last_run) if last_run else datetime.now(timezone.utc)
+        base = _as_local(datetime.fromisoformat(last_run)) if last_run else _now()
         return croniter(cron, base).get_next(datetime).isoformat()
     except Exception:
         return None
@@ -104,14 +146,14 @@ def _next_run(cron, last_run):
 def cron_preview(cron, n=5):
     """Validate a cron string and return its next `n` fire times — powers the task
     editor's live preview so the user sees *when* a schedule fires before saving.
-    Times are UTC (the same base the scheduler/_next_run use). {valid, runs:[iso…]}
-    or {valid: False, error}."""
+    Times are in the schedule timezone (host-local unless OCEANO_TZ is set), the same
+    base the scheduler/_next_run use. {valid, runs:[iso…]} or {valid: False, error}."""
     cron = (cron or "").strip()
     try:
         from croniter import croniter
         if not croniter.is_valid(cron):
             return {"valid": False, "error": "not a valid cron — format: min hr day mon wkday"}
-        it = croniter(cron, datetime.now(timezone.utc))
+        it = croniter(cron, _now())
         return {"valid": True, "runs": [it.get_next(datetime).isoformat() for _ in range(max(1, min(int(n), 10)))]}
     except ImportError:
         return {"valid": True, "runs": []}            # croniter absent → can't preview, don't block
@@ -121,29 +163,31 @@ def cron_preview(cron, n=5):
 
 def all_tasks():
     con = _db()
-    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source, model, base_url "
-                       "FROM tasks ORDER BY id").fetchall()
+    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source, model, base_url, "
+                       "run_once_at, last_status, last_summary FROM tasks ORDER BY id").fetchall()
     con.close()
     return [{"id": r[0], "cron": r[1], "instruction": r[2], "last_run": r[3],
-             "enabled": bool(r[4]), "next_run": _next_run(r[1], r[3]),
+             "enabled": bool(r[4]), "next_run": _next_run(r[1], r[3], r[8]),
              "source": r[5], "managed": bool(r[5]),
-             "model": r[6], "base_url": r[7]} for r in rows]      # which model runs it ('' = system default)
+             "model": r[6], "base_url": r[7],                     # which model runs it ('' = system default)
+             "run_once_at": r[8], "last_status": r[9], "last_summary": r[10]} for r in rows]
 
 
-def add_task(cron, instruction, source=None, model=None, base_url=None):
-    try:
-        from croniter import croniter
-        if not croniter.is_valid(cron):
-            return None
-    except ImportError:
-        pass
+def add_task(cron, instruction, source=None, model=None, base_url=None, run_once_at=None):
+    if not run_once_at:                                  # a cron task must have a valid cron; one-shots don't
+        try:
+            from croniter import croniter
+            if not croniter.is_valid(cron):
+                return None
+        except ImportError:
+            pass
     con = _db()
     # Seed last_run = now (creation baseline) so the task fires at its NEXT cron occurrence
     # instead of never — a NULL last_run made is_due() always look one interval into the future.
-    cur = con.execute("INSERT INTO tasks (cron, instruction, source, model, base_url, last_run) "
-                      "VALUES (?,?,?,?,?,?)",
-                      (cron, instruction, source, model or None, base_url or None,
-                       datetime.now(timezone.utc).isoformat()))
+    cur = con.execute("INSERT INTO tasks (cron, instruction, source, model, base_url, last_run, run_once_at) "
+                      "VALUES (?,?,?,?,?,?,?)",
+                      (cron or "", instruction, source, model or None, base_url or None,
+                       _now().isoformat(), run_once_at))
     con.commit()
     tid = cur.lastrowid
     con.close()
@@ -212,18 +256,24 @@ def delete_task(tid, allow_managed=False):
 
 
 # --- the actual runner (driven by the engine's loop) ----------------------
-def is_due(cron, last_run, now=None):
-    """True if a task on `cron` whose last run was `last_run` should run by now.
+def is_due(cron, last_run, now=None, run_once_at=None):
+    """True if a task should run by now. A one-shot (`run_once_at` set) is due once its time
+    has arrived; run_due_once disables it on fire so it runs exactly once.
 
-    `last_run` is normally seeded at creation (see add_task/_db), so the usual path is:
-    next fire AFTER the last run has already passed → due. The None branch is a defensive
-    backstop: base it on the PREVIOUS scheduled time (get_prev, always ≤ now) so a task that
-    somehow has no baseline still fires on the next tick rather than never — the old code based
-    it on `now`, whose get_next() is always in the future, which is why such tasks never ran."""
+    For cron tasks, `last_run` is normally seeded at creation (see add_task/_db), so the usual
+    path is: next fire AFTER the last run has already passed → due. The None branch is a
+    defensive backstop: base it on the PREVIOUS scheduled time (get_prev, always ≤ now) so a
+    task that somehow has no baseline still fires on the next tick rather than never. Cron is
+    evaluated in the schedule timezone (host-local unless OCEANO_TZ is set)."""
+    now = now or _now()
+    if run_once_at:
+        try:
+            return _as_local(datetime.fromisoformat(run_once_at)) <= now
+        except ValueError:
+            return False
     from croniter import croniter
-    now = now or datetime.now(timezone.utc)
     if last_run:
-        return croniter(cron, datetime.fromisoformat(last_run)).get_next(datetime) <= now
+        return croniter(cron, _as_local(datetime.fromisoformat(last_run))).get_next(datetime) <= now
     return croniter(cron, now).get_prev(datetime) <= now
 
 
@@ -246,15 +296,34 @@ def _ensure_worker():
         threading.Thread(target=_drain_loop, name="sched-drain", daemon=True).start()
 
 
+def _set_run_status(tid, status, summary):
+    """Record the outcome of a task's most recent run so list_tasks/all_tasks (and the UI)
+    can show 'last run FAILED' instead of the failure being invisible."""
+    if not tid:
+        return
+    try:
+        con = _db()
+        con.execute("UPDATE tasks SET last_status=?, last_summary=? WHERE id=?",
+                    (status, (summary or "")[:500], tid))
+        con.commit()
+        con.close()
+    except Exception:                                               # noqa: BLE001 - status is best-effort
+        pass
+
+
 def _drain_loop():
     while True:
-        source, instruction, ref, model, base_url = _TASK_Q.get()
+        tid, source, instruction, ref, model, base_url = _TASK_Q.get()
         try:
             print(f"[scheduler] running {ref}: {instruction}")
             answer = _dispatch(source, instruction, ref=ref, model=model, base_url=base_url)
+            _set_run_status(tid, "ok", answer)
             notify(f"{instruction}\n\n{answer}", title="Oceano task")   # full report; notify() chunks per channel
         except Exception as e:                                          # noqa: BLE001
             print(f"[scheduler] task {ref} failed: {e}")
+            _set_run_status(tid, "error", f"{type(e).__name__}: {e}")
+            notify(f"⚠️ Scheduled task failed:\n{instruction}\n\n{type(e).__name__}: {e}",
+                   title="Oceano task failed")                          # silent failures → visible
         finally:
             _TASK_Q.task_done()
 
@@ -337,16 +406,19 @@ def run_due_once():
     beat()                                  # tell the UI we're alive
     _ensure_worker()
     con = _db()
-    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source, model, base_url "
+    rows = con.execute("SELECT id, cron, instruction, last_run, enabled, source, model, base_url, run_once_at "
                        "FROM tasks").fetchall()
-    now = datetime.now(timezone.utc)
+    now = _now()
     queued = 0
-    for tid, cron, instruction, last_run, enabled, source, model, base_url in rows:
-        if not (enabled and is_due(cron, last_run, now)):
+    for tid, cron, instruction, last_run, enabled, source, model, base_url, run_once_at in rows:
+        if not (enabled and is_due(cron, last_run, now, run_once_at)):
             continue
-        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (now.isoformat(), tid))  # claim it before dispatch
+        if run_once_at:                              # one-shot: fire exactly once, then disable
+            con.execute("UPDATE tasks SET last_run=?, enabled=0 WHERE id=?", (now.isoformat(), tid))
+        else:
+            con.execute("UPDATE tasks SET last_run=? WHERE id=?", (now.isoformat(), tid))  # claim before dispatch
         con.commit()
-        _TASK_Q.put((source, instruction, source or f"task:{tid}", model, base_url))
+        _TASK_Q.put((tid, source, instruction, source or f"task:{tid}", model, base_url))
         queued += 1
     con.close()
     return queued
@@ -367,10 +439,12 @@ def run_task(tid, advance=True):
     try:
         answer = _dispatch(source, instruction, ref=source or f"task:{tid}", model=model, base_url=base_url) or ""
     except Exception as e:
+        _set_run_status(tid, "error", f"{type(e).__name__}: {e}")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    _set_run_status(tid, "ok", answer)
     if advance:
         con = _db()
-        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), tid))
+        con.execute("UPDATE tasks SET last_run=? WHERE id=?", (_now().isoformat(), tid))
         con.commit()
         con.close()
     notify(f"{instruction}\n\n{answer}", title="Oceano task (manual)")  # full report; notify() chunks per channel

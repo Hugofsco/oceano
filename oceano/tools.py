@@ -728,24 +728,29 @@ def browser_scroll(amount=600):
     "type": "function",
     "function": {
         "name": "schedule_task",
-        "description": "Schedule an instruction to run automatically on a cron schedule. "
-                       "Example cron: '0 8 * * *' = every day at 08:00.",
+        "description": "Schedule an instruction to run automatically — either REPEATING on a cron "
+                       "schedule, or ONCE at a specific date/time. For recurring, pass `cron` (e.g. "
+                       "'0 8 * * *' = every day at 08:00). For a one-off (\"remind me at 3pm "
+                       "tomorrow\"), pass `at` as a local date/time like '2026-07-01 15:00' and leave "
+                       "cron empty; it fires once then disables itself. Times are host-local.",
         "parameters": {"type": "object", "properties": {
-            "cron": {"type": "string"},
             "instruction": {"type": "string"},
-        }, "required": ["cron", "instruction"]},
+            "cron": {"type": "string", "description": "5-field cron for a REPEATING task"},
+            "at": {"type": "string", "description": "local date/time for a ONE-OFF task, e.g. '2026-07-01 15:00'"},
+        }, "required": ["instruction"]},
     },
 })
-def schedule_task(cron, instruction):
-    return scheduler.schedule_task(cron, instruction)
+def schedule_task(instruction, cron="", at=""):
+    return scheduler.schedule_task(cron, instruction, run_once_at=(at or None))
 
 
 @tool({
     "type": "function",
     "function": {
         "name": "list_tasks",
-        "description": "List the user's scheduled tasks, each shown as '#id [cron] on/off: instruction'. "
-                       "Use the id with update_task / cancel_task.",
+        "description": "List the user's scheduled tasks, each shown as '#id [cron] on/off: instruction' "
+                       "(one-offs show 'once @ <time>'; a failed last run is flagged). Use the id with "
+                       "update_task / cancel_task.",
         "parameters": {"type": "object", "properties": {}},
     },
 })
