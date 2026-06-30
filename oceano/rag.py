@@ -10,6 +10,7 @@ from oceano import embeddings, rerank
 
 DB_PATH = config.WORKSPACE.parent / "data" / "rag.db"
 CHUNK_WORDS = 250
+CHUNK_OVERLAP = 40          # ~15% word overlap so a fact spanning a chunk boundary isn't split in two
 RERANK_POOL = 10            # dense candidates handed to the cross-encoder reranker (eval favoured ~8-10;
                            # a wider pool of short near-neighbours hurt). No-op if the reranker is off.
 TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".rst"}
@@ -42,8 +43,13 @@ def _read(path: Path):
 
 def _chunks(text):
     words = text.split()
-    for i in range(0, len(words), CHUNK_WORDS):
+    if not words:
+        return
+    step = max(1, CHUNK_WORDS - CHUNK_OVERLAP)       # advance by less than a full chunk → windows overlap
+    for i in range(0, len(words), step):
         yield " ".join(words[i:i + CHUNK_WORDS])
+        if i + CHUNK_WORDS >= len(words):            # this window already reached the end — stop (no tiny tail)
+            break
 
 
 def index_docs(folder, only=None):
@@ -155,13 +161,19 @@ def search_docs(query, k=4):
     if not rows:
         return "(no documents indexed yet — run index_docs first)"
     qvec = embeddings.embed(query, "query")
-    if not qvec:
-        return "ERROR: embed server down"
-    scored = []
-    for path, chunk, emb in rows:
-        v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
-        if v:
-            scored.append((embeddings.cosine(qvec, v), path, chunk))
+    if qvec:
+        scored = []
+        for path, chunk, emb in rows:
+            v = embeddings.loads_vec(emb)            # skip a corrupt/missing embedding row
+            if v:
+                scored.append((embeddings.cosine(qvec, v), path, chunk))
+    else:                                            # embed server down → keyword fallback (like memory),
+        words = set(query.lower().split())           # so docs stay searchable instead of erroring out
+        scored = [(float(sum(w in chunk.lower() for w in words)), path, chunk)
+                  for path, chunk, _ in rows]
+        scored = [s for s in scored if s[0] > 0]
+        if not scored:
+            return "(embed server down; no keyword match in the indexed docs for this query)"
     scored.sort(key=lambda x: x[0], reverse=True)
     return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in _rerank_top(query, scored, k))
 

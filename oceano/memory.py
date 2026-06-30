@@ -81,8 +81,20 @@ def remember(text, tags="", category="fact", pinned=False, source=""):
     """Store a durable fact/preference/note the agent should keep. `source` is an optional
     URL or workspace file path the fact came from — mainly for 'knowledge' memories, so the
     agent can reopen it later (fetch_url / read_file) to investigate further."""
+    text = (text or "").strip()
+    if not text:
+        return "nothing to remember (empty text)"
     vec = _embed(text)
     con = _db()
+    # Skip a near-identical duplicate so explicit remember() calls don't pile up copies between the
+    # weekly maintain() runs. High bar (0.95) and semantic-only — distinct-but-related facts still
+    # save, and with the embed server down we don't dedupe (keep the old always-save behaviour).
+    if vec:
+        for (t, emb) in con.execute("SELECT text, embedding FROM memories").fetchall():
+            v = embeddings.loads_vec(emb)
+            if v and _cosine(vec, v) >= 0.95:
+                con.close()
+                return f"already remembered (near-identical to an existing memory): {t!r}"
     con.execute(
         "INSERT INTO memories (ts, text, tags, embedding, category, pinned, source) VALUES (?,?,?,?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(), text, tags,
