@@ -53,6 +53,7 @@ _ALLOW = {
     "list_skills", "load_skill", "learn_skill",              # skills — reuse + grow Oceano's skill library (parity with the local mind)
     "run_workflow", "list_workflows",                        # workflows — run Oceano's saved multi-step recipes
     "search_docs", "index_docs",                             # RAG — search (and add to) the user's indexed documents
+    "list_suggestions", "accept_suggestion", "dismiss_suggestion",   # the self-improvement queue (reflection → approve → act)
     "ui_open", "ui_close", "ui_arrange",                      # the windows (JARVIS bit)
     "notify",                                                 # push a notification to the user
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches

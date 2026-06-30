@@ -863,6 +863,63 @@ def cancel_task(id):
     return f"cancelled task #{tid}"
 
 
+@tool({
+    "type": "function",
+    "function": {
+        "name": "list_suggestions",
+        "description": "List Oceano's self-improvement suggestions — proposals nightly reflection filed for "
+                       "the user to approve. Each shows '#id [kind] status: title'. Defaults to pending; "
+                       "pass status='all' for every status. Accept one with accept_suggestion.",
+        "parameters": {"type": "object", "properties": {
+            "status": {"type": "string", "description": "pending (default), accepted, dismissed, done, or all"},
+        }},
+    },
+})
+def list_suggestions(status="pending"):
+    from oceano import suggestions
+    items = suggestions.all_suggestions(status=(status or "pending"))
+    if not items:
+        return "(no suggestions)"
+    return "\n".join(f"#{s['id']} [{s['kind']}] {s['status']}: {s['title']}"
+                     + (f" — {s['detail']}" if s['detail'] else "") for s in items)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "accept_suggestion",
+        "description": "Accept a pending suggestion by id (from list_suggestions) and ACT on it: a "
+                       "'research' suggestion creates a scheduled research topic, 'workflow' a workflow "
+                       "draft, 'memory' a saved memory; other kinds are marked for manual follow-up. "
+                       "This changes Oceano's setup, so do it when the user approves.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the suggestion id shown by list_suggestions"},
+        }, "required": ["id"]},
+    },
+})
+def accept_suggestion(id):
+    from oceano import suggestions
+    r = suggestions.accept(int(id))
+    return r.get("result") if r.get("ok") else f"could not accept #{id}: {r.get('error')}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "dismiss_suggestion",
+        "description": "Dismiss a self-improvement suggestion by id (from list_suggestions) so it's no "
+                       "longer pending.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the suggestion id shown by list_suggestions"},
+        }, "required": ["id"]},
+    },
+})
+def dismiss_suggestion(id):
+    from oceano import suggestions
+    r = suggestions.dismiss(int(id))
+    return f"dismissed suggestion #{id}" if r.get("ok") else f"could not dismiss #{id}: {r.get('error')}"
+
+
 def _run_one_workflow(name, inp=""):
     from oceano import workflows
     name = str(name or "").strip()
