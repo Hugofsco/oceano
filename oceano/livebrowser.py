@@ -14,9 +14,11 @@ Research lifecycle:
   • manual navigation (address bar) reuses the active tab; a one-off open with no
     preceding search just navigates — tabs are left alone
 """
+import base64
 import os
 import queue
 import threading
+import time
 
 VIEWPORT = {"width": 1280, "height": 800}
 MAX_TABS = 8                       # cap so a big research run can't pile up pages
@@ -32,6 +34,12 @@ LATEST = {"frame": None, "v": 0, "url": "about:blank", "tabs": []}
 # to go back to a vanilla headless launch.
 STEALTH = os.environ.get("OCEANO_BROWSER_STEALTH", "1") == "1"
 ACCEPT_LANGUAGE = os.environ.get("OCEANO_BROWSER_LANG", "en-US,en;q=0.9")
+
+# CDP screencast: Chromium PUSHES JPEG frames on visual change, instead of the worker polling
+# page.screenshot() on the input thread (slow, and it fights every click/scroll). Probed at
+# startup — if frames don't actually flow we fall back to the screenshot poll, so the live view
+# never breaks. Disable with OCEANO_BROWSER_SCREENCAST=0.
+SCREENCAST = os.environ.get("OCEANO_BROWSER_SCREENCAST", "1") == "1"
 
 # Runs before any page script — removes the leftover automation tells that the
 # launch flags don't cover.
@@ -116,6 +124,50 @@ def _new_context(br):
             pass
     _install_ssrf_guard(ctx)         # block redirects/JS-navigation to internal addresses
     return ctx
+
+def _start_screencast(page):
+    """Best-effort CDP screencast on `page`: Chromium pushes JPEG frames into LATEST as the page
+    changes, so the worker thread never blocks on a synchronous screenshot. Returns the CDP
+    session, or None if it couldn't start. Frames arrive while the worker pumps Playwright."""
+    try:
+        cdp = page.context.new_cdp_session(page)
+    except Exception:
+        return None
+
+    def on_frame(params):
+        try:
+            LATEST["frame"] = base64.b64decode(params["data"])
+            LATEST["v"] += 1
+        except Exception:
+            pass
+        try:
+            cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
+        except Exception:
+            pass
+
+    try:
+        cdp.on("Page.screencastFrame", on_frame)
+        cdp.send("Page.startScreencast", {
+            "format": "jpeg", "quality": 55,
+            "maxWidth": VIEWPORT["width"], "maxHeight": VIEWPORT["height"], "everyNthFrame": 1,
+        })
+        return cdp
+    except Exception:
+        return None
+
+
+def _stop_screencast(cdp):
+    if not cdp:
+        return
+    try:
+        cdp.send("Page.stopScreencast")
+    except Exception:
+        pass
+    try:
+        cdp.detach()
+    except Exception:
+        pass
+
 
 _CMD = queue.Queue()
 _started = False
@@ -212,24 +264,55 @@ def _worker():
                     out.append((cmd, arg, resp))
             return out
 
+        # Screencast probe: if Chromium actually pushes frames under our pump, use it; otherwise
+        # fall back to the screenshot poll so the view can't end up frozen.
+        cast = None
+        if SCREENCAST and cur():
+            v0 = LATEST["v"]
+            c = _start_screencast(cur())
+            if c:
+                try: cur().wait_for_timeout(300)       # let the initial frame land
+                except Exception: pass
+                if LATEST["v"] > v0:
+                    cast = c                            # frames flow → push-based rendering
+                else:
+                    _stop_screencast(c)                 # silent → fall back to polling
+
         closing = False
+        last_safety = 0.0
         while not closing:
-            try:
-                first = _CMD.get(timeout=0.15)     # the timeout IS the idle frame pacing
+            batch = []                                 # NON-blocking drain: we must keep pumping the
+            try:                                       # cast, so we never block on the command queue
+                batch.append(_CMD.get_nowait())
+                while True:
+                    try:
+                        batch.append(_CMD.get_nowait())
+                    except queue.Empty:
+                        break
             except queue.Empty:
-                try:                               # idle: stream a frame of the active tab
-                    if cur():
-                        grab()
-                        LATEST["url"] = cur().url
-                except Exception:
-                    pass
+                pass
+            if not batch:                              # idle
+                if cast is not None and cur():
+                    try: cur().wait_for_timeout(33)     # ~30fps PUMP → screencastFrame fires here
+                    except Exception: pass
+                else:
+                    grab()                              # fallback: poll a frame like before
+                    time.sleep(0.12)
+                now = time.monotonic()
+                if now - last_safety > 1.5:             # safety net: refresh url/tabs (+ a poll frame
+                    last_safety = now                   # even with a cast) so the view can't freeze
+                    try:
+                        if cur():
+                            if cast is not None:
+                                grab()
+                            LATEST["url"] = cur().url
+                            refresh()
+                    except Exception:
+                        pass
                 continue
-            batch = [first]
-            while True:                            # drain whatever piled up behind it
-                try:
-                    batch.append(_CMD.get_nowait())
-                except queue.Empty:
-                    break
+            nav_in_batch = any(c in ("open", "navigate", "switch_tab", "close_tab",
+                                     "back", "forward", "reload", "new_tab")
+                               for c, _, _ in batch)   # → re-cast the (possibly new) active page after
             for cmd, arg, resp in coalesce(batch):
                 out = {"ok": True}
                 try:
@@ -263,6 +346,31 @@ def _worker():
                                     try: t["page"].close()
                                     except Exception: pass
                                     tabs.pop(idx); clamp_active(); break
+                    elif cmd == "new_tab":                 # open a fresh blank tab and focus it
+                        if len(tabs) >= MAX_TABS:
+                            try: tabs.pop(0)["page"].close()
+                            except Exception: pass
+                            clamp_active()
+                        t = make_tab(); tabs.append(t); st["active"] = len(tabs) - 1
+                    elif cmd in ("back", "forward", "reload"):   # history navigation of the active tab
+                        pg = cur()
+                        try:
+                            if cmd == "back":
+                                pg.go_back(wait_until="domcontentloaded", timeout=15000)
+                            elif cmd == "forward":
+                                pg.go_forward(wait_until="domcontentloaded", timeout=15000)
+                            else:
+                                pg.reload(wait_until="domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass                           # no history / aborted load → no-op
+                        pg.wait_for_timeout(200)
+                        try:
+                            tabs[st["active"]]["title"] = (pg.title() or pg.url)[:48]
+                        except Exception:
+                            pass
+                    elif cmd == "stop":                    # stop the in-flight page load
+                        try: cur().evaluate("window.stop()")
+                        except Exception: pass
                     elif cmd == "click":
                         cur().mouse.click(arg[0], arg[1]); cur().wait_for_timeout(300)
                     elif cmd == "mousedown":           # press-hold-release, streamed live — lets the
@@ -309,9 +417,14 @@ def _worker():
                     resp.put(out)
             if closing:
                 break
-            grab()                                 # ONE frame + tab-bar update per batch,
-            refresh()                              # not per command — bursts stay snappy
+            if cast is not None and nav_in_batch:  # page navigated/tab switched → re-cast for a fresh
+                _stop_screencast(cast)             # frame (startScreencast emits the current view)
+                cast = _start_screencast(cur())
+            if cast is None:
+                grab()                             # no cast → poll one frame per batch (old behaviour)
+            refresh()                              # tab-bar + url update per batch
 
+        _stop_screencast(cast)
         for t in tabs:                             # tear Chrome down ON this thread (it's
             try: t["page"].close()                 # thread-bound) so the subprocess exits
             except Exception: pass                 # cleanly instead of segfaulting at exit

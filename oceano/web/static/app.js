@@ -2182,7 +2182,7 @@ function hideCtx() { const m = $("#ctxMenu"); if (m) m.remove(); }
 document.addEventListener("click", hideCtx);
 
 /* ---------- live browser window (interactive — you + the agent share it) ---------- */
-let _liveES = null;
+let _liveES = null, _liveWS = null;
 function _mapToPage(img, clientX, clientY) {           // displayed frame coords → page coords (handles letterbox)
   const r = img.getBoundingClientRect();
   const nW = img.naturalWidth || 1280, nH = img.naturalHeight || 800;
@@ -2196,17 +2196,22 @@ function _mapToPage(img, clientX, clientY) {           // displayed frame coords
 }
 function openLiveView() {
   const { body, reused } = createWindow({ id: "win-live", title: "Live browser — drive it, or watch Oceano", icon: "◫", width: 720, height: 600,
-    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } } });
+    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } if (_liveWS) { _liveWS.onclose = null; try { _liveWS.close(); } catch {} _liveWS = null; } } });
   if (reused) return;
   body.innerHTML = `
-    <div class="live-addr"><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button></div>
+    <div class="live-addr"><button class="exp-btn live-nav" id="liveBack" title="Back (Alt+←)">←</button><button class="exp-btn live-nav" id="liveFwd" title="Forward (Alt+→)">→</button><button class="exp-btn live-nav" id="liveReload" title="Reload">⟳</button><button class="exp-btn live-nav" id="liveStop" title="Stop loading">✕</button><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button><button class="exp-btn live-nav" id="liveNewTab" title="New tab">+</button><button class="exp-btn live-nav" id="liveExt" title="Open this page in my browser">↗</button></div>
     <div class="live-tabs" id="liveTabs" style="display:none"></div>
-    <div class="live-url" id="liveUrl">idle — type a URL, click or drag in the page, or let the agent browse</div>
     <div class="live-stage" id="liveStage" tabindex="0"><span class="live-wait" id="liveWait">No frames yet. Enter a URL above, click/drag into the page (drag works — solve slider captchas by hand), or ask the agent to browse.</span><img id="liveImg" alt="live" draggable="false" style="display:none"></div>`;
   const post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
-  const go = () => { const url = $("#liveInput", body).value.trim(); if (!url) return; $("#liveUrl", body).textContent = "loading " + url + " …"; post("/api/browser/go", { url }); };
+  const go = () => { const url = $("#liveInput", body).value.trim(); if (!url) return; post("/api/browser/go", { url }); };
   $("#liveGo", body).onclick = go;
   $("#liveInput", body).addEventListener("keydown", e => { if (e.key === "Enter") { e.stopPropagation(); go(); } });
+  $("#liveBack", body).onclick = () => post("/api/browser/back", {});
+  $("#liveFwd", body).onclick = () => post("/api/browser/forward", {});
+  $("#liveReload", body).onclick = () => post("/api/browser/reload", {});
+  $("#liveStop", body).onclick = () => post("/api/browser/stop", {});
+  $("#liveNewTab", body).onclick = () => post("/api/browser/newtab", {});
+  $("#liveExt", body).onclick = () => { const u = $("#liveInput", body).value.trim(); if (/^https?:\/\//.test(u)) window.open(u, "_blank", "noopener"); };
 
   const img = $("#liveImg", body), stage = $("#liveStage", body);
   // Pointer-driven click AND drag. A press that doesn't move is a click; once the pointer moves
@@ -2258,21 +2263,50 @@ function openLiveView() {
     }, 80);
   }, { passive: false });
   stage.addEventListener("keydown", e => {
+    if (e.altKey && e.key === "ArrowLeft") { post("/api/browser/back", {}); e.preventDefault(); return; }
+    if (e.altKey && e.key === "ArrowRight") { post("/api/browser/forward", {}); e.preventDefault(); return; }
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { post("/api/browser/type", { text: e.key }); e.preventDefault(); }
     else if (["Enter", "Backspace", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End"].includes(e.key)) { post("/api/browser/key", { key: e.key }); e.preventDefault(); }
   });
 
   _lastTabsSig = null;                       // force a tab-bar rebuild on (re)open
-  _liveES = new EventSource("/api/browser/stream");
-  _liveES.onmessage = e => {
-    const win = document.getElementById("win-live");
-    if (win && win.style.display === "none") return;       // minimized → don't decode frames into a hidden view
-    let d; try { d = JSON.parse(e.data); } catch { return; }
-    if (d.frame && img) { img.src = d.frame; img.style.display = "block"; const w = $("#liveWait", body); if (w) w.style.display = "none"; }
-    const u = $("#liveUrl", body);
-    if (u && d.url && u.textContent !== d.url) { u.textContent = d.url; u.classList.add("on"); }
+  const hidden = () => { const win = document.getElementById("win-live"); return !!(win && win.style.display === "none"); };
+  const applyMeta = d => {
+    const input = $("#liveInput", body);                 // reflect the live URL into the address bar,
+    if (input && d.url && document.activeElement !== input && input.value !== d.url) {
+      input.value = d.url;                               // but never clobber what the user is typing
+    }
     if (d.tabs) renderLiveTabs(d.tabs);
   };
+  const showFrame = src => {                  // src is a blob: (WebSocket) or data: (SSE) URL
+    const prev = img.src;
+    img.src = src; img.style.display = "block";
+    const w = $("#liveWait", body); if (w) w.style.display = "none";
+    if (prev && prev.indexOf("blob:") === 0) { try { URL.revokeObjectURL(prev); } catch {} }
+  };
+  // Fallback transport: SSE with base64 data-URL frames (EventSource auto-reconnects).
+  const startLiveSSE = () => {
+    if (_liveES) return;
+    _liveES = new EventSource("/api/browser/stream");
+    _liveES.onmessage = e => {
+      if (hidden()) return;                    // minimized → don't decode frames into a hidden view
+      let d; try { d = JSON.parse(e.data); } catch { return; }
+      if (d.frame && img) showFrame(d.frame);
+      applyMeta(d);
+    };
+  };
+  // Primary transport: WebSocket — binary JPEG frames (no base64) + text metadata. Falls back to SSE.
+  try {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    _liveWS = new WebSocket(`${proto}://${location.host}/api/browser/ws`);
+    _liveWS.binaryType = "blob";
+    _liveWS.onmessage = ev => {
+      if (typeof ev.data === "string") { try { applyMeta(JSON.parse(ev.data)); } catch {} }
+      else if (!hidden()) showFrame(URL.createObjectURL(ev.data));
+    };
+    _liveWS.onclose = () => { _liveWS = null; startLiveSSE(); };   // dropped/never-opened → SSE takes over
+    _liveWS.onerror = () => { try { _liveWS.close(); } catch {} };
+  } catch { startLiveSSE(); }
 }
 const _post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 let _lastTabsSig = null;

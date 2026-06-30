@@ -2568,6 +2568,36 @@ async def browser_tab_close(req: Request):
     return {"ok": True}
 
 
+@app.post("/api/browser/back")
+async def browser_back_ep():
+    livebrowser.submit("back")
+    return {"ok": True}
+
+
+@app.post("/api/browser/forward")
+async def browser_forward_ep():
+    livebrowser.submit("forward")
+    return {"ok": True}
+
+
+@app.post("/api/browser/reload")
+async def browser_reload_ep():
+    livebrowser.submit("reload")
+    return {"ok": True}
+
+
+@app.post("/api/browser/stop")
+async def browser_stop_ep():
+    livebrowser.submit("stop")
+    return {"ok": True}
+
+
+@app.post("/api/browser/newtab")
+async def browser_newtab_ep():
+    livebrowser.submit("new_tab")
+    return {"ok": True}
+
+
 # ---------------- scheduler ----------------
 @app.get("/api/scheduler")
 def get_scheduler():
@@ -3141,6 +3171,45 @@ async def browser_stream():
             await asyncio.sleep(0.1)     # ~10 fps relay
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@app.websocket("/api/browser/ws")
+async def browser_ws(ws: WebSocket):
+    """Live browser frames over a WebSocket: BINARY JPEG frames + TEXT metadata (url/tabs). The
+    client renders frames via createImageBitmap→canvas — far lighter than the SSE+base64 data-URL
+    fallback. Auth-gated here (the HTTP _require_auth middleware doesn't cover WS handshakes):
+    same-origin (anti-CSWSH) + a valid session cookie, matching /api/terminal/ws."""
+    host = ws.headers.get("host", "")
+    origin = ws.headers.get("origin", "")
+    if not host or origin not in (f"http://{host}", f"https://{host}"):
+        await ws.close(code=1008)
+        return
+    if not _token_user(ws.cookies.get(SESSION_COOKIE, ""), load().get("auth", {})):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    from starlette.websockets import WebSocketDisconnect
+    last_v, last_tabs = -1, None
+    try:
+        while True:
+            L = livebrowser.LATEST
+            if L["v"] != last_v and L["frame"]:
+                last_v = L["v"]
+                await ws.send_bytes(L["frame"])               # raw JPEG — no base64 inflation
+            tabs = L.get("tabs", [])
+            tabs_sig = json.dumps([[t["id"], t["url"], t["active"], t["title"]] for t in tabs])
+            if tabs_sig != last_tabs:
+                last_tabs = tabs_sig
+                await ws.send_text(json.dumps({"url": L["url"], "tabs": tabs}))
+            await asyncio.sleep(0.03)                          # ~30fps poll of LATEST
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    try:
+        await ws.close()
+    except Exception:
+        pass
 
 
 @app.get("/api/ui/stream")
