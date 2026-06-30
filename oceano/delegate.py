@@ -445,6 +445,17 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             q.put(None)                              # EOF sentinel
     threading.Thread(target=reader, daemon=True).start()
 
+    errbuf = []                                      # drained continuously: a chatty stderr (>64KB) would
+    def errreader():                                 # otherwise fill the OS pipe, block the child's writes,
+        try:                                         # stall its stdout, and trip the idle-timeout on a
+            for line in proc.stderr:                 # perfectly healthy run.
+                errbuf.append(line)
+                if len(errbuf) > 400:                # bounded memory — keep the tail, drop old noise
+                    del errbuf[:200]
+        except Exception:
+            pass
+    threading.Thread(target=errreader, daemon=True).start()
+
     final, is_error, turns, cost, cancelled = "", False, 0, 0.0, False
     started = last_evt = time.monotonic()
     stalled, capped = False, False
@@ -518,7 +529,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         err = "the delegate reported an error"
     elif not final:
         try:
-            err = (proc.stderr.read() or "").strip()[:400] or "the delegate returned no output"
+            err = ("".join(errbuf)).strip()[:400] or "the delegate returned no output"
         except Exception:
             err = "the delegate returned no output"
     ok = bool(final) and not is_error and not stalled and not capped

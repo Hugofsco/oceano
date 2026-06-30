@@ -862,20 +862,29 @@ class Agent:
         for _ in range(config.MAX_STEPS):
             seg_first = None             # time the first token of THIS segment arrived (for decode rate)
             content, reason, calls, ntok, ptok = "", "", None, 0, 0
-            for item in llm.stream(self.messages, tools=turn_tools,
-                                   model=self.model, base_url=self.base_url, api_key=self.api_key):
-                if "reasoning" in item:
-                    if seg_first is None: seg_first = time.perf_counter()
-                    reason += item["reasoning"]
-                    yield {"type": "reasoning", "text": item["reasoning"]}
-                elif "content" in item:
-                    if seg_first is None: seg_first = time.perf_counter()
-                    content += item["content"]
-                    yield {"type": "token", "text": item["content"]}   # final answer streams live
-                elif "tool_calls" in item:
-                    calls = item["tool_calls"]
-                elif "usage" in item:
-                    ntok = item["usage"]; ptok = item.get("prompt_tokens", 0)
+            try:
+                for item in llm.stream(self.messages, tools=turn_tools,
+                                       model=self.model, base_url=self.base_url, api_key=self.api_key):
+                    if "reasoning" in item:
+                        if seg_first is None: seg_first = time.perf_counter()
+                        reason += item["reasoning"]
+                        yield {"type": "reasoning", "text": item["reasoning"]}
+                    elif "content" in item:
+                        if seg_first is None: seg_first = time.perf_counter()
+                        content += item["content"]
+                        yield {"type": "token", "text": item["content"]}   # final answer streams live
+                    elif "tool_calls" in item:
+                        calls = item["tool_calls"]
+                    elif "usage" in item:
+                        ntok = item["usage"]; ptok = item.get("prompt_tokens", 0)
+            except Exception as e:                     # provider/socket died mid-stream
+                # Keep history paired (never strand a dangling user/tool turn) and surface the error
+                # inline with whatever streamed so far, rather than a 500 that loses the partial.
+                self.messages.append({"role": "assistant",
+                                      "content": content or f"(interrupted: {type(e).__name__})"})
+                yield {"type": "token", "text": f"\n\n⚠️ model stream failed: {e}"}
+                yield {"type": "answer_done"}
+                return
             total_tok += ntok
 
             if not calls:                              # final answer
@@ -937,17 +946,24 @@ class Agent:
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         content, tokens, ptok, tfirst = "", 0, 0, None
-        for item in llm.stream(self.messages, model=self.model,
-                               base_url=self.base_url, api_key=self.api_key):
-            if "reasoning" in item:
-                yield {"type": "reasoning", "text": item["reasoning"]}
-            elif "content" in item:
-                if tfirst is None:
-                    tfirst = time.perf_counter()      # measure decode from first answer token
-                content += item["content"]
-                yield {"type": "token", "text": item["content"]}
-            elif "usage" in item:
-                tokens = item["usage"]; ptok = item.get("prompt_tokens", 0)
+        try:
+            for item in llm.stream(self.messages, model=self.model,
+                                   base_url=self.base_url, api_key=self.api_key):
+                if "reasoning" in item:
+                    yield {"type": "reasoning", "text": item["reasoning"]}
+                elif "content" in item:
+                    if tfirst is None:
+                        tfirst = time.perf_counter()      # measure decode from first answer token
+                    content += item["content"]
+                    yield {"type": "token", "text": item["content"]}
+                elif "usage" in item:
+                    tokens = item["usage"]; ptok = item.get("prompt_tokens", 0)
+        except Exception as e:                            # provider/socket died mid-stream
+            self.messages.append({"role": "assistant",
+                                  "content": content or f"(interrupted: {type(e).__name__})"})
+            yield {"type": "token", "text": f"\n\n⚠️ model stream failed: {e}"}
+            yield {"type": "answer_done"}
+            return
         self.messages.append({"role": "assistant", "content": content})
         self._learn(user_message, content)
         secs = (time.perf_counter() - tfirst) if tfirst else 0
