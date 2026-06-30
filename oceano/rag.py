@@ -26,6 +26,9 @@ def _db():
                 "id INTEGER PRIMARY KEY, path TEXT, chunk TEXT, embedding TEXT)")
     # per-file content hash so re-indexing skips unchanged docs (incremental)
     con.execute("CREATE TABLE IF NOT EXISTS docmeta (path TEXT PRIMARY KEY, hash TEXT)")
+    # the folders that were index_docs'd, so the nightly reindex can re-walk them and pick up
+    # NEW files dropped in since (not just refresh/prune the files it already knows about)
+    con.execute("CREATE TABLE IF NOT EXISTS docroots (path TEXT PRIMARY KEY)")
     return con
 
 
@@ -82,6 +85,8 @@ def index_docs(folder, only=None):
         prune = True
 
     con = _db()
+    if only is None:                      # remember this root so the nightly reindex re-walks it for new files
+        con.execute("INSERT OR IGNORE INTO docroots (path) VALUES (?)", (str(base),))
     seen = set()
     n_files = n_chunks = skipped = 0
     for path in paths:
@@ -294,5 +299,41 @@ def reindex():
             con.execute("INSERT OR REPLACE INTO docmeta (path, hash) VALUES (?,?)", (path, h))
             refreshed += 1
         con.commit()
+
+    # discovery: re-walk each indexed root and embed any NEW files dropped in since last time
+    # (the loop above only refreshes files already in docmeta — new ones were invisible before).
+    known = {r[0] for r in con.execute("SELECT path FROM docmeta").fetchall()}
+    discovered = 0
+    down = False
+    for (root,) in con.execute("SELECT path FROM docroots").fetchall():
+        if down:
+            break
+        rp = Path(root)
+        if not rp.is_dir():
+            continue
+        for p in rp.rglob("*"):
+            if not p.is_file() or str(p) in known:
+                continue
+            text = _read(p)
+            if not text.strip():
+                continue
+            sp = str(p)
+            h = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+            con.execute("DELETE FROM chunks WHERE path=?", (sp,))   # idempotent (clean any partial)
+            ok = True
+            for ch in _chunks(text):
+                vec = embeddings.embed(ch)
+                if not vec:                                        # embed server down → stop, retry next run
+                    ok = False
+                    down = True
+                    break
+                con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)", (sp, ch, json.dumps(vec)))
+            if ok:
+                con.execute("INSERT OR REPLACE INTO docmeta (path, hash) VALUES (?,?)", (sp, h))
+                known.add(sp)
+                discovered += 1
+            con.commit()
+            if down:
+                break
     con.close()
-    return f"{present} present, {refreshed} refreshed, {pruned} pruned"
+    return f"{present} present, {refreshed} refreshed, {discovered} new, {pruned} pruned"

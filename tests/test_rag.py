@@ -36,3 +36,22 @@ def test_search_docs_keyword_fallback_when_embed_down(tmp_path, monkeypatch):
     out = rag.search_docs("what is the capital of france", k=1)
     assert "paris" in out.lower()                                 # found by keyword, not an ERROR string
     assert "error" not in out.lower()
+
+
+def test_reindex_discovers_new_files_in_indexed_roots(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "rag.db")
+    monkeypatch.setattr(config, "CONFINE_TO_WORKSPACE", False)    # tmp_path lives outside the workspace
+    from oceano import embeddings
+    monkeypatch.setattr(embeddings, "embed", lambda *a, **k: [0.1, 0.2, 0.3])   # fake "up" embed server
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("first document about apples")
+    rag.index_docs(str(docs))                                    # indexes a.md, records the root
+    (docs / "b.md").write_text("second document about bananas")  # drop a NEW file in afterwards
+    summary = rag.reindex()                                      # nightly job → should DISCOVER b.md
+    assert "1 new" in summary
+    con = rag._db()
+    paths = {os.path.basename(p) for (p,) in con.execute("SELECT DISTINCT path FROM chunks")}
+    con.close()
+    assert {"a.md", "b.md"} <= paths                             # both now indexed
