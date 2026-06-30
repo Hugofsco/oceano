@@ -32,3 +32,32 @@ def test_remember_keyword_mode_still_saves(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "_embed", lambda text, kind="document": None)
     assert "keyword" in memory.remember("a one-off note")
     assert memory.count() == 1
+
+
+def _kw_embed(text, kind="document"):
+    """Deterministic keyword embedding so tests need no embed server: one dim per concept."""
+    t = (text or "").lower()
+    return [1.0 if "apple" in t else 0.0, 1.0 if "ocean" in t else 0.0, 0.1]
+
+
+def test_vector_cache_results_and_invalidation(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
+    monkeypatch.setattr(memory, "_embed", _kw_embed)         # real loads_vec/cosine; only the embed is faked
+    memory._invalidate()                                     # module-global cache — start clean
+
+    memory.remember("apples are red and crisp", category="fact")
+    memory.remember("the ocean is deep blue water", category="fact")
+    assert memory.count() == 2
+
+    bm = memory.best_match("fresh apples")                   # populates the cache, returns the apple memory
+    assert bm and "apple" in bm["text"]
+    assert memory._VEC_CACHE, "best_match should have cached a parsed vector"
+
+    mid = bm["id"]
+    memory.forget(mid)
+    assert mid not in memory._VEC_CACHE                       # forget pops it (so a reused id can't go stale)
+
+    memory.search("ocean")                                   # repopulate from the remaining row
+    assert memory._VEC_CACHE
+    memory.reindex(force=True)                                # re-embeds → must clear the cache
+    assert memory._VEC_CACHE == {}
