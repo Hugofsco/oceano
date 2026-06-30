@@ -345,6 +345,20 @@ def make_folder(path):
     return f"created folder {p.relative_to(_ws())}"
 
 
+# After this turn read untrusted content (a web page, email, or document), shell/Python execution
+# is blocked — the same anti-exfiltration gate ssh_run/mail_send use — so an instruction injected
+# into that content can't run a command to read secrets (SSH keys, mail passwords) and curl them
+# out. Applies in EVERY channel, including unattended scheduler/Telegram runs where no human is
+# watching — which is exactly where this matters most.
+_SHELL_TAINTED = ("Blocked for safety: this turn already read external content (a web page, email, or "
+                  "document), so running shell/Python is disabled — injected text must not execute "
+                  "commands. Ask the user to send a fresh message to run this.")
+
+
+def _shell_blocked():
+    return _SHELL_TAINTED if (safety.untrusted_seen() or safety.bridge_untrusted_seen()) else None
+
+
 @tool({
     "type": "function",
     "function": {
@@ -357,6 +371,9 @@ def make_folder(path):
     },
 })
 def run_shell(command):
+    blocked = _shell_blocked()                   # anti-exfiltration: no shell after reading untrusted content
+    if blocked:
+        return blocked
     refusal = safety.check_shell(command)
     if refusal:
         return refusal
@@ -464,6 +481,9 @@ def fetch_url(url):
     },
 })
 def python_exec(code):
+    blocked = _shell_blocked()                   # anti-exfiltration: no Python after reading untrusted content
+    if blocked:
+        return blocked
     refusal = safety.check_python(code)          # parity with run_shell — can't shell out to bypass the guard
     if refusal:
         return refusal
