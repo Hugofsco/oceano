@@ -1,3 +1,5 @@
+# Top-level deps with floor versions. For a reproducible install, use the fully-pinned
+# transitive closure in requirements.lock instead (regenerate it after changing this file).
 openai>=1.40
 requests>=2.31
 # CLI frontend (cli.py): prompt_toolkit handles line editing/history/completion, rich
