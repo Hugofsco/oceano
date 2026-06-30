@@ -742,12 +742,56 @@ def schedule_task(cron, instruction):
     "type": "function",
     "function": {
         "name": "list_tasks",
-        "description": "List the user's scheduled tasks.",
+        "description": "List the user's scheduled tasks, each shown as '#id [cron] on/off: instruction'. "
+                       "Use the id with update_task / cancel_task.",
         "parameters": {"type": "object", "properties": {}},
     },
 })
 def list_tasks():
     return scheduler.list_tasks()
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "update_task",
+        "description": "Edit an existing scheduled task by its id (from list_tasks). Pass only the "
+                       "fields you want to change: a new cron schedule, a new instruction, or "
+                       "enabled (false to PAUSE the task without deleting it, true to resume).",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the task id shown by list_tasks"},
+            "cron": {"type": "string", "description": "new cron expression, e.g. '0 8 * * *'"},
+            "instruction": {"type": "string", "description": "new instruction text"},
+            "enabled": {"type": "boolean", "description": "false pauses the task, true resumes it"},
+        }, "required": ["id"]},
+    },
+})
+def update_task(id, cron=None, instruction=None, enabled=None):
+    ok = scheduler.update_task(int(id), cron=cron, instruction=instruction, enabled=enabled)
+    if not ok:
+        return f"could not update task #{id} (no such task, or invalid cron expression)"
+    return f"updated task #{id}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "cancel_task",
+        "description": "Delete a scheduled task by its id (from list_tasks) so it stops running. "
+                       "To pause a task but keep it, use update_task with enabled=false instead. "
+                       "(Built-in maintenance jobs come back on the next restart — pause those rather "
+                       "than cancelling.)",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the task id shown by list_tasks"},
+        }, "required": ["id"]},
+    },
+})
+def cancel_task(id):
+    tid = int(id)
+    if tid not in {t["id"] for t in scheduler.all_tasks()}:
+        return f"no task #{tid} — use list_tasks to see the current ids"
+    scheduler.delete_task(tid)
+    return f"cancelled task #{tid}"
 
 
 def _run_one_workflow(name, inp=""):

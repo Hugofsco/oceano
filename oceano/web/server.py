@@ -864,6 +864,7 @@ _TOOL_CATEGORY = {
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills", "evaluate_skill": "skills",
     "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
+    "update_task": "scheduler", "cancel_task": "scheduler",
     "run_workflow": "workflow", "list_workflows": "workflow",
     "calendar_events": "calendar", "add_calendar_event": "calendar",
     "update_calendar_event": "calendar", "delete_calendar_event": "calendar",

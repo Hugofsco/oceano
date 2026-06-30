@@ -276,6 +276,15 @@ steps, written for your future self. It enters review and only joins your active
 skills once an independent model approves it, so save genuinely useful candidates
 without fear — but not trivial or one-off details.
 
+SCHEDULING: you have your own task scheduler, and it PERSISTS across restarts. Use
+schedule_task(cron, instruction) to make any instruction run automatically on a cron
+schedule (e.g. '0 8 * * *' = every day at 08:00); list_tasks() to see what's already
+scheduled (each has an id); update_task(id, …) to change a task's schedule or instruction
+or pause it (enabled=false); and cancel_task(id) to remove one. This is the ONE place the
+user sees and manages recurring jobs, so route ALL recurring or future-dated work through
+it — every job survives restarts and shows up in their scheduler. Don't reach for any other
+timer or reminder mechanism.
+
 DELEGATION: you can hand a self-contained subtask to a stronger assistant with the
 `delegate` tool (who that is — Claude Code or a cloud model — is set by the user in
 Settings; you needn't care, just delegate). Give it precise instructions, the relevant
@@ -608,6 +617,13 @@ class Agent:
             "because they'd browse invisibly. After a search, OPEN the best result with mcp__oceano__fetch_url "
             "to actually read it.\n"
             "• CALENDAR: mcp__oceano__calendar_events / manage_calendar / find_free_slots.\n"
+            "• SCHEDULER — for ANY recurring or future-dated work use Oceano's scheduler: "
+            "mcp__oceano__schedule_task (cron + instruction), mcp__oceano__list_tasks, "
+            "mcp__oceano__update_task (retime/edit, or pause with enabled=false), and "
+            "mcp__oceano__cancel_task. Do NOT use your own built-in cron/scheduling tools (CronCreate, "
+            "CronList, CronDelete): those are scoped to your session and vanish, whereas Oceano's tasks "
+            "PERSIST across restarts and are the ones the user sees and manages in the scheduler window. "
+            "Schedule through Oceano, always.\n"
             "• SERVERS — mcp__oceano__list_hosts to see the user's registered servers, mcp__oceano__ssh_run "
             "to run command batches on one over SSH (it's gated: per-host policy, and armed hosts must be "
             "unlocked by the user — if it refuses, relay why).\n"
@@ -665,7 +681,7 @@ class Agent:
                 holder["res"] = delegate.to_claude_stream(
                     prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
                     on_progress=on_prog, append_system=sys_prompt, cancel=cancel,
-                    disallow="WebSearch,WebFetch")             # force web through Oceano's visible live browser
+                    disallow="WebSearch,WebFetch,CronCreate,CronList,CronDelete")  # web → Oceano's visible browser; cron → Oceano's persistent scheduler
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
@@ -739,6 +755,10 @@ class Agent:
             "your own web access is off because it would browse invisibly. After a search, OPEN the best "
             "result with `fetch_url` to actually read it.\n"
             "• CALENDAR: `calendar_events`, `manage_calendar`, `find_free_slots` for scheduling.\n"
+            "• SCHEDULER: for ANY recurring or future-dated work use `schedule_task` (cron + instruction), "
+            "`list_tasks`, `update_task` (retime/edit, or pause with enabled=false), and `cancel_task`. "
+            "Don't use any private cron or timer of your own — Oceano's tasks PERSIST across restarts and "
+            "are the ones the user sees and manages.\n"
             "• SERVERS: `list_hosts` to see the user's registered servers, `ssh_run` to run command "
             "batches on one over SSH. It's gated: per-host policy, and armed hosts must be unlocked by "
             "the user — if it refuses, relay why.\n"
