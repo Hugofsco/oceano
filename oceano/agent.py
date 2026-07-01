@@ -8,6 +8,7 @@ model/base_url/api_key can be set per instance or swapped between turns (so the
 web UI can change model mid-conversation).
 """
 import json
+import os
 import re
 import threading
 import time
@@ -368,6 +369,18 @@ _VOICE_NOTE = ("\n\nVOICE MODE — your reply is being read ALOUD. Keep it SHORT
 # streaming delegate is the one that matters — a long build shouldn't look frozen.
 _STREAMING_TOOLS = {"delegate", "delegate_to_claude"}
 
+# Rolling context fold (the always-on safety net; /context <n> auto-compact stays the opt-in,
+# count-based, fold-EVERYTHING variant). Char-based because the resident Claude/Codex minds
+# rebuild the WHOLE conversation into one prompt every turn — cost and latency grow with
+# characters, not message count. When the conversation passes _FOLD_CHARS, the OLDEST roughly
+#-half is summarized into one note while the newest _FOLD_KEEP messages always stay verbatim
+# (a fold must never eat the exchange the user is in the middle of). An earlier fold note sits
+# at the front, so the next overflow folds it again — the summary "rolls" forward. 120k chars
+# ≈ 30k tokens, and stays well clear of Linux's 128KB MAX_ARG_STRLEN even if a prompt ever
+# travels as an argv string again. 0 disables folding.
+_FOLD_CHARS = int(os.environ.get("OCEANO_CTX_FOLD_CHARS", "120000"))
+_FOLD_KEEP = 12
+
 
 class Agent:
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
@@ -404,6 +417,7 @@ class Agent:
         (it needn't call recall/list_skills). Rebuilt each turn, never accumulates.
         `voice` (hands-free conversation) appends a be-brief directive FOR THIS TURN ONLY."""
         safety.reset_untrusted(); safety.reset_bridge_untrusted()   # fresh turn: clear the injection taint (local + MCP-bridge) that gates ssh_run
+        self._autofold()                                            # rolling fold once the conversation outgrows the threshold
         if self.messages and self.messages[0]["role"] == "system":
             ctx = _context_block(user_message) if self.inject_context else \
                 "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note()) if p)
@@ -417,6 +431,42 @@ class Agent:
         stats (prompt tokens), but this works before the first reply too."""
         chars = sum(len(str(m.get("content") or "")) for m in self.messages)
         return len(self.messages), chars // 4
+
+    def _autofold(self):
+        """Rolling compaction, called at the start of every turn: when the conversation
+        exceeds _FOLD_CHARS, summarize its OLDEST ~half into one note and keep the newest
+        _FOLD_KEEP messages verbatim. Unlike compact() (user-triggered, folds everything),
+        this is the automatic safety net that keeps a months-long chat from growing the
+        per-turn prompt without bound. Fires once per overflow, not per turn; on a failed
+        summarize it leaves the history untouched (the turn still runs; retried next turn).
+        The web transcript is unaffected — the client keeps the full history, and the fold
+        note points the model at search_chats for anything summarized away.
+        Returns the number of messages folded (0 = no fold)."""
+        if _FOLD_CHARS <= 0 or len(self.messages) <= _FOLD_KEEP + 1:
+            return 0
+        total = sum(len(str(m.get("content") or "")) for m in self.messages[1:])
+        if total < _FOLD_CHARS:
+            return 0
+        take, acc = [], 0
+        for m in self.messages[1:len(self.messages) - _FOLD_KEEP]:
+            take.append(m)
+            acc += len(str(m.get("content") or ""))
+            if acc >= total // 2:
+                break
+        if not take:
+            return 0
+        convo = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in take if m.get("content"))
+        try:
+            summary = self._summarize_convo(convo[:12000])
+        except Exception as e:                       # never block the turn on a failed summarize
+            print(f"[fold] summarize failed, keeping full history this turn: {e}", flush=True)
+            return 0
+        note = {"role": "assistant", "content":
+                "📋 Earlier conversation, folded to keep the context small (the full transcript "
+                "is still in the chat window, and search_chats can recall specifics):\n" + summary}
+        self.messages = [self.messages[0], note] + self.messages[1 + len(take):]
+        print(f"[fold] folded {len(take)} messages (~{acc} chars) into a summary note", flush=True)
+        return len(take)
 
     def compact(self):
         """Fold everything but the system message into a single summary note, shrinking
