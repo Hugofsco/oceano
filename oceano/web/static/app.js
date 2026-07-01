@@ -5516,6 +5516,7 @@ const WF_PORTS = {
   decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2],
   tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
   http: [1, 2], subflow: [1, 2], transform: [1, 2],
+  agent: [1, 2], await: [1, 2],
 };
 // branch label for an output port (Drawflow names them output_1, output_2…), per node type
 function wfOutBranch(type, outName, node) {
@@ -5555,6 +5556,8 @@ function wfNodeData(n) {
       c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
       c3op: g(2, "op", "contains"), c3val: g(2, "value", ""), c3label: g(2, "label", "") }; }
   if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
+  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", label: n.label || "", timeout: String(n.timeout || 600) };
+  if (n.type === "await") return { timeout: String(n.timeout || 900) };
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
   if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
@@ -5577,6 +5580,8 @@ function wfNodeHtml(type, data) {
   if (type === "subflow") return `<div class="wfn wfn-subflow"><b>▣ Sub-workflow</b><input df-workflow class="wfn-f" placeholder="workflow name or id"><textarea df-wfinput class="wfn-f" placeholder="input to pass · default {{last}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   if (type === "transform") return `<div class="wfn wfn-transform"><b>ƒ Transform</b><select df-mode class="wfn-f"><option value="template">template</option><option value="regex">regex extract</option><option value="jsonpath">json path</option><option value="python">python</option></select><input df-source class="wfn-f" placeholder="input · default {{last}}"><textarea df-text class="wfn-f" placeholder="template / regex / a.b.0 path / python (value holds input)"></textarea><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   if (type === "approval") return `<div class="wfn wfn-approval"><b>✋ Approval</b><textarea df-prompt class="wfn-f" placeholder="what to approve?"></textarea><label class="wfn-mini">timeout (min) <input df-timeout type="number" min="1" class="wfn-f wfn-num" placeholder="60"></label><div class="wfn-branches"><span>▸ approved</span><span>▸ rejected</span></div></div>`;
+  if (type === "agent") return `<div class="wfn wfn-agent"><b>🤖 Agent (background)</b><textarea df-task class="wfn-f" placeholder="self-contained task — it runs while the flow continues; join later with an Await node"></textarea><select df-provider class="wfn-f"><option value="">delegation default</option><option value="claude">claude</option><option value="codex">codex</option><option value="api">api</option><option value="local">local (weak · serialized)</option></select><input df-label class="wfn-f" placeholder="short label"><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="600"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "await") return `<div class="wfn wfn-await"><b>⏳ Await agents</b><div class="wf-hint">waits for all agents spawned in this run, then continues with their results ({{node.ID}} of each agent node)</div><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="900"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   return `<div class="wfn"><b>${type}</b></div>`;
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
@@ -5824,6 +5829,8 @@ const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
   : n.type === "subflow" ? "▣ " + (n.workflow || "sub-workflow")
   : n.type === "transform" ? "ƒ " + (n.mode || "transform")
   : n.type === "approval" ? "✋ approval"
+  : n.type === "agent" ? "🤖 " + ((n.label || n.task || "agent").slice(0, 44))
+  : n.type === "await" ? "⏳ await agents"
   : n.type;
 
 function openWorkflows() {
@@ -5968,6 +5975,7 @@ async function wfRenderEditor(body, w) {
           <button class="wf-pal-btn" data-add="tool">🔧 Tool</button>
           <button class="wf-pal-btn" data-add="instruction">✎ Instruction</button>
           <button class="wf-pal-btn" data-add="delegate">↗ Delegate</button>
+          <button class="wf-pal-btn" data-add="agent">🤖 Agent (bg)</button>
           <button class="wf-pal-btn" data-add="http">🌐 HTTP request</button>
           <button class="wf-pal-btn" data-add="subflow">▣ Sub-workflow</button>
           <button class="wf-pal-btn" data-add="transform">ƒ Transform</button></div>
@@ -5975,7 +5983,8 @@ async function wfRenderEditor(body, w) {
           <button class="wf-pal-btn" data-add="decision">◆ Decision</button>
           <button class="wf-pal-btn" data-add="switch">⤳ Switch</button>
           <button class="wf-pal-btn" data-add="loop">↻ Loop</button>
-          <button class="wf-pal-btn" data-add="approval">✋ Approval</button></div>
+          <button class="wf-pal-btn" data-add="approval">✋ Approval</button>
+          <button class="wf-pal-btn" data-add="await">⏳ Await agents</button></div>
         <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>
           <button class="wf-pal-btn" data-add="end">■ End</button></div>
         <div class="wf-pal-foot">
@@ -6066,6 +6075,8 @@ function wfReadCanvas(editor) {
     else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
+    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.label = d.label || ""; node.timeout = intOr0(d.timeout) || 600; }
+    else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     nodes.push(node);
     const outs = nd.outputs || {};
     for (const oname in outs) (outs[oname].connections || []).forEach(c =>

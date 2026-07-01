@@ -34,7 +34,9 @@ SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
 # switch=multi-branch, loop=foreach, http/subflow/transform=connectivity+data, approval=human-in-the-loop.
 NODE_TYPES = ("start", "trigger", "tool", "instruction", "delegate", "decision",
-              "switch", "loop", "http", "subflow", "transform", "approval", "end")
+              "switch", "loop", "http", "subflow", "transform", "approval",
+              "agent", "await", "end")
+_AGENT_PROVIDERS = ("", "claude", "codex", "api", "local")   # "" = the delegation default
 _TRIGGER_NODE_KINDS = ("manual", "schedule", "webhook", "keyword", "watch", "email")
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 _TRANSFORM_MODES = ("template", "regex", "jsonpath", "python")
@@ -143,6 +145,20 @@ def _norm_graph(graph):
         elif t == "delegate":
             node["text"] = str(n.get("text", ""))
             node["role"] = n.get("role") if n.get("role") in ("default", "improve") else "default"
+        elif t == "agent":                            # spawn a background sub-agent; the flow continues
+            node["task"] = str(n.get("task", ""))
+            node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
+            node["label"] = str(n.get("label", "")).strip()[:80]
+            try:
+                node["timeout"] = max(1, min(int(n.get("timeout", 600)), 3600))    # seconds
+            except (TypeError, ValueError):
+                node["timeout"] = 600
+        elif t == "await":                            # join: wait for this run's spawned agents
+            node["agents"] = str(n.get("agents", "")).strip()   # optional id list; empty = all spawned
+            try:
+                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 3600))    # seconds
+            except (TypeError, ValueError):
+                node["timeout"] = 900
         elif t == "decision":
             node["mode"] = n.get("mode") if n.get("mode") in ("rule", "model", "delegate") else "model"
             node["question"] = str(n.get("question", ""))
@@ -826,6 +842,11 @@ def _node_label(n):
         return (n.get("text", "")[:54] or "instruction")
     if t == "delegate":
         return "↗ " + (n.get("text", "")[:48] or "delegate")
+    if t == "agent":
+        return "🤖 " + (n.get("label") or n.get("task", "")[:44] or "agent") \
+            + (f" ({n['provider']})" if n.get("provider") else "")
+    if t == "await":
+        return "⏳ await agents"
     if t == "decision":
         return "◆ " + (n.get("question", "")[:48] or n.get("mode", "decision"))
     if t == "switch":
@@ -929,6 +950,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     # ctx powers {{...}} templating between nodes (issue 8 A)
     ctx = {"input": inp, "last": "", "nodes": {}, "item": None, "index": None}
     loop_state = {}                                    # loop node id -> {items, cursor}
+    spawned = {}                                       # agent node id -> agentjobs id (this run's spawns)
     results, last_output, visits = [], "", 0
     cur = start
     if not nested:
@@ -1012,6 +1034,53 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             ok = bool(r.get("ok"))
                             output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
                             ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
+                        elif t == "agent":             # spawn a background sub-agent — do NOT block
+                            from oceano import agentjobs
+                            rec = agentjobs.spawn(_tmpl(cur.get("task", ""), ctx),
+                                                  provider=cur.get("provider", ""),
+                                                  label=cur.get("label", ""),
+                                                  timeout=cur.get("timeout", 600),
+                                                  cwd=config.WORKSPACE)   # raises on cap → error edge
+                            spawned[cur["id"]] = rec["id"]
+                            output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
+                                                 "provider": rec["provider"], "state": rec["state"]})
+                        elif t == "await":             # join: block until this run's agents finish
+                            from oceano import agentjobs
+                            want = [w.strip() for w in (cur.get("agents") or "").split(",") if w.strip()]
+                            targets = ({nid: aid for nid, aid in spawned.items() if nid in want or str(aid) in want}
+                                       if want else dict(spawned))
+                            if not targets:
+                                ok, output = False, "await: no agents were spawned in this run"
+                            else:
+                                deadline = time.time() + cur.get("timeout", 900)
+                                done, failed = {}, {}
+                                while time.time() < deadline:
+                                    beat()             # keep the live entry fresh while we wait
+                                    left = False
+                                    for nid, aid in targets.items():
+                                        if nid in done or nid in failed:
+                                            continue
+                                        r = agentjobs.status(aid) or {"state": "lost"}
+                                        if r["state"] == "done":
+                                            done[nid] = r.get("output") or ""
+                                        elif r["state"] in ("failed", "lost"):
+                                            failed[nid] = r.get("error") or r["state"]
+                                        else:
+                                            left = True
+                                    if not left:
+                                        break
+                                    time.sleep(2)
+                                for nid, out in done.items():        # replace each spawn stub with the
+                                    ctx["nodes"][nid] = out          # real result, so {{nodes.X}} works
+                                timed_out = [nid for nid in targets if nid not in done and nid not in failed]
+                                ok = not failed and not timed_out
+                                parts = [f"[{nid}] {out}" for nid, out in done.items()]
+                                parts += [f"[{nid}] FAILED: {err}" for nid, err in failed.items()]
+                                parts += [f"[{nid}] TIMED OUT (still running)" for nid in timed_out]
+                                output = "\n\n".join(parts)
+                                if done:
+                                    ag.messages.append({"role": "user",
+                                                        "content": f"(agents finished → {output[:1500]})"})
                         elif t == "decision":
                             fnode = {**cur, "question": _tmpl(cur.get("question", ""), ctx),
                                      "ruleValue": _tmpl(cur.get("ruleValue", ""), ctx)}
