@@ -47,6 +47,7 @@ _ALLOW = {
     "calendar_events", "manage_calendar", "find_free_slots",  # the calendar
     "schedule_task", "list_tasks", "update_task", "cancel_task",   # the PERSISTENT task scheduler — create/list/edit/cancel; the one the user sees, use instead of the mind's own cron
     "spawn_job", "job_status",                                # background OS jobs Oceano itself owns/outlives — use INSTEAD of your own native background execution, which dies or is orphaned the instant this turn's CLI process exits
+    "spawn_agent", "agent_status",                            # background SUB-AGENTS (contained delegate runs) Oceano owns — parallel subtasks that report back into this chat
     "list_skills", "load_skill", "learn_skill",              # skills — reuse + grow Oceano's skill library (parity with the local mind)
     "run_workflow", "list_workflows",                        # workflows — run Oceano's saved multi-step recipes
     "search_docs", "index_docs",                             # RAG — search (and add to) the user's indexed documents

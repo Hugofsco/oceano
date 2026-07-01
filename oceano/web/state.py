@@ -273,35 +273,57 @@ def _embed_reachable():
         return False
 
 
-def _deliver_job_to_session(rec):
-    """Fired on a reaper thread when a spawn_job process ends: inject its result into the live
-    in-memory Agent for the spawning conversation, so the MIND has it as context on its next turn.
-    The user-visible transcript delivery is client-driven (the browser polls /api/bgjobs and prints
-    the result), so we deliberately DON'T write chats.json here — the client stays the sole persister,
-    which keeps the two from clobbering each other's message list."""
-    from oceano import bgjobs
-    sid = rec.get("sid")
-    if not sid:
-        return
+def _inject_session_message(sid, content):
+    """Inject a message into the live in-memory Agent for conversation `sid`, so the MIND has it
+    as context on its next turn. The user-visible transcript delivery is client-driven (the
+    browser polls /api/bgjobs and prints the result), so we deliberately DON'T write chats.json
+    here — the client stays the sole persister, which keeps the two from clobbering each other's
+    message list. No-op if the session isn't loaded (it rehydrates from the client's chat later)."""
     ag = _sessions.get(sid)
     if ag is None:
-        return                      # not loaded → rehydrated from the client-persisted chat on next open
-    label, state, code = rec.get("label", "job"), rec.get("state"), rec.get("exit_code")
-    head = (f'Background job "{label}" finished (exit {code}).' if state == "done"
-            else f'Background job "{label}" failed (exit {code}).' if state == "failed"
-            else f'Background job "{label}" was lost (Oceano restarted while it ran).')
-    tail = bgjobs._tail_file(rec["log_path"], 2000) if rec.get("log_path") else ""
-    content = head + (("\n\n" + tail) if tail else "")
+        return
     lock = _session_lock(sid)
-    if lock.acquire(timeout=30):    # wait out an in-flight turn, but never wedge the reaper forever
+    if lock.acquire(timeout=30):    # wait out an in-flight turn, but never wedge the caller forever
         try:
             ag.messages.append({"role": "assistant", "content": content})
         finally:
             lock.release()
 
 
-from oceano import bgjobs as _bgjobs      # noqa: E402 - register the completion hook once, at import
+def _deliver_job_to_session(rec):
+    """Fired on a reaper thread when a spawn_job process ends: inject its result into the
+    spawning conversation's live Agent."""
+    from oceano import bgjobs
+    sid = rec.get("sid")
+    if not sid:
+        return
+    label, state, code = rec.get("label", "job"), rec.get("state"), rec.get("exit_code")
+    head = (f'Background job "{label}" finished (exit {code}).' if state == "done"
+            else f'Background job "{label}" failed (exit {code}).' if state == "failed"
+            else f'Background job "{label}" was lost (Oceano restarted while it ran).')
+    tail = bgjobs._tail_file(rec["log_path"], 2000) if rec.get("log_path") else ""
+    _inject_session_message(sid, head + (("\n\n" + tail) if tail else ""))
+
+
+def _deliver_agent_to_session(rec):
+    """Fired on an agent worker thread when a spawn_agent run ends: same delivery, but the
+    result lives bounded in the record itself (no log read needed)."""
+    sid = rec.get("sid")
+    if not sid:
+        return
+    label, prov, state = rec.get("label", "agent"), rec.get("provider", ""), rec.get("state")
+    head = (f'Background agent "{label}" ({prov}) finished.' if state == "done"
+            else f'Background agent "{label}" ({prov}) failed: {rec.get("error") or "no output"}.'
+            if state == "failed"
+            else f'Background agent "{label}" was lost (Oceano restarted while it ran).')
+    body = rec.get("output") or ""
+    _inject_session_message(sid, head + (("\n\n" + body) if body else ""))
+
+
+from oceano import bgjobs as _bgjobs      # noqa: E402 - register the completion hooks once, at import
+from oceano import agentjobs as _agentjobs  # noqa: E402
 _bgjobs.set_on_complete(_deliver_job_to_session)
+_agentjobs.set_on_complete(_deliver_agent_to_session)
 
 
 _TOOL_CATEGORY = {
@@ -320,6 +342,7 @@ _TOOL_CATEGORY = {
     "index_docs": "documents", "search_docs": "documents", "search_chats": "memory",
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills", "evaluate_skill": "skills",
     "delegate": "delegate", "delegate_to_claude": "delegate",
+    "spawn_agent": "delegate", "agent_status": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
     "update_task": "scheduler", "cancel_task": "scheduler",
     "list_suggestions": "evolve", "accept_suggestion": "evolve", "dismiss_suggestion": "evolve",

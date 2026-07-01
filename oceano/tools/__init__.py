@@ -149,9 +149,11 @@ from oceano.tools.mail_tools import (  # noqa: E402, F401
     mail_send,
 )
 from oceano.tools.selfimprove import (  # noqa: E402, F401
+    agent_status,
     delegate_tool,
     evaluate_skill,
     learn_skill,
+    spawn_agent,
 )
 from oceano.tools.calendar_tools import (  # noqa: E402, F401
     _format_ops,

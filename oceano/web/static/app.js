@@ -6206,14 +6206,19 @@ async function pollJobDeliveries() {
   let delivered = false;
   for (const j of (d && d.pending) || []) {
     if (state.session !== sid) break;             // user switched chats mid-poll → stop
-    if (_deliveredJobs.has(j.id)) continue;
-    _deliveredJobs.add(j.id);
-    const head = j.state === "done" ? `✅ Background job “${j.label}” finished (exit ${j.exit_code}).`
-               : j.state === "failed" ? `❌ Background job “${j.label}” failed (exit ${j.exit_code}).`
-               : `⚠️ Background job “${j.label}” was lost — Oceano restarted while it ran.`;
-    appendT({ role: "assistant", content: j.tail ? head + "\n\n```\n" + j.tail + "\n```" : head, ts: Date.now() });
+    const kind = j.kind || "job";                 // "job" (spawn_job) or "agent" (spawn_agent)
+    const key = kind + ":" + j.id;                // ids are per-registry — never dedup across kinds
+    if (_deliveredJobs.has(key)) continue;
+    _deliveredJobs.add(key);
+    const noun = kind === "agent" ? `Background agent “${j.label}” (${j.provider || "?"})` : `Background job “${j.label}”`;
+    const exit = kind === "agent" ? "" : ` (exit ${j.exit_code})`;
+    const head = j.state === "done" ? `✅ ${noun} finished${exit}.`
+               : j.state === "failed" ? `❌ ${noun} failed${exit}.` + (kind === "agent" && j.error ? " " + j.error : "")
+               : `⚠️ ${noun} was lost — Oceano restarted while it ran.`;
+    const body = kind === "agent" ? (j.output || "") : (j.tail ? "```\n" + j.tail + "\n```" : "");
+    appendT({ role: "assistant", content: body ? head + "\n\n" + body : head, ts: Date.now() });
     delivered = true;
-    try { await fetch("/api/bgjobs/" + encodeURIComponent(j.id) + "/ack", { method: "POST" }); } catch {}
+    try { await fetch("/api/bgjobs/" + encodeURIComponent(j.id) + "/ack?kind=" + kind, { method: "POST" }); } catch {}
   }
   if (delivered) { renderThread(); persistChat(); }
 }

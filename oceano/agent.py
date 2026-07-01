@@ -711,6 +711,11 @@ class Agent:
             "keeps it running and proactively tells the user when it's done. Check progress with "
             "mcp__oceano__job_status. Never tell the user 'I'll let you know when it's done' or 'I'll monitor "
             "this' unless you actually used spawn_job — with your own backgrounding that promise is false.\n"
+            "• SUB-AGENTS — mcp__oceano__spawn_agent starts a contained agent on a self-contained subtask IN "
+            "THE BACKGROUND (provider: the configured delegate default, or claude/codex/api/local — 'local' is "
+            "weak and serialized, avoid for heavy work) while you keep talking; Oceano runs it, notifies the "
+            "user, and delivers its result into this chat. Check with mcp__oceano__agent_status. For one "
+            "blocking subtask whose answer you need before replying, keep using delegation instead.\n"
             "Use your built-in tools for files and shell. Touch files only inside the workspace.")
         convo = []
         for m in self.messages[1:]:                            # the conversation Claude continues (no system msg)
@@ -855,6 +860,11 @@ class Agent:
             "when it's done. Check progress with `job_status`. Never tell the user 'I'll let you know when "
             "it's done' or 'I'll monitor this' unless you actually used spawn_job — with your own backgrounding "
             "that promise is false.\n"
+            "• SUB-AGENTS — `spawn_agent` starts a contained agent on a self-contained subtask IN THE "
+            "BACKGROUND (provider: the configured delegate default, or claude/codex/api/local — 'local' is "
+            "weak and serialized, avoid for heavy work) while you keep talking; Oceano runs it, notifies the "
+            "user, and delivers its result into this chat. Check with `agent_status`. For one blocking "
+            "subtask whose answer you need before replying, keep using delegation instead.\n"
             "Keep your file and shell work inside the workspace. Reply as Oceano."
         )
         convo = []

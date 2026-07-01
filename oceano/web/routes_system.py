@@ -339,12 +339,18 @@ def jobs_snapshot():
     """What background work is in flight right now + the serialize setting (for the
     running indicators and the Settings toggle). Running spawn_job OS-processes (bgjobs)
     are folded in so they show in the same indicator as Oceano's in-process work."""
-    from oceano import jobs, bgjobs
+    from oceano import jobs, bgjobs, agentjobs
     s = jobs.snapshot()
     now = time.time()
     extra = [{"id": f"bg{j['id']}", "kind": "job", "label": j["label"], "ref": f"bgjob:{j['id']}",
               "state": "running", "elapsed": round(now - j["started"], 1)}
              for j in bgjobs.status() if j["state"] in ("running", "starting")]
+    # running sub-agents too — except LOCAL ones, which already sit in the jobs registry via
+    # the serialization gate (counting them here would double them in the indicator)
+    extra += [{"id": f"ag{j['id']}", "kind": "agent", "label": j["label"], "ref": f"agent:{j['id']}",
+               "state": "running", "elapsed": round(now - j["started"], 1)}
+              for j in agentjobs.status()
+              if j["state"] in ("running", "starting") and j.get("provider") != "local"]
     if extra:
         s["jobs"] = list(s.get("jobs", [])) + extra
         s["running"] = s.get("running", 0) + len(extra)
@@ -353,18 +359,24 @@ def jobs_snapshot():
 
 @router.get("/api/bgjobs")
 def bgjobs_list(session: str = ""):
-    """Background OS-jobs (spawn_job). `pending` = terminal jobs for this conversation whose
-    result hasn't been printed into the chat yet (the client polls this to deliver them, then
-    acks); `jobs` = everything tracked, for a detail view."""
-    from oceano import bgjobs
-    return {"jobs": bgjobs.status(), "pending": bgjobs.pending_for(session) if session else []}
+    """Background OS-jobs (spawn_job) AND sub-agents (spawn_agent). `pending` = terminal items
+    for this conversation whose result hasn't been printed into the chat yet, each tagged with
+    `kind` ("job" | "agent") so the client acks against the right registry; `jobs`/`agents` =
+    everything tracked, for a detail view."""
+    from oceano import bgjobs, agentjobs
+    pending = []
+    if session:
+        pending = ([{**r, "kind": "job"} for r in bgjobs.pending_for(session)]
+                   + [{**r, "kind": "agent"} for r in agentjobs.pending_for(session)])
+    return {"jobs": bgjobs.status(), "agents": agentjobs.status(), "pending": pending}
 
 
 @router.post("/api/bgjobs/{jid}/ack")
-def bgjobs_ack(jid: int):
-    """Mark a job's result as delivered into its conversation, so it's never printed twice."""
-    from oceano import bgjobs
-    return {"ok": bgjobs.mark_delivered(jid)}
+def bgjobs_ack(jid: int, kind: str = "job"):
+    """Mark a job's/agent's result as delivered into its conversation (never printed twice)."""
+    from oceano import bgjobs, agentjobs
+    reg = agentjobs if kind == "agent" else bgjobs
+    return {"ok": reg.mark_delivered(jid)}
 
 
 @router.get("/api/logs")

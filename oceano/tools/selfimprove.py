@@ -99,3 +99,73 @@ def delegate_tool(instructions):
 # back-compat: the tool was once 'delegate_to_claude'. Keep the old name callable (not shown
 # to the model) so any saved reference still routes to the generalized delegate.
 _TOOLS["delegate_to_claude"] = delegate_tool
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "spawn_agent",
+        "description": (
+            "Start a contained sub-agent on a task IN THE BACKGROUND and return immediately — "
+            "like delegate, but you keep working while it runs. Oceano's daemon owns the run, "
+            "tracks it, notifies the user when it finishes, and delivers the result back into "
+            "this conversation. Give precise, self-contained instructions (file paths, exactly "
+            "what to produce) — it cannot ask questions. provider: omit for the configured "
+            "delegation default, or pick 'claude' | 'codex' | 'api' | 'local' ('local' shares "
+            "the one resident model: serialized and weak — avoid for heavy work). Check on it "
+            "with agent_status. Use for parallel subtasks; for one blocking subtask whose answer "
+            "you need right now, use delegate instead."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "complete, self-contained instructions"},
+            "provider": {"type": "string", "enum": ["", "claude", "codex", "api", "local"],
+                         "description": "who runs it; empty = the configured delegation default"},
+            "label": {"type": "string", "description": "short name, e.g. 'summarize logs'"},
+            "timeout": {"type": "integer", "description": "seconds before the agent is stopped (default 600)"},
+        }, "required": ["task"]},
+    },
+})
+def spawn_agent(task, provider="", label="", timeout=0):
+    from oceano import agentjobs, mindbridge   # lazy: mindbridge imports tools (avoid an import cycle)
+    try:
+        rec = agentjobs.spawn(task, provider=provider, label=label, timeout=timeout,
+                              cwd=config.WORKSPACE, sid=mindbridge.active_session())
+    except RuntimeError as e:                  # cap / unknown provider → relay the reason verbatim
+        return f"could not spawn the agent: {e}"
+    out = (f"started agent #{rec['id']} ({rec['provider']}) \"{rec['label']}\" — running in the "
+           f"background; check it with agent_status(agent_id={rec['id']}). The user is notified "
+           f"and the result is delivered here when it finishes.")
+    if rec.get("warning"):
+        out += "\n" + rec["warning"]
+    return out
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "agent_status",
+        "description": "Check a background sub-agent started with spawn_agent: state (running/"
+                       "done/failed/lost), its result or error, and a tail of its progress. "
+                       "Omit agent_id to list every agent Oceano is tracking.",
+        "parameters": {"type": "object", "properties": {
+            "agent_id": {"type": "integer", "description": "id from spawn_agent; omit to list all"},
+        }},
+    },
+})
+def agent_status(agent_id=None):
+    from oceano import agentjobs
+    if not agent_id:
+        js = agentjobs.status()
+        return "\n".join(f"#{j['id']} [{j['state']}] ({j['provider']}) {j['label']}" for j in js) \
+            or "no background agents"
+    rec = agentjobs.status(agent_id)
+    if rec is None:
+        return f"ERROR: no agent #{agent_id}"
+    out = f"#{rec['id']} \"{rec['label']}\" ({rec['provider']}) — {rec['state']}"
+    if rec["state"] == "done" and rec.get("output"):
+        out += "\n--- result ---\n" + rec["output"]
+    elif rec["state"] == "failed":
+        out += f"\nerror: {rec.get('error') or 'unknown'}"
+    if rec.get("tail") and rec["state"] == "running":
+        out += "\n--- progress tail ---\n" + rec["tail"]
+    return out
