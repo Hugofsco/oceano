@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import config
-from oceano import atomicio
+from oceano import atomicio, turnctx
 
 # --- channels --------------------------------------------------------------
 # Oceano is driven from several places, and they don't share a screen. The live
@@ -15,16 +15,18 @@ from oceano import atomicio
 # drive it. Telegram (the user can't see the browser) and unattended jobs
 # (Researcher / scheduler / evals — nobody is watching) must NOT, or they'd hijack
 # whatever the web view is showing. Off-web channels fall back to a plain HTTP
-# fetch and decline the interactive browser tools. The channel is thread-local
-# because each frontend/job runs on its own thread and drives tools synchronously.
+# fetch and decline the interactive browser tools. The channel (and the workspace
+# override below) live on the ONE per-turn TurnContext (oceano.turnctx) — each
+# frontend/job brackets its work, and turnctx.carry() hands the whole context to a
+# worker thread instead of the old thread-locals silently reverting to defaults.
 #   web        → full interactive: live browser + screenshots
 #   telegram   → attended chat, but no shared browser (HTTP fetch instead)
 #   background → unattended job (Researcher/scheduler/evals): no browser
-_local = threading.local()
+_local = threading.local()     # now only the progress sink — see below
 
 
 def current_channel():
-    return getattr(_local, "channel", "web")
+    return turnctx.get().channel
 
 
 def live_browser_available():
@@ -40,12 +42,8 @@ def is_background():
 @contextlib.contextmanager
 def channel(name):
     """Run the enclosed agent work as a given channel (web/telegram/background)."""
-    prev = getattr(_local, "channel", "web")
-    _local.channel = name
-    try:
+    with turnctx.push(channel=name):
         yield
-    finally:
-        _local.channel = prev
 
 
 # --- progress sink ---------------------------------------------------------
@@ -77,27 +75,20 @@ def background():
 
 
 def _ws():
-    """The workspace root for file/shell tools on THIS thread — a per-run override
+    """The workspace root for file/shell tools on this turn — a per-run override
     (set by the eval harness for isolation) or the global workspace by default."""
-    return getattr(_local, "workspace", None) or config.WORKSPACE
+    return turnctx.get().workspace or config.WORKSPACE
 
 
 @contextlib.contextmanager
 def background_workspace(path):
-    """Redirect this thread's file/shell tools to an isolated root (used by the eval
+    """Redirect this turn's file/shell tools to an isolated root (used by the eval
     harness so each case runs in a clean, throwaway workspace). Implies background()."""
     from pathlib import Path as _P
     root = _P(path).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    prev_ws = getattr(_local, "workspace", None)
-    prev_ch = getattr(_local, "channel", "web")
-    _local.workspace = root
-    _local.channel = "background"
-    try:
+    with turnctx.push(workspace=root, channel="background"):
         yield root
-    finally:
-        _local.workspace = prev_ws
-        _local.channel = prev_ch
 
 
 # --- registry --------------------------------------------------------------

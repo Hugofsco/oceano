@@ -516,7 +516,11 @@ class Agent:
             finally:
                 tools.clear_progress_sink()
                 q.put(("__done__", None))
-        threading.Thread(target=worker, daemon=True).start()
+        # carry(): the worker inherits THIS turn's context (channel/workspace/session/taint)
+        # instead of silently reverting to defaults — a streaming tool run from a background
+        # or workspace-isolated turn stays background/isolated on the worker thread too.
+        from oceano import turnctx
+        threading.Thread(target=turnctx.carry(worker), daemon=True).start()
         while True:
             kind, payload = q.get()
             if kind == "__done__":

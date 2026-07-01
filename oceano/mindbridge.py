@@ -11,36 +11,30 @@ Flow:  Claude  →(stdio MCP)→  mcp_bridge_server  →(HTTP + token)→  /api/
 import json
 import os
 import secrets
-import threading
 from contextlib import contextmanager
 
-from oceano import tools
+from oceano import tools, turnctx
 
 # The conversation (chat session id) a tool call belongs to, so spawn_job can route a job's eventual
-# result back to the chat that asked for it. It's THREAD-LOCAL, not a process-global, so two mind
-# turns for different sessions never misattribute each other's jobs:
+# result back to the chat that asked for it. It lives on the per-turn TurnContext (oceano.turnctx),
+# NOT a process-global, so two mind turns for different sessions never misattribute each other's jobs:
 #   • local model — tools run inline on the per-session turn thread, which session() marks directly;
 #   • Claude/Codex — the bridged tool call runs on a DIFFERENT daemon thread (/api/mcp/call →
 #     to_thread), so the sid rides through the bridge per turn (OCEANO_MCP_SESSION in the mind's own
 #     per-turn MCP config → an X-Oceano-Session header on each call) and run_tool() marks the request
-#     thread for the duration of that one call.
-_tls = threading.local()
+#     context for the duration of that one call.
 
 
 @contextmanager
 def session(sid):
-    """Mark `sid` as the conversation for tool calls on THIS thread, for the block's duration
+    """Mark `sid` as the conversation for tool calls on this turn, for the block's duration
     (save+restore so nested/sequential turns don't clobber an outer one)."""
-    prev = getattr(_tls, "session", None)
-    _tls.session = sid
-    try:
+    with turnctx.push(session=sid):
         yield
-    finally:
-        _tls.session = prev
 
 
 def active_session():
-    return getattr(_tls, "session", None)
+    return turnctx.get().session
 
 
 # The mind's BODY: Oceano's own tools, so the mind acts THROUGH Oceano (and the user can see it).
