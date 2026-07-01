@@ -276,6 +276,15 @@ steps, written for your future self. It enters review and only joins your active
 skills once an independent model approves it, so save genuinely useful candidates
 without fear — but not trivial or one-off details.
 
+SCHEDULING: you have your own task scheduler, and it PERSISTS across restarts. Use
+schedule_task(cron, instruction) to make any instruction run automatically on a cron
+schedule (e.g. '0 8 * * *' = every day at 08:00); list_tasks() to see what's already
+scheduled (each has an id); update_task(id, …) to change a task's schedule or instruction
+or pause it (enabled=false); and cancel_task(id) to remove one. This is the ONE place the
+user sees and manages recurring jobs, so route ALL recurring or future-dated work through
+it — every job survives restarts and shows up in their scheduler. Don't reach for any other
+timer or reminder mechanism.
+
 DELEGATION: you can hand a self-contained subtask to a stronger assistant with the
 `delegate` tool (who that is — Claude Code or a cloud model — is set by the user in
 Settings; you needn't care, just delegate). Give it precise instructions, the relevant
@@ -608,6 +617,17 @@ class Agent:
             "because they'd browse invisibly. After a search, OPEN the best result with mcp__oceano__fetch_url "
             "to actually read it.\n"
             "• CALENDAR: mcp__oceano__calendar_events / manage_calendar / find_free_slots.\n"
+            "• SCHEDULER — for ANY recurring or future-dated work use Oceano's scheduler: "
+            "mcp__oceano__schedule_task (cron + instruction), mcp__oceano__list_tasks, "
+            "mcp__oceano__update_task (retime/edit, or pause with enabled=false), and "
+            "mcp__oceano__cancel_task. Do NOT use your own built-in cron/scheduling tools (CronCreate, "
+            "CronList, CronDelete): those are scoped to your session and vanish, whereas Oceano's tasks "
+            "PERSIST across restarts and are the ones the user sees and manages in the scheduler window. "
+            "Schedule through Oceano, always.\n"
+            "• SKILLS / WORKFLOWS / DOCS — mcp__oceano__list_skills + load_skill to reuse Oceano's learned "
+            "skills (learn_skill to add one), mcp__oceano__run_workflow + list_workflows to run its saved "
+            "multi-step recipes, and mcp__oceano__search_docs (+ index_docs) to search the user's indexed "
+            "documents.\n"
             "• SERVERS — mcp__oceano__list_hosts to see the user's registered servers, mcp__oceano__ssh_run "
             "to run command batches on one over SSH (it's gated: per-host policy, and armed hosts must be "
             "unlocked by the user — if it refuses, relay why).\n"
@@ -665,7 +685,7 @@ class Agent:
                 holder["res"] = delegate.to_claude_stream(
                     prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
                     on_progress=on_prog, append_system=sys_prompt, cancel=cancel,
-                    disallow="WebSearch,WebFetch")             # force web through Oceano's visible live browser
+                    disallow="WebSearch,WebFetch,CronCreate,CronList,CronDelete")  # web → Oceano's visible browser; cron → Oceano's persistent scheduler
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
@@ -739,6 +759,13 @@ class Agent:
             "your own web access is off because it would browse invisibly. After a search, OPEN the best "
             "result with `fetch_url` to actually read it.\n"
             "• CALENDAR: `calendar_events`, `manage_calendar`, `find_free_slots` for scheduling.\n"
+            "• SCHEDULER: for ANY recurring or future-dated work use `schedule_task` (cron + instruction), "
+            "`list_tasks`, `update_task` (retime/edit, or pause with enabled=false), and `cancel_task`. "
+            "Don't use any private cron or timer of your own — Oceano's tasks PERSIST across restarts and "
+            "are the ones the user sees and manages.\n"
+            "• SKILLS / WORKFLOWS / DOCS: `list_skills`/`load_skill`/`learn_skill` for Oceano's skill "
+            "library, `run_workflow`/`list_workflows` for its saved recipes, and `search_docs`/`index_docs` "
+            "to search the user's indexed documents.\n"
             "• SERVERS: `list_hosts` to see the user's registered servers, `ssh_run` to run command "
             "batches on one over SSH. It's gated: per-host policy, and armed hosts must be unlocked by "
             "the user — if it refuses, relay why.\n"
@@ -842,20 +869,29 @@ class Agent:
         for _ in range(config.MAX_STEPS):
             seg_first = None             # time the first token of THIS segment arrived (for decode rate)
             content, reason, calls, ntok, ptok = "", "", None, 0, 0
-            for item in llm.stream(self.messages, tools=turn_tools,
-                                   model=self.model, base_url=self.base_url, api_key=self.api_key):
-                if "reasoning" in item:
-                    if seg_first is None: seg_first = time.perf_counter()
-                    reason += item["reasoning"]
-                    yield {"type": "reasoning", "text": item["reasoning"]}
-                elif "content" in item:
-                    if seg_first is None: seg_first = time.perf_counter()
-                    content += item["content"]
-                    yield {"type": "token", "text": item["content"]}   # final answer streams live
-                elif "tool_calls" in item:
-                    calls = item["tool_calls"]
-                elif "usage" in item:
-                    ntok = item["usage"]; ptok = item.get("prompt_tokens", 0)
+            try:
+                for item in llm.stream(self.messages, tools=turn_tools,
+                                       model=self.model, base_url=self.base_url, api_key=self.api_key):
+                    if "reasoning" in item:
+                        if seg_first is None: seg_first = time.perf_counter()
+                        reason += item["reasoning"]
+                        yield {"type": "reasoning", "text": item["reasoning"]}
+                    elif "content" in item:
+                        if seg_first is None: seg_first = time.perf_counter()
+                        content += item["content"]
+                        yield {"type": "token", "text": item["content"]}   # final answer streams live
+                    elif "tool_calls" in item:
+                        calls = item["tool_calls"]
+                    elif "usage" in item:
+                        ntok = item["usage"]; ptok = item.get("prompt_tokens", 0)
+            except Exception as e:                     # provider/socket died mid-stream
+                # Keep history paired (never strand a dangling user/tool turn) and surface the error
+                # inline with whatever streamed so far, rather than a 500 that loses the partial.
+                self.messages.append({"role": "assistant",
+                                      "content": content or f"(interrupted: {type(e).__name__})"})
+                yield {"type": "token", "text": f"\n\n⚠️ model stream failed: {e}"}
+                yield {"type": "answer_done"}
+                return
             total_tok += ntok
 
             if not calls:                              # final answer
@@ -917,17 +953,24 @@ class Agent:
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         content, tokens, ptok, tfirst = "", 0, 0, None
-        for item in llm.stream(self.messages, model=self.model,
-                               base_url=self.base_url, api_key=self.api_key):
-            if "reasoning" in item:
-                yield {"type": "reasoning", "text": item["reasoning"]}
-            elif "content" in item:
-                if tfirst is None:
-                    tfirst = time.perf_counter()      # measure decode from first answer token
-                content += item["content"]
-                yield {"type": "token", "text": item["content"]}
-            elif "usage" in item:
-                tokens = item["usage"]; ptok = item.get("prompt_tokens", 0)
+        try:
+            for item in llm.stream(self.messages, model=self.model,
+                                   base_url=self.base_url, api_key=self.api_key):
+                if "reasoning" in item:
+                    yield {"type": "reasoning", "text": item["reasoning"]}
+                elif "content" in item:
+                    if tfirst is None:
+                        tfirst = time.perf_counter()      # measure decode from first answer token
+                    content += item["content"]
+                    yield {"type": "token", "text": item["content"]}
+                elif "usage" in item:
+                    tokens = item["usage"]; ptok = item.get("prompt_tokens", 0)
+        except Exception as e:                            # provider/socket died mid-stream
+            self.messages.append({"role": "assistant",
+                                  "content": content or f"(interrupted: {type(e).__name__})"})
+            yield {"type": "token", "text": f"\n\n⚠️ model stream failed: {e}"}
+            yield {"type": "answer_done"}
+            return
         self.messages.append({"role": "assistant", "content": content})
         self._learn(user_message, content)
         secs = (time.perf_counter() - tfirst) if tfirst else 0

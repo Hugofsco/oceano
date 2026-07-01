@@ -27,6 +27,28 @@ def _embed(text, kind="document"):
 
 _cosine = embeddings.cosine
 
+# Parsed-vector cache: for_prompt() runs every turn and used to json-deserialize every stored
+# embedding (hundreds of ~768-float arrays) on each call. Cache the parse by memory id; invalidate
+# on the writes that change embeddings (forget / reindex / wipe). New rows (remember/add_if_new) get
+# fresh ids, so they simply miss the cache and populate it on first read — no stale risk.
+_VEC_CACHE = {}
+
+
+def _loads_cached(mid, blob):
+    v = _VEC_CACHE.get(mid)
+    if v is None:
+        v = embeddings.loads_vec(blob)
+        if v is not None:
+            _VEC_CACHE[mid] = v
+    return v
+
+
+def _invalidate(mid=None):
+    if mid is None:
+        _VEC_CACHE.clear()
+    else:
+        _VEC_CACHE.pop(mid, None)
+
 # Memory types + how each is injected into the agent's context:
 #   always   = inject every turn, regardless of the prompt (identity-type facts)
 #   relevant = inject only when semantically related to the prompt (default)
@@ -81,8 +103,20 @@ def remember(text, tags="", category="fact", pinned=False, source=""):
     """Store a durable fact/preference/note the agent should keep. `source` is an optional
     URL or workspace file path the fact came from — mainly for 'knowledge' memories, so the
     agent can reopen it later (fetch_url / read_file) to investigate further."""
+    text = (text or "").strip()
+    if not text:
+        return "nothing to remember (empty text)"
     vec = _embed(text)
     con = _db()
+    # Skip a near-identical duplicate so explicit remember() calls don't pile up copies between the
+    # weekly maintain() runs. High bar (0.95) and semantic-only — distinct-but-related facts still
+    # save, and with the embed server down we don't dedupe (keep the old always-save behaviour).
+    if vec:
+        for (t, emb) in con.execute("SELECT text, embedding FROM memories").fetchall():
+            v = embeddings.loads_vec(emb)
+            if v and _cosine(vec, v) >= 0.95:
+                con.close()
+                return f"already remembered (near-identical to an existing memory): {t!r}"
     con.execute(
         "INSERT INTO memories (ts, text, tags, embedding, category, pinned, source) VALUES (?,?,?,?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(), text, tags,
@@ -152,7 +186,7 @@ def for_prompt(query, k=5, max_always=20, threshold=0.28):
         if qv:
             scored = []
             for r in pool:                           # skip rows with a missing/corrupt vector
-                v = embeddings.loads_vec(r[5])
+                v = _loads_cached(r[0], r[5])         # cached parse — this runs every turn
                 if v:
                     scored.append((_cosine(qv, v), r))
         else:
@@ -179,6 +213,8 @@ def reindex(force=False):
             done += 1
     con.commit()
     con.close()
+    if done:
+        _invalidate()                            # embeddings changed under cached ids → drop the cache
     return f"reindexed {done}/{len(rows)} memories"
 
 
@@ -225,6 +261,7 @@ def forget(mid):
     con.execute("DELETE FROM memories WHERE id=?", (mid,))
     con.commit()
     con.close()
+    _invalidate(mid)                             # drop the cached vector (and free the id for reuse)
     return True
 
 
@@ -235,6 +272,7 @@ def wipe():
     con.execute("DELETE FROM memories")
     con.commit()
     con.close()
+    _invalidate()                                # whole store gone → drop the cache
     return n
 
 
@@ -258,7 +296,7 @@ def search(query, k=8):
     if qvec:
         scored = []
         for r in rows:                               # corrupt/missing vector → -1.0 (sorts last)
-            v = embeddings.loads_vec(r[6])
+            v = _loads_cached(r[0], r[6])
             scored.append((_cosine(qvec, v) if v else -1.0, r))
     else:
         words = set(query.lower().split())
@@ -363,7 +401,7 @@ def best_match(query):
     if qv:
         scored = []
         for i, t, e in rows:                          # corrupt/missing vector → -1.0 (sorts last)
-            v = embeddings.loads_vec(e)
+            v = _loads_cached(i, e)
             scored.append((_cosine(qv, v) if v else -1.0, i, t))
     else:
         ql = set(query.lower().split())

@@ -186,6 +186,7 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
     if model:
         cmd += ["--model", str(model)]
     sandbox = delegate.codex_sandbox_mode("workspace-write")    # falls back off bwrap if it can't sandbox here
+    cmd += delegate._codex_effort_args()                        # honour the configured reasoning effort
     cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
     if cwd:
         cmd += ["--cd", str(cwd)]
@@ -240,6 +241,18 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
             q.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
+
+    errbuf = []                                  # drain stderr continuously so a chatty stderr can't fill
+    def errreader():                             # the pipe, block codex's writes, and stall its stdout
+        try:
+            for line in proc.stderr:
+                errbuf.append(line)
+                if len(errbuf) > 400:            # bounded — keep the tail
+                    del errbuf[:200]
+        except Exception:
+            pass
+
+    threading.Thread(target=errreader, daemon=True).start()
 
     pending = {}
     parts = []
@@ -326,7 +339,7 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
         pass
     # Read stderr only on a NATURAL exit. After a kill, reading the pipe can block on a grandchild
     # that briefly outlives the group; we already synthesize a definitive error below, so skip it.
-    err = "" if killed else ((proc.stderr.read() or "").strip()[:1000] if proc.stderr else "")
+    err = "" if killed else ("".join(errbuf)).strip()[:1000]
     answer = ''.join(parts).strip()
     ok = bool(answer) and not cancelled and not stalled and not capped and proc.returncode == 0
     if ok and err.startswith("Reading additional input from stdin"):

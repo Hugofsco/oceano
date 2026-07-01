@@ -49,10 +49,18 @@ def _bridge_channel():
 _ALLOW = {
     "remember", "recall", "forget_memory", "update_memory",   # memory — Oceano's, the one the user sees
     "calendar_events", "manage_calendar", "find_free_slots",  # the calendar
+    "schedule_task", "list_tasks", "update_task", "cancel_task",   # the PERSISTENT task scheduler — create/list/edit/cancel; the one the user sees, use instead of the mind's own cron
+    "list_skills", "load_skill", "learn_skill",              # skills — reuse + grow Oceano's skill library (parity with the local mind)
+    "run_workflow", "list_workflows",                        # workflows — run Oceano's saved multi-step recipes
+    "search_docs", "index_docs",                             # RAG — search (and add to) the user's indexed documents
+    "list_suggestions", "accept_suggestion", "dismiss_suggestion",   # the self-improvement queue (reflection → approve → act)
     "ui_open", "ui_close", "ui_arrange",                      # the windows (JARVIS bit)
     "notify",                                                 # push a notification to the user
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
     "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
+    "browser_snapshot", "browser_fill", "browser_select", "browser_press",      # …operate forms: map elements, fill, select, submit
+    "browser_wait", "browser_extract", "browser_read",                          # …wait for content, extract data, read as markdown
+    "browser_eval", "browser_hover", "browser_upload", "browser_dialog", "browser_tab",   # …JS eval (web-only), hover, upload, dialogs, tabs
     "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
     "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
     "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)

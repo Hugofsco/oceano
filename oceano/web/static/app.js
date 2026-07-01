@@ -1367,6 +1367,11 @@ const SETTINGS_PAGES = {
       <label class="set-toggle"><input type="checkbox" id="serializeChatToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Queue chat messages too <span class="st-note">— a chat turn also waits behind running work (share the gate; enable the option above for full serialization)</span></span></label>
     </div>
     <div class="drawer-section">
+      <h3>Live browser</h3>
+      <p class="sub">Drive a <b>real, persistent Google Chrome</b> instead of the throwaway headless one — a genuine fingerprint, and your logins &amp; extensions persist across runs (sign in to a site once in the Live browser and it's remembered). It's still viewed through the Live browser window. Needs Google Chrome installed on the host.</p>
+      <label class="set-toggle"><input type="checkbox" id="realChromeToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Drive a real, persistent Chrome <span class="st-note">— toggling restarts the browser; the current session drops</span></span></label>
+    </div>
+    <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
       <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
       <div class="chat-tools">
@@ -1390,11 +1395,15 @@ const SETTINGS_PAGES = {
         <label class="field-label">Claude model <span class="lbl-sub">used by the Claude mind <b>and</b> Claude-Code delegation</span></label>
         <select id="claudeModelSel"></select>
         <div class="dg-hint">Sonnet is usually the sweet spot for the agent — fast and capable. Switch to Opus for the hardest reasoning. Aliases always track the latest of each tier.</div>
+        <label class="field-label">Reasoning effort <span class="lbl-sub">how hard it thinks — higher = deeper but slower/pricier</span></label>
+        <select id="claudeEffortSel"></select>
       </div>
       <div class="dg-claude-model" id="codexModelRow" style="display:none">
         <label class="field-label">Codex model <span class="lbl-sub">used by the resident Codex mind</span></label>
         <select id="codexModelSel"></select>
         <div class="dg-hint">Recommended default: GPT-5.5. Use GPT-5.4 mini when you want a faster, cheaper option.</div>
+        <label class="field-label">Reasoning effort <span class="lbl-sub">how hard it thinks — higher = deeper but slower/pricier</span></label>
+        <select id="codexEffortSel"></select>
       </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
@@ -1548,7 +1557,17 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadBrowserSetting(); loadVoiceSettings(); }
+async function _wireEffort(selId, endpoint, label) {   // reasoning-effort dropdown for a mind (Claude/Codex)
+  const esel = $("#" + selId); if (!esel) return;
+  let e; try { e = await api(endpoint); } catch { return; }
+  esel.innerHTML = `<option value="">default</option>`
+    + (e.options || []).map(o => `<option value="${escapeHtml(o)}"${o === e.effort ? " selected" : ""}>${escapeHtml(o)}</option>`).join("");
+  esel.onchange = async () => {
+    try { const r = await _postJ(endpoint, { effort: esel.value }); toast(label + " effort → " + (r.effort || "default"), "info"); }
+    catch { toast("couldn't set " + label + " effort", "err"); }
+  };
+}
 async function loadClaudeModel() {
   const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
   let d; try { d = await api("/api/claude-model"); } catch { return; }
@@ -1560,6 +1579,7 @@ async function loadClaudeModel() {
       toast("Claude model → " + (r.model || "default"), "info"); }
     catch { toast("couldn't set the Claude model", "err"); }
   };
+  _wireEffort("claudeEffortSel", "/api/claude-effort", "Claude");
 }
 async function loadCodexModel() {
   const row = $("#codexModelRow"), sel = $("#codexModelSel"); if (!row || !sel) return;
@@ -1572,6 +1592,7 @@ async function loadCodexModel() {
       toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info"); }
     catch { toast("couldn't set the Codex model", "err"); }
   };
+  _wireEffort("codexEffortSel", "/api/codex-effort", "Codex");
 }
 async function loadMind() {
   let d; try { d = await api("/api/mind"); } catch { return; }
@@ -1737,6 +1758,14 @@ async function loadJobsSetting() {
   if (tc) tc.checked = !!d.serialize_chat;
   t.onchange = () => _postJ("/api/jobs/serialize", { enabled: t.checked }).then(r => toast(r.serialize ? "Background jobs will queue" : "Background jobs run in parallel", "info")).catch(() => {});
   if (tc) tc.onchange = () => _postJ("/api/jobs/serialize", { chat: tc.checked }).then(r => toast(r.serialize_chat ? "Chat messages will queue" : "Chat messages run immediately", "info")).catch(() => {});
+}
+async function loadBrowserSetting() {
+  const t = $("#realChromeToggle"); if (!t) return;
+  let d; try { d = await api("/api/browser/settings"); } catch { return; }
+  t.checked = !!d.real_chrome;
+  t.onchange = () => _postJ("/api/browser/settings", { real_chrome: t.checked })
+    .then(r => toast(r.real_chrome ? "Live browser will use a real, persistent Chrome (restarting)" : "Live browser back to headless Chromium (restarting)", "info"))
+    .catch(() => {});
 }
 
 const POLICY_OPTS = [["always", "Always inject"], ["relevant", "When relevant"], ["off", "Off"]];
@@ -2182,7 +2211,7 @@ function hideCtx() { const m = $("#ctxMenu"); if (m) m.remove(); }
 document.addEventListener("click", hideCtx);
 
 /* ---------- live browser window (interactive — you + the agent share it) ---------- */
-let _liveES = null;
+let _liveES = null, _liveWS = null, _liveRO = null;
 function _mapToPage(img, clientX, clientY) {           // displayed frame coords → page coords (handles letterbox)
   const r = img.getBoundingClientRect();
   const nW = img.naturalWidth || 1280, nH = img.naturalHeight || 800;
@@ -2196,19 +2225,36 @@ function _mapToPage(img, clientX, clientY) {           // displayed frame coords
 }
 function openLiveView() {
   const { body, reused } = createWindow({ id: "win-live", title: "Live browser — drive it, or watch Oceano", icon: "◫", width: 720, height: 600,
-    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } } });
+    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } if (_liveWS) { _liveWS.onclose = null; try { _liveWS.close(); } catch {} _liveWS = null; } if (_liveRO) { try { _liveRO.disconnect(); } catch {} _liveRO = null; } } });
   if (reused) return;
   body.innerHTML = `
-    <div class="live-addr"><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button></div>
+    <div class="live-addr"><button class="exp-btn live-nav" id="liveBack" title="Back (Alt+←)">←</button><button class="exp-btn live-nav" id="liveFwd" title="Forward (Alt+→)">→</button><button class="exp-btn live-nav" id="liveReload" title="Reload">⟳</button><button class="exp-btn live-nav" id="liveStop" title="Stop loading">✕</button><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button><button class="exp-btn live-nav" id="liveNewTab" title="New tab">+</button><button class="exp-btn live-nav" id="liveExt" title="Open this page in my browser">↗</button></div>
     <div class="live-tabs" id="liveTabs" style="display:none"></div>
-    <div class="live-url" id="liveUrl">idle — type a URL, click or drag in the page, or let the agent browse</div>
     <div class="live-stage" id="liveStage" tabindex="0"><span class="live-wait" id="liveWait">No frames yet. Enter a URL above, click/drag into the page (drag works — solve slider captchas by hand), or ask the agent to browse.</span><img id="liveImg" alt="live" draggable="false" style="display:none"></div>`;
   const post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
-  const go = () => { const url = $("#liveInput", body).value.trim(); if (!url) return; $("#liveUrl", body).textContent = "loading " + url + " …"; post("/api/browser/go", { url }); };
+  const go = () => { const url = $("#liveInput", body).value.trim(); if (!url) return; post("/api/browser/go", { url }); };
   $("#liveGo", body).onclick = go;
   $("#liveInput", body).addEventListener("keydown", e => { if (e.key === "Enter") { e.stopPropagation(); go(); } });
+  $("#liveBack", body).onclick = () => post("/api/browser/back", {});
+  $("#liveFwd", body).onclick = () => post("/api/browser/forward", {});
+  $("#liveReload", body).onclick = () => post("/api/browser/reload", {});
+  $("#liveStop", body).onclick = () => post("/api/browser/stop", {});
+  $("#liveNewTab", body).onclick = () => post("/api/browser/newtab", {});
+  $("#liveExt", body).onclick = () => { const u = $("#liveInput", body).value.trim(); if (/^https?:\/\//.test(u)) window.open(u, "_blank", "noopener"); };
 
   const img = $("#liveImg", body), stage = $("#liveStage", body);
+  // keep the browser viewport matched to the window size — responsive layout that fills the window,
+  // instead of a fixed 1280×800 frame letterboxed to fit. Debounced so a drag-resize sends once.
+  let _rsTimer = null, _lastWH = "";
+  const sendResize = () => {
+    const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
+    if (w < 100 || h < 100) return;                    // minimized / collapsed → skip
+    const sig = w + "x" + h; if (sig === _lastWH) return; _lastWH = sig;
+    post("/api/browser/resize", { width: w, height: h });
+  };
+  _liveRO = new ResizeObserver(() => { clearTimeout(_rsTimer); _rsTimer = setTimeout(sendResize, 180); });
+  _liveRO.observe(stage);
+  setTimeout(sendResize, 120);                          // initial sync when the window opens
   // Pointer-driven click AND drag. A press that doesn't move is a click; once the pointer moves
   // past a small threshold it becomes a real press→move→release drag (streamed live), so you can
   // drag sliders and solve drag-to-verify captchas / bot checks by hand. mousedown is sent lazily
@@ -2258,21 +2304,69 @@ function openLiveView() {
     }, 80);
   }, { passive: false });
   stage.addEventListener("keydown", e => {
+    if (e.altKey && e.key === "ArrowLeft") { post("/api/browser/back", {}); e.preventDefault(); return; }
+    if (e.altKey && e.key === "ArrowRight") { post("/api/browser/forward", {}); e.preventDefault(); return; }
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === "c" || e.key === "C")) {          // copy the page's selection → local clipboard
+      e.preventDefault();                                   // (needs a secure context: localhost or https)
+      if (navigator.clipboard && window.ClipboardItem) {
+        try { navigator.clipboard.write([new ClipboardItem({ "text/plain":
+          fetch("/api/browser/copy", { method: "POST" }).then(r => r.json()).then(j => new Blob([j.text || ""], { type: "text/plain" })) })]).catch(() => {}); } catch {}
+      }
+      return;
+    }
+    if (mod && (e.key === "a" || e.key === "A")) { post("/api/browser/key", { key: "Control+a" }); e.preventDefault(); return; }  // select all in the page
+    if (mod && (e.key === "v" || e.key === "V")) return;    // paste → handled by the 'paste' listener below
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { post("/api/browser/type", { text: e.key }); e.preventDefault(); }
     else if (["Enter", "Backspace", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End"].includes(e.key)) { post("/api/browser/key", { key: e.key }); e.preventDefault(); }
   });
+  // clipboard bridge (in): paste your local clipboard into the page's focused field. The paste event
+  // hands us the text with no permission prompt; the server inserts it via keyboard.insert_text.
+  stage.addEventListener("paste", e => {
+    const cd = e.clipboardData || window.clipboardData;
+    const t = cd ? cd.getData("text") : "";
+    if (t) post("/api/browser/paste", { text: t });
+    e.preventDefault();
+  });
 
   _lastTabsSig = null;                       // force a tab-bar rebuild on (re)open
-  _liveES = new EventSource("/api/browser/stream");
-  _liveES.onmessage = e => {
-    const win = document.getElementById("win-live");
-    if (win && win.style.display === "none") return;       // minimized → don't decode frames into a hidden view
-    let d; try { d = JSON.parse(e.data); } catch { return; }
-    if (d.frame && img) { img.src = d.frame; img.style.display = "block"; const w = $("#liveWait", body); if (w) w.style.display = "none"; }
-    const u = $("#liveUrl", body);
-    if (u && d.url && u.textContent !== d.url) { u.textContent = d.url; u.classList.add("on"); }
+  const hidden = () => { const win = document.getElementById("win-live"); return !!(win && win.style.display === "none"); };
+  const applyMeta = d => {
+    const input = $("#liveInput", body);                 // reflect the live URL into the address bar,
+    if (input && d.url && document.activeElement !== input && input.value !== d.url) {
+      input.value = d.url;                               // but never clobber what the user is typing
+    }
     if (d.tabs) renderLiveTabs(d.tabs);
   };
+  const showFrame = src => {                  // src is a blob: (WebSocket) or data: (SSE) URL
+    const prev = img.src;
+    img.src = src; img.style.display = "block";
+    const w = $("#liveWait", body); if (w) w.style.display = "none";
+    if (prev && prev.indexOf("blob:") === 0) { try { URL.revokeObjectURL(prev); } catch {} }
+  };
+  // Fallback transport: SSE with base64 data-URL frames (EventSource auto-reconnects).
+  const startLiveSSE = () => {
+    if (_liveES) return;
+    _liveES = new EventSource("/api/browser/stream");
+    _liveES.onmessage = e => {
+      if (hidden()) return;                    // minimized → don't decode frames into a hidden view
+      let d; try { d = JSON.parse(e.data); } catch { return; }
+      if (d.frame && img) showFrame(d.frame);
+      applyMeta(d);
+    };
+  };
+  // Primary transport: WebSocket — binary JPEG frames (no base64) + text metadata. Falls back to SSE.
+  try {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    _liveWS = new WebSocket(`${proto}://${location.host}/api/browser/ws`);
+    _liveWS.binaryType = "blob";
+    _liveWS.onmessage = ev => {
+      if (typeof ev.data === "string") { try { applyMeta(JSON.parse(ev.data)); } catch {} }
+      else if (!hidden()) showFrame(URL.createObjectURL(ev.data));
+    };
+    _liveWS.onclose = () => { _liveWS = null; startLiveSSE(); };   // dropped/never-opened → SSE takes over
+    _liveWS.onerror = () => { try { _liveWS.close(); } catch {} };
+  } catch { startLiveSSE(); }
 }
 const _post = (p, b) => fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 let _lastTabsSig = null;
@@ -3994,6 +4088,7 @@ function openResearcher() {
       <input id="resFocus" placeholder="focus / guidance (optional)" style="flex:1;min-width:150px">
       <select id="resPreset" class="sched-preset"></select>
       <input id="resCron" class="sched-cron" placeholder="cron" value="0 8 * * *">
+      <select id="resModel" class="sched-preset" title="which model runs this research"><option value="">default model</option></select>
       <button class="primary sm" id="resAdd">Add</button>
     </div>
     <div class="kn-note" id="resMsg"></div>
@@ -4001,10 +4096,12 @@ function openResearcher() {
   const RES_PRESETS = { "daily 8am": "0 8 * * *", "every 12h": "0 */12 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1", "monthly (1st, 9am)": "0 9 1 * *" };
   $("#resPreset", body).innerHTML = `<option value="">preset…</option>` + Object.entries(RES_PRESETS).map(([k, v]) => `<option value="${v}">${k}</option>`).join("");
   $("#resPreset", body).onchange = e => { if (e.target.value) $("#resCron").value = e.target.value; };
+  api("/api/models").then(ms => { const sel = $("#resModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, "", ""); }).catch(() => {});
   $("#resAdd", body).onclick = async () => {
     const topic = $("#resTopic").value.trim(), focus = $("#resFocus").value.trim(), cron = $("#resCron").value.trim(), msg = $("#resMsg");
     if (!topic || !cron) return;
-    const r = await api("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) });
+    const { model, base_url } = _schedModelPick($("#resModel", body));
+    const r = await api("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron, model, base_url }) });
     if (!r.ok) { msg.textContent = r.error || "could not add topic"; msg.className = "kn-note err"; return; }
     msg.textContent = "research topic added ✓ — it will run on its schedule (or hit ▶ to run now)"; msg.className = "kn-note ok";
     $("#resTopic").value = ""; $("#resFocus").value = "";
@@ -4022,25 +4119,83 @@ async function loadResearch() {
     const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
     const last = t.last_run ? t.last_run.slice(0, 16).replace("T", " ") + " UTC" : "never";
     const status = t.running ? `<span class="res-running">⟳ researching now…</span>` : `last run ${escapeHtml(last)}`;
+    const modelTag = t.model
+      ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : (t.model === "codex" ? "Codex" : escapeHtml(t.model))}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
       <div class="sr-body"><div class="sr-instr">${escapeHtml(t.topic)}</div>
-      <div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · ${status}${t.focus ? `<div class="res-focus">focus: ${escapeHtml(t.focus)}</div>` : ""}</div></div>
+      <div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · ${status}${modelTag}${t.focus ? `<div class="res-focus">focus: ${escapeHtml(t.focus)}</div>` : ""}</div></div>
       <button class="sr-btn res-run" title="run this research now" ${t.running ? "disabled" : ""}>▶ run</button>
       <button class="sr-btn res-doc" title="open the research document" ${t.doc_exists ? "" : "disabled"}>doc</button>
       <button class="sr-btn sr-edit">edit</button><button class="sr-btn sr-del">✕</button>`;
     $("input", row).onchange = async e => { await fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadResearch(); };
     $(".res-run", row).onclick = async () => { await fetch("/api/research/" + t.id + "/run", { method: "POST" }); loadResearch(); };
     $(".res-doc", row).onclick = () => openFileWindow(t.doc);
-    $(".sr-edit", row).onclick = () => editResearch(t);
+    $(".sr-edit", row).onclick = () => openResearchEditor(t);
     $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete research topic?", `“${t.topic}” and its scheduler entry will be removed. The document in workspace/research/ is kept.`)) return; await fetch("/api/research/" + t.id, { method: "DELETE" }); loadResearch(); };
     list.appendChild(row);
   });
 }
-async function editResearch(t) {
-  const topic = await promptDialog("Research topic", { value: t.topic, okLabel: "Next" }); if (topic === null) return;
-  const focus = await promptDialog("Focus / guidance", { value: t.focus || "", message: "Optional — leave blank for none", okLabel: "Next" }); if (focus === null) return;
-  const cron = await promptDialog("Schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Save" }); if (cron === null) return;
-  fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) }).then(() => loadResearch());
+// A proper editor window for a research topic — topic, focus, schedule (with a live "next runs"
+// preview), a MODEL picker (run it on the local model, or a stronger mind that drills deeper), and
+// an enabled toggle. Mirrors the scheduled-task editor.
+const RES_PRESETS = { "daily 8am": "0 8 * * *", "every 12h": "0 */12 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1", "monthly (1st, 9am)": "0 9 1 * *" };
+function openResearchEditor(t) {
+  const { body } = createWindow({ id: "win-researchedit", title: "Edit research topic", icon: "✎", width: 540, height: 560 });
+  body.classList.add("set-win");
+  const presets = `<option value="">preset…</option>`
+    + Object.entries(RES_PRESETS).map(([k, v]) => `<option value="${escapeHtml(v)}">${escapeHtml(k)}</option>`).join("");
+  body.innerHTML = `<div class="drawer-section">
+    <label class="field-label">Topic <span class="lbl-sub">what to research, deepening over time</span></label>
+    <input id="reTopic" value="${escapeHtml(t.topic)}" placeholder="e.g. Solana MEV landscape">
+    <label class="field-label">Focus / guidance <span class="lbl-sub">optional — steer the deep-dive</span></label>
+    <textarea id="reFocus" spellcheck="false" placeholder="optional — e.g. emphasize primary sources and recent changes">${escapeHtml(t.focus || "")}</textarea>
+    <label class="field-label">Schedule <span class="lbl-sub">cron · min hr day mon wkday</span></label>
+    <div class="te-cron-row">
+      <select id="rePreset" class="sched-preset">${presets}</select>
+      <input id="reCron" class="sched-cron" value="${escapeHtml(t.cron)}" placeholder="0 8 * * *">
+    </div>
+    <div id="rePreview" class="te-preview">…</div>
+    <label class="field-label">Model <span class="lbl-sub">which model runs this research — default uses your primary; a stronger mind drills deeper</span></label>
+    <select id="reModel" class="te-model"><option value="">default model</option></select>
+    <label class="te-enabled"><span class="sw sm"><input type="checkbox" id="reEnabled" ${t.enabled ? "checked" : ""}><span></span></span> Enabled</label>
+    <div class="acct-actions"><span class="acct-msg" id="reMsg"></span>
+      <span class="te-btns"><button class="ghost-btn sm" id="reCancel">Cancel</button>
+      <button class="primary sm" id="reSave">Save</button></span></div>
+  </div>`;
+  const cronEl = $("#reCron", body), prev = $("#rePreview", body);
+  let pvTimer = null, pvSeq = 0;
+  async function refreshPreview() {
+    const cron = cronEl.value.trim();
+    if (!cron) { prev.className = "te-preview"; prev.textContent = "enter a cron expression"; return; }
+    const seq = ++pvSeq;
+    try {
+      const d = await api("/api/cron/preview?n=4&cron=" + encodeURIComponent(cron));
+      if (seq !== pvSeq) return;
+      if (!d.valid) { prev.className = "te-preview bad"; prev.textContent = "✗ " + (d.error || "invalid cron"); return; }
+      if (!d.runs.length) { prev.className = "te-preview"; prev.textContent = "valid ✓"; return; }
+      prev.className = "te-preview ok";
+      prev.innerHTML = `<span class="te-pv-lbl">next runs · UTC</span>`
+        + d.runs.map(r => `<span class="te-pv-when">${escapeHtml(r.slice(0, 16).replace("T", " "))}</span>`).join("");
+    } catch { if (seq === pvSeq) { prev.className = "te-preview"; prev.textContent = ""; } }
+  }
+  cronEl.oninput = () => { clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); };
+  $("#rePreset", body).onchange = e => { if (e.target.value) { cronEl.value = e.target.value; refreshPreview(); } };
+  refreshPreview();
+  api("/api/models").then(ms => { const sel = $("#reModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, t.model || "", t.base_url || ""); }).catch(() => {});
+  const close = () => { const w = body.closest(".win"); if (w) w.remove(); };
+  $("#reCancel", body).onclick = close;
+  $("#reSave", body).onclick = async () => {
+    const msg = $("#reMsg", body), topic = $("#reTopic", body).value.trim(), cron = cronEl.value.trim();
+    if (!topic) { msg.textContent = "topic required"; msg.className = "acct-msg err"; return; }
+    if (!cron) { msg.textContent = "schedule required"; msg.className = "acct-msg err"; return; }
+    const pick = _schedModelPick($("#reModel", body));   // "" = system default
+    const payload = { topic, focus: $("#reFocus", body).value.trim(), cron,
+                      enabled: $("#reEnabled", body).checked, model: pick.model, base_url: pick.base_url };
+    const r = await fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload) }).then(x => x.json()).catch(() => ({ ok: false }));
+    if (!r.ok) { msg.textContent = r.error || "save failed — check the cron"; msg.className = "acct-msg err"; return; }
+    close(); loadResearch();
+  };
 }
 
 /* ====================================================================

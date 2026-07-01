@@ -732,10 +732,6 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
   background:linear-gradient(135deg,transparent 45%,var(--line-strong) 45%,var(--line-strong) 55%,transparent 55%)}
 
 /* live browser window */
-.live-url{padding:7px 12px;font-family:var(--font-mono);font-size:11px;color:var(--mist);background:rgba(var(--abyss-0-rgb),.55);
-  border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:7px}
-.live-url::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--coral);flex:none;animation:pulse 1.6s infinite}
-.live-url.on::before{background:var(--biolum)}
 .live-stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#020a0e;overflow:hidden;outline:none}
 .live-stage:focus{box-shadow:inset 0 0 0 2px rgba(var(--biolum-rgb),.45)}
 .live-stage img{max-width:100%;max-height:100%;object-fit:contain;display:block;cursor:crosshair;user-select:none}
@@ -836,6 +832,7 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .live-addr{display:flex;gap:7px;padding:8px 10px;border-bottom:1px solid var(--line);background:rgba(var(--abyss-0-rgb),.4)}
 .live-addr input{flex:1;background:rgba(var(--abyss-0-rgb),.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-mono);font-size:12px;padding:7px 11px;outline:none}
 .live-addr input:focus{border-color:var(--biolum)}
+.live-nav{flex:none;width:30px;padding:5px 0;text-align:center;font-size:14px;line-height:1.1}
 
 /* file viewer / editor window */
 .fw-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line)}
@@ -904,6 +901,11 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .set-win select.te-model{width:100%;box-sizing:border-box;background:rgba(var(--abyss-0-rgb),.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-body);font-size:12.5px;padding:9px 32px 9px 11px;outline:none;cursor:pointer;-webkit-appearance:none;-moz-appearance:none;appearance:none;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2374c9d6' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");background-repeat:no-repeat;background-position:right 11px center}
 .set-win select.te-model:hover{border-color:var(--line-strong)}
 .set-win select.te-model:focus{border-color:var(--biolum)}
+/* research editor: topic input + focus textarea — match the editor's other polished fields */
+.set-win input#reTopic,.set-win textarea#reFocus{width:100%;box-sizing:border-box;background:rgba(var(--abyss-0-rgb),.6);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-body);font-size:13px;line-height:1.5;padding:9px 11px;outline:none}
+.set-win textarea#reFocus{min-height:64px;resize:vertical}
+.set-win input#reTopic:focus,.set-win textarea#reFocus:focus{border-color:var(--biolum)}
+.set-win input#reTopic::placeholder,.set-win textarea#reFocus::placeholder{color:var(--faint)}
 /* footer: keep Cancel next to Save (right-grouped), Cancel in red */
 .te-btns{display:flex;gap:9px;align-items:center}
 .te-cancel{border-color:rgba(var(--coral-rgb),.45);color:var(--coral)}

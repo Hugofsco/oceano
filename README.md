@@ -25,9 +25,9 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **64 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
-  tests), media (transcribe · speak · fetch · convert), web search, a real headless browser,
-  HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
+- **81 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+  tests), media (transcribe · speak · fetch · convert), web search, a real headless browser the
+  agent operates (snapshot the page · fill forms · click · extract), HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
   one shot), **a gated SSH keychain** (run command batches on registered servers),
   **multi-account email** (IMAP + SMTP — read, organize, delete spam, send & reply), agent-driven
@@ -125,7 +125,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (64)
+## The agent's tools (81)
 
 | Group | Tools |
 |-------|-------|
@@ -135,11 +135,12 @@ from a web UI or Telegram.
 | **Web / data** | `http_request` (authenticated REST + webhooks + Home Assistant; SSRF-guarded with an opt-in `OCEANO_HTTP_ALLOW` allowlist for local hosts), `rss` (read RSS/Atom feeds), `sql_query` (read-only DuckDB over CSV/TSV/Parquet/JSON) |
 | **UI** (web only) | `ui_open` (pop a window or a file/folder — Preview, Calendar, Files…), `ui_close`, `ui_arrange` (tile · cascade · focus · center · minimize) — the agent drives the floating-window desktop, so it can *show* you what it made, not just describe it |
 | **Web** | `web_search` (SearXNG), `fetch_url` (renders in the live browser) |
-| **Browser** | `browser_open`, `browser_screenshot`, `browser_click`, `browser_scroll` |
+| **Browser** | *navigate/see:* `browser_open`, `browser_snapshot` (numbered map of interactive elements), `browser_read` (page as markdown w/ links), `browser_extract` (data by CSS selector), `browser_screenshot`; *act:* `browser_click` (by `[ref]` or text), `browser_fill` (forms, optional submit), `browser_select` (dropdowns), `browser_press` (Enter/Escape/…), `browser_scroll`, `browser_hover`; *more:* `browser_wait` (for content/load), `browser_eval` (JS · web-UI only), `browser_upload`, `browser_dialog` (accept/dismiss), `browser_tab` (list/new/switch/close) |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget_memory`, `search_chats` (recall past conversations) |
 | **Documents (RAG)** | `index_docs`, `search_docs` |
 | **Skills** | `list_skills`, `load_skill` (one or several), `learn_skill`, `evaluate_skill` (independent review → staging) |
-| **Scheduling** | `schedule_task`, `list_tasks`, `notify` (ntfy push) |
+| **Scheduling** | `schedule_task` (recurring cron **or** a one-off `at` time), `list_tasks`, `update_task` (retime/edit/pause), `cancel_task`, `notify` (ntfy push) |
+| **Self-improvement** | `list_suggestions`, `accept_suggestion` (auto-creates the research topic / workflow draft / memory), `dismiss_suggestion` — the approvable queue nightly reflection fills |
 | **Workflows** | `run_workflow` (one or several), `list_workflows` (trigger saved workflows; authored in the UI) |
 | **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server), `sftp` (list / get / put files — gated; see [Hosts](#hosts--ssh-keychain)) |
 | **Mail (IMAP/SMTP)** | `mail_accounts`, `mail_folders` (counts + which are empty), `mail_list`, `mail_read`, `mail_move`, `mail_delete` (→ Trash), `mail_flag` (read/unread/flag/spam), `mail_send`, `mail_reply` (both can attach workspace files), `mail_save_attachment` (save an incoming attachment to the workspace), `mail_folder` (create/rename/delete) — multi-account, gated; see [Mail](#mail--imap--smtp) |

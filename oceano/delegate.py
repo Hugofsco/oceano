@@ -49,6 +49,10 @@ _KEY_KEY = "oceano_default_api_key"        # api key for that endpoint (empty = 
 _ENABLED_KEY = "delegation_enabled"        # master on/off for delegation (run + delegate tool)
 _CLAUDE_MODEL_KEY = "claude_model"         # which Claude model the CLI uses (alias/id); "" = CLI default
 _CODEX_MODEL_KEY = "codex_model"           # which Codex model the CLI uses (alias/id); "" = CLI default
+_CLAUDE_EFFORT_KEY = "claude_effort"       # Claude `--effort` reasoning level; "" = CLI default
+_CODEX_EFFORT_KEY = "codex_effort"         # Codex model_reasoning_effort; "" = CLI default
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # accepted by `claude --effort`
+CODEX_EFFORTS = ("minimal", "low", "medium", "high")         # codex model_reasoning_effort values
 _RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key",
              "delegation_enabled", "claude_model", "codex_model")
 # Claude models the user can pick for the CLI (mind + delegation). Aliases track the latest of each
@@ -188,10 +192,54 @@ def set_codex_model(model):
     return get_codex_model()
 
 
+def get_claude_effort():
+    """The Claude `--effort` reasoning level (mind + delegation). '' = the CLI's own default."""
+    e = (_raw().get(_CLAUDE_EFFORT_KEY) or "").strip()
+    return e if e in CLAUDE_EFFORTS else ""
+
+
+def set_claude_effort(effort):
+    d = _raw()
+    d[_CLAUDE_EFFORT_KEY] = (effort or "").strip()
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_claude_effort()
+
+
+def get_codex_effort():
+    """Codex's model_reasoning_effort (mind + delegation). '' = the CLI's own default."""
+    e = (_raw().get(_CODEX_EFFORT_KEY) or "").strip()
+    return e if e in CODEX_EFFORTS else ""
+
+
+def set_codex_effort(effort):
+    d = _raw()
+    d[_CODEX_EFFORT_KEY] = (effort or "").strip()
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_codex_effort()
+
+
 def _claude_model_args():
     """`--model <m>` for the claude CLI when the user pinned one, else [] (CLI default)."""
     m = get_claude_model()
     return ["--model", m] if m else []
+
+
+def _claude_effort_args():
+    """`--effort <level>` for the claude CLI when the user pinned one, else [] (CLI default)."""
+    e = get_claude_effort()
+    return ["--effort", e] if e else []
+
+
+def _codex_effort_args():
+    """`-c model_reasoning_effort="<level>"` for the codex CLI when pinned, else [] (CLI default)."""
+    e = get_codex_effort()
+    return ["-c", f'model_reasoning_effort="{e}"'] if e else []
 
 
 def _codex_model_args():
@@ -338,7 +386,7 @@ def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turn
         return {"ok": False, "output": "",
                 "error": "claude CLI not found — install Claude Code, or set OCEANO_CLAUDE_BIN"}
     cmd = [binary, "-p", "--output-format", "text",
-           "--max-turns", str(int(max_turns))] + _claude_model_args()
+           "--max-turns", str(int(max_turns))] + _claude_model_args() + _claude_effort_args()
     if tools:
         cmd += ["--allowedTools", tools]
     try:
@@ -392,7 +440,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
                 "or set OCEANO_CLAUDE_BIN", "partial": False, "turns": 0, "cost": 0.0}
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose",
-           "--max-turns", str(int(max_turns))] + _claude_model_args()
+           "--max-turns", str(int(max_turns))] + _claude_model_args() + _claude_effort_args()
     if tools:
         cmd += ["--allowedTools", tools]
     if append_system:
@@ -444,6 +492,17 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         finally:
             q.put(None)                              # EOF sentinel
     threading.Thread(target=reader, daemon=True).start()
+
+    errbuf = []                                      # drained continuously: a chatty stderr (>64KB) would
+    def errreader():                                 # otherwise fill the OS pipe, block the child's writes,
+        try:                                         # stall its stdout, and trip the idle-timeout on a
+            for line in proc.stderr:                 # perfectly healthy run.
+                errbuf.append(line)
+                if len(errbuf) > 400:                # bounded memory — keep the tail, drop old noise
+                    del errbuf[:200]
+        except Exception:
+            pass
+    threading.Thread(target=errreader, daemon=True).start()
 
     final, is_error, turns, cost, cancelled = "", False, 0, 0.0, False
     started = last_evt = time.monotonic()
@@ -518,7 +577,7 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         err = "the delegate reported an error"
     elif not final:
         try:
-            err = (proc.stderr.read() or "").strip()[:400] or "the delegate returned no output"
+            err = ("".join(errbuf)).strip()[:400] or "the delegate returned no output"
         except Exception:
             err = "the delegate returned no output"
     ok = bool(final) and not is_error and not stalled and not capped
@@ -613,7 +672,7 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     os.close(fd)
     cmd = [binary, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",
            "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{sandbox}"',
-           "-o", out_path] + _codex_model_args()
+           "-o", out_path] + _codex_model_args() + _codex_effort_args()
     for img in (images or []):
         cmd += ["-i", str(img)]
     if cwd:

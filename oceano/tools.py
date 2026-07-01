@@ -6,8 +6,10 @@ work, without roaming the whole disk. Set OCEANO_CONFINE=0 to lift the fence.
 """
 import contextlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -343,6 +345,62 @@ def make_folder(path):
     return f"created folder {p.relative_to(_ws())}"
 
 
+# After this turn read untrusted content (a web page, email, or document), shell/Python execution
+# is blocked — the same anti-exfiltration gate ssh_run/mail_send use — so an instruction injected
+# into that content can't run a command to read secrets (SSH keys, mail passwords) and curl them
+# out. Applies in EVERY channel, including unattended scheduler/Telegram runs where no human is
+# watching — which is exactly where this matters most.
+_SHELL_TAINTED = ("Blocked for safety: this turn already read external content (a web page, email, or "
+                  "document), so running shell/Python is disabled — injected text must not execute "
+                  "commands. Ask the user to send a fresh message to run this.")
+
+
+def _shell_blocked():
+    return _SHELL_TAINTED if (safety.untrusted_seen() or safety.bridge_untrusted_seen()) else None
+
+
+# Defense-in-depth filesystem confinement for the agent's shell (run_shell / python_exec). The
+# daemon needs data/ (mail passwords, SSH keys, the mind token), but the agent's shell never does —
+# so run it in a bubblewrap sandbox that HIDES data/ and the user's own credential stores, makes the
+# rest of the filesystem read-only, keeps the workspace writable, and leaves the network intact. So
+# even a shell call that slips past the taint gate can't read secrets to exfiltrate. The sandbox is
+# probe-gated: if bwrap is absent or unprivileged user namespaces are blocked on the host, we fall
+# back to running the command directly (never break the shell). Force off with OCEANO_SHELL_SANDBOX=0.
+_sandbox_probe = None
+
+
+def _bwrap_base():
+    ws = str(config.WORKSPACE)
+    data = str(config.WORKSPACE.parent / "data")
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+            "--bind", ws, ws, "--tmpfs", data, "--chdir", ws, "--unshare-pid", "--die-with-parent"]
+    home = os.path.expanduser("~")
+    for sub in (".ssh", ".aws", ".gnupg", ".config/gcloud"):     # mask the user's own credential stores too
+        p = os.path.join(home, sub)
+        if os.path.exists(p):
+            args += ["--tmpfs", p]
+    return args
+
+
+def _sandbox_ok():
+    """True if the bwrap sandbox (with our exact bind set) actually works on this host. Probed once."""
+    global _sandbox_probe
+    if _sandbox_probe is None:
+        try:
+            r = subprocess.run(_bwrap_base() + ["--", "true"], capture_output=True, timeout=10)
+            _sandbox_probe = (r.returncode == 0)
+        except Exception:                            # bwrap absent / userns blocked / any setup error
+            _sandbox_probe = False
+    return _sandbox_probe
+
+
+def _sandbox_wrap(inner):
+    """Wrap a command argv in the sandbox when it's available; otherwise return it unchanged."""
+    if os.environ.get("OCEANO_SHELL_SANDBOX", "auto") == "0" or not _sandbox_ok():
+        return inner
+    return _bwrap_base() + ["--", *inner]
+
+
 @tool({
     "type": "function",
     "function": {
@@ -355,11 +413,14 @@ def make_folder(path):
     },
 })
 def run_shell(command):
+    blocked = _shell_blocked()                   # anti-exfiltration: no shell after reading untrusted content
+    if blocked:
+        return blocked
     refusal = safety.check_shell(command)
     if refusal:
         return refusal
     r = subprocess.run(
-        command, shell=True, cwd=str(_ws()),
+        _sandbox_wrap(["bash", "-c", command]), cwd=str(_ws()),   # confined: data/ + home creds hidden
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
@@ -462,11 +523,14 @@ def fetch_url(url):
     },
 })
 def python_exec(code):
+    blocked = _shell_blocked()                   # anti-exfiltration: no Python after reading untrusted content
+    if blocked:
+        return blocked
     refusal = safety.check_python(code)          # parity with run_shell — can't shell out to bypass the guard
     if refusal:
         return refusal
     r = subprocess.run(
-        [sys.executable, "-"], input=code, cwd=str(_ws()),
+        _sandbox_wrap([sys.executable, "-"]), input=code, cwd=str(_ws()),   # same confinement as run_shell
         capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
     )
     out = (r.stdout + r.stderr).strip()
@@ -688,17 +752,20 @@ def browser_screenshot(url, name="screenshot.png"):
     "type": "function",
     "function": {
         "name": "browser_click",
-        "description": "Click an element (link/button) on the CURRENT browser page by its visible "
-                       "text. Use after browser_open/fetch_url to interact with a page step by step.",
+        "description": "Click an element on the CURRENT browser page — by its [ref] number from "
+                       "browser_snapshot (most reliable), or by its visible text. Use after "
+                       "browser_open/fetch_url to interact with a page step by step.",
         "parameters": {"type": "object", "properties": {
-            "text": {"type": "string", "description": "visible text of the link/button to click"}
+            "text": {"type": "string", "description": "a [ref] number from browser_snapshot, or the "
+                                                      "visible text of the link/button to click"}
         }, "required": ["text"]},
     },
 })
 def browser_click(text):
     if not live_browser_available():
         return _BG_BROWSER_NOTE
-    r = livebrowser.click_text(text)
+    t = str(text).strip()
+    r = livebrowser.click_ref(t) if t.isdigit() else livebrowser.click_text(text)
     if not r.get("ok"):
         return f"could not click {text!r}: {r.get('error')}"
     return safety.wrap_untrusted(r.get("url", ""), livebrowser.read_text())
@@ -721,33 +788,436 @@ def browser_scroll(amount=600):
     return f"scrolled {amount}px"
 
 
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_snapshot",
+        "description": "Map the interactive elements on the CURRENT browser page — links, buttons, "
+                       "inputs, textareas, dropdowns — each with a numbered [ref]. Use the [ref] with "
+                       "browser_click / browser_fill / browser_select to act on an element RELIABLY "
+                       "(instead of guessing text). Re-run it after the page changes — refs go stale "
+                       "on navigation.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+})
+def browser_snapshot():
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    items = (livebrowser.snapshot() or {}).get("items") or []
+    if not items:
+        return "(no interactive elements found — load a page first with browser_open/fetch_url)"
+    lines = []
+    for it in items:
+        parts = [f"[{it['ref']}]", it.get("role", "")]
+        if it.get("label"):
+            parts.append(f'"{it["label"]}"')
+        if it.get("type"):
+            parts.append(f'({it["type"]})')
+        if it.get("value"):
+            parts.append(f'= {it["value"]!r}')
+        if it.get("href"):
+            parts.append(f'→ {it["href"]}')
+        if it.get("options"):
+            parts.append("options: " + ", ".join(it["options"]))
+        lines.append(" ".join(str(p) for p in parts if p))
+    return safety.wrap_untrusted(livebrowser.LATEST.get("url", ""), "\n".join(lines))
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_fill",
+        "description": "Type text into a form field on the current page (search box, login, etc.). "
+                       "Target the field by its [ref] from browser_snapshot (most reliable) or by its "
+                       "label/placeholder text. Set enter=true to press Enter after — e.g. to run a "
+                       "search or submit a form.",
+        "parameters": {"type": "object", "properties": {
+            "field": {"type": "string", "description": "a [ref] number from browser_snapshot, or the field's label/placeholder"},
+            "text": {"type": "string", "description": "the text to type into the field"},
+            "enter": {"type": "boolean", "description": "press Enter after filling (submit)"},
+        }, "required": ["field", "text"]},
+    },
+})
+def browser_fill(field, text, enter=False):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.fill(field, text, enter=enter)
+    if not r.get("ok"):
+        return f"could not fill {field!r}: {r.get('error')}"
+    if enter:                                        # submitted → show the resulting page
+        return safety.wrap_untrusted(r.get("url", ""), livebrowser.read_text())
+    return f"filled {field!r}" + (f" — at {r.get('url')}" if r.get("url") else "")
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_select",
+        "description": "Choose an option in a dropdown (<select>) on the current page. Target the "
+                       "dropdown by its [ref] from browser_snapshot or by label; `option` is the "
+                       "visible option text.",
+        "parameters": {"type": "object", "properties": {
+            "field": {"type": "string", "description": "a [ref] number from browser_snapshot, or the dropdown's label"},
+            "option": {"type": "string", "description": "the visible text of the option to choose"},
+        }, "required": ["field", "option"]},
+    },
+})
+def browser_select(field, option):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.select(field, option)
+    if not r.get("ok"):
+        return f"could not select {option!r} in {field!r}: {r.get('error')}"
+    return f"selected {option!r} in {field!r}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_press",
+        "description": "Press a keyboard key on the current page — 'Enter' to submit, 'Escape' to "
+                       "dismiss, 'Tab' to move between fields, 'PageDown', etc. (To type text into a "
+                       "field, use browser_fill.)",
+        "parameters": {"type": "object", "properties": {
+            "key": {"type": "string", "description": "the key to press, e.g. Enter, Escape, Tab, PageDown"},
+        }, "required": ["key"]},
+    },
+})
+def browser_press(key):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.press(key)
+    if not r.get("ok"):
+        return f"could not press {key!r}: {r.get('error')}"
+    if str(key).lower() in ("enter", "return"):      # likely submitted/navigated → show the page
+        return safety.wrap_untrusted(r.get("url", ""), livebrowser.read_text())
+    return f"pressed {key}" + (f" — at {r.get('url')}" if r.get("url") else "")
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_wait",
+        "description": "Wait for the current page to be ready before acting — for JS/SPA pages that "
+                       "load content after navigation. mode='text' waits for visible text to appear, "
+                       "'selector' for a CSS selector, 'load' for the page to settle (networkidle), "
+                       "'time' for a fixed pause. Times out (default 8s) and reports if not ready.",
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "description": "text | selector | load | time"},
+            "value": {"type": "string", "description": "the text or CSS selector to wait for (mode text/selector)"},
+            "timeout_ms": {"type": "integer", "description": "max wait in ms, default 8000 (cap 25000)"},
+        }},
+    },
+})
+def browser_wait(mode="text", value="", timeout_ms=8000):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.wait_for(mode, value, int(timeout_ms))
+    return "ready" if r.get("ok") else f"still not ready ({mode} {value!r}) — {r.get('error')}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_extract",
+        "description": "Pull structured data from the current page by CSS selector — returns each "
+                       "matching element's text, or a given attribute (e.g. href). Use for "
+                       "lists/tables/search results instead of reading the whole page. Examples: "
+                       "selector='h3' ; selector='a.result' attr='href' ; selector='table tr td'.",
+        "parameters": {"type": "object", "properties": {
+            "selector": {"type": "string", "description": "a CSS selector"},
+            "attr": {"type": "string", "description": "optional attribute to return instead of text (e.g. href, src)"},
+            "limit": {"type": "integer", "description": "max matches to return, default 30 (cap 100)"},
+        }, "required": ["selector"]},
+    },
+})
+def browser_extract(selector, attr=None, limit=30):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.extract(selector, attr=attr, limit=int(limit))
+    if not r.get("ok"):
+        return f"could not extract {selector!r}: {r.get('error')}"
+    results = r.get("results") or []
+    if not results:
+        return f"(no elements matched {selector!r})"
+    return safety.wrap_untrusted(livebrowser.LATEST.get("url", ""), "\n".join(f"- {x}" for x in results))
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_read",
+        "description": "Read the CURRENT browser page as clean markdown — headings marked, links "
+                       "inlined as 'text <url>', scripts/boilerplate stripped. Better than a raw text "
+                       "dump when you need the page's structure and link targets after clicking or "
+                       "navigating (fetch_url is still best for opening a fresh URL).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+})
+def browser_read():
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.read_markdown()
+    return safety.wrap_untrusted(livebrowser.LATEST.get("url", ""), r.get("text") or "(empty page)")
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_eval",
+        "description": "Run JavaScript in the CURRENT page and return its result — a power tool for "
+                       "reading or manipulating anything the other browser tools can't. Return a value "
+                       "from the JS to get it back, e.g. 'document.title' or '[...document.images].map("
+                       "i=>i.src)'. WEB-UI ONLY — blocked in background/scheduled runs.",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "JavaScript expression/function to evaluate in the page"},
+        }, "required": ["code"]},
+    },
+})
+def browser_eval(code):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE      # inherently web-only → no arbitrary JS in unattended runs
+    r = livebrowser.evaluate_js(code)
+    if not r.get("ok"):
+        return f"eval error: {r.get('error')}"
+    try:
+        s = json.dumps(r.get("result"), default=str, ensure_ascii=False)
+    except Exception:
+        s = str(r.get("result"))
+    return safety.wrap_untrusted(livebrowser.LATEST.get("url", ""), s[:4000])
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_hover",
+        "description": "Hover the mouse over an element to reveal a dropdown menu, tooltip, or hidden "
+                       "controls. Target by [ref] from browser_snapshot or by visible text.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "a [ref] number from browser_snapshot, or visible text"},
+        }, "required": ["target"]},
+    },
+})
+def browser_hover(target):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    r = livebrowser.hover(target)
+    return f"hovered {target!r}" if r.get("ok") else f"could not hover {target!r}: {r.get('error')}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_upload",
+        "description": "Upload a workspace file to a file-input on the current page. Target the file "
+                       "input by [ref] from browser_snapshot or by label; `path` is a workspace file path.",
+        "parameters": {"type": "object", "properties": {
+            "field": {"type": "string", "description": "a [ref] number from browser_snapshot, or the input's label"},
+            "path": {"type": "string", "description": "workspace path of the file to upload"},
+        }, "required": ["field", "path"]},
+    },
+})
+def browser_upload(field, path):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    try:
+        p = _resolve(path)
+    except Exception as e:                           # noqa: BLE001 - path confinement refusal
+        return f"(refused: {e})"
+    if not p.is_file():
+        return f"(no such file in the workspace: {path})"
+    r = livebrowser.upload(field, [str(p)])
+    return f"uploaded {p.name} to {field!r}" if r.get("ok") else f"could not upload: {r.get('error')}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_dialog",
+        "description": "Set how the page's JavaScript dialogs (alert/confirm/prompt) are handled from "
+                       "now on: 'accept' to accept them (e.g. to confirm an action before the click "
+                       "that triggers it), or 'dismiss' to cancel (the default). For a prompt, `text` "
+                       "is the answer submitted.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "accept | dismiss"},
+            "text": {"type": "string", "description": "answer for a prompt dialog (when accepting)"},
+        }, "required": ["action"]},
+    },
+})
+def browser_dialog(action, text=""):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    livebrowser.dialog(action, text)
+    return "dialogs will be accepted" if action == "accept" else "dialogs will be dismissed"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "browser_tab",
+        "description": "Manage browser tabs: action='list' shows the open tabs with their ids, 'new' "
+                       "opens a blank tab, 'switch' (with id) focuses a tab, 'close' (with id) closes "
+                       "one. Tab ids come from 'list'.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "list | new | switch | close"},
+            "id": {"type": "integer", "description": "tab id (for switch/close), from action=list"},
+        }, "required": ["action"]},
+    },
+})
+def browser_tab(action, id=None):
+    if not live_browser_available():
+        return _BG_BROWSER_NOTE
+    action = (action or "list").lower()
+    if action == "list":
+        tabs = livebrowser.LATEST.get("tabs") or []
+        if not tabs:
+            return "(no tabs)"
+        return "\n".join(f"[{t['id']}]{' *' if t.get('active') else ''} {t.get('title', '')} — {t.get('url', '')}"
+                         for t in tabs)
+    if action == "new":
+        livebrowser.submit("new_tab")
+        return "opened a new tab"
+    if action in ("switch", "close"):
+        if id is None:
+            return f"{action} needs a tab id (from browser_tab list)"
+        livebrowser.submit("switch_tab" if action == "switch" else "close_tab", int(id))
+        return f"{'switched to' if action == 'switch' else 'closed'} tab {id}"
+    return "action must be one of: list, new, switch, close"
+
+
 # --- scheduled tasks + notifications ---------------------------------------
 @tool({
     "type": "function",
     "function": {
         "name": "schedule_task",
-        "description": "Schedule an instruction to run automatically on a cron schedule. "
-                       "Example cron: '0 8 * * *' = every day at 08:00.",
+        "description": "Schedule an instruction to run automatically — either REPEATING on a cron "
+                       "schedule, or ONCE at a specific date/time. For recurring, pass `cron` (e.g. "
+                       "'0 8 * * *' = every day at 08:00). For a one-off (\"remind me at 3pm "
+                       "tomorrow\"), pass `at` as a local date/time like '2026-07-01 15:00' and leave "
+                       "cron empty; it fires once then disables itself. Times are host-local.",
         "parameters": {"type": "object", "properties": {
-            "cron": {"type": "string"},
             "instruction": {"type": "string"},
-        }, "required": ["cron", "instruction"]},
+            "cron": {"type": "string", "description": "5-field cron for a REPEATING task"},
+            "at": {"type": "string", "description": "local date/time for a ONE-OFF task, e.g. '2026-07-01 15:00'"},
+        }, "required": ["instruction"]},
     },
 })
-def schedule_task(cron, instruction):
-    return scheduler.schedule_task(cron, instruction)
+def schedule_task(instruction, cron="", at=""):
+    return scheduler.schedule_task(cron, instruction, run_once_at=(at or None))
 
 
 @tool({
     "type": "function",
     "function": {
         "name": "list_tasks",
-        "description": "List the user's scheduled tasks.",
+        "description": "List the user's scheduled tasks, each shown as '#id [cron] on/off: instruction' "
+                       "(one-offs show 'once @ <time>'; a failed last run is flagged). Use the id with "
+                       "update_task / cancel_task.",
         "parameters": {"type": "object", "properties": {}},
     },
 })
 def list_tasks():
     return scheduler.list_tasks()
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "update_task",
+        "description": "Edit an existing scheduled task by its id (from list_tasks). Pass only the "
+                       "fields you want to change: a new cron schedule, a new instruction, or "
+                       "enabled (false to PAUSE the task without deleting it, true to resume).",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the task id shown by list_tasks"},
+            "cron": {"type": "string", "description": "new cron expression, e.g. '0 8 * * *'"},
+            "instruction": {"type": "string", "description": "new instruction text"},
+            "enabled": {"type": "boolean", "description": "false pauses the task, true resumes it"},
+        }, "required": ["id"]},
+    },
+})
+def update_task(id, cron=None, instruction=None, enabled=None):
+    ok = scheduler.update_task(int(id), cron=cron, instruction=instruction, enabled=enabled)
+    if not ok:
+        return f"could not update task #{id} (no such task, or invalid cron expression)"
+    return f"updated task #{id}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "cancel_task",
+        "description": "Delete a scheduled task by its id (from list_tasks) so it stops running. "
+                       "To pause a task but keep it, use update_task with enabled=false instead. "
+                       "(Built-in maintenance jobs come back on the next restart — pause those rather "
+                       "than cancelling.)",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the task id shown by list_tasks"},
+        }, "required": ["id"]},
+    },
+})
+def cancel_task(id):
+    tid = int(id)
+    if tid not in {t["id"] for t in scheduler.all_tasks()}:
+        return f"no task #{tid} — use list_tasks to see the current ids"
+    scheduler.delete_task(tid)
+    return f"cancelled task #{tid}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "list_suggestions",
+        "description": "List Oceano's self-improvement suggestions — proposals nightly reflection filed for "
+                       "the user to approve. Each shows '#id [kind] status: title'. Defaults to pending; "
+                       "pass status='all' for every status. Accept one with accept_suggestion.",
+        "parameters": {"type": "object", "properties": {
+            "status": {"type": "string", "description": "pending (default), accepted, dismissed, done, or all"},
+        }},
+    },
+})
+def list_suggestions(status="pending"):
+    from oceano import suggestions
+    items = suggestions.all_suggestions(status=(status or "pending"))
+    if not items:
+        return "(no suggestions)"
+    return "\n".join(f"#{s['id']} [{s['kind']}] {s['status']}: {s['title']}"
+                     + (f" — {s['detail']}" if s['detail'] else "") for s in items)
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "accept_suggestion",
+        "description": "Accept a pending suggestion by id (from list_suggestions) and ACT on it: a "
+                       "'research' suggestion creates a scheduled research topic, 'workflow' a workflow "
+                       "draft, 'memory' a saved memory; other kinds are marked for manual follow-up. "
+                       "This changes Oceano's setup, so do it when the user approves.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the suggestion id shown by list_suggestions"},
+        }, "required": ["id"]},
+    },
+})
+def accept_suggestion(id):
+    from oceano import suggestions
+    r = suggestions.accept(int(id))
+    return r.get("result") if r.get("ok") else f"could not accept #{id}: {r.get('error')}"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "dismiss_suggestion",
+        "description": "Dismiss a self-improvement suggestion by id (from list_suggestions) so it's no "
+                       "longer pending.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "the suggestion id shown by list_suggestions"},
+        }, "required": ["id"]},
+    },
+})
+def dismiss_suggestion(id):
+    from oceano import suggestions
+    r = suggestions.dismiss(int(id))
+    return f"dismissed suggestion #{id}" if r.get("ok") else f"could not dismiss #{id}: {r.get('error')}"
 
 
 def _run_one_workflow(name, inp=""):

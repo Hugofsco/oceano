@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # libsndfile is needed by soundfile; ffmpeg by the voice/media tools.
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libsndfile1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Real-bug subset only (see ruff.toml) — fails on syntax/undefined-name errors.
+      - name: Lint
+        run: ruff check .
+
+      # Import-health + tool-surface consistency. Fast, no LLM/network/daemon.
+      - name: Smoke tests
+        run: pytest tests/ -v -rs

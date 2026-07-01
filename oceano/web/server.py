@@ -859,11 +859,18 @@ _TOOL_CATEGORY = {
     "web_search": "web", "fetch_url": "web",
     "browser_open": "browser", "browser_screenshot": "browser",
     "browser_click": "browser", "browser_scroll": "browser",
+    "browser_snapshot": "browser", "browser_fill": "browser",
+    "browser_select": "browser", "browser_press": "browser",
+    "browser_wait": "browser", "browser_extract": "browser", "browser_read": "browser",
+    "browser_eval": "browser", "browser_hover": "browser", "browser_upload": "browser",
+    "browser_dialog": "browser", "browser_tab": "browser",
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
     "index_docs": "documents", "search_docs": "documents", "search_chats": "memory",
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills", "evaluate_skill": "skills",
     "delegate": "delegate", "delegate_to_claude": "delegate",
     "schedule_task": "scheduler", "list_tasks": "scheduler", "notify": "scheduler",
+    "update_task": "scheduler", "cancel_task": "scheduler",
+    "list_suggestions": "evolve", "accept_suggestion": "evolve", "dismiss_suggestion": "evolve",
     "run_workflow": "workflow", "list_workflows": "workflow",
     "calendar_events": "calendar", "add_calendar_event": "calendar",
     "update_calendar_event": "calendar", "delete_calendar_event": "calendar",
@@ -873,6 +880,10 @@ _TOOL_CATEGORY = {
     "git": "dev", "code_search": "dev", "run_tests": "dev",
     "http_request": "web", "rss": "web", "sql_query": "data",
     "ui_open": "ui", "ui_close": "ui", "ui_arrange": "ui",
+    "mail_accounts": "mail", "mail_folders": "mail", "mail_list": "mail", "mail_read": "mail",
+    "mail_move": "mail", "mail_delete": "mail", "mail_flag": "mail", "mail_send": "mail",
+    "mail_reply": "mail", "mail_folder": "mail", "mail_save_attachment": "mail",
+    "list_hosts": "servers", "ssh_run": "servers", "sftp": "servers",
 }
 
 
@@ -979,6 +990,34 @@ async def codex_model_set(req: Request):
     return {"ok": True, "model": delegate.set_codex_model(model)}
 
 
+@app.get("/api/claude-effort")
+def claude_effort_get():
+    """The Claude reasoning-effort level (Claude mind + Claude-Code delegation). '' = CLI default."""
+    from oceano import delegate
+    return {"effort": delegate.get_claude_effort(), "options": list(delegate.CLAUDE_EFFORTS),
+            "available": delegate.available()}
+
+
+@app.post("/api/claude-effort")
+async def claude_effort_set(req: Request):
+    from oceano import delegate
+    return {"ok": True, "effort": delegate.set_claude_effort((await req.json()).get("effort", ""))}
+
+
+@app.get("/api/codex-effort")
+def codex_effort_get():
+    """The Codex reasoning-effort level for the resident Codex mind + delegation. '' = CLI default."""
+    from oceano import delegate
+    return {"effort": delegate.get_codex_effort(), "options": list(delegate.CODEX_EFFORTS),
+            "available": delegate.codex_available()}
+
+
+@app.post("/api/codex-effort")
+async def codex_effort_set(req: Request):
+    from oceano import delegate
+    return {"ok": True, "effort": delegate.set_codex_effort((await req.json()).get("effort", ""))}
+
+
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
 #     (mindbridge.token()), localhost; exempt from the session middleware above. The token rides in a
 #     header (never the URL/body, so it can't leak into access logs) and is compared constant-time. ---
@@ -1080,7 +1119,7 @@ async def set_default_model_api(req: Request):
 async def set_delegation_enabled(req: Request):
     """Master delegation switch. Off → run() refuses (background jobs + the tool) and the
     delegate tool is withheld from the agent. (Also toggleable per-tool under Settings → Tools.)"""
-    from oceano import delegate
+    from oceano import delegate, tools
     b = await req.json()
     on = bool(b.get("enabled", True))
     delegate.set_enabled(on)
@@ -2550,6 +2589,20 @@ async def browser_key_ep(req: Request):
     return {"ok": True}
 
 
+@app.post("/api/browser/paste")
+async def browser_paste_ep(req: Request):
+    """Insert the user's local clipboard text into the page's focused field (clipboard bridge in)."""
+    livebrowser.submit("paste", (await req.json()).get("text", ""))
+    return {"ok": True}
+
+
+@app.post("/api/browser/copy")
+async def browser_copy_ep():
+    """Return the page's current text selection so the client can put it on the local clipboard (out)."""
+    res = livebrowser.submit("copy", wait=True)
+    return {"ok": True, "text": (res or {}).get("text", "")}
+
+
 @app.post("/api/browser/tab")
 async def browser_tab_switch(req: Request):
     livebrowser.submit("switch_tab", (await req.json()).get("id"))
@@ -2560,6 +2613,67 @@ async def browser_tab_switch(req: Request):
 async def browser_tab_close(req: Request):
     livebrowser.submit("close_tab", (await req.json()).get("id"))
     return {"ok": True}
+
+
+@app.post("/api/browser/back")
+async def browser_back_ep():
+    livebrowser.submit("back")
+    return {"ok": True}
+
+
+@app.post("/api/browser/forward")
+async def browser_forward_ep():
+    livebrowser.submit("forward")
+    return {"ok": True}
+
+
+@app.post("/api/browser/reload")
+async def browser_reload_ep():
+    livebrowser.submit("reload")
+    return {"ok": True}
+
+
+@app.post("/api/browser/stop")
+async def browser_stop_ep():
+    livebrowser.submit("stop")
+    return {"ok": True}
+
+
+@app.post("/api/browser/newtab")
+async def browser_newtab_ep():
+    livebrowser.submit("new_tab")
+    return {"ok": True}
+
+
+@app.post("/api/browser/resize")
+async def browser_resize_ep(req: Request):
+    """Match the browser viewport to the LIVE window size (responsive layout, no letterbox)."""
+    b = await req.json()
+    try:
+        livebrowser.submit("resize", (int(b["width"]), int(b["height"])))
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "width,height required"}
+    return {"ok": True}
+
+
+@app.get("/api/browser/settings")
+def get_browser_settings():
+    return {"real_chrome": bool(load().get("prefs", {}).get("real_chrome"))}
+
+
+@app.post("/api/browser/settings")
+async def set_browser_settings(req: Request):
+    """Toggle whether the live browser drives a real, persistent Chrome vs the throwaway headless
+    Chromium. Restarts the browser worker so the new mode takes effect on the next action."""
+    b = await req.json()
+    data = load()
+    data.setdefault("prefs", {})["real_chrome"] = bool(b.get("real_chrome"))
+    save(data)
+    try:
+        livebrowser.shutdown()      # drop the current browser; next navigation relaunches in the new mode
+    except Exception:
+        pass
+    return {"ok": True, "real_chrome": data["prefs"]["real_chrome"]}
 
 
 # ---------------- scheduler ----------------
@@ -3088,7 +3202,8 @@ def get_research():
 @app.post("/api/research")
 async def add_research(req: Request):
     b = await req.json()
-    rid = researcher.add_topic(b.get("topic", ""), b.get("focus", ""), b.get("cron", "0 8 * * *"))
+    rid = researcher.add_topic(b.get("topic", ""), b.get("focus", ""), b.get("cron", "0 8 * * *"),
+                               b.get("model", ""), b.get("base_url", ""))
     return {"ok": rid is not None, "id": rid,
             **({} if rid is not None else {"error": "topic and a valid cron are required"})}
 
@@ -3096,7 +3211,8 @@ async def add_research(req: Request):
 @app.patch("/api/research/{rid}")
 async def update_research(rid: int, req: Request):
     b = await req.json()
-    ok = researcher.update_topic(rid, b.get("topic"), b.get("focus"), b.get("cron"), b.get("enabled"))
+    ok = researcher.update_topic(rid, b.get("topic"), b.get("focus"), b.get("cron"), b.get("enabled"),
+                                 b.get("model"), b.get("base_url"))
     return {"ok": ok}
 
 
@@ -3135,6 +3251,45 @@ async def browser_stream():
             await asyncio.sleep(0.1)     # ~10 fps relay
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@app.websocket("/api/browser/ws")
+async def browser_ws(ws: WebSocket):
+    """Live browser frames over a WebSocket: BINARY JPEG frames + TEXT metadata (url/tabs). The
+    client renders frames via createImageBitmap→canvas — far lighter than the SSE+base64 data-URL
+    fallback. Auth-gated here (the HTTP _require_auth middleware doesn't cover WS handshakes):
+    same-origin (anti-CSWSH) + a valid session cookie, matching /api/terminal/ws."""
+    host = ws.headers.get("host", "")
+    origin = ws.headers.get("origin", "")
+    if not host or origin not in (f"http://{host}", f"https://{host}"):
+        await ws.close(code=1008)
+        return
+    if not _token_user(ws.cookies.get(SESSION_COOKIE, ""), load().get("auth", {})):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    from starlette.websockets import WebSocketDisconnect
+    last_v, last_tabs = -1, None
+    try:
+        while True:
+            L = livebrowser.LATEST
+            if L["v"] != last_v and L["frame"]:
+                last_v = L["v"]
+                await ws.send_bytes(L["frame"])               # raw JPEG — no base64 inflation
+            tabs = L.get("tabs", [])
+            tabs_sig = json.dumps([[t["id"], t["url"], t["active"], t["title"]] for t in tabs])
+            if tabs_sig != last_tabs:
+                last_tabs = tabs_sig
+                await ws.send_text(json.dumps({"url": L["url"], "tabs": tabs}))
+            await asyncio.sleep(0.03)                          # ~30fps poll of LATEST
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    try:
+        await ws.close()
+    except Exception:
+        pass
 
 
 @app.get("/api/ui/stream")

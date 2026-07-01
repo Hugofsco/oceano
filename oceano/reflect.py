@@ -9,6 +9,8 @@ A locked scheduler entry (source `self:reflect`) — schedulable + toggleable in
 not editable/removable there. The local model never judges its own behaviour: reflection runs on
 the configured 'improve' delegate, same as skill review and memory maintenance.
 """
+import json
+import re
 from datetime import datetime
 
 import config
@@ -71,10 +73,32 @@ Write a SHORT reflection in markdown (~150-300 words) with exactly these section
 - **Next steps** — 2-4 CONCRETE, actionable proposals (a research topic to add, a skill worth learning,
   a workflow to build, a setting to change). Be specific — no vague aspirations.
 
-Output ONLY the markdown reflection, no preamble.
+After the markdown, output the SAME next-step proposals once more as a single fenced ```json block so
+they can be queued for the user to approve:
+```json
+{{"proposals": [{{"kind": "research|workflow|memory|skill|setting|other", "title": "<short imperative>", "detail": "<specifics>"}}]}}
+```
+Use kind="research" for a topic to investigate on a schedule, "workflow" for a multi-step recipe to
+build, "memory" for a durable fact to remember, and "skill"/"setting"/"other" otherwise.
+
+Output the markdown reflection, then the json block — nothing else.
 
 DIGEST:
 {digest}"""
+
+
+def _extract_proposals(text):
+    """Split the reflection into (clean_markdown, [proposal dicts]) by pulling out the fenced json
+    block. Tolerant: if there's no block or it won't parse, returns the text unchanged and []."""
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not m:
+        return text, []
+    try:
+        proposals = json.loads(m.group(1)).get("proposals") or []
+    except Exception:                                # noqa: BLE001 - malformed block → just skip proposals
+        return text, []
+    clean = (text[:m.start()] + text[m.end():]).strip()
+    return clean, [p for p in proposals if isinstance(p, dict) and (p.get("title") or "").strip()]
 
 
 def reflect():
@@ -92,13 +116,22 @@ def reflect():
         body = (r.get("output") or "").strip()
         if not body:
             return "reflection produced nothing"
+        body, proposals = _extract_proposals(body)       # peel the structured proposals off the prose
         day = datetime.now().strftime("%Y-%m-%d")        # local day, matches the chat folders
         JOURNAL.mkdir(parents=True, exist_ok=True)
         path = JOURNAL / f"{day}.md"
         prior = path.read_text(encoding="utf-8") if path.exists() else ""
         head = prior + "\n\n---\n\n" if prior else f"# Reflection — {day}\n\n"
         atomicio.write_text(path, (head + body).strip() + "\n")
-        return f"📓 Reflection journaled → workspace/journal/{day}.md\n\n{body}"
+        queued = 0                                       # file the proposals as approvable suggestions
+        if proposals:
+            from oceano import suggestions
+            for p in proposals[:8]:
+                if suggestions.add(p.get("kind", "other"), p.get("title", ""), p.get("detail", ""), source=SOURCE):
+                    queued += 1
+        tail = (f"\n\n💡 {queued} suggestion(s) queued — review with list_suggestions, then "
+                f"accept_suggestion / dismiss_suggestion.") if queued else ""
+        return f"📓 Reflection journaled → workspace/journal/{day}.md{tail}\n\n{body}"
 
 
 def ensure_task():

@@ -88,32 +88,38 @@ async def embed_supervisor(stop):
     global _embed_proc
     backoff = 2
     while not stop.is_set():
-        proc = await asyncio.create_subprocess_exec("bash", str(EMBED_SCRIPT))
-        _embed_proc = proc
-        log(f"[embed] embedding server up (pid {proc.pid})")
+        try:
+            proc = await asyncio.create_subprocess_exec("bash", str(EMBED_SCRIPT))
+            _embed_proc = proc
+            started = asyncio.get_running_loop().time()
+            log(f"[embed] embedding server up (pid {proc.pid})")
 
-        # Wait for the child to exit OR a shutdown request, whichever comes first.
-        waiter = asyncio.ensure_future(proc.wait())
-        stopper = asyncio.ensure_future(stop.wait())
-        await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            # Wait for the child to exit OR a shutdown request, whichever comes first.
+            waiter = asyncio.ensure_future(proc.wait())
+            stopper = asyncio.ensure_future(stop.wait())
+            await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
 
-        if stop.is_set():
-            if proc.returncode is None:        # shutting down → take the child with us
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            for f in (waiter, stopper):
-                f.cancel()
-            log("[embed] embedding server stopped")
-            return
+            if stop.is_set():
+                if proc.returncode is None:        # shutting down → take the child with us
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                for f in (waiter, stopper):
+                    f.cancel()
+                log("[embed] embedding server stopped")
+                return
 
-        stopper.cancel()                       # child died on its own → restart it
-        log(f"[embed] exited (rc={proc.returncode}); restarting in {backoff}s")
+            stopper.cancel()                       # child died on its own → restart it
+            if asyncio.get_running_loop().time() - started >= 60:
+                backoff = 2                        # stayed up a while → not a crash-loop, reset
+            log(f"[embed] exited (rc={proc.returncode}); restarting in {backoff}s")
+        except Exception as e:                     # spawn/supervise error → never let the supervisor die
+            log(f"[embed] supervisor error: {e!r}; retrying in {backoff}s")
         await _sleep_or_stop(stop, backoff)
-        backoff = min(backoff * 2, 30)         # back off on a crash-loop, cap at 30s
+        backoff = min(backoff * 2, 30)             # back off on a crash-loop, cap at 30s
 
 
 async def rerank_supervisor(stop):
@@ -133,29 +139,35 @@ async def rerank_supervisor(stop):
     global _rerank_proc
     backoff = 2
     while not stop.is_set():
-        proc = await asyncio.create_subprocess_exec("bash", str(RERANK_SCRIPT))
-        _rerank_proc = proc
-        log(f"[rerank] reranker server up (pid {proc.pid})")
+        try:
+            proc = await asyncio.create_subprocess_exec("bash", str(RERANK_SCRIPT))
+            _rerank_proc = proc
+            started = asyncio.get_running_loop().time()
+            log(f"[rerank] reranker server up (pid {proc.pid})")
 
-        waiter = asyncio.ensure_future(proc.wait())
-        stopper = asyncio.ensure_future(stop.wait())
-        await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            waiter = asyncio.ensure_future(proc.wait())
+            stopper = asyncio.ensure_future(stop.wait())
+            await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
 
-        if stop.is_set():
-            if proc.returncode is None:            # shutting down → take the child with us
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            for f in (waiter, stopper):
-                f.cancel()
-            log("[rerank] reranker server stopped")
-            return
+            if stop.is_set():
+                if proc.returncode is None:            # shutting down → take the child with us
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                for f in (waiter, stopper):
+                    f.cancel()
+                log("[rerank] reranker server stopped")
+                return
 
-        stopper.cancel()                           # child died on its own → restart it
-        log(f"[rerank] exited (rc={proc.returncode}); restarting in {backoff}s")
+            stopper.cancel()                           # child died on its own → restart it
+            if asyncio.get_running_loop().time() - started >= 60:
+                backoff = 2                            # stayed up a while → not a crash-loop, reset
+            log(f"[rerank] exited (rc={proc.returncode}); restarting in {backoff}s")
+        except Exception as e:                         # spawn/supervise error → never let the supervisor die
+            log(f"[rerank] supervisor error: {e!r}; retrying in {backoff}s")
         await _sleep_or_stop(stop, backoff)
         backoff = min(backoff * 2, 30)
 
