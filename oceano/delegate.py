@@ -734,7 +734,8 @@ def _api_only_tools(tools_spec):
     return names
 
 
-def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600, on_progress=None):
+def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600, on_progress=None,
+           exclude=None):
     """Delegate to the configured cloud model by running it through OUR agent loop — the
     SAME machinery local models use. `tools` (a Claude-CLI-style spec) is translated to
     the equivalent local tools and enforced, and `timeout` puts a wall-clock deadline on
@@ -763,9 +764,10 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         from oceano import tools as _tools
         # learn=False + inject_context=False: a delegate gets a self-contained task, not the
         # user's persona/memories; exclude the delegate tool (both names) so it can't delegate
-        # to itself in an infinite loop.
+        # to itself in an infinite loop. `exclude` widens that set (agentjobs adds spawn_agent
+        # and run_workflow, so a spawned agent can't fan out further).
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
-                   inject_context=False, exclude_tools={"delegate", "delegate_to_claude"},
+                   inject_context=False, exclude_tools=(exclude or {"delegate", "delegate_to_claude"}),
                    only_tools=_api_only_tools(tools), on_event=_on_ev)
         deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()
