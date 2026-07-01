@@ -1367,6 +1367,11 @@ const SETTINGS_PAGES = {
       <label class="set-toggle"><input type="checkbox" id="serializeChatToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Queue chat messages too <span class="st-note">— a chat turn also waits behind running work (share the gate; enable the option above for full serialization)</span></span></label>
     </div>
     <div class="drawer-section">
+      <h3>Live browser</h3>
+      <p class="sub">Drive a <b>real, persistent Google Chrome</b> instead of the throwaway headless one — a genuine fingerprint, and your logins &amp; extensions persist across runs (sign in to a site once in the Live browser and it's remembered). It's still viewed through the Live browser window. Needs Google Chrome installed on the host.</p>
+      <label class="set-toggle"><input type="checkbox" id="realChromeToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Drive a real, persistent Chrome <span class="st-note">— toggling restarts the browser; the current session drops</span></span></label>
+    </div>
+    <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
       <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
       <div class="chat-tools">
@@ -1548,7 +1553,7 @@ async function wipeTarget(key) {
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadBrowserSetting(); loadVoiceSettings(); }
 async function loadClaudeModel() {
   const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
   let d; try { d = await api("/api/claude-model"); } catch { return; }
@@ -1737,6 +1742,14 @@ async function loadJobsSetting() {
   if (tc) tc.checked = !!d.serialize_chat;
   t.onchange = () => _postJ("/api/jobs/serialize", { enabled: t.checked }).then(r => toast(r.serialize ? "Background jobs will queue" : "Background jobs run in parallel", "info")).catch(() => {});
   if (tc) tc.onchange = () => _postJ("/api/jobs/serialize", { chat: tc.checked }).then(r => toast(r.serialize_chat ? "Chat messages will queue" : "Chat messages run immediately", "info")).catch(() => {});
+}
+async function loadBrowserSetting() {
+  const t = $("#realChromeToggle"); if (!t) return;
+  let d; try { d = await api("/api/browser/settings"); } catch { return; }
+  t.checked = !!d.real_chrome;
+  t.onchange = () => _postJ("/api/browser/settings", { real_chrome: t.checked })
+    .then(r => toast(r.real_chrome ? "Live browser will use a real, persistent Chrome (restarting)" : "Live browser back to headless Chromium (restarting)", "info"))
+    .catch(() => {});
 }
 
 const POLICY_OPTS = [["always", "Always inject"], ["relevant", "When relevant"], ["off", "Off"]];
@@ -2182,7 +2195,7 @@ function hideCtx() { const m = $("#ctxMenu"); if (m) m.remove(); }
 document.addEventListener("click", hideCtx);
 
 /* ---------- live browser window (interactive — you + the agent share it) ---------- */
-let _liveES = null, _liveWS = null;
+let _liveES = null, _liveWS = null, _liveRO = null;
 function _mapToPage(img, clientX, clientY) {           // displayed frame coords → page coords (handles letterbox)
   const r = img.getBoundingClientRect();
   const nW = img.naturalWidth || 1280, nH = img.naturalHeight || 800;
@@ -2196,7 +2209,7 @@ function _mapToPage(img, clientX, clientY) {           // displayed frame coords
 }
 function openLiveView() {
   const { body, reused } = createWindow({ id: "win-live", title: "Live browser — drive it, or watch Oceano", icon: "◫", width: 720, height: 600,
-    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } if (_liveWS) { _liveWS.onclose = null; try { _liveWS.close(); } catch {} _liveWS = null; } } });
+    restoreKey: "live", onClose: () => { if (_liveES) { _liveES.close(); _liveES = null; } if (_liveWS) { _liveWS.onclose = null; try { _liveWS.close(); } catch {} _liveWS = null; } if (_liveRO) { try { _liveRO.disconnect(); } catch {} _liveRO = null; } } });
   if (reused) return;
   body.innerHTML = `
     <div class="live-addr"><button class="exp-btn live-nav" id="liveBack" title="Back (Alt+←)">←</button><button class="exp-btn live-nav" id="liveFwd" title="Forward (Alt+→)">→</button><button class="exp-btn live-nav" id="liveReload" title="Reload">⟳</button><button class="exp-btn live-nav" id="liveStop" title="Stop loading">✕</button><input id="liveInput" placeholder="type a URL and press Enter…" autocomplete="off"><button class="exp-btn" id="liveGo">Go</button><button class="exp-btn live-nav" id="liveNewTab" title="New tab">+</button><button class="exp-btn live-nav" id="liveExt" title="Open this page in my browser">↗</button></div>
@@ -2214,6 +2227,18 @@ function openLiveView() {
   $("#liveExt", body).onclick = () => { const u = $("#liveInput", body).value.trim(); if (/^https?:\/\//.test(u)) window.open(u, "_blank", "noopener"); };
 
   const img = $("#liveImg", body), stage = $("#liveStage", body);
+  // keep the browser viewport matched to the window size — responsive layout that fills the window,
+  // instead of a fixed 1280×800 frame letterboxed to fit. Debounced so a drag-resize sends once.
+  let _rsTimer = null, _lastWH = "";
+  const sendResize = () => {
+    const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
+    if (w < 100 || h < 100) return;                    // minimized / collapsed → skip
+    const sig = w + "x" + h; if (sig === _lastWH) return; _lastWH = sig;
+    post("/api/browser/resize", { width: w, height: h });
+  };
+  _liveRO = new ResizeObserver(() => { clearTimeout(_rsTimer); _rsTimer = setTimeout(sendResize, 180); });
+  _liveRO.observe(stage);
+  setTimeout(sendResize, 120);                          // initial sync when the window opens
   // Pointer-driven click AND drag. A press that doesn't move is a click; once the pointer moves
   // past a small threshold it becomes a real press→move→release drag (streamed live), so you can
   // drag sliders and solve drag-to-verify captchas / bot checks by hand. mousedown is sent lazily
@@ -2265,8 +2290,27 @@ function openLiveView() {
   stage.addEventListener("keydown", e => {
     if (e.altKey && e.key === "ArrowLeft") { post("/api/browser/back", {}); e.preventDefault(); return; }
     if (e.altKey && e.key === "ArrowRight") { post("/api/browser/forward", {}); e.preventDefault(); return; }
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === "c" || e.key === "C")) {          // copy the page's selection → local clipboard
+      e.preventDefault();                                   // (needs a secure context: localhost or https)
+      if (navigator.clipboard && window.ClipboardItem) {
+        try { navigator.clipboard.write([new ClipboardItem({ "text/plain":
+          fetch("/api/browser/copy", { method: "POST" }).then(r => r.json()).then(j => new Blob([j.text || ""], { type: "text/plain" })) })]).catch(() => {}); } catch {}
+      }
+      return;
+    }
+    if (mod && (e.key === "a" || e.key === "A")) { post("/api/browser/key", { key: "Control+a" }); e.preventDefault(); return; }  // select all in the page
+    if (mod && (e.key === "v" || e.key === "V")) return;    // paste → handled by the 'paste' listener below
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { post("/api/browser/type", { text: e.key }); e.preventDefault(); }
     else if (["Enter", "Backspace", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End"].includes(e.key)) { post("/api/browser/key", { key: e.key }); e.preventDefault(); }
+  });
+  // clipboard bridge (in): paste your local clipboard into the page's focused field. The paste event
+  // hands us the text with no permission prompt; the server inserts it via keyboard.insert_text.
+  stage.addEventListener("paste", e => {
+    const cd = e.clipboardData || window.clipboardData;
+    const t = cd ? cd.getData("text") : "";
+    if (t) post("/api/browser/paste", { text: t });
+    e.preventDefault();
   });
 
   _lastTabsSig = null;                       // force a tab-bar rebuild on (re)open

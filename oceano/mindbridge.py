@@ -58,6 +58,9 @@ _ALLOW = {
     "notify",                                                 # push a notification to the user
     "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
     "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
+    "browser_snapshot", "browser_fill", "browser_select", "browser_press",      # …operate forms: map elements, fill, select, submit
+    "browser_wait", "browser_extract", "browser_read",                          # …wait for content, extract data, read as markdown
+    "browser_eval", "browser_hover", "browser_upload", "browser_dialog", "browser_tab",   # …JS eval (web-only), hover, upload, dialogs, tabs
     "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
     "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
     "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)

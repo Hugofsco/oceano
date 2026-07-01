@@ -859,6 +859,11 @@ _TOOL_CATEGORY = {
     "web_search": "web", "fetch_url": "web",
     "browser_open": "browser", "browser_screenshot": "browser",
     "browser_click": "browser", "browser_scroll": "browser",
+    "browser_snapshot": "browser", "browser_fill": "browser",
+    "browser_select": "browser", "browser_press": "browser",
+    "browser_wait": "browser", "browser_extract": "browser", "browser_read": "browser",
+    "browser_eval": "browser", "browser_hover": "browser", "browser_upload": "browser",
+    "browser_dialog": "browser", "browser_tab": "browser",
     "remember": "memory", "recall": "memory", "update_memory": "memory", "forget_memory": "memory",
     "index_docs": "documents", "search_docs": "documents", "search_chats": "memory",
     "list_skills": "skills", "load_skill": "skills", "learn_skill": "skills", "evaluate_skill": "skills",
@@ -2556,6 +2561,20 @@ async def browser_key_ep(req: Request):
     return {"ok": True}
 
 
+@app.post("/api/browser/paste")
+async def browser_paste_ep(req: Request):
+    """Insert the user's local clipboard text into the page's focused field (clipboard bridge in)."""
+    livebrowser.submit("paste", (await req.json()).get("text", ""))
+    return {"ok": True}
+
+
+@app.post("/api/browser/copy")
+async def browser_copy_ep():
+    """Return the page's current text selection so the client can put it on the local clipboard (out)."""
+    res = livebrowser.submit("copy", wait=True)
+    return {"ok": True, "text": (res or {}).get("text", "")}
+
+
 @app.post("/api/browser/tab")
 async def browser_tab_switch(req: Request):
     livebrowser.submit("switch_tab", (await req.json()).get("id"))
@@ -2596,6 +2615,37 @@ async def browser_stop_ep():
 async def browser_newtab_ep():
     livebrowser.submit("new_tab")
     return {"ok": True}
+
+
+@app.post("/api/browser/resize")
+async def browser_resize_ep(req: Request):
+    """Match the browser viewport to the LIVE window size (responsive layout, no letterbox)."""
+    b = await req.json()
+    try:
+        livebrowser.submit("resize", (int(b["width"]), int(b["height"])))
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "width,height required"}
+    return {"ok": True}
+
+
+@app.get("/api/browser/settings")
+def get_browser_settings():
+    return {"real_chrome": bool(load().get("prefs", {}).get("real_chrome"))}
+
+
+@app.post("/api/browser/settings")
+async def set_browser_settings(req: Request):
+    """Toggle whether the live browser drives a real, persistent Chrome vs the throwaway headless
+    Chromium. Restarts the browser worker so the new mode takes effect on the next action."""
+    b = await req.json()
+    data = load()
+    data.setdefault("prefs", {})["real_chrome"] = bool(b.get("real_chrome"))
+    save(data)
+    try:
+        livebrowser.shutdown()      # drop the current browser; next navigation relaunches in the new mode
+    except Exception:
+        pass
+    return {"ok": True, "real_chrome": data["prefs"]["real_chrome"]}
 
 
 # ---------------- scheduler ----------------
