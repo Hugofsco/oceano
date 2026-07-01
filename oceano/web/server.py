@@ -3124,7 +3124,8 @@ def get_research():
 @app.post("/api/research")
 async def add_research(req: Request):
     b = await req.json()
-    rid = researcher.add_topic(b.get("topic", ""), b.get("focus", ""), b.get("cron", "0 8 * * *"))
+    rid = researcher.add_topic(b.get("topic", ""), b.get("focus", ""), b.get("cron", "0 8 * * *"),
+                               b.get("model", ""), b.get("base_url", ""))
     return {"ok": rid is not None, "id": rid,
             **({} if rid is not None else {"error": "topic and a valid cron are required"})}
 
@@ -3132,7 +3133,8 @@ async def add_research(req: Request):
 @app.patch("/api/research/{rid}")
 async def update_research(rid: int, req: Request):
     b = await req.json()
-    ok = researcher.update_topic(rid, b.get("topic"), b.get("focus"), b.get("cron"), b.get("enabled"))
+    ok = researcher.update_topic(rid, b.get("topic"), b.get("focus"), b.get("cron"), b.get("enabled"),
+                                 b.get("model"), b.get("base_url"))
     return {"ok": ok}
 
 

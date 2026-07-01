@@ -4028,6 +4028,7 @@ function openResearcher() {
       <input id="resFocus" placeholder="focus / guidance (optional)" style="flex:1;min-width:150px">
       <select id="resPreset" class="sched-preset"></select>
       <input id="resCron" class="sched-cron" placeholder="cron" value="0 8 * * *">
+      <select id="resModel" class="sched-preset" title="which model runs this research"><option value="">default model</option></select>
       <button class="primary sm" id="resAdd">Add</button>
     </div>
     <div class="kn-note" id="resMsg"></div>
@@ -4035,10 +4036,12 @@ function openResearcher() {
   const RES_PRESETS = { "daily 8am": "0 8 * * *", "every 12h": "0 */12 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1", "monthly (1st, 9am)": "0 9 1 * *" };
   $("#resPreset", body).innerHTML = `<option value="">preset…</option>` + Object.entries(RES_PRESETS).map(([k, v]) => `<option value="${v}">${k}</option>`).join("");
   $("#resPreset", body).onchange = e => { if (e.target.value) $("#resCron").value = e.target.value; };
+  api("/api/models").then(ms => { const sel = $("#resModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, "", ""); }).catch(() => {});
   $("#resAdd", body).onclick = async () => {
     const topic = $("#resTopic").value.trim(), focus = $("#resFocus").value.trim(), cron = $("#resCron").value.trim(), msg = $("#resMsg");
     if (!topic || !cron) return;
-    const r = await api("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) });
+    const { model, base_url } = _schedModelPick($("#resModel", body));
+    const r = await api("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron, model, base_url }) });
     if (!r.ok) { msg.textContent = r.error || "could not add topic"; msg.className = "kn-note err"; return; }
     msg.textContent = "research topic added ✓ — it will run on its schedule (or hit ▶ to run now)"; msg.className = "kn-note ok";
     $("#resTopic").value = ""; $("#resFocus").value = "";
@@ -4056,25 +4059,83 @@ async function loadResearch() {
     const row = document.createElement("div"); row.className = "sched-row" + (t.enabled ? "" : " off");
     const last = t.last_run ? t.last_run.slice(0, 16).replace("T", " ") + " UTC" : "never";
     const status = t.running ? `<span class="res-running">⟳ researching now…</span>` : `last run ${escapeHtml(last)}`;
+    const modelTag = t.model
+      ? ` · <span class="sr-model" title="runs on this model">🧠 ${t.model === "claude" ? "Claude" : (t.model === "codex" ? "Codex" : escapeHtml(t.model))}</span>` : "";
     row.innerHTML = `<label class="sw"><input type="checkbox" ${t.enabled ? "checked" : ""}><span></span></label>
       <div class="sr-body"><div class="sr-instr">${escapeHtml(t.topic)}</div>
-      <div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · ${status}${t.focus ? `<div class="res-focus">focus: ${escapeHtml(t.focus)}</div>` : ""}</div></div>
+      <div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · ${status}${modelTag}${t.focus ? `<div class="res-focus">focus: ${escapeHtml(t.focus)}</div>` : ""}</div></div>
       <button class="sr-btn res-run" title="run this research now" ${t.running ? "disabled" : ""}>▶ run</button>
       <button class="sr-btn res-doc" title="open the research document" ${t.doc_exists ? "" : "disabled"}>doc</button>
       <button class="sr-btn sr-edit">edit</button><button class="sr-btn sr-del">✕</button>`;
     $("input", row).onchange = async e => { await fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadResearch(); };
     $(".res-run", row).onclick = async () => { await fetch("/api/research/" + t.id + "/run", { method: "POST" }); loadResearch(); };
     $(".res-doc", row).onclick = () => openFileWindow(t.doc);
-    $(".sr-edit", row).onclick = () => editResearch(t);
+    $(".sr-edit", row).onclick = () => openResearchEditor(t);
     $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete research topic?", `“${t.topic}” and its scheduler entry will be removed. The document in workspace/research/ is kept.`)) return; await fetch("/api/research/" + t.id, { method: "DELETE" }); loadResearch(); };
     list.appendChild(row);
   });
 }
-async function editResearch(t) {
-  const topic = await promptDialog("Research topic", { value: t.topic, okLabel: "Next" }); if (topic === null) return;
-  const focus = await promptDialog("Focus / guidance", { value: t.focus || "", message: "Optional — leave blank for none", okLabel: "Next" }); if (focus === null) return;
-  const cron = await promptDialog("Schedule", { value: t.cron, message: "Cron · min hr day mon wkday", okLabel: "Save" }); if (cron === null) return;
-  fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, focus, cron }) }).then(() => loadResearch());
+// A proper editor window for a research topic — topic, focus, schedule (with a live "next runs"
+// preview), a MODEL picker (run it on the local model, or a stronger mind that drills deeper), and
+// an enabled toggle. Mirrors the scheduled-task editor.
+const RES_PRESETS = { "daily 8am": "0 8 * * *", "every 12h": "0 */12 * * *", "weekdays 9am": "0 9 * * 1-5", "weekly Mon 9am": "0 9 * * 1", "monthly (1st, 9am)": "0 9 1 * *" };
+function openResearchEditor(t) {
+  const { body } = createWindow({ id: "win-researchedit", title: "Edit research topic", icon: "✎", width: 540, height: 560 });
+  body.classList.add("set-win");
+  const presets = `<option value="">preset…</option>`
+    + Object.entries(RES_PRESETS).map(([k, v]) => `<option value="${escapeHtml(v)}">${escapeHtml(k)}</option>`).join("");
+  body.innerHTML = `<div class="drawer-section">
+    <label class="field-label">Topic <span class="lbl-sub">what to research, deepening over time</span></label>
+    <input id="reTopic" value="${escapeHtml(t.topic)}" placeholder="e.g. Solana MEV landscape">
+    <label class="field-label">Focus / guidance <span class="lbl-sub">optional — steer the deep-dive</span></label>
+    <textarea id="reFocus" spellcheck="false" placeholder="optional — e.g. emphasize primary sources and recent changes">${escapeHtml(t.focus || "")}</textarea>
+    <label class="field-label">Schedule <span class="lbl-sub">cron · min hr day mon wkday</span></label>
+    <div class="te-cron-row">
+      <select id="rePreset" class="sched-preset">${presets}</select>
+      <input id="reCron" class="sched-cron" value="${escapeHtml(t.cron)}" placeholder="0 8 * * *">
+    </div>
+    <div id="rePreview" class="te-preview">…</div>
+    <label class="field-label">Model <span class="lbl-sub">which model runs this research — default uses your primary; a stronger mind drills deeper</span></label>
+    <select id="reModel" class="te-model"><option value="">default model</option></select>
+    <label class="te-enabled"><span class="sw sm"><input type="checkbox" id="reEnabled" ${t.enabled ? "checked" : ""}><span></span></span> Enabled</label>
+    <div class="acct-actions"><span class="acct-msg" id="reMsg"></span>
+      <span class="te-btns"><button class="ghost-btn sm" id="reCancel">Cancel</button>
+      <button class="primary sm" id="reSave">Save</button></span></div>
+  </div>`;
+  const cronEl = $("#reCron", body), prev = $("#rePreview", body);
+  let pvTimer = null, pvSeq = 0;
+  async function refreshPreview() {
+    const cron = cronEl.value.trim();
+    if (!cron) { prev.className = "te-preview"; prev.textContent = "enter a cron expression"; return; }
+    const seq = ++pvSeq;
+    try {
+      const d = await api("/api/cron/preview?n=4&cron=" + encodeURIComponent(cron));
+      if (seq !== pvSeq) return;
+      if (!d.valid) { prev.className = "te-preview bad"; prev.textContent = "✗ " + (d.error || "invalid cron"); return; }
+      if (!d.runs.length) { prev.className = "te-preview"; prev.textContent = "valid ✓"; return; }
+      prev.className = "te-preview ok";
+      prev.innerHTML = `<span class="te-pv-lbl">next runs · UTC</span>`
+        + d.runs.map(r => `<span class="te-pv-when">${escapeHtml(r.slice(0, 16).replace("T", " "))}</span>`).join("");
+    } catch { if (seq === pvSeq) { prev.className = "te-preview"; prev.textContent = ""; } }
+  }
+  cronEl.oninput = () => { clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); };
+  $("#rePreset", body).onchange = e => { if (e.target.value) { cronEl.value = e.target.value; refreshPreview(); } };
+  refreshPreview();
+  api("/api/models").then(ms => { const sel = $("#reModel", body); if (sel) sel.innerHTML = _schedModelOpts(ms, t.model || "", t.base_url || ""); }).catch(() => {});
+  const close = () => { const w = body.closest(".win"); if (w) w.remove(); };
+  $("#reCancel", body).onclick = close;
+  $("#reSave", body).onclick = async () => {
+    const msg = $("#reMsg", body), topic = $("#reTopic", body).value.trim(), cron = cronEl.value.trim();
+    if (!topic) { msg.textContent = "topic required"; msg.className = "acct-msg err"; return; }
+    if (!cron) { msg.textContent = "schedule required"; msg.className = "acct-msg err"; return; }
+    const pick = _schedModelPick($("#reModel", body));   // "" = system default
+    const payload = { topic, focus: $("#reFocus", body).value.trim(), cron,
+                      enabled: $("#reEnabled", body).checked, model: pick.model, base_url: pick.base_url };
+    const r = await fetch("/api/research/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload) }).then(x => x.json()).catch(() => ({ ok: false }));
+    if (!r.ok) { msg.textContent = r.error || "save failed — check the cron"; msg.className = "acct-msg err"; return; }
+    close(); loadResearch();
+  };
 }
 
 /* ====================================================================
