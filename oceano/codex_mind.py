@@ -170,10 +170,12 @@ def _tool_result(item):
     return ""
 
 
-def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
+def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=None, background=False):
     """Run one stateless Codex turn. The caller passes the WHOLE conversation in `prompt` (Oceano's
     self.messages is the single source of truth, mirroring the Claude mind), so every turn is a fresh
-    ephemeral `codex exec` — no server-side thread to resume, drift, or lose."""
+    ephemeral `codex exec` — no server-side thread to resume, drift, or lose. `session` is the chat
+    this turn drives and `background` marks an unattended turn (bridged tools then run on the
+    background channel) — both ride to the MCP bridge per-turn via -c env overrides, never a global."""
     from oceano import delegate
     binary = delegate.find_codex()
     if not binary:
@@ -188,6 +190,15 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
     sandbox = delegate.codex_sandbox_mode("workspace-write")    # falls back off bwrap if it can't sandbox here
     cmd += delegate._codex_effort_args()                        # honour the configured reasoning effort
     cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
+    if session:
+        # Per-turn config override (merges one leaf into the shared config.toml's env table, so
+        # concurrent Codex turns for different chats never share a sid): the MCP bridge subprocess
+        # gets OCEANO_MCP_SESSION in its env and forwards it as X-Oceano-Session on each tool call.
+        cmd += ["-c", f'mcp_servers.oceano.env.OCEANO_MCP_SESSION="{session}"']
+    if background:
+        # Same per-turn mechanism for the channel: forwarded as X-Oceano-Background, so an
+        # unattended turn's bridged tools are gated off the live browser/UI without any global state.
+        cmd += ["-c", 'mcp_servers.oceano.env.OCEANO_MCP_BACKGROUND="1"']
     if cwd:
         cmd += ["--cd", str(cwd)]
     # Feed the WHOLE conversation on stdin, NOT as a positional argument: Linux caps a single argv

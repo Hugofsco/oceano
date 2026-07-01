@@ -6194,7 +6194,29 @@ async function wfRenderRuns(body, w) {
 }
 
 /* ---------------- background-jobs running indicator (global, polled) ---------------- */
-let _jobsLast = [], _jobsTimer = null;
+let _jobsLast = [], _jobsTimer = null, _deliveredJobs = new Set();
+// A spawn_job (Oceano-owned background OS job) that finished after the turn that started it: print
+// its result into the conversation that spawned it. The client is the sole persister of a chat, so
+// delivery flows through here (not a server-side chats.json write) to avoid clobbering _curT. The
+// server tracks a per-job `delivered` flag too, so a reload never re-prints an already-shown result.
+async function pollJobDeliveries() {
+  const sid = state.session;
+  if (!sid || state.busy) return;                 // don't interleave with a streaming turn
+  let d; try { d = await api("/api/bgjobs?session=" + encodeURIComponent(sid)); } catch { return; }
+  let delivered = false;
+  for (const j of (d && d.pending) || []) {
+    if (state.session !== sid) break;             // user switched chats mid-poll → stop
+    if (_deliveredJobs.has(j.id)) continue;
+    _deliveredJobs.add(j.id);
+    const head = j.state === "done" ? `✅ Background job “${j.label}” finished (exit ${j.exit_code}).`
+               : j.state === "failed" ? `❌ Background job “${j.label}” failed (exit ${j.exit_code}).`
+               : `⚠️ Background job “${j.label}” was lost — Oceano restarted while it ran.`;
+    appendT({ role: "assistant", content: j.tail ? head + "\n\n```\n" + j.tail + "\n```" : head, ts: Date.now() });
+    delivered = true;
+    try { await fetch("/api/bgjobs/" + encodeURIComponent(j.id) + "/ack", { method: "POST" }); } catch {}
+  }
+  if (delivered) { renderThread(); persistChat(); }
+}
 function renderJobsPop(pop) {
   if (!_jobsLast.length) { pop.innerHTML = `<div class="jb-empty">No background jobs running.</div>`; return; }
   pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j =>
@@ -6216,6 +6238,7 @@ async function pollJobs() {
   const running = new Set(_jobsLast.filter(j => j.state === "running" && j.ref).map(j => j.ref));
   $$(".wf-card[data-wid]").forEach(c => c.classList.toggle("job-running", running.has("workflow:" + c.dataset.wid)));
   $$(".sched-row[data-tid]").forEach(r => r.classList.toggle("job-running", running.has(r.dataset.src) || running.has("task:" + r.dataset.tid)));
+  pollJobDeliveries();          // print any just-finished spawn_job results into the open conversation
 }
 
 /* ---------------- wiring ---------------- */

@@ -31,6 +31,7 @@ def test_shell_blocked_after_untrusted_read():
     # both execution tools refuse — and refuse BEFORE running anything
     assert tools.run_shell("echo should-not-run") == tools._SHELL_TAINTED
     assert tools.python_exec("print('nope')") == tools._SHELL_TAINTED
+    assert tools.spawn_job("echo should-not-run") == tools._SHELL_TAINTED
 
 
 def test_bridge_taint_also_blocks():

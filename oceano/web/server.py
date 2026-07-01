@@ -446,6 +446,7 @@ async def twofa_disable(req: Request):
 def _agent(sid):
     if sid not in _sessions:
         ag = Agent()
+        ag.session_id = sid          # so the mind's per-turn bridge can route a spawn_job back to this chat
         # Rehydrate the conversation so continuing an existing chat — or any chat after a
         # server restart — has its real history, not a blank slate. (Bare Agent() starts with
         # only the system message; without this the model has no memory of the chat it's in.)
@@ -817,9 +818,65 @@ def health_dashboard():
 @app.get("/api/jobs")
 def jobs_snapshot():
     """What background work is in flight right now + the serialize setting (for the
-    running indicators and the Settings toggle)."""
-    from oceano import jobs
-    return jobs.snapshot()
+    running indicators and the Settings toggle). Running spawn_job OS-processes (bgjobs)
+    are folded in so they show in the same indicator as Oceano's in-process work."""
+    from oceano import jobs, bgjobs
+    s = jobs.snapshot()
+    now = time.time()
+    extra = [{"id": f"bg{j['id']}", "kind": "job", "label": j["label"], "ref": f"bgjob:{j['id']}",
+              "state": "running", "elapsed": round(now - j["started"], 1)}
+             for j in bgjobs.status() if j["state"] in ("running", "starting")]
+    if extra:
+        s["jobs"] = list(s.get("jobs", [])) + extra
+        s["running"] = s.get("running", 0) + len(extra)
+    return s
+
+
+@app.get("/api/bgjobs")
+def bgjobs_list(session: str = ""):
+    """Background OS-jobs (spawn_job). `pending` = terminal jobs for this conversation whose
+    result hasn't been printed into the chat yet (the client polls this to deliver them, then
+    acks); `jobs` = everything tracked, for a detail view."""
+    from oceano import bgjobs
+    return {"jobs": bgjobs.status(), "pending": bgjobs.pending_for(session) if session else []}
+
+
+@app.post("/api/bgjobs/{jid}/ack")
+def bgjobs_ack(jid: int):
+    """Mark a job's result as delivered into its conversation, so it's never printed twice."""
+    from oceano import bgjobs
+    return {"ok": bgjobs.mark_delivered(jid)}
+
+
+def _deliver_job_to_session(rec):
+    """Fired on a reaper thread when a spawn_job process ends: inject its result into the live
+    in-memory Agent for the spawning conversation, so the MIND has it as context on its next turn.
+    The user-visible transcript delivery is client-driven (the browser polls /api/bgjobs and prints
+    the result), so we deliberately DON'T write chats.json here — the client stays the sole persister,
+    which keeps the two from clobbering each other's message list."""
+    from oceano import bgjobs
+    sid = rec.get("sid")
+    if not sid:
+        return
+    ag = _sessions.get(sid)
+    if ag is None:
+        return                      # not loaded → rehydrated from the client-persisted chat on next open
+    label, state, code = rec.get("label", "job"), rec.get("state"), rec.get("exit_code")
+    head = (f'Background job "{label}" finished (exit {code}).' if state == "done"
+            else f'Background job "{label}" failed (exit {code}).' if state == "failed"
+            else f'Background job "{label}" was lost (Oceano restarted while it ran).')
+    tail = bgjobs._tail_file(rec["log_path"], 2000) if rec.get("log_path") else ""
+    content = head + (("\n\n" + tail) if tail else "")
+    lock = _session_lock(sid)
+    if lock.acquire(timeout=30):    # wait out an in-flight turn, but never wedge the reaper forever
+        try:
+            ag.messages.append({"role": "assistant", "content": content})
+        finally:
+            lock.release()
+
+
+from oceano import bgjobs as _bgjobs      # noqa: E402 - register the completion hook once, at import
+_bgjobs.set_on_complete(_deliver_job_to_session)
 
 
 @app.get("/api/logs")
@@ -855,7 +912,7 @@ async def jobs_set_serialize(req: Request):
 _TOOL_CATEGORY = {
     "list_files": "workspace", "read_file": "workspace", "write_file": "workspace",
     "edit_file": "workspace", "make_folder": "workspace", "run_shell": "workspace",
-    "python_exec": "workspace",
+    "python_exec": "workspace", "spawn_job": "workspace", "job_status": "workspace",
     "web_search": "web", "fetch_url": "web",
     "browser_open": "browser", "browser_screenshot": "browser",
     "browser_click": "browser", "browser_scroll": "browser",
@@ -1042,8 +1099,10 @@ async def mcp_call(req: Request):
     from oceano import mindbridge
     b = await req.json()
     name, args = b.get("name", ""), b.get("args") or {}
+    session = req.headers.get("x-oceano-session") or None    # which chat this mind turn drives (spawn_job routing)
+    background = req.headers.get("x-oceano-background") == "1"   # unattended turn → background channel (no live UI)
     print(f"[mind] tool {name}({list(args)})", flush=True)            # so the body's actions land in the journal
-    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args)}
+    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args, session, background)}
 
 
 @app.get("/api/delegate")
@@ -1385,13 +1444,18 @@ async def chat(req: Request):
                     # chat mode still gets the user-chosen memory tools (Settings → Tools) so it can
                     # manage what it knows about you without full agent mode; agent mode → all tools.
                     from oceano import tools as _tools
+                    from oceano import mindbridge
                     stream = ag.run_stream(turn_msg, cancel=cancel, voice=voice) if agent_mode else ag.run_stream(turn_msg, only_tools=_tools.chat_tools(), cancel=cancel, voice=voice)
-                    for ev in stream:
-                        if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
-                            _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
-                        if cancel.is_set():
-                            break           # stop feeding — query was aborted
-                        put(ev)
+                    # Tag this turn with its conversation for the duration of the run, so a spawn_job
+                    # call (local model in-thread, or the Claude/Codex mind via the bridge on another
+                    # thread) can route the job's eventual result back to THIS chat.
+                    with mindbridge.session(sid):
+                        for ev in stream:
+                            if isinstance(ev, dict) and ev.get("type") == "stats" and ev.get("ctx"):
+                                _last_ctx[sid] = ev["ctx"]   # remember real prompt tokens for /status
+                            if cancel.is_set():
+                                break           # stop feeding — query was aborted
+                            put(ev)
                 if not cancel.is_set():
                     put({"type": "done"})
         except Exception as ex:

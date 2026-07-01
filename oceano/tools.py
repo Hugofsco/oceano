@@ -17,7 +17,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import config
-from oceano import memory, skills, rag, browser, scheduler, safety, livebrowser, atomicio
+from oceano import memory, skills, rag, browser, scheduler, safety, livebrowser, atomicio, bgjobs
 
 # --- channels --------------------------------------------------------------
 # Oceano is driven from several places, and they don't share a screen. The live
@@ -425,6 +425,67 @@ def run_shell(command):
     )
     out = (r.stdout + r.stderr).strip()
     return f"(exit {r.returncode})\n{out[:8000]}" or f"(exit {r.returncode}, no output)"
+
+
+# --- background OS jobs — owned by Oceano's daemon, unlike the mind's own native backgrounding ---
+@tool({
+    "type": "function",
+    "function": {
+        "name": "spawn_job",
+        "description": (
+            "Run a bash command as a background job OWNED BY OCEANO. Use this — never your own "
+            "native background/async execution — for anything that must keep running after this "
+            "turn ends (a build, a long script, a batch job). Your own backgrounding dies or is "
+            "orphaned the instant this CLI process exits between turns, so Oceano can't track it "
+            "or tell the user it finished, even if you said you would. spawn_job hands the process "
+            "to Oceano's own long-lived daemon instead, which keeps running it and proactively "
+            "notifies the user when it exits. Poll progress with job_status. Never say 'I'll let "
+            "you know when it's done' unless you actually used this tool."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "the bash command to run in the workspace"},
+            "label": {"type": "string", "description": "short name for this job, e.g. 'build frontend'"},
+        }, "required": ["command"]},
+    },
+})
+def spawn_job(command, label=""):
+    blocked = _shell_blocked()                    # same anti-exfiltration gate as run_shell
+    if blocked:
+        return blocked
+    refusal = safety.check_shell(command)          # same catastrophic-command guard as run_shell
+    if refusal:
+        return refusal
+    argv = _sandbox_wrap(["bash", "-c", command])  # same bubblewrap sandbox as run_shell
+    from oceano import mindbridge                   # lazy: mindbridge imports tools (avoid an import cycle)
+    rec = bgjobs.spawn(argv, cwd=str(_ws()), display=command, label=label, sid=mindbridge.active_session())
+    return f"started job #{rec['id']} ({rec['label']}) — check it with job_status(job_id={rec['id']})"
+
+
+@tool({
+    "type": "function",
+    "function": {
+        "name": "job_status",
+        "description": "Check a background job started with spawn_job: state (running/done/failed/"
+                       "lost), exit code, and a tail of its output. Omit job_id to list every job "
+                       "Oceano is tracking.",
+        "parameters": {"type": "object", "properties": {
+            "job_id": {"type": "integer", "description": "id from spawn_job; omit to list all"},
+        }},
+    },
+})
+def job_status(job_id=None):
+    if not job_id:
+        js = bgjobs.status()
+        return "\n".join(f"#{j['id']} [{j['state']}] {j['label']}" for j in js) or "no background jobs"
+    rec = bgjobs.status(job_id)
+    if rec is None:
+        return f"ERROR: no job #{job_id}"
+    out = f"#{rec['id']} \"{rec['label']}\" — {rec['state']}"
+    if rec["exit_code"] is not None:
+        out += f" (exit {rec['exit_code']})"
+    if rec.get("tail"):
+        out += "\n--- output tail ---\n" + rec["tail"]
+    return out
 
 
 _HTTP_HEADERS = {

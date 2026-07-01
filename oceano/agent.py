@@ -392,6 +392,10 @@ class Agent:
         # but NOT the user's personal memories/research/skills — a delegate gets a self-contained
         # task, and we shouldn't ship personal data to it (esp. a cloud delegate).
         self.inject_context = inject_context
+        # The chat/conversation this Agent serves (set by the web layer's _agent(sid)). Threaded to
+        # the mind's per-turn MCP bridge so a spawn_job routes its result back to THIS chat; None for
+        # utility/delegate agents and non-web callers (their jobs just notify, unattributed).
+        self.session_id = None
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + _date_note()}]
 
     def _prepare_turn(self, user_message, voice=False):
@@ -646,6 +650,13 @@ class Agent:
             "live, logs, hosts, settings (e.g. open Calendar before discussing the schedule, or Hosts when "
             "managing servers).\n"
             "• mcp__oceano__notify to ping the user (ntfy + Telegram).\n"
+            "• BACKGROUND JOBS — your own Bash tool's run_in_background (or any native async execution) does "
+            "NOT survive this turn: it's killed or orphaned the instant this Claude Code process exits between "
+            "turns. For anything that must outlive this turn (a build, a long script, a batch job), use "
+            "mcp__oceano__spawn_job instead — it hands the process to Oceano's own long-lived daemon, which "
+            "keeps it running and proactively tells the user when it's done. Check progress with "
+            "mcp__oceano__job_status. Never tell the user 'I'll let you know when it's done' or 'I'll monitor "
+            "this' unless you actually used spawn_job — with your own backgrounding that promise is false.\n"
             "Use your built-in tools for files and shell. Touch files only inside the workspace.")
         convo = []
         for m in self.messages[1:]:                            # the conversation Claude continues (no system msg)
@@ -671,10 +682,12 @@ class Agent:
                 q.put(("toolres", str(ev.get("text", ""))))
 
         def work():
-            if bg:
-                mindbridge.begin_background_turn()             # bridged tools run 'background' for the whole turn
             try:
-                mcp_path = mindbridge.mcp_config_path()        # the body: Oceano's own tools, executed in the daemon
+                # The body: Oceano's own tools, executed in the daemon. The per-turn config carries
+                # this chat's id AND whether the turn is unattended (bridged tools then run on the
+                # background channel — no live browser/UI) — per turn, so concurrent turns for other
+                # chats are never dragged into the background channel by this one.
+                mcp_path = mindbridge.mcp_config_path(self.session_id, background=bg)
                 # Claude keeps its native tools for files/shell; Oceano's BODY (memory, calendar, windows,
                 # notify, AND the web) rides alongside as mcp__oceano — it reaches for those because nothing
                 # native competes. The web is the exception: its native WebSearch/WebFetch ARE disallowed, so
@@ -689,8 +702,6 @@ class Agent:
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
-                if bg:
-                    mindbridge.end_background_turn()
                 q.put(("done", None))
 
         threading.Thread(target=work, daemon=True).start()
@@ -744,7 +755,7 @@ class Agent:
         server-side Codex thread. Oceano's history stays the single source of truth — so /compact,
         /truncate and edits actually take effect, and there's no session to drift or to lose."""
         import queue
-        from oceano import codex_mind, mindbridge
+        from oceano import codex_mind
         bg = tools.is_background()
         self._prepare_turn(user_message, voice=voice)
         self.messages.append({"role": "user", "content": user_message})
@@ -783,6 +794,13 @@ class Agent:
             "search, voice, workflows, live, logs, hosts, settings (e.g. open Calendar before discussing "
             "the schedule, or Hosts when managing servers).\n"
             "• `notify` to ping the user (ntfy + Telegram).\n"
+            "• BACKGROUND JOBS — your own native background/async execution does NOT survive this turn: it's "
+            "killed or orphaned the instant this Codex process exits between turns. For anything that must "
+            "outlive this turn (a build, a long script, a batch job), use `spawn_job` instead — it hands the "
+            "process to Oceano's own long-lived daemon, which keeps it running and proactively tells the user "
+            "when it's done. Check progress with `job_status`. Never tell the user 'I'll let you know when "
+            "it's done' or 'I'll monitor this' unless you actually used spawn_job — with your own backgrounding "
+            "that promise is false.\n"
             "Keep your file and shell work inside the workspace. Reply as Oceano."
         )
         convo = []
@@ -800,18 +818,17 @@ class Agent:
             q.put(ev)
 
         def work():
-            if bg:
-                mindbridge.begin_background_turn()
             try:
                 from oceano import delegate
                 holder["res"] = codex_mind.run_stream(
                     prompt, cwd=config.WORKSPACE,
-                    cancel=cancel, on_event=on_ev, model=delegate.get_codex_model())
+                    cancel=cancel, on_event=on_ev, model=delegate.get_codex_model(),
+                    # per-turn -c overrides carry this chat's id + unattended flag to the bridge —
+                    # never a process-global, so concurrent chats keep their own channel
+                    session=self.session_id, background=bg)
             except Exception as e:
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
             finally:
-                if bg:
-                    mindbridge.end_background_turn()
                 q.put({"type": "done"})
 
         threading.Thread(target=work, daemon=True).start()

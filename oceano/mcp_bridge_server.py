@@ -19,7 +19,13 @@ import mcp.types as t
 
 URL = os.environ.get("OCEANO_MCP_URL", "http://127.0.0.1:8800").rstrip("/")
 TOKEN = os.environ.get("OCEANO_MCP_TOKEN", "")
-HEADERS = {"X-Oceano-Mind-Token": TOKEN}        # token in a header, never the URL/body (no log leak)
+SESSION = os.environ.get("OCEANO_MCP_SESSION", "")   # the chat this mind turn drives (per-turn config)
+BACKGROUND = os.environ.get("OCEANO_MCP_BACKGROUND", "")   # unattended turn → tools run on the background channel
+HEADERS = {"X-Oceano-Mind-Token": TOKEN}             # token in a header, never the URL/body (no log leak)
+if SESSION:
+    HEADERS["X-Oceano-Session"] = SESSION            # so a spawn_job routes its result back to this chat
+if BACKGROUND:
+    HEADERS["X-Oceano-Background"] = "1"             # so the daemon gates live-browser/UI tools for this turn
 
 server = Server("oceano")
 _SCHEMAS = []
