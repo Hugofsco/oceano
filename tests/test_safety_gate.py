@@ -50,7 +50,7 @@ def test_sandbox_disabled_returns_inner(monkeypatch):
 
 def test_sandbox_wraps_when_available(monkeypatch):
     monkeypatch.delenv("OCEANO_SHELL_SANDBOX", raising=False)
-    monkeypatch.setattr(tools, "_sandbox_ok", lambda: True)        # pretend bwrap works
+    monkeypatch.setattr(tools.shell, "_sandbox_ok", lambda: True)  # pretend bwrap works (patch the owning module — _sandbox_wrap lives there)
     argv = tools._sandbox_wrap(["bash", "-c", "echo x"])
     assert argv[0] == "bwrap"
     assert argv[-4:] == ["--", "bash", "-c", "echo x"]            # the real command, after the separator
