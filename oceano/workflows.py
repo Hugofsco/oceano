@@ -1040,6 +1040,10 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                                   provider=cur.get("provider", ""),
                                                   label=cur.get("label", ""),
                                                   timeout=cur.get("timeout", 600),
+                                                  # same read-only tool scope as the sibling delegate
+                                                  # node above — a background agent in a flow must not
+                                                  # be quietly MORE privileged than a blocking one
+                                                  tools="Read,Glob,Grep",
                                                   cwd=config.WORKSPACE)   # raises on cap → error edge
                             spawned[cur["id"]] = rec["id"]
                             output = json.dumps({"agent_id": rec["id"], "label": rec["label"],

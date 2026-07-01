@@ -34,9 +34,10 @@ class FakeAgentJobs:
         self.spawned = []
         self._ids = iter(range(1, 100))
 
-    def spawn(self, task, provider="", label="", timeout=0, cwd=None, sid=None):
+    def spawn(self, task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None):
         aid = next(self._ids)
-        self.spawned.append({"id": aid, "task": task, "provider": provider, "timeout": timeout})
+        self.spawned.append({"id": aid, "task": task, "provider": provider,
+                             "tools": tools, "timeout": timeout})
         return {"id": aid, "label": label or task, "provider": provider or "api", "state": "running"}
 
     def status(self, aid=None):
@@ -57,6 +58,9 @@ def test_agent_node_spawns_without_blocking_and_await_collects(monkeypatch):
     rec = workflows.run(wf, trigger="manual", inp="tides", nested=True)
     assert rec["status"] == "ok"
     assert fake.spawned[0]["task"] == "research tides"        # {{input}} templated into the task
+    # gate parity with the sibling delegate node: a background agent in a flow gets the SAME
+    # read-only tool scope, never the read-write default
+    assert fake.spawned[0]["tools"] == "Read,Glob,Grep"
     steps = {s["id"]: s for s in rec["steps"]}
     assert "AGENT-RESULT" in steps[3]["output"]               # await surfaced the result
     assert rec["output"] == "got: AGENT-RESULT"               # ctx["nodes"][2] replaced by the real result
