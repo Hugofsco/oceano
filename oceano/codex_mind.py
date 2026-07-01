@@ -186,6 +186,7 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None):
     if model:
         cmd += ["--model", str(model)]
     sandbox = delegate.codex_sandbox_mode("workspace-write")    # falls back off bwrap if it can't sandbox here
+    cmd += delegate._codex_effort_args()                        # honour the configured reasoning effort
     cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
     if cwd:
         cmd += ["--cd", str(cwd)]

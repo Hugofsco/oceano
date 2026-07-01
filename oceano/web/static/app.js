@@ -1395,11 +1395,15 @@ const SETTINGS_PAGES = {
         <label class="field-label">Claude model <span class="lbl-sub">used by the Claude mind <b>and</b> Claude-Code delegation</span></label>
         <select id="claudeModelSel"></select>
         <div class="dg-hint">Sonnet is usually the sweet spot for the agent — fast and capable. Switch to Opus for the hardest reasoning. Aliases always track the latest of each tier.</div>
+        <label class="field-label">Reasoning effort <span class="lbl-sub">how hard it thinks — higher = deeper but slower/pricier</span></label>
+        <select id="claudeEffortSel"></select>
       </div>
       <div class="dg-claude-model" id="codexModelRow" style="display:none">
         <label class="field-label">Codex model <span class="lbl-sub">used by the resident Codex mind</span></label>
         <select id="codexModelSel"></select>
         <div class="dg-hint">Recommended default: GPT-5.5. Use GPT-5.4 mini when you want a faster, cheaper option.</div>
+        <label class="field-label">Reasoning effort <span class="lbl-sub">how hard it thinks — higher = deeper but slower/pricier</span></label>
+        <select id="codexEffortSel"></select>
       </div>
       <div class="dg-hint" id="mindNote"></div>
     </div>
@@ -1554,6 +1558,16 @@ async function wipeTarget(key) {
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
 function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadBrowserSetting(); loadVoiceSettings(); }
+async function _wireEffort(selId, endpoint, label) {   // reasoning-effort dropdown for a mind (Claude/Codex)
+  const esel = $("#" + selId); if (!esel) return;
+  let e; try { e = await api(endpoint); } catch { return; }
+  esel.innerHTML = `<option value="">default</option>`
+    + (e.options || []).map(o => `<option value="${escapeHtml(o)}"${o === e.effort ? " selected" : ""}>${escapeHtml(o)}</option>`).join("");
+  esel.onchange = async () => {
+    try { const r = await _postJ(endpoint, { effort: esel.value }); toast(label + " effort → " + (r.effort || "default"), "info"); }
+    catch { toast("couldn't set " + label + " effort", "err"); }
+  };
+}
 async function loadClaudeModel() {
   const row = $("#claudeModelRow"), sel = $("#claudeModelSel"); if (!row || !sel) return;
   let d; try { d = await api("/api/claude-model"); } catch { return; }
@@ -1565,6 +1579,7 @@ async function loadClaudeModel() {
       toast("Claude model → " + (r.model || "default"), "info"); }
     catch { toast("couldn't set the Claude model", "err"); }
   };
+  _wireEffort("claudeEffortSel", "/api/claude-effort", "Claude");
 }
 async function loadCodexModel() {
   const row = $("#codexModelRow"), sel = $("#codexModelSel"); if (!row || !sel) return;
@@ -1577,6 +1592,7 @@ async function loadCodexModel() {
       toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info"); }
     catch { toast("couldn't set the Codex model", "err"); }
   };
+  _wireEffort("codexEffortSel", "/api/codex-effort", "Codex");
 }
 async function loadMind() {
   let d; try { d = await api("/api/mind"); } catch { return; }

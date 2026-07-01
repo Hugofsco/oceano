@@ -990,6 +990,34 @@ async def codex_model_set(req: Request):
     return {"ok": True, "model": delegate.set_codex_model(model)}
 
 
+@app.get("/api/claude-effort")
+def claude_effort_get():
+    """The Claude reasoning-effort level (Claude mind + Claude-Code delegation). '' = CLI default."""
+    from oceano import delegate
+    return {"effort": delegate.get_claude_effort(), "options": list(delegate.CLAUDE_EFFORTS),
+            "available": delegate.available()}
+
+
+@app.post("/api/claude-effort")
+async def claude_effort_set(req: Request):
+    from oceano import delegate
+    return {"ok": True, "effort": delegate.set_claude_effort((await req.json()).get("effort", ""))}
+
+
+@app.get("/api/codex-effort")
+def codex_effort_get():
+    """The Codex reasoning-effort level for the resident Codex mind + delegation. '' = CLI default."""
+    from oceano import delegate
+    return {"effort": delegate.get_codex_effort(), "options": list(delegate.CODEX_EFFORTS),
+            "available": delegate.codex_available()}
+
+
+@app.post("/api/codex-effort")
+async def codex_effort_set(req: Request):
+    from oceano import delegate
+    return {"ok": True, "effort": delegate.set_codex_effort((await req.json()).get("effort", ""))}
+
+
 # --- the body-bridge: the Claude-mind's MCP proxy reaches Oceano's tools through here. Token-gated
 #     (mindbridge.token()), localhost; exempt from the session middleware above. The token rides in a
 #     header (never the URL/body, so it can't leak into access logs) and is compared constant-time. ---
