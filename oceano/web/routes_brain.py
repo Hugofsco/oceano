@@ -1,11 +1,11 @@
 """Brain routes: embedding-engine stats + semantic search, Rivers (HF model
-catalog → hwfit → download → serve), memories, the memory graph, and the
-memory-injection policy."""
+catalog → hwfit → download → serve), memories, the memory graph, the
+memory-injection policy, and Oceano's personality."""
 import asyncio
 
 from fastapi import APIRouter, Request
 
-from oceano import chats, embeddings, memory, rag, rivers
+from oceano import chats, embeddings, memory, personality, rag, rivers
 from oceano.web.state import _embed_reachable
 
 router = APIRouter()
@@ -139,6 +139,17 @@ async def rivers_unserve(request: Request):
 async def rivers_delete(request: Request):
     """Delete a model's .gguf from disk (refuses if served, or if it's the embedding model)."""
     return rivers.delete_model((await request.json()).get("filename", ""))
+
+
+# ---------------- personality (Brain -> Identity: freeform, user-edited only) -------
+@router.get("/api/personality")
+def get_personality():
+    return {"text": personality.get()}
+
+
+@router.post("/api/personality")
+async def set_personality(req: Request):
+    return {"text": personality.save((await req.json()).get("text", ""))}
 
 
 # ---------------- memories ----------------

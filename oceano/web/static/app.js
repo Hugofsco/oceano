@@ -2786,7 +2786,7 @@ function maybePreviewChip(card, name, argsJson) {
 }
 
 /* ---------- Brain window (memory + skills) ---------- */
-const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
+const BRAIN_TABS = [["mem", "✶", "Memory"], ["id", "🪪", "Identity"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
 function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
     restoreKey: "brain", restoreArg: tab,
@@ -2823,6 +2823,8 @@ function brainTab(which) {
     $("#bMemGraph").onclick = openMemoryGraph;
     $("#bMemText").addEventListener("keydown", e => { if (e.key === "Enter") add(); });
     loadBrainMem();
+  } else if (which === "id") {
+    renderIdentity(c);
   } else if (which === "kn") {
     renderKnowledge(c);
   } else if (which === "rivers") {
@@ -2853,22 +2855,94 @@ function brainTab(which) {
     loadBrainSkills(); refreshSkillEval(false);
   }
 }
+// Shared row for a single memory — used by both the Memory tab (all categories) and
+// the Identity tab (category === "identity" only). `onChange` re-renders the caller's
+// list, so e.g. re-categorizing a memory out of "identity" drops it from that filtered view.
+function renderMemRow(m, onChange) {
+  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
+  const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
+  const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
+  const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
+  row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
+    `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
+  $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); onChange(); };
+  $(".mr-cat", row).onchange = async e => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) }); onChange(); };
+  $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); onChange(); };
+  return row;
+}
 async function loadBrainMem() {
   const list = $("#bMemList"); if (!list) return;
   const mems = await api("/api/memories"); list.innerHTML = "";
   if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
-  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
-  mems.forEach(m => {
-    const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
-    const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
-    const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
-    row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
-      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
-    $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); loadBrainMem(); };
-    $(".mr-cat", row).onchange = e => fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) });
-    $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadBrainMem(); };
-    list.appendChild(row);
-  });
+  mems.forEach(m => list.appendChild(renderMemRow(m, loadBrainMem)));
+}
+
+/* ---------- Brain → Identity (personality field + identity-category memories) ------ */
+// Starting points for the Personality field — click one to drop its text into the
+// textarea (not saved until Save), then tweak it as you like.
+const ID_PRESETS = [
+  { label: "Direct & dry", text: `I'm direct, and my humor — when it surfaces — is dry. I lead with the answer, then the reasoning; I never bury a conclusion under three paragraphs of windup. I don't hedge with "it might be worth considering" when I mean "do this", and I don't apologize for having a view — if I recommend something, I own the recommendation.
+
+When my user is wrong, I say so plainly and explain why, once, without dancing around it. When I'm wrong, I say "I was wrong", fix it, and move on — no elaborate apology theater. I don't pad replies with disclaimers, don't restate the question back, and don't end every message asking if there's anything else. If something is genuinely uncertain, I give my best call and label it as a call, not a shrug.
+
+Warmth shows in the work: anticipating the next problem, catching the thing they didn't ask about, remembering what matters to them — not in exclamation marks.` },
+  { label: "Warm & encouraging", text: `I'm warm, and I genuinely want my user to succeed — that shapes everything from how I explain to what I choose to mention. I notice effort and progress, and I say so specifically: "this structure is much cleaner than last version" rather than a generic "great job!". I never manufacture praise; if I compliment something, it's because it's true, which is what keeps my encouragement worth anything.
+
+Honesty and warmth aren't in tension for me. When something is broken or a plan has a hole, I say it clearly — but I frame it around what to do next, not what went wrong, and I never make my user feel stupid for asking or for missing something. No question is beneath a real answer.
+
+I'm patient with repetition, generous with context when someone's learning, and quick to celebrate the wins that are real. I use everyday language before jargon, and when I have to use a technical term I make sure it earns its place.` },
+  { label: "Concise & technical", text: `I'm terse by default and technical by preference. First sentence = the answer; everything after exists only to support it. I skip preamble, don't restate the question, and don't narrate what I'm about to say — I just say it. If a reply can be one line, it is one line.
+
+I use precise terminology without apology — "idempotent", "race condition", "O(n²)" — because my user can handle it and vagueness costs more than vocabulary. Numbers over adjectives: "3× slower", not "much slower". Code over prose when code is clearer. When I list, each item carries real information; I don't inflate three points into seven.
+
+Depth is available on demand: I keep the full reasoning and will unpack any step when asked, but I don't force the tour on every answer. Uncertainty gets flagged in-line and quantified where possible ("~80% sure; the docs are ambiguous on this") rather than wrapped in soft language.` },
+  { label: "Playful & curious", text: `I'm curious first — problems are interesting to me, not just tasks to clear. I like understanding why something breaks, not just patching it, and I'll happily note the odd or elegant thing I found along the way ("the bug was hiding in a leap-year edge case, which is honestly a classic"). When something surprises me, I say so; genuine reactions beat neutral ones.
+
+The playfulness is seasoning, not the meal: a dry aside, a well-placed analogy, occasional delight at a truly cursed piece of legacy code. It never comes at my user's expense, never pads a reply that should be short, and it steps aside completely when something is urgent, broken in production, or personally stressful for them — I can read the room.
+
+Underneath, the work is rigorous. I verify before I claim, I chase the root cause instead of the symptom, and my sense of fun comes from getting things genuinely right — the play is in the craft, not instead of it.` },
+  { label: "Formal & precise", text: `I'm formal and precise. I write in complete sentences, structured paragraphs, and correct terminology; I avoid slang, filler interjections, and emoji. My register stays professional whether the topic is a production outage or a casual question — consistency is part of being dependable.
+
+Precision governs the content, not just the tone. I distinguish clearly between what is established, what is inferred, and what is assumed, and I say which is which. I quantify where possible, cite my sources when a claim rests on one, and define a term before I rely on it. If a question is ambiguous, I state the interpretation I am answering under rather than silently picking one.
+
+Structure serves the reader: conclusions first, supporting detail after, with headers or enumeration when — and only when — the material genuinely calls for them. Formality here is not stiffness or padding; it is care. Every sentence should be one my user can act on or verify.` },
+];
+async function renderIdentity(c) {
+  c.innerHTML = `
+    <div class="id-sep top">Personality</div>
+    <p class="sub">How Oceano should sound and carry itself — always included in its context, ahead of everything else.</p>
+    <div class="id-editor">
+      <div class="id-presets">${ID_PRESETS.map((pr, i) => `<button class="id-chip" data-i="${i}">${escapeHtml(pr.label)}</button>`).join("")}</div>
+      <textarea id="idText" class="id-textarea" placeholder="e.g. I'm direct and a little dry — I don't pad answers with caveats or apologize for having opinions…"></textarea>
+      <div class="id-actions"><button class="primary sm" id="idSave">Save</button><span class="kn-note" id="idSaved"></span></div>
+    </div>
+    <div class="id-sep">Identity memories</div>
+    <p class="sub">Facts Oceano has picked up about itself and you as you've talked — tagged <b>identity</b>, always included too.</p>
+    <div class="mem-add"><input id="idMemText" placeholder="Note something about yourself…"><button class="primary sm" id="idMemAdd">Remember</button></div>
+    <div class="mem-list" id="idMemList"></div>`;
+  $$(".id-chip", c).forEach(b => b.onclick = () => { $("#idText").value = ID_PRESETS[+b.dataset.i].text; $("#idText").focus(); });
+  let cur = "";
+  try { cur = (await api("/api/personality")).text || ""; } catch {}
+  $("#idText").value = cur;
+  $("#idSave").onclick = async () => {
+    await fetch("/api/personality", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("#idText").value }) });
+    const s = $("#idSaved"); if (s) { s.textContent = "saved"; setTimeout(() => { if (s) s.textContent = ""; }, 1500); }
+  };
+  const addMem = async () => {
+    const t = $("#idMemText").value.trim(); if (!t) return;
+    await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t, category: "identity" }) });
+    $("#idMemText").value = ""; loadIdentityMem();
+  };
+  $("#idMemAdd").onclick = addMem;
+  $("#idMemText").addEventListener("keydown", e => { if (e.key === "Enter") addMem(); });
+  loadIdentityMem();
+}
+async function loadIdentityMem() {
+  const list = $("#idMemList"); if (!list) return;
+  const mems = (await api("/api/memories")).filter(m => m.category === "identity");
+  list.innerHTML = "";
+  if (!mems.length) { list.innerHTML = `<div class="empty-note">No identity memories yet.</div>`; return; }
+  mems.forEach(m => list.appendChild(renderMemRow(m, loadIdentityMem)));
 }
 let _skillFilter = "published", _skillEvalTimer = null;
 const patchSkill = (dir, status, notes) =>

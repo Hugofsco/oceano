@@ -79,6 +79,19 @@ def _workspace_note():
             "folders here. File and shell tools use paths relative to it.")
 
 
+def _personality_note():
+    """Oceano's user-edited personality (Brain -> Identity) — how it should sound and
+    carry itself. Read fresh each turn so an edit takes effect immediately; empty until
+    the user writes one. Excluded for delegates (inject_context=False) — a delegate is
+    doing a contained subtask, not being Oceano."""
+    try:
+        from oceano import personality
+        text = personality.get()
+        return f"WHO YOU ARE:\n{text}" if text else ""
+    except Exception:
+        return ""
+
+
 def _skills_note(user_message):
     try:
         from oceano import skills
@@ -141,7 +154,7 @@ def _context_block(user_message):
     """Everything injected into the system message at the start of a turn: the date,
     the channel, any relevant memories, matching research notes, and the skills
     catalog. Rebuilt each turn."""
-    return "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note(),
+    return "\n\n".join(p for p in (_personality_note(), _date_note(), _workspace_note(), _channel_note(),
                                    _relevant_memories(user_message), _research_note(user_message),
                                    _skills_note(user_message)) if p)
 
