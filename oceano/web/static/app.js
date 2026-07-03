@@ -1280,8 +1280,68 @@ function renderAppearance(root) {
 }
 
 /* ================= SETTINGS WINDOW ================= */
+// keyboard shortcuts — open / surface / tuck away an app. User-remappable (see the Shortcuts settings
+// page + _shortcutOverrides below); `defKey` is just the factory default. A separate table from
+// UI_OPENERS/UI_WINIDS further down: those are what the *agent* is allowed to open via ui_open (Mail is
+// deliberately left out of that one), this is what the *user's own keypress* can reach — the two trust
+// levels aren't the same, so Mail gets a shortcut here without being added there. Defined here (ahead of
+// SETTINGS_PAGES, same reason WIPE_TARGETS precedes it below) since the Shortcuts settings page reads it
+// while building its template string.
+const APP_SHORTCUTS = [
+  { id: "chat",      label: "Chat",         icon: "◈", open: () => { setView("chat"); sideShowChats(); }, defKey: { alt: true, shift: true, key: "c" } },
+  { id: "files",     label: "Files",        icon: "▤", open: openExplorer,          win: "win-explorer",   defKey: { alt: true, shift: true, key: "f" } },
+  { id: "brain",     label: "Brain",        icon: "✶", open: openBrain,             win: "win-brain",      defKey: { alt: true, shift: true, key: "b" } },
+  { id: "scheduler", label: "Scheduler",    icon: "⏱", open: openScheduler,         win: "win-sched",      defKey: { alt: true, shift: true, key: "k" } },
+  { id: "calendar",  label: "Calendar",     icon: "◷", open: openCalendar,          win: "win-cal",        defKey: { alt: true, shift: true, key: "a" } },
+  { id: "researcher",label: "Researcher",   icon: "⌖", open: openResearcher,        win: "win-research",   defKey: { alt: true, shift: true, key: "r" } },
+  { id: "workflows", label: "Workflows",    icon: "⚙", open: openWorkflows,         win: "win-workflows",  defKey: { alt: true, shift: true, key: "w" } },
+  { id: "search",    label: "Search",       icon: "⌕", open: openSearch,            win: "win-search",     defKey: { alt: true, shift: true, key: "s" } },
+  { id: "notes",     label: "Notes",        icon: "❏", open: openNotes,             win: "win-notes",      defKey: { alt: true, shift: true, key: "n" } },
+  { id: "logs",      label: "Logs",         icon: "▤", open: openLogs,              win: "win-logs",       defKey: { alt: true, shift: true, key: "g" } },
+  { id: "hosts",     label: "Hosts",        icon: "⌗", open: openHosts,             win: "win-hosts",      defKey: { alt: true, shift: true, key: "o" } },
+  { id: "mail",      label: "Mail",         icon: "✉", open: openMail,              win: "win-mail",       defKey: { alt: true, shift: true, key: "m" } },
+  { id: "terminal",  label: "Terminal",     icon: "▸", open: () => openTerminal(),  win: "win-terminal",   defKey: { alt: true, shift: true, key: "t" } },
+  { id: "health",    label: "Health",       icon: "◉", open: openHealth,            win: "win-health",     defKey: { alt: true, shift: true, key: "h" } },
+  { id: "live",      label: "Live browser", icon: "◫", open: openLiveView,          win: "win-live",       defKey: { alt: true, shift: true, key: "v" } },
+  { id: "settings",  label: "Settings",     icon: "⚙", open: openSettings,          win: "win-settings",   defKey: { alt: true, shift: true, key: "p" } },
+];
+// user overrides, keyed by APP_SHORTCUTS id → {ctrl,alt,shift,meta,key}; only entries that differ from
+// defKey are stored, so an untouched install has an empty object here.
+function _loadShortcutOverrides() { try { return JSON.parse(localStorage.getItem("oceano.shortcutKeys") || "{}"); } catch { return {}; } }
+let _shortcutOverrides = _loadShortcutOverrides();
+function _saveShortcutOverrides() { try { localStorage.setItem("oceano.shortcutKeys", JSON.stringify(_shortcutOverrides)); } catch {} }
+function _comboFor(entry) { return _shortcutOverrides[entry.id] || entry.defKey; }
+function _comboEq(a, b) {
+  return !!a.ctrl === !!b.ctrl && !!a.alt === !!b.alt && !!a.shift === !!b.shift && !!a.meta === !!b.meta
+    && (a.key || "").toLowerCase() === (b.key || "").toLowerCase();
+}
+const _isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
+function _comboStr(c) {
+  const parts = [];
+  if (c.ctrl) parts.push("Ctrl");
+  if (c.alt) parts.push("Alt");
+  if (c.shift) parts.push("Shift");
+  if (c.meta) parts.push(_isMac ? "Cmd" : "Win");
+  parts.push(c.key === " " ? "Space" : c.key.length === 1 ? c.key.toUpperCase() : c.key);
+  return parts.join("+");
+}
+// assign `combo` to the app `id`; if another app already owns that exact combo, the two swap (rather
+// than one silently becoming unreachable behind the other)
+function _applyShortcut(id, combo) {
+  const entry = APP_SHORTCUTS.find(a => a.id === id); if (!entry) return;
+  const conflict = APP_SHORTCUTS.find(a => a.id !== id && _comboEq(_comboFor(a), combo));
+  const oldCombo = _comboFor(entry);
+  if (conflict) _setShortcutOverride(conflict.id, oldCombo);
+  _setShortcutOverride(id, combo);
+  toast(conflict ? `${entry.label} ↔ ${conflict.label} swapped` : `${entry.label} → ${_comboStr(combo)}`, "info");
+}
+function _setShortcutOverride(id, combo) {
+  const entry = APP_SHORTCUTS.find(a => a.id === id); if (!entry) return;
+  if (_comboEq(combo, entry.defKey)) delete _shortcutOverrides[id]; else _shortcutOverrides[id] = combo;
+  _saveShortcutOverrides();
+}
 const SETTINGS_TABS = [
-  ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
+  ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["shortcuts", "⌨", "Shortcuts"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
   ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
   ["voice", "🔊", "Voice"], ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
@@ -1309,6 +1369,13 @@ const SETTINGS_PAGES = {
     <div class="drawer-section">
       <h3>Two-factor authentication <span class="lbl-sub">optional</span></h3>
       <div id="twofaBody"><div class="acct-row">checking…</div></div>
+    </div>`,
+  shortcuts: `
+    <div class="drawer-section">
+      <h3>Keyboard shortcuts <span class="lbl-sub">click a shortcut, then press the new key combo — Esc cancels</span></h3>
+      <div class="wipe-list" id="scList"></div>
+      <div class="acct-actions"><span class="acct-msg" id="scMsg"></span><button class="ghost-btn sm" id="scResetAll">Reset all to defaults</button></div>
+      <p class="sub">Picking a combo already used by another app swaps the two rather than leaving one unreachable. A combo with no Ctrl/Alt/Cmd only fires when you're not typing, so you can still use that key normally in Chat, Notes, etc. Pressing a shortcut again while that app is already the front-most window minimizes it. In the <b>Terminal</b> and <b>Live browser</b> windows, shortcuts pass through untouched so the keys reach the shell / remote page instead.</p>
     </div>`,
   appearance: `
     <div class="drawer-section">
@@ -1542,6 +1609,7 @@ function openSettings() {
   $("#vcTestBtn", body).onclick = testVoiceSettings;
   $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
   renderAppearance(body);
+  renderShortcuts(body);
   loadSettingsAll();
 }
 async function wipeTarget(key) {
@@ -6331,6 +6399,84 @@ async function pollJobs() {
   pollJobDeliveries();          // print any just-finished spawn_job results into the open conversation
 }
 
+/* ---------------- app keyboard shortcuts (user-remappable — open / surface / tuck away) ---------------- */
+// open a floating-window app; if it's already open, surface it (un-minimize + bring to front); if it's
+// already the front-most visible window, tuck it away instead — press the same shortcut again to toggle.
+function _appShortcutFire(entry) {
+  if (!entry.win) { entry.open(); return; }
+  const el = document.getElementById(entry.win);
+  if (!el) { entry.open(); return; }
+  const front = $$("#windows .win").filter(w => w.style.display !== "none")
+    .sort((a, b) => (+a.style.zIndex || 0) - (+b.style.zIndex || 0)).pop();
+  if (el.style.display !== "none" && el === front) { minimizeWindow(el); return; }
+  el.style.display = "flex"; el.style.zIndex = ++_winZ;
+  if (el._chip) { el._chip.remove(); el._chip = null; _setWinMin(el.id, false); }
+}
+function _isTypingTarget(el) {
+  if (!el) return false;
+  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
+}
+let _recordingId = null;   // non-null while the Shortcuts settings page is waiting for a key combo
+function wireAppShortcuts() {
+  document.addEventListener("keydown", e => {
+    if (_recordingId) { _captureShortcutKey(e); return; }
+    if (e.repeat) return;
+    const combo = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key };
+    const hasStrongMod = combo.ctrl || combo.alt || combo.meta;
+    if (!hasStrongMod && _isTypingTarget(document.activeElement)) return;   // e.g. a bare "n" shouldn't hijack typing
+    const entry = APP_SHORTCUTS.find(a => _comboEq(_comboFor(a), combo));
+    if (!entry) return;
+    const active = document.activeElement;
+    if (active && active.closest("#win-terminal, #win-live")) return;   // let the shell / remote page keep raw keys
+    e.preventDefault();
+    _appShortcutFire(entry);
+  });
+  document.addEventListener("click", () => {
+    if (!_recordingId) return;
+    _recordingId = null;                                    // clicking away cancels an in-progress capture
+    const w = document.getElementById("win-settings"); if (w) renderShortcuts($(".win-body", w));
+  });
+}
+const _SHORTCUT_IGNORE_KEYS = ["Control", "Alt", "Shift", "Meta", "OS", "AltGraph",
+  "CapsLock", "NumLock", "ScrollLock", "Fn", "FnLock", "Hyper", "Super", "Symbol", "SymbolLock"];
+function _captureShortcutKey(e) {
+  if (_SHORTCUT_IGNORE_KEYS.includes(e.key)) return;   // a bare modifier press — keep waiting for a real key
+  e.preventDefault(); e.stopPropagation();
+  const bare = !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
+  if (e.key !== "Escape" || !bare) {                    // bare Escape cancels; anything else is the new combo
+    _applyShortcut(_recordingId, { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key });
+  }
+  _recordingId = null;
+  const w = document.getElementById("win-settings"); if (w) renderShortcuts($(".win-body", w));
+}
+function renderShortcuts(root) {
+  const list = $("#scList", root); if (!list) return;
+  list.innerHTML = APP_SHORTCUTS.map(a => {
+    const recording = _recordingId === a.id;
+    return `<div class="wipe-row sc-row">
+      <div class="wipe-info"><div class="wipe-name">${a.icon} ${escapeHtml(a.label)}</div></div>
+      <button class="kbd sc-key${recording ? " recording" : ""}" data-id="${a.id}">${recording ? "press a key…" : escapeHtml(_comboStr(_comboFor(a)))}</button>
+      ${_shortcutOverrides[a.id] ? `<button class="ghost-btn sm sc-reset" data-id="${a.id}" title="reset to default">↺</button>` : ""}
+    </div>`;
+  }).join("");
+  $$(".sc-key", list).forEach(btn => btn.onclick = e => {
+    e.stopPropagation();
+    _recordingId = _recordingId === btn.dataset.id ? null : btn.dataset.id;
+    renderShortcuts(root);
+  });
+  $$(".sc-reset", list).forEach(btn => btn.onclick = e => {
+    e.stopPropagation();
+    delete _shortcutOverrides[btn.dataset.id]; _saveShortcutOverrides();
+    renderShortcuts(root);
+  });
+  const resetAll = $("#scResetAll", root);
+  if (resetAll) resetAll.onclick = () => {
+    _shortcutOverrides = {}; _saveShortcutOverrides(); _recordingId = null;
+    renderShortcuts(root);
+    toast("Shortcuts reset to defaults", "info");
+  };
+}
+
 /* ---------------- wiring ---------------- */
 const autosize = t => { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; };
 function wire() {
@@ -6377,6 +6523,7 @@ function wire() {
   $("#liveBtn").onclick = openLiveView;
   { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
   wireAttach();
+  wireAppShortcuts();
   { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
   document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
   pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);

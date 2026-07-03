@@ -1140,6 +1140,14 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .wipe-desc{font-size:11.5px;color:var(--faint);margin-top:2px}
 .wipe-btn{flex:none}
 
+/* ===== Settings → Shortcuts ===== */
+.kbd{flex:none;font-family:var(--font-mono);font-size:11px;font-weight:500;color:var(--foam);padding:3px 8px;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;background:rgba(var(--abyss-0-rgb),.6)}
+button.kbd{cursor:pointer;transition:.15s}
+button.kbd:hover{border-color:var(--biolum);color:var(--biolum)}
+button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:var(--biolum);animation:sc-pulse 1s ease-in-out infinite}
+.sc-reset{flex:none;padding:3px 9px;font-size:13px;line-height:1}
+@keyframes sc-pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
 /* ---------- Delegation settings ---------- */
 .dg-status{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:14px;background:rgba(var(--abyss-0-rgb),.4)}
 .dg-line{font-size:12.5px;color:var(--foam);margin:2px 0}
