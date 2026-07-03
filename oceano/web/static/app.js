@@ -1280,8 +1280,68 @@ function renderAppearance(root) {
 }
 
 /* ================= SETTINGS WINDOW ================= */
+// keyboard shortcuts — open / surface / tuck away an app. User-remappable (see the Shortcuts settings
+// page + _shortcutOverrides below); `defKey` is just the factory default. A separate table from
+// UI_OPENERS/UI_WINIDS further down: those are what the *agent* is allowed to open via ui_open (Mail is
+// deliberately left out of that one), this is what the *user's own keypress* can reach — the two trust
+// levels aren't the same, so Mail gets a shortcut here without being added there. Defined here (ahead of
+// SETTINGS_PAGES, same reason WIPE_TARGETS precedes it below) since the Shortcuts settings page reads it
+// while building its template string.
+const APP_SHORTCUTS = [
+  { id: "chat",      label: "Chat",         icon: "◈", open: () => { setView("chat"); sideShowChats(); }, defKey: { alt: true, shift: true, key: "c" } },
+  { id: "files",     label: "Files",        icon: "▤", open: openExplorer,          win: "win-explorer",   defKey: { alt: true, shift: true, key: "f" } },
+  { id: "brain",     label: "Brain",        icon: "✶", open: openBrain,             win: "win-brain",      defKey: { alt: true, shift: true, key: "b" } },
+  { id: "scheduler", label: "Scheduler",    icon: "⏱", open: openScheduler,         win: "win-sched",      defKey: { alt: true, shift: true, key: "k" } },
+  { id: "calendar",  label: "Calendar",     icon: "◷", open: openCalendar,          win: "win-cal",        defKey: { alt: true, shift: true, key: "a" } },
+  { id: "researcher",label: "Researcher",   icon: "⌖", open: openResearcher,        win: "win-research",   defKey: { alt: true, shift: true, key: "r" } },
+  { id: "workflows", label: "Workflows",    icon: "⚙", open: openWorkflows,         win: "win-workflows",  defKey: { alt: true, shift: true, key: "w" } },
+  { id: "search",    label: "Search",       icon: "⌕", open: openSearch,            win: "win-search",     defKey: { alt: true, shift: true, key: "s" } },
+  { id: "notes",     label: "Notes",        icon: "❏", open: openNotes,             win: "win-notes",      defKey: { alt: true, shift: true, key: "n" } },
+  { id: "logs",      label: "Logs",         icon: "▤", open: openLogs,              win: "win-logs",       defKey: { alt: true, shift: true, key: "g" } },
+  { id: "hosts",     label: "Hosts",        icon: "⌗", open: openHosts,             win: "win-hosts",      defKey: { alt: true, shift: true, key: "o" } },
+  { id: "mail",      label: "Mail",         icon: "✉", open: openMail,              win: "win-mail",       defKey: { alt: true, shift: true, key: "m" } },
+  { id: "terminal",  label: "Terminal",     icon: "▸", open: () => openTerminal(),  win: "win-terminal",   defKey: { alt: true, shift: true, key: "t" } },
+  { id: "health",    label: "Health",       icon: "◉", open: openHealth,            win: "win-health",     defKey: { alt: true, shift: true, key: "h" } },
+  { id: "live",      label: "Live browser", icon: "◫", open: openLiveView,          win: "win-live",       defKey: { alt: true, shift: true, key: "v" } },
+  { id: "settings",  label: "Settings",     icon: "⚙", open: openSettings,          win: "win-settings",   defKey: { alt: true, shift: true, key: "p" } },
+];
+// user overrides, keyed by APP_SHORTCUTS id → {ctrl,alt,shift,meta,key}; only entries that differ from
+// defKey are stored, so an untouched install has an empty object here.
+function _loadShortcutOverrides() { try { return JSON.parse(localStorage.getItem("oceano.shortcutKeys") || "{}"); } catch { return {}; } }
+let _shortcutOverrides = _loadShortcutOverrides();
+function _saveShortcutOverrides() { try { localStorage.setItem("oceano.shortcutKeys", JSON.stringify(_shortcutOverrides)); } catch {} }
+function _comboFor(entry) { return _shortcutOverrides[entry.id] || entry.defKey; }
+function _comboEq(a, b) {
+  return !!a.ctrl === !!b.ctrl && !!a.alt === !!b.alt && !!a.shift === !!b.shift && !!a.meta === !!b.meta
+    && (a.key || "").toLowerCase() === (b.key || "").toLowerCase();
+}
+const _isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
+function _comboStr(c) {
+  const parts = [];
+  if (c.ctrl) parts.push("Ctrl");
+  if (c.alt) parts.push("Alt");
+  if (c.shift) parts.push("Shift");
+  if (c.meta) parts.push(_isMac ? "Cmd" : "Win");
+  parts.push(c.key === " " ? "Space" : c.key.length === 1 ? c.key.toUpperCase() : c.key);
+  return parts.join("+");
+}
+// assign `combo` to the app `id`; if another app already owns that exact combo, the two swap (rather
+// than one silently becoming unreachable behind the other)
+function _applyShortcut(id, combo) {
+  const entry = APP_SHORTCUTS.find(a => a.id === id); if (!entry) return;
+  const conflict = APP_SHORTCUTS.find(a => a.id !== id && _comboEq(_comboFor(a), combo));
+  const oldCombo = _comboFor(entry);
+  if (conflict) _setShortcutOverride(conflict.id, oldCombo);
+  _setShortcutOverride(id, combo);
+  toast(conflict ? `${entry.label} ↔ ${conflict.label} swapped` : `${entry.label} → ${_comboStr(combo)}`, "info");
+}
+function _setShortcutOverride(id, combo) {
+  const entry = APP_SHORTCUTS.find(a => a.id === id); if (!entry) return;
+  if (_comboEq(combo, entry.defKey)) delete _shortcutOverrides[id]; else _shortcutOverrides[id] = combo;
+  _saveShortcutOverrides();
+}
 const SETTINGS_TABS = [
-  ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
+  ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["shortcuts", "⌨", "Shortcuts"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
   ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
   ["voice", "🔊", "Voice"], ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
@@ -1309,6 +1369,13 @@ const SETTINGS_PAGES = {
     <div class="drawer-section">
       <h3>Two-factor authentication <span class="lbl-sub">optional</span></h3>
       <div id="twofaBody"><div class="acct-row">checking…</div></div>
+    </div>`,
+  shortcuts: `
+    <div class="drawer-section">
+      <h3>Keyboard shortcuts <span class="lbl-sub">click a shortcut, then press the new key combo — Esc cancels</span></h3>
+      <div class="wipe-list" id="scList"></div>
+      <div class="acct-actions"><span class="acct-msg" id="scMsg"></span><button class="ghost-btn sm" id="scResetAll">Reset all to defaults</button></div>
+      <p class="sub">Picking a combo already used by another app swaps the two rather than leaving one unreachable. A combo with no Ctrl/Alt/Cmd only fires when you're not typing, so you can still use that key normally in Chat, Notes, etc. Pressing a shortcut again while that app is already the front-most window minimizes it. In the <b>Terminal</b> and <b>Live browser</b> windows, shortcuts pass through untouched so the keys reach the shell / remote page instead.</p>
     </div>`,
   appearance: `
     <div class="drawer-section">
@@ -1542,6 +1609,7 @@ function openSettings() {
   $("#vcTestBtn", body).onclick = testVoiceSettings;
   $$(".wipe-btn", body).forEach(b => b.onclick = () => wipeTarget(b.dataset.wipe));
   renderAppearance(body);
+  renderShortcuts(body);
   loadSettingsAll();
 }
 async function wipeTarget(key) {
@@ -2786,7 +2854,7 @@ function maybePreviewChip(card, name, argsJson) {
 }
 
 /* ---------- Brain window (memory + skills) ---------- */
-const BRAIN_TABS = [["mem", "✶", "Memory"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
+const BRAIN_TABS = [["mem", "✶", "Memory"], ["id", "🪪", "Identity"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
 function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
     restoreKey: "brain", restoreArg: tab,
@@ -2823,6 +2891,8 @@ function brainTab(which) {
     $("#bMemGraph").onclick = openMemoryGraph;
     $("#bMemText").addEventListener("keydown", e => { if (e.key === "Enter") add(); });
     loadBrainMem();
+  } else if (which === "id") {
+    renderIdentity(c);
   } else if (which === "kn") {
     renderKnowledge(c);
   } else if (which === "rivers") {
@@ -2853,22 +2923,94 @@ function brainTab(which) {
     loadBrainSkills(); refreshSkillEval(false);
   }
 }
+// Shared row for a single memory — used by both the Memory tab (all categories) and
+// the Identity tab (category === "identity" only). `onChange` re-renders the caller's
+// list, so e.g. re-categorizing a memory out of "identity" drops it from that filtered view.
+function renderMemRow(m, onChange) {
+  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
+  const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
+  const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
+  const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
+  row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
+    `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
+  $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); onChange(); };
+  $(".mr-cat", row).onchange = async e => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) }); onChange(); };
+  $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); onChange(); };
+  return row;
+}
 async function loadBrainMem() {
   const list = $("#bMemList"); if (!list) return;
   const mems = await api("/api/memories"); list.innerHTML = "";
   if (!mems.length) { list.innerHTML = `<div class="empty-note">No memories yet.</div>`; return; }
-  const CATS = ["identity", "preference", "project", "fact", "task", "knowledge"];
-  mems.forEach(m => {
-    const row = document.createElement("div"); row.className = "mem-row" + (m.pinned ? " pinned" : "");
-    const catSel = `<select class="mr-cat" title="memory type">${CATS.map(c => `<option value="${c}"${c === m.category ? " selected" : ""}>${c}</option>`).join("")}</select>`;
-    const srcChip = m.source ? `<span class="mr-src" title="source — where this was learned">↪ ${escapeHtml(m.source)}</span>` : "";
-    row.innerHTML = `<button class="mr-pin${m.pinned ? " on" : ""}" title="${m.pinned ? "pinned — always injected" : "pin (always inject)"}">📌</button>` +
-      `<div class="mr-body"><div class="mr-text">${escapeHtml(m.text)}</div><div class="mr-meta">${catSel}${srcChip}<span class="mr-date">${(m.ts || "").slice(0, 10)}</span></div></div><button class="mr-del">✕</button>`;
-    $(".mr-pin", row).onclick = async () => { await fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: !m.pinned }) }); loadBrainMem(); };
-    $(".mr-cat", row).onchange = e => fetch("/api/memories/" + m.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: e.target.value }) });
-    $(".mr-del", row).onclick = async () => { if (!await confirmAction("Delete memory?", m.text.slice(0, 100))) return; await fetch("/api/memories/" + m.id, { method: "DELETE" }); loadBrainMem(); };
-    list.appendChild(row);
-  });
+  mems.forEach(m => list.appendChild(renderMemRow(m, loadBrainMem)));
+}
+
+/* ---------- Brain → Identity (personality field + identity-category memories) ------ */
+// Starting points for the Personality field — click one to drop its text into the
+// textarea (not saved until Save), then tweak it as you like.
+const ID_PRESETS = [
+  { label: "Direct & dry", text: `I'm direct, and my humor — when it surfaces — is dry. I lead with the answer, then the reasoning; I never bury a conclusion under three paragraphs of windup. I don't hedge with "it might be worth considering" when I mean "do this", and I don't apologize for having a view — if I recommend something, I own the recommendation.
+
+When my user is wrong, I say so plainly and explain why, once, without dancing around it. When I'm wrong, I say "I was wrong", fix it, and move on — no elaborate apology theater. I don't pad replies with disclaimers, don't restate the question back, and don't end every message asking if there's anything else. If something is genuinely uncertain, I give my best call and label it as a call, not a shrug.
+
+Warmth shows in the work: anticipating the next problem, catching the thing they didn't ask about, remembering what matters to them — not in exclamation marks.` },
+  { label: "Warm & encouraging", text: `I'm warm, and I genuinely want my user to succeed — that shapes everything from how I explain to what I choose to mention. I notice effort and progress, and I say so specifically: "this structure is much cleaner than last version" rather than a generic "great job!". I never manufacture praise; if I compliment something, it's because it's true, which is what keeps my encouragement worth anything.
+
+Honesty and warmth aren't in tension for me. When something is broken or a plan has a hole, I say it clearly — but I frame it around what to do next, not what went wrong, and I never make my user feel stupid for asking or for missing something. No question is beneath a real answer.
+
+I'm patient with repetition, generous with context when someone's learning, and quick to celebrate the wins that are real. I use everyday language before jargon, and when I have to use a technical term I make sure it earns its place.` },
+  { label: "Concise & technical", text: `I'm terse by default and technical by preference. First sentence = the answer; everything after exists only to support it. I skip preamble, don't restate the question, and don't narrate what I'm about to say — I just say it. If a reply can be one line, it is one line.
+
+I use precise terminology without apology — "idempotent", "race condition", "O(n²)" — because my user can handle it and vagueness costs more than vocabulary. Numbers over adjectives: "3× slower", not "much slower". Code over prose when code is clearer. When I list, each item carries real information; I don't inflate three points into seven.
+
+Depth is available on demand: I keep the full reasoning and will unpack any step when asked, but I don't force the tour on every answer. Uncertainty gets flagged in-line and quantified where possible ("~80% sure; the docs are ambiguous on this") rather than wrapped in soft language.` },
+  { label: "Playful & curious", text: `I'm curious first — problems are interesting to me, not just tasks to clear. I like understanding why something breaks, not just patching it, and I'll happily note the odd or elegant thing I found along the way ("the bug was hiding in a leap-year edge case, which is honestly a classic"). When something surprises me, I say so; genuine reactions beat neutral ones.
+
+The playfulness is seasoning, not the meal: a dry aside, a well-placed analogy, occasional delight at a truly cursed piece of legacy code. It never comes at my user's expense, never pads a reply that should be short, and it steps aside completely when something is urgent, broken in production, or personally stressful for them — I can read the room.
+
+Underneath, the work is rigorous. I verify before I claim, I chase the root cause instead of the symptom, and my sense of fun comes from getting things genuinely right — the play is in the craft, not instead of it.` },
+  { label: "Formal & precise", text: `I'm formal and precise. I write in complete sentences, structured paragraphs, and correct terminology; I avoid slang, filler interjections, and emoji. My register stays professional whether the topic is a production outage or a casual question — consistency is part of being dependable.
+
+Precision governs the content, not just the tone. I distinguish clearly between what is established, what is inferred, and what is assumed, and I say which is which. I quantify where possible, cite my sources when a claim rests on one, and define a term before I rely on it. If a question is ambiguous, I state the interpretation I am answering under rather than silently picking one.
+
+Structure serves the reader: conclusions first, supporting detail after, with headers or enumeration when — and only when — the material genuinely calls for them. Formality here is not stiffness or padding; it is care. Every sentence should be one my user can act on or verify.` },
+];
+async function renderIdentity(c) {
+  c.innerHTML = `
+    <div class="id-sep top">Personality</div>
+    <p class="sub">How Oceano should sound and carry itself — always included in its context, ahead of everything else.</p>
+    <div class="id-editor">
+      <div class="id-presets">${ID_PRESETS.map((pr, i) => `<button class="id-chip" data-i="${i}">${escapeHtml(pr.label)}</button>`).join("")}</div>
+      <textarea id="idText" class="id-textarea" placeholder="e.g. I'm direct and a little dry — I don't pad answers with caveats or apologize for having opinions…"></textarea>
+      <div class="id-actions"><button class="primary sm" id="idSave">Save</button><span class="kn-note" id="idSaved"></span></div>
+    </div>
+    <div class="id-sep">Identity memories</div>
+    <p class="sub">Facts Oceano has picked up about itself and you as you've talked — tagged <b>identity</b>, always included too.</p>
+    <div class="mem-add"><input id="idMemText" placeholder="Note something about yourself…"><button class="primary sm" id="idMemAdd">Remember</button></div>
+    <div class="mem-list" id="idMemList"></div>`;
+  $$(".id-chip", c).forEach(b => b.onclick = () => { $("#idText").value = ID_PRESETS[+b.dataset.i].text; $("#idText").focus(); });
+  let cur = "";
+  try { cur = (await api("/api/personality")).text || ""; } catch {}
+  $("#idText").value = cur;
+  $("#idSave").onclick = async () => {
+    await fetch("/api/personality", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("#idText").value }) });
+    const s = $("#idSaved"); if (s) { s.textContent = "saved"; setTimeout(() => { if (s) s.textContent = ""; }, 1500); }
+  };
+  const addMem = async () => {
+    const t = $("#idMemText").value.trim(); if (!t) return;
+    await fetch("/api/memories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t, category: "identity" }) });
+    $("#idMemText").value = ""; loadIdentityMem();
+  };
+  $("#idMemAdd").onclick = addMem;
+  $("#idMemText").addEventListener("keydown", e => { if (e.key === "Enter") addMem(); });
+  loadIdentityMem();
+}
+async function loadIdentityMem() {
+  const list = $("#idMemList"); if (!list) return;
+  const mems = (await api("/api/memories")).filter(m => m.category === "identity");
+  list.innerHTML = "";
+  if (!mems.length) { list.innerHTML = `<div class="empty-note">No identity memories yet.</div>`; return; }
+  mems.forEach(m => list.appendChild(renderMemRow(m, loadIdentityMem)));
 }
 let _skillFilter = "published", _skillEvalTimer = null;
 const patchSkill = (dir, status, notes) =>
@@ -5516,6 +5658,7 @@ const WF_PORTS = {
   decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2],
   tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
   http: [1, 2], subflow: [1, 2], transform: [1, 2],
+  agent: [1, 2], await: [1, 2],
 };
 // branch label for an output port (Drawflow names them output_1, output_2…), per node type
 function wfOutBranch(type, outName, node) {
@@ -5555,6 +5698,8 @@ function wfNodeData(n) {
       c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
       c3op: g(2, "op", "contains"), c3val: g(2, "value", ""), c3label: g(2, "label", "") }; }
   if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
+  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", label: n.label || "", timeout: String(n.timeout || 600) };
+  if (n.type === "await") return { timeout: String(n.timeout || 900) };
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
   if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
@@ -5577,6 +5722,8 @@ function wfNodeHtml(type, data) {
   if (type === "subflow") return `<div class="wfn wfn-subflow"><b>▣ Sub-workflow</b><input df-workflow class="wfn-f" placeholder="workflow name or id"><textarea df-wfinput class="wfn-f" placeholder="input to pass · default {{last}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   if (type === "transform") return `<div class="wfn wfn-transform"><b>ƒ Transform</b><select df-mode class="wfn-f"><option value="template">template</option><option value="regex">regex extract</option><option value="jsonpath">json path</option><option value="python">python</option></select><input df-source class="wfn-f" placeholder="input · default {{last}}"><textarea df-text class="wfn-f" placeholder="template / regex / a.b.0 path / python (value holds input)"></textarea><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   if (type === "approval") return `<div class="wfn wfn-approval"><b>✋ Approval</b><textarea df-prompt class="wfn-f" placeholder="what to approve?"></textarea><label class="wfn-mini">timeout (min) <input df-timeout type="number" min="1" class="wfn-f wfn-num" placeholder="60"></label><div class="wfn-branches"><span>▸ approved</span><span>▸ rejected</span></div></div>`;
+  if (type === "agent") return `<div class="wfn wfn-agent"><b>🤖 Agent (background)</b><textarea df-task class="wfn-f" placeholder="self-contained task — it runs while the flow continues; join later with an Await node"></textarea><select df-provider class="wfn-f"><option value="">delegation default</option><option value="claude">claude</option><option value="codex">codex</option><option value="api">api</option><option value="local">local (weak · serialized)</option></select><input df-label class="wfn-f" placeholder="short label"><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="600"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
+  if (type === "await") return `<div class="wfn wfn-await"><b>⏳ Await agents</b><div class="wf-hint">waits for all agents spawned in this run, then continues with their results ({{node.ID}} of each agent node)</div><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="900"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
   return `<div class="wfn"><b>${type}</b></div>`;
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
@@ -5824,6 +5971,8 @@ const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
   : n.type === "subflow" ? "▣ " + (n.workflow || "sub-workflow")
   : n.type === "transform" ? "ƒ " + (n.mode || "transform")
   : n.type === "approval" ? "✋ approval"
+  : n.type === "agent" ? "🤖 " + ((n.label || n.task || "agent").slice(0, 44))
+  : n.type === "await" ? "⏳ await agents"
   : n.type;
 
 function openWorkflows() {
@@ -5968,6 +6117,7 @@ async function wfRenderEditor(body, w) {
           <button class="wf-pal-btn" data-add="tool">🔧 Tool</button>
           <button class="wf-pal-btn" data-add="instruction">✎ Instruction</button>
           <button class="wf-pal-btn" data-add="delegate">↗ Delegate</button>
+          <button class="wf-pal-btn" data-add="agent">🤖 Agent (bg)</button>
           <button class="wf-pal-btn" data-add="http">🌐 HTTP request</button>
           <button class="wf-pal-btn" data-add="subflow">▣ Sub-workflow</button>
           <button class="wf-pal-btn" data-add="transform">ƒ Transform</button></div>
@@ -5975,7 +6125,8 @@ async function wfRenderEditor(body, w) {
           <button class="wf-pal-btn" data-add="decision">◆ Decision</button>
           <button class="wf-pal-btn" data-add="switch">⤳ Switch</button>
           <button class="wf-pal-btn" data-add="loop">↻ Loop</button>
-          <button class="wf-pal-btn" data-add="approval">✋ Approval</button></div>
+          <button class="wf-pal-btn" data-add="approval">✋ Approval</button>
+          <button class="wf-pal-btn" data-add="await">⏳ Await agents</button></div>
         <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>
           <button class="wf-pal-btn" data-add="end">■ End</button></div>
         <div class="wf-pal-foot">
@@ -6066,6 +6217,8 @@ function wfReadCanvas(editor) {
     else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
+    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.label = d.label || ""; node.timeout = intOr0(d.timeout) || 600; }
+    else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     nodes.push(node);
     const outs = nd.outputs || {};
     for (const oname in outs) (outs[oname].connections || []).forEach(c =>
@@ -6194,7 +6347,34 @@ async function wfRenderRuns(body, w) {
 }
 
 /* ---------------- background-jobs running indicator (global, polled) ---------------- */
-let _jobsLast = [], _jobsTimer = null;
+let _jobsLast = [], _jobsTimer = null, _deliveredJobs = new Set();
+// A spawn_job (Oceano-owned background OS job) that finished after the turn that started it: print
+// its result into the conversation that spawned it. The client is the sole persister of a chat, so
+// delivery flows through here (not a server-side chats.json write) to avoid clobbering _curT. The
+// server tracks a per-job `delivered` flag too, so a reload never re-prints an already-shown result.
+async function pollJobDeliveries() {
+  const sid = state.session;
+  if (!sid || state.busy) return;                 // don't interleave with a streaming turn
+  let d; try { d = await api("/api/bgjobs?session=" + encodeURIComponent(sid)); } catch { return; }
+  let delivered = false;
+  for (const j of (d && d.pending) || []) {
+    if (state.session !== sid) break;             // user switched chats mid-poll → stop
+    const kind = j.kind || "job";                 // "job" (spawn_job) or "agent" (spawn_agent)
+    const key = kind + ":" + j.id;                // ids are per-registry — never dedup across kinds
+    if (_deliveredJobs.has(key)) continue;
+    _deliveredJobs.add(key);
+    const noun = kind === "agent" ? `Background agent “${j.label}” (${j.provider || "?"})` : `Background job “${j.label}”`;
+    const exit = kind === "agent" ? "" : ` (exit ${j.exit_code})`;
+    const head = j.state === "done" ? `✅ ${noun} finished${exit}.`
+               : j.state === "failed" ? `❌ ${noun} failed${exit}.` + (kind === "agent" && j.error ? " " + j.error : "")
+               : `⚠️ ${noun} was lost — Oceano restarted while it ran.`;
+    const body = kind === "agent" ? (j.output || "") : (j.tail ? "```\n" + j.tail + "\n```" : "");
+    appendT({ role: "assistant", content: body ? head + "\n\n" + body : head, ts: Date.now() });
+    delivered = true;
+    try { await fetch("/api/bgjobs/" + encodeURIComponent(j.id) + "/ack?kind=" + kind, { method: "POST" }); } catch {}
+  }
+  if (delivered) { renderThread(); persistChat(); }
+}
 function renderJobsPop(pop) {
   if (!_jobsLast.length) { pop.innerHTML = `<div class="jb-empty">No background jobs running.</div>`; return; }
   pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j =>
@@ -6216,6 +6396,85 @@ async function pollJobs() {
   const running = new Set(_jobsLast.filter(j => j.state === "running" && j.ref).map(j => j.ref));
   $$(".wf-card[data-wid]").forEach(c => c.classList.toggle("job-running", running.has("workflow:" + c.dataset.wid)));
   $$(".sched-row[data-tid]").forEach(r => r.classList.toggle("job-running", running.has(r.dataset.src) || running.has("task:" + r.dataset.tid)));
+  pollJobDeliveries();          // print any just-finished spawn_job results into the open conversation
+}
+
+/* ---------------- app keyboard shortcuts (user-remappable — open / surface / tuck away) ---------------- */
+// open a floating-window app; if it's already open, surface it (un-minimize + bring to front); if it's
+// already the front-most visible window, tuck it away instead — press the same shortcut again to toggle.
+function _appShortcutFire(entry) {
+  if (!entry.win) { entry.open(); return; }
+  const el = document.getElementById(entry.win);
+  if (!el) { entry.open(); return; }
+  const front = $$("#windows .win").filter(w => w.style.display !== "none")
+    .sort((a, b) => (+a.style.zIndex || 0) - (+b.style.zIndex || 0)).pop();
+  if (el.style.display !== "none" && el === front) { minimizeWindow(el); return; }
+  el.style.display = "flex"; el.style.zIndex = ++_winZ;
+  if (el._chip) { el._chip.remove(); el._chip = null; _setWinMin(el.id, false); }
+}
+function _isTypingTarget(el) {
+  if (!el) return false;
+  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
+}
+let _recordingId = null;   // non-null while the Shortcuts settings page is waiting for a key combo
+function wireAppShortcuts() {
+  document.addEventListener("keydown", e => {
+    if (_recordingId) { _captureShortcutKey(e); return; }
+    if (e.repeat) return;
+    const combo = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key };
+    const hasStrongMod = combo.ctrl || combo.alt || combo.meta;
+    if (!hasStrongMod && _isTypingTarget(document.activeElement)) return;   // e.g. a bare "n" shouldn't hijack typing
+    const entry = APP_SHORTCUTS.find(a => _comboEq(_comboFor(a), combo));
+    if (!entry) return;
+    const active = document.activeElement;
+    if (active && active.closest("#win-terminal, #win-live")) return;   // let the shell / remote page keep raw keys
+    e.preventDefault();
+    _appShortcutFire(entry);
+  });
+  document.addEventListener("click", () => {
+    if (!_recordingId) return;
+    _recordingId = null;                                    // clicking away cancels an in-progress capture
+    const w = document.getElementById("win-settings"); if (w) renderShortcuts($(".win-body", w));
+  });
+}
+const _SHORTCUT_IGNORE_KEYS = ["Control", "Alt", "Shift", "Meta", "OS", "AltGraph",
+  "CapsLock", "NumLock", "ScrollLock", "Fn", "FnLock", "Hyper", "Super", "Symbol", "SymbolLock"];
+function _captureShortcutKey(e) {
+  if (_SHORTCUT_IGNORE_KEYS.includes(e.key)) return;   // a bare modifier press — keep waiting for a real key
+  e.preventDefault(); e.stopPropagation();
+  const bare = !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
+  if (e.key !== "Escape" || !bare) {                    // bare Escape cancels; anything else is the new combo
+    _applyShortcut(_recordingId, { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key });
+  }
+  _recordingId = null;
+  const w = document.getElementById("win-settings"); if (w) renderShortcuts($(".win-body", w));
+}
+function renderShortcuts(root) {
+  const list = $("#scList", root); if (!list) return;
+  list.innerHTML = APP_SHORTCUTS.map(a => {
+    const recording = _recordingId === a.id;
+    return `<div class="wipe-row sc-row">
+      <div class="wipe-info"><div class="wipe-name">${a.icon} ${escapeHtml(a.label)}</div></div>
+      <button class="kbd sc-key${recording ? " recording" : ""}" data-id="${a.id}">${recording ? "press a key…" : escapeHtml(_comboStr(_comboFor(a)))}</button>
+      ${_shortcutOverrides[a.id] ? `<button class="ghost-btn sm sc-reset" data-id="${a.id}" title="reset to default">↺</button>` : ""}
+    </div>`;
+  }).join("");
+  $$(".sc-key", list).forEach(btn => btn.onclick = e => {
+    e.stopPropagation();
+    _recordingId = _recordingId === btn.dataset.id ? null : btn.dataset.id;
+    renderShortcuts(root);
+  });
+  $$(".sc-reset", list).forEach(btn => btn.onclick = e => {
+    e.stopPropagation();
+    delete _shortcutOverrides[btn.dataset.id]; _saveShortcutOverrides();
+    renderShortcuts(root);
+  });
+  const resetAll = $("#scResetAll", root);
+  if (resetAll) resetAll.onclick = () => {
+    _shortcutOverrides = {}; _saveShortcutOverrides(); _recordingId = null;
+    renderShortcuts(root);
+    toast("Shortcuts reset to defaults", "info");
+  };
 }
 
 /* ---------------- wiring ---------------- */
@@ -6264,6 +6523,7 @@ function wire() {
   $("#liveBtn").onclick = openLiveView;
   { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
   wireAttach();
+  wireAppShortcuts();
   { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
   document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
   pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);

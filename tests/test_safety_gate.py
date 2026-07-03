@@ -31,6 +31,7 @@ def test_shell_blocked_after_untrusted_read():
     # both execution tools refuse — and refuse BEFORE running anything
     assert tools.run_shell("echo should-not-run") == tools._SHELL_TAINTED
     assert tools.python_exec("print('nope')") == tools._SHELL_TAINTED
+    assert tools.spawn_job("echo should-not-run") == tools._SHELL_TAINTED
 
 
 def test_bridge_taint_also_blocks():
@@ -49,7 +50,7 @@ def test_sandbox_disabled_returns_inner(monkeypatch):
 
 def test_sandbox_wraps_when_available(monkeypatch):
     monkeypatch.delenv("OCEANO_SHELL_SANDBOX", raising=False)
-    monkeypatch.setattr(tools, "_sandbox_ok", lambda: True)        # pretend bwrap works
+    monkeypatch.setattr(tools.shell, "_sandbox_ok", lambda: True)  # pretend bwrap works (patch the owning module — _sandbox_wrap lives there)
     argv = tools._sandbox_wrap(["bash", "-c", "echo x"])
     assert argv[0] == "bwrap"
     assert argv[-4:] == ["--", "bash", "-c", "echo x"]            # the real command, after the separator

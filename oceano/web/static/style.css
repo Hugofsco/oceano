@@ -647,6 +647,17 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .mem-row .mr-cat{background:rgba(var(--abyss-0-rgb),.5);border:1px solid var(--line);border-radius:6px;color:var(--biolum);font-family:var(--font-mono);font-size:10.5px;padding:2px 5px;outline:none;cursor:pointer}
 .mem-row .mr-src{font-family:var(--font-mono);font-size:10.5px;color:var(--faint);opacity:.85;min-width:0;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mem-row .mr-date{font-family:var(--font-mono);font-size:11px;color:var(--faint)}
+/* identity (Brain → Identity: personality profile + identity-category memories) */
+.brain-pane .sub{font-size:13px;color:var(--faint);line-height:1.5;margin-bottom:14px}
+.id-editor{margin-bottom:8px}
+.id-textarea{width:100%;box-sizing:border-box;min-height:130px;resize:vertical;padding:11px 13px;background:rgba(var(--abyss-0-rgb),.5);border:1px solid var(--line);border-radius:10px;color:var(--foam);font-family:var(--font-body);font-size:14px;line-height:1.55;outline:none}
+.id-textarea:focus{border-color:var(--biolum)}
+.id-actions{display:flex;align-items:center;gap:10px;margin-top:10px}
+.id-sep{font-family:var(--font-mono);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;margin:22px 0 12px;padding-top:16px;border-top:1px solid var(--line)}
+.id-sep.top{margin-top:0;padding-top:0;border-top:none}
+.id-presets{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px}
+.id-chip{padding:5px 12px;background:rgba(var(--abyss-0-rgb),.5);border:1px solid var(--line);border-radius:20px;color:var(--mist);font-family:var(--font-body);font-size:12px;cursor:pointer;transition:.15s}
+.id-chip:hover{border-color:var(--biolum);color:var(--foam)}
 /* memory injection policy (Settings → Memory) */
 .mem-policy{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
 .mp-row{display:flex;align-items:center;gap:10px}
@@ -1128,6 +1139,14 @@ body:not([data-view="chat"]) .sidebar-foot{flex:1;justify-content:flex-end}
 .wipe-name{font-size:13.5px;font-weight:600;color:var(--foam)}
 .wipe-desc{font-size:11.5px;color:var(--faint);margin-top:2px}
 .wipe-btn{flex:none}
+
+/* ===== Settings → Shortcuts ===== */
+.kbd{flex:none;font-family:var(--font-mono);font-size:11px;font-weight:500;color:var(--foam);padding:3px 8px;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;background:rgba(var(--abyss-0-rgb),.6)}
+button.kbd{cursor:pointer;transition:.15s}
+button.kbd:hover{border-color:var(--biolum);color:var(--biolum)}
+button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:var(--biolum);animation:sc-pulse 1s ease-in-out infinite}
+.sc-reset{flex:none;padding:3px 9px;font-size:13px;line-height:1}
+@keyframes sc-pulse{0%,100%{opacity:1}50%{opacity:.5}}
 
 /* ---------- Delegation settings ---------- */
 .dg-status{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:14px;background:rgba(var(--abyss-0-rgb),.4)}
