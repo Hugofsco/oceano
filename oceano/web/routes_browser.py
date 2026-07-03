@@ -8,7 +8,7 @@ import json
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import StreamingResponse
 
-from oceano import livebrowser, safety, uibridge
+from oceano import desktopbridge, livebrowser, safety, uibridge
 from oceano.web.state import SESSION_COOKIE, _sse, _token_user, load, save
 
 router = APIRouter()
@@ -271,3 +271,40 @@ async def ui_stream():
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@router.get("/api/desktop/stream")
+async def desktop_stream():
+    """Server→OceanoDesktop native-action requests (oceano/tools/desktop.py's calls land here). Only
+    OceanoDesktop's main process ever holds this open — it's the one place a native OS action
+    (notification, file picker) can actually run. Auth-gated by the middleware like /api/ui/stream."""
+    loop = asyncio.get_running_loop()
+    q = desktopbridge.subscribe(loop)
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    cmd = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ka\n\n"          # keep-alive
+                    continue
+                yield _sse(cmd)
+        finally:
+            desktopbridge.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@router.post("/api/desktop/result")
+async def desktop_result(req: Request):
+    """OceanoDesktop's answer to a pending desktopbridge.call() — matched by the `id` it was given
+    on /api/desktop/stream. A stray or duplicate post (e.g. after a timeout already gave up) is a
+    harmless no-op, so this never needs to error the desktop app's side."""
+    body = await req.json()
+    rid = body.get("id")
+    if rid is None:
+        return {"ok": False, "error": "missing id"}
+    matched = desktopbridge.resolve(rid, bool(body.get("ok")), body.get("result"))
+    return {"ok": True, "matched": matched}

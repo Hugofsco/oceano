@@ -24,8 +24,10 @@ from oceano.tools.core import (  # noqa: F401
     chat_tools,
     clear_progress_sink,
     current_channel,
+    current_client,
     emit_progress,
     is_background,
+    is_desktop_client,
     is_enabled,
     live_browser_available,
     register,
@@ -55,6 +57,7 @@ from oceano.tools import (  # noqa: E402, F401
     media,
     dev,
     ui,
+    desktop,
 )
 
 # Re-export the tool functions (and the private gates/helpers tests rely on) so
@@ -182,4 +185,14 @@ from oceano.tools.ui import (  # noqa: E402, F401
     ui_arrange,
     ui_close,
     ui_open,
+)
+from oceano.tools.desktop import (  # noqa: E402, F401
+    desktop_clipboard_read,
+    desktop_clipboard_write,
+    desktop_notify,
+    desktop_open_path,
+    desktop_pick_file,
+    desktop_reveal_path,
+    desktop_save_file,
+    desktop_screenshot,
 )

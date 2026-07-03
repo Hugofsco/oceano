@@ -10,7 +10,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 import config
-from oceano import chats, rag, skills
+from oceano import chats, rag, skills, turnctx
 from oceano.web.state import (
     _CHAT_LIVE_KEEP,
     _agent,
@@ -51,6 +51,10 @@ async def chat(req: Request):
     req_base_url, req_api_key = base_url, api_key
     agent_mode = bool(body.get("agent_mode"))
     voice = bool(body.get("voice"))                  # hands-free converse → ask for a short, spoken-friendly reply
+    # OceanoDesktop tags its own requests (full client, quick chat, and its main-process API calls
+    # alike — see OceanoDesktop/src/main.js) so desktop-only tools (oceano/tools/desktop.py) know a
+    # real native OS process is actually on the other end, not just a browser tab.
+    client = "desktop" if (req.headers.get("x-oceano-client") or "").strip().lower() == "desktop" else "web"
     attachments = body.get("attachments") or []      # [{path, name, kind}] from /api/upload
     # so it's verifiable in the journal which mode a message actually ran in (tools
     # are only attached in agent mode) — settles "the toggle was on but it didn't use tools".
@@ -155,7 +159,8 @@ async def chat(req: Request):
                 b["running"] = False                      # turn is over — reconnection stops polling
             put(None)  # sentinel: stream finished
 
-    threading.Thread(target=worker, daemon=True).start()
+    with turnctx.push(client=client):
+        threading.Thread(target=turnctx.carry(worker), daemon=True).start()
 
     async def gen():
         try:

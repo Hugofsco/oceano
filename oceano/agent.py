@@ -756,10 +756,12 @@ class Agent:
         def work():
             try:
                 # The body: Oceano's own tools, executed in the daemon. The per-turn config carries
-                # this chat's id AND whether the turn is unattended (bridged tools then run on the
-                # background channel — no live browser/UI) — per turn, so concurrent turns for other
-                # chats are never dragged into the background channel by this one.
-                mcp_path = mindbridge.mcp_config_path(self.session_id, background=bg)
+                # this chat's id, whether the turn is unattended (bridged tools then run on the
+                # background channel — no live browser/UI), and which client started it (so
+                # oceano/tools/desktop.py's tools unlock only when OceanoDesktop, not a browser tab,
+                # is on the other end) — all per turn, so concurrent turns for other chats never
+                # inherit this one's channel or client.
+                mcp_path = mindbridge.mcp_config_path(self.session_id, background=bg, client=tools.current_client())
                 # Claude keeps its native tools for files/shell; Oceano's BODY (memory, calendar, windows,
                 # notify, AND the web) rides alongside as mcp__oceano — it reaches for those because nothing
                 # native competes. The web is the exception: its native WebSearch/WebFetch ARE disallowed, so

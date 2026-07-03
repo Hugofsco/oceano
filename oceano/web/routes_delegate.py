@@ -115,8 +115,9 @@ async def mcp_call(req: Request):
     name, args = b.get("name", ""), b.get("args") or {}
     session = req.headers.get("x-oceano-session") or None    # which chat this mind turn drives (spawn_job routing)
     background = req.headers.get("x-oceano-background") == "1"   # unattended turn → background channel (no live UI)
+    client = req.headers.get("x-oceano-client") or "web"      # "desktop" unlocks oceano/tools/desktop.py's tools
     print(f"[mind] tool {name}({list(args)})", flush=True)            # so the body's actions land in the journal
-    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args, session, background)}
+    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args, session, background, client)}
 
 
 @router.get("/api/delegate")

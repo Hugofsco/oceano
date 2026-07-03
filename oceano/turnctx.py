@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 @dataclass(frozen=True)
 class TurnContext:
     channel: str = "web"      # web (interactive, may drive the live browser) | telegram | background
+    client: str = "web"       # web (plain browser tab) | desktop (OceanoDesktop) — see oceano.desktopbridge
     workspace: object = None  # Path override for file/shell tools (None → config.WORKSPACE)
     session: str = None       # the chat sid this turn drives (spawn_job result routing)
     tainted: bool = False     # this turn ingested untrusted content (web page / email / doc)

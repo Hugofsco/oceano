@@ -46,6 +46,20 @@ def channel(name):
         yield
 
 
+# --- client (which app made this HTTP request, orthogonal to channel) ------
+# channel says WHERE the turn runs (web/telegram/background); client says which app the "web"
+# channel actually came through — a plain browser tab, or OceanoDesktop (Electron, tagged via the
+# X-Oceano-Client header in routes_chat.py). Only OceanoDesktop has a real OS process to run native
+# actions in (see oceano.desktopbridge), so desktop-only tools gate on this, not on channel.
+def current_client():
+    return turnctx.get().client
+
+
+def is_desktop_client():
+    """True only when this turn came through the OceanoDesktop app (not a plain browser tab)."""
+    return current_client() == "desktop"
+
+
 # --- progress sink ---------------------------------------------------------
 # A long-running tool (the streaming delegate) can push live progress to whoever is driving
 # it. The agent sets a sink before running such a tool (on the same thread the tool runs on)

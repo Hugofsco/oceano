@@ -88,6 +88,27 @@ def test_carried_worker_mutations_do_not_leak_back():
     assert not safety.untrusted_seen()
 
 
+def test_client_field_defaults_and_carries():
+    """client (which app made the request — plain browser vs OceanoDesktop) defaults to "web" and
+    rides the same context/carry discipline as channel — set in routes_chat.py from the
+    X-Oceano-Client header, read via tools.current_client()/is_desktop_client()."""
+    assert turnctx.get().client == "web"
+    assert not tools.is_desktop_client()
+    seen = {}
+
+    def worker():
+        seen["client"] = tools.current_client()
+        seen["is_desktop"] = tools.is_desktop_client()
+
+    with turnctx.push(client="desktop"):
+        assert tools.current_client() == "desktop"
+        assert tools.is_desktop_client()
+        t = threading.Thread(target=turnctx.carry(worker))
+        t.start(); t.join()
+    assert seen == {"client": "desktop", "is_desktop": True}
+    assert turnctx.get().client == "web"                   # restored outside the push
+
+
 def test_concurrent_turns_stay_isolated():
     """Two overlapping turns on different threads each keep their own full context."""
     seen, barrier = {}, threading.Barrier(2)

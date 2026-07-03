@@ -93,6 +93,74 @@ def test_mcp_config_carries_the_background_flag(tmp_path, monkeypatch):
     assert "OCEANO_MCP_BACKGROUND" not in json.loads(Path(pi).read_text())["mcpServers"]["oceano"]["env"]
 
 
+def test_mcp_config_carries_the_client_flag(tmp_path, monkeypatch):
+    """A turn that started via OceanoDesktop gets OCEANO_MCP_CLIENT=desktop and its own config
+    file, so oceano/tools/desktop.py's tools unlock for the mind on that turn — and a plain web
+    turn's config must NOT carry the flag (the default, so it doesn't need its own filename)."""
+    import config
+    monkeypatch.setattr(config, "WORKSPACE", tmp_path / "workspace")
+    p = mindbridge.mcp_config_path("chatQ", client="desktop")
+    cfg = json.loads(Path(p).read_text())
+    assert p.endswith("mind-mcp-chatQ-desktop.json")
+    assert cfg["mcpServers"]["oceano"]["env"]["OCEANO_MCP_CLIENT"] == "desktop"
+    # the default (web) config must NOT carry the flag or get a suffixed filename
+    p0 = mindbridge.mcp_config_path("chatQ")
+    cfg0 = json.loads(Path(p0).read_text())
+    assert p0.endswith("mind-mcp-chatQ.json")
+    assert "OCEANO_MCP_CLIENT" not in cfg0["mcpServers"]["oceano"]["env"]
+    # background + desktop together get both suffixes, no clobbering either concurrent config
+    pb = mindbridge.mcp_config_path("chatQ", background=True, client="desktop")
+    assert pb.endswith("mind-mcp-chatQ-bg-desktop.json")
+
+
+def test_run_tool_client_is_per_call_not_global():
+    """Two OVERLAPPING bridged calls — one from OceanoDesktop, one from a plain browser tab —
+    must each see only their own client, same guarantee as channel above."""
+    from oceano import tools
+    barrier = threading.Barrier(2)
+
+    def probe():
+        barrier.wait()                     # guarantee both calls are inside run_tool simultaneously
+        time.sleep(0.05)
+        return "CLI=" + tools.current_client()
+
+    tools.register("__probe_client",
+                   {"type": "function", "function": {"name": "__probe_client",
+                    "parameters": {"type": "object", "properties": {}}}},
+                   probe)
+    mindbridge._ALLOW.add("__probe_client")
+    seen = {}
+    try:
+        def call(key, client):
+            seen[key] = mindbridge.run_tool("__probe_client", {}, client=client)
+
+        t1 = threading.Thread(target=call, args=("desktop", "desktop"))
+        t2 = threading.Thread(target=call, args=("web", "web"))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        assert seen == {"desktop": "CLI=desktop", "web": "CLI=web"}
+    finally:
+        mindbridge._ALLOW.discard("__probe_client")
+        tools.unregister_prefix("__probe_client")
+
+
+def test_desktop_tools_are_allowed_to_the_mind():
+    """Regression lock: these must stay in _ALLOW or the Claude/Codex mind can never see them at
+    all, no matter how the client/taint gates in oceano/tools/desktop.py are configured."""
+    for name in ("desktop_notify", "desktop_pick_file", "desktop_save_file", "desktop_reveal_path",
+                 "desktop_open_path", "desktop_clipboard_read", "desktop_clipboard_write", "desktop_screenshot"):
+        assert name in mindbridge._ALLOW, name
+
+
+def test_run_tool_desktop_gate_follows_the_threaded_client():
+    """End-to-end through the actual bridge call, not just turnctx: a desktop-client call reaches
+    (and is refused only by) the desktopbridge "not connected" gate; a plain web-client call is
+    refused earlier, by the client gate itself."""
+    out_web = mindbridge.run_tool("desktop_notify", {"title": "t", "body": "b"}, client="web")
+    assert "only available when chatting through the OceanoDesktop app" in out_web
+    out_desktop = mindbridge.run_tool("desktop_notify", {"title": "t", "body": "b"}, client="desktop")
+    assert "couldn't show the notification" in out_desktop and "isn't connected" in out_desktop
+
+
 def test_run_tool_channel_is_per_call_not_global():
     """Two OVERLAPPING bridged calls — one background, one interactive — must each run on their
     own channel. This is the regression test for the old `_bg_mind_turns` process-global, where
