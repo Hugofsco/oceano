@@ -125,3 +125,87 @@ def test_norm_graph_normalizes_agent_and_await():
     a, w = g["nodes"]
     assert a["provider"] == "" and a["timeout"] == 3600       # bogus provider → default; clamped
     assert w["timeout"] == 1
+
+
+# ---------------- orchestrate: plugged-in agents run in ordered steps ----------------
+def _orch_wf(plan, states, extra_orch=None):
+    """start → orchestrate (with agents 2,3,4 plugged in) → transform → end.
+    The agent→orchestrate edges are ATTACHMENTS — traversal must never walk them."""
+    orch = {"id": 5, "type": "orchestrate", "plan": plan, "timeout": 5, **(extra_orch or {})}
+    return _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "agent", "task": "scan A", "label": "a"},
+         {"id": 3, "type": "agent", "task": "scan B", "label": "b"},
+         {"id": 4, "type": "agent", "task": "synthesize", "label": "c"},
+         orch,
+         {"id": 6, "type": "transform", "mode": "template", "text": "got: {{node.4}}"},
+         {"id": 7, "type": "end"}],
+        [{"from": 1, "to": 5},
+         {"from": 2, "to": 5}, {"from": 3, "to": 5}, {"from": 4, "to": 5},
+         {"from": 5, "to": 6}, {"from": 6, "to": 7}])
+
+
+def test_orchestrate_steps_in_order_with_context_passing(monkeypatch):
+    fake = FakeAgentJobs({1: {"state": "done", "output": "A1-OUT", "error": ""},
+                          2: {"state": "done", "output": "A2-OUT", "error": ""},
+                          3: {"state": "done", "output": "A3-OUT", "error": ""}})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _orch_wf({"2": 1, "3": 1, "4": 2}, fake.states)
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    tasks = [s["task"] for s in fake.spawned]
+    assert len(tasks) == 3
+    assert tasks[0] == "scan A" and tasks[1] == "scan B"      # step 1: parallel pair, no context yet
+    assert tasks[2].startswith("synthesize")                  # step 2 spawned after step 1 joined…
+    assert "A1-OUT" in tasks[2] and "A2-OUT" in tasks[2]      # …and received step 1's results
+    steps = {s["id"]: s for s in rec["steps"]}
+    assert "A3-OUT" in steps[5]["output"]                     # compile includes the final agent
+    assert rec["output"] == "got: A3-OUT"                     # each agent is {{node.ID}}-addressable
+    # attachments are not flow edges: the agent nodes never executed as standalone steps
+    assert 2 not in steps and 3 not in steps and 4 not in steps
+
+
+def test_orchestrate_failure_stops_later_steps_and_takes_error_edge(monkeypatch):
+    fake = FakeAgentJobs({1: {"state": "failed", "output": "", "error": "boom"}})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "agent", "task": "flaky", "label": "a"},
+         {"id": 3, "type": "agent", "task": "never spawned", "label": "b"},
+         {"id": 4, "type": "orchestrate", "plan": {"2": 1, "3": 2}, "timeout": 5},
+         {"id": 5, "type": "transform", "mode": "template", "text": "HAPPY"},
+         {"id": 6, "type": "transform", "mode": "template", "text": "RESCUED"},
+         {"id": 7, "type": "end"}],
+        [{"from": 1, "to": 4}, {"from": 2, "to": 4}, {"from": 3, "to": 4},
+         {"from": 4, "to": 5}, {"from": 4, "to": 6, "branch": "error"},
+         {"from": 5, "to": 7}, {"from": 6, "to": 7}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    steps = {s["id"]: s for s in rec["steps"]}
+    assert steps[4]["ok"] is False and "boom" in steps[4]["output"]
+    assert len(fake.spawned) == 1                             # step 2 never triggered
+    assert 6 in steps and 5 not in steps                      # error edge taken
+
+
+def test_orchestrate_without_agents_fails_cleanly(monkeypatch):
+    fake = FakeAgentJobs({})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _wf(
+        [{"id": 1, "type": "start"}, {"id": 2, "type": "orchestrate", "plan": {}, "timeout": 5},
+         {"id": 3, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    steps = {s["id"]: s for s in rec["steps"]}
+    assert steps[2]["ok"] is False and "no agent nodes" in steps[2]["output"]
+
+
+def test_norm_graph_normalizes_orchestrate():
+    g = workflows._norm_graph({"nodes": [
+        {"id": 1, "type": "orchestrate", "plan": {"7": "2", "x": 3, "8": 0, "9": 99},
+         "mode": "bogus", "timeout": 99999},
+    ], "edges": []})
+    n = g["nodes"][0]
+    assert n["plan"] == {"7": 2, "8": 1, "9": 20}             # ints, clamped 1..20, junk keys dropped
+    assert n["mode"] == "concat" and n["timeout"] == 3600

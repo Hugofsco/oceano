@@ -5661,6 +5661,7 @@ const WF_PORTS = {
   tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
   http: [1, 2], subflow: [1, 2], transform: [1, 2],
   agent: [1, 2], await: [1, 2],
+  orchestrate: [2, 2],   // input_1 = flow in · input_2 = the "agents" attachment port
 };
 // branch label for an output port (Drawflow names them output_1, output_2…), per node type
 function wfOutBranch(type, outName, node) {
@@ -5703,6 +5704,7 @@ function wfNodeData(n) {
   if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
   if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", label: n.label || "", timeout: String(n.timeout || 600) };
   if (n.type === "await") return { timeout: String(n.timeout || 900) };
+  if (n.type === "orchestrate") return { plan: JSON.stringify(n.plan || {}), mode: n.mode || "concat", text: n.text || "", timeout: String(n.timeout || 900) };
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
   if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
@@ -5719,6 +5721,7 @@ const WF_ICONS = {
   delegate: _wfSvg('<line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/>'),
   agent: _wfSvg('<rect x="5" y="8" width="14" height="11" rx="2.5"/><circle cx="9.5" cy="13.5" r="1"/><circle cx="14.5" cy="13.5" r="1"/><line x1="12" y1="8" x2="12" y2="5"/><circle cx="12" cy="4" r="1"/>'),
   await: _wfSvg('<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 13.5"/>'),
+  orchestrate: _wfSvg('<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>'),
   http: _wfSvg('<circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a15.3 15.3 0 0 1 4 9 15.3 15.3 0 0 1-4 9 15.3 15.3 0 0 1-4-9 15.3 15.3 0 0 1 4-9z"/>'),
   subflow: _wfSvg('<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'),
   transform: _wfSvg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>'),
@@ -5735,6 +5738,7 @@ const WF_META = {
   delegate: { name: "Delegate", kicker: "cloud task" },
   agent: { name: "Agent Spawn", kicker: "background" },
   await: { name: "Await Agents", kicker: "join" },
+  orchestrate: { name: "Orchestrator", kicker: "multi-agent" },
   http: { name: "HTTP Request", kicker: "action" },
   subflow: { name: "Sub-workflow", kicker: "action" },
   transform: { name: "Transform", kicker: "data" },
@@ -5759,6 +5763,7 @@ function wfCardText(type, d) {
   if (type === "delegate") return ["Delegate", _wfTrunc(d.text) || "task for Claude / cloud"];
   if (type === "agent") return ["Agent Spawn", _wfTrunc(d.label || d.task) || "background task"];
   if (type === "await") return ["Await Agents", "join spawned agents"];
+  if (type === "orchestrate") return ["Orchestrator", "plug agents into me"];   // sub refined live in wfCardRefresh
   if (type === "http") { let h = ""; try { h = new URL(d.url).host; } catch {} return ["HTTP Request", ((d.method || "GET") + " " + (h || _wfTrunc(d.url, 28))).trim()]; }
   if (type === "subflow") return ["Sub-workflow", _wfTrunc(d.workflow, 32) || "pick a workflow"];
   if (type === "transform") return ["Transform", d.mode || "template"];
@@ -5792,6 +5797,17 @@ function wfCardRefresh(editor, dfId) {
   if (ss) ss.textContent = s || (WF_META[nd.name] || {}).kicker || "";
   const labs = wfPortLabels(nd.name, nd.data || {});
   el.querySelectorAll(".outputs .output").forEach((o, i) => o.setAttribute("data-lbl", labs[i] || ""));
+  if (nd.name === "orchestrate") {
+    // input_2 is the attachment port; the summary counts what's actually plugged in right now
+    const ilabs = ["", "agents"];
+    el.querySelectorAll(".inputs .input").forEach((o, i) => o.setAttribute("data-lbl", ilabs[i] || ""));
+    const conns = ((nd.inputs || {}).input_2 || {}).connections || [];
+    let plan = {}; try { plan = JSON.parse((nd.data || {}).plan || "{}"); } catch {}
+    const nsteps = new Set(conns.map(c => plan[String(c.node)] || 1)).size;
+    if (ss) ss.textContent = conns.length
+      ? conns.length + " agent" + (conns.length > 1 ? "s" : "") + " · " + nsteps + " step" + (nsteps > 1 ? "s" : "")
+      : "plug agents into me";
+  }
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
 const _WF_LONG_STR = /content|text|body|code|message|prompt|command|instruction/i;
@@ -6051,7 +6067,7 @@ const WF_FIELDS = {
     { k: "provider", t: "select", l: "provider", opts: [["", "delegation default"], ["claude", "claude"], ["codex", "codex"], ["api", "api"], ["local", "local (weak · serialized)"]] },
     { k: "label", t: "text", l: "label", ph: "short label" },
     { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 },
-    { t: "note", text: "join spawned agents later with an <b>Await Agents</b> node — each result lands in its {{node.ID}}." }],
+    { t: "note", text: "join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}." }],
   await: [
     { t: "note", text: "waits for every agent spawned in this run, then continues with their results." },
     { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 }],
@@ -6117,6 +6133,50 @@ function wfInspSwitch(editor, dfId, box, sync) {
   };
   box.querySelectorAll("input,select").forEach(f => { f.addEventListener("change", upd); if (f.tagName !== "SELECT") f.addEventListener("input", upd); });
 }
+// orchestrator inspector: lists the agent nodes plugged into the "agents" port and lets each one
+// be assigned a STEP number — same step = run in parallel, steps run 1 → 2 → 3…, and every later
+// step automatically receives the earlier steps' results (they're also {{node.ID}}-addressable).
+function wfInspOrch(editor, dfId, box, sync) {
+  const render = () => {
+    const nd = editor.getNodeFromId(dfId); if (!nd) return;
+    const d = nd.data || {};
+    let plan = {}; try { plan = JSON.parse(d.plan || "{}"); } catch {}
+    const conns = ((nd.inputs || {}).input_2 || {}).connections || [];
+    const agents = conns.map(c => {
+      const an = editor.getNodeFromId(c.node);
+      return an && an.name === "agent" ? { id: String(c.node), data: an.data || {} } : null;
+    }).filter(Boolean);
+    // auto-heal the plan: newly plugged agents start at step 1, unplugged ones drop out
+    const healed = {};
+    agents.forEach(a => { healed[a.id] = Math.max(1, parseInt(plan[a.id], 10) || 1); });
+    if (JSON.stringify(healed) !== JSON.stringify(plan)) { plan = healed; sync({ plan: JSON.stringify(plan) }); }
+    let h = "";
+    if (!agents.length) {
+      h += `<div class="wf-insp-note">no agents plugged in yet — drag an <b>Agent Spawn</b> node's output dot onto this node's <b>agents</b> port (its lower input dot).</div>`;
+    } else {
+      h += `<div class="wfn-lab">plugged-in agents · step order</div>`;
+      h += agents.map(a => {
+        const nm = a.data.label || (a.data.task || "").slice(0, 34) || ("agent " + a.id);
+        return `<div class="wf-orch-row"><input type="number" min="1" max="20" class="wf-orch-step" data-oa="${a.id}" value="${plan[a.id]}" title="step"><span class="wf-orch-name" title="${escapeHtml(a.data.task || "")}">${escapeHtml(nm)}</span></div>`;
+      }).join("");
+      h += `<div class="wfn-hint">same step = run in parallel · steps run 1 → 2 → 3… · later steps automatically receive the earlier results</div>`;
+    }
+    h += `<div class="wf-insp-row"><label class="wfn-lab">when all are done</label><select class="wfn-fld" data-k="mode"><option value="concat"${d.mode !== "summarize" ? " selected" : ""}>pass the combined results onward</option><option value="summarize"${d.mode === "summarize" ? " selected" : ""}>compile with the model first</option></select></div>`;
+    if (d.mode === "summarize") h += `<div class="wf-insp-row"><label class="wfn-lab">compile brief</label><textarea class="wfn-fld" data-k="text" placeholder="how to compile the results — e.g. merge into one report, dedupe, note which agent found what">${escapeHtml(d.text || "")}</textarea></div>`;
+    h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"></div>`;
+    box.innerHTML = h;
+    box.querySelectorAll("[data-oa]").forEach(f => f.addEventListener("change", () => {
+      plan[f.dataset.oa] = Math.max(1, parseInt(f.value, 10) || 1);
+      sync({ plan: JSON.stringify(plan) });
+    }));
+    box.querySelectorAll("[data-k]").forEach(f => {
+      const h2 = () => { sync({ [f.dataset.k]: f.value }); if (f.dataset.k === "mode") render(); };
+      f.addEventListener("change", h2);
+      if (f.tagName !== "SELECT") f.addEventListener("input", h2);
+    });
+  };
+  render();
+}
 function wfInspect(editor, dfId, body) {
   const insp = $("#wfInsp", body); if (!insp) return;
   const nd = editor.getNodeFromId(dfId); if (!nd) return;
@@ -6144,6 +6204,7 @@ function wfInspect(editor, dfId, body) {
   else if (type === "trigger") wfInspTrigger(editor, dfId, box, sync);
   else if (type === "http") wfInspHttp(editor, dfId, box, sync);
   else if (type === "switch") wfInspSwitch(editor, dfId, box, sync);
+  else if (type === "orchestrate") wfInspOrch(editor, dfId, box, sync);
   else wfInspGeneric(editor, dfId, type, box, sync);
 }
 
@@ -6285,7 +6346,7 @@ async function wfRenderEditor(body, w) {
     <div class="wf-editor-main">
       <div class="wf-sidebar" id="wfSidebar">
         <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>${pal("trigger")}</div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>${["tool", "instruction", "delegate", "agent", "http", "subflow", "transform"].map(pal).join("")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>${["tool", "instruction", "delegate", "agent", "orchestrate", "http", "subflow", "transform"].map(pal).join("")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "approval", "await"].map(pal).join("")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>${pal("end")}</div>
         <div class="wf-pal-foot"><div class="wf-hint">click a node to edit it in the settings panel · drag an output dot onto an input dot to connect · values: {{input}} · {{last}} · {{node.ID}}</div></div>
@@ -6327,19 +6388,35 @@ async function wfRenderEditor(body, w) {
     wfCardRefresh(editor, dfId);      // port branch labels (yes/no · error · case names)
     return dfId;
   };
-  // build from the saved graph, or seed a fresh start node
+  // build from the saved graph, or seed a fresh start node. Saved node ids are PRESERVED
+  // (editor.nodeId is pinned before each add) so {{node.ID}} references and orchestrator
+  // step plans stay valid across edit sessions instead of silently renumbering.
   if (w && w.graph && w.graph.nodes && w.graph.nodes.length) {
     const map = {};
-    w.graph.nodes.forEach(n => { map[n.id] = addNode(n.type, n.x || 60, n.y || 60, n); });
+    w.graph.nodes.forEach(n => { editor.nodeId = n.id; map[n.id] = addNode(n.type, n.x || 60, n.y || 60, n); });
+    editor.nodeId = Math.max(0, ...w.graph.nodes.map(n => n.id)) + 1;
     (w.graph.edges || []).forEach(e => {
       const from = map[e.from], to = map[e.to]; if (from == null || to == null) return;
       const src = w.graph.nodes.find(x => x.id === e.from) || {};
+      const dst = w.graph.nodes.find(x => x.id === e.to) || {};
       const port = wfBranchPort(src.type, e.branch, src);
-      try { editor.addConnection(from, to, port, "input_1"); } catch {}
+      // agent → orchestrator edges are attachments: they land on the dedicated "agents" port
+      const inPort = (src.type === "agent" && dst.type === "orchestrate" && !e.branch) ? "input_2" : "input_1";
+      try { editor.addConnection(from, to, port, inPort); } catch {}
     });
+    w.graph.nodes.forEach(n => { if (map[n.id] != null) wfCardRefresh(editor, map[n.id]); });  // orch summaries need the connections
   } else {
     addNode("start", 40, 80, { type: "start" });
   }
+  // orchestrator cards + an open orchestrator inspector track plug/unplug live
+  const onConn = () => {
+    const dd = editor.drawflow.drawflow.Home.data;
+    Object.keys(dd).forEach(k => { if (dd[k].name === "orchestrate") wfCardRefresh(editor, k); });
+    const insp = $("#wfInsp", body);
+    if (insp && insp.classList.contains("open") && insp.dataset.node) wfInspect(editor, +insp.dataset.node, body);
+  };
+  editor.on("connectionCreated", onConn);
+  editor.on("connectionRemoved", onConn);
   $$(".wf-sidebar [data-add]", body).forEach(b => b.onclick = () => wfInspect(editor, addNode(b.dataset.add), body));
   $("#wfZoomIn", body).onclick = () => editor.zoom_in();
   $("#wfZoomOut", body).onclick = () => editor.zoom_out();
@@ -6388,6 +6465,10 @@ function wfReadCanvas(editor) {
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
     else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.label = d.label || ""; node.timeout = intOr0(d.timeout) || 600; }
     else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
+    else if (t === "orchestrate") {
+      try { node.plan = (d.plan || "").trim() ? JSON.parse(d.plan) : {}; } catch { node.plan = {}; }
+      node.mode = d.mode || "concat"; node.text = d.text || ""; node.timeout = intOr0(d.timeout) || 900;
+    }
     nodes.push(node);
     const outs = nd.outputs || {};
     for (const oname in outs) (outs[oname].connections || []).forEach(c =>

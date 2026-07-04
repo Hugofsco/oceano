@@ -32,10 +32,11 @@ STORE = config.WORKSPACE.parent / "data" / "workflows.json"
 SOURCE_PREFIX = "workflow:"
 SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
-# switch=multi-branch, loop=foreach, http/subflow/transform=connectivity+data, approval=human-in-the-loop.
+# switch=multi-branch, loop=foreach, http/subflow/transform=connectivity+data, approval=human-in-the-loop,
+# agent/await/orchestrate=multi-agent (orchestrate = plugged-in agent nodes run in ordered steps).
 NODE_TYPES = ("start", "trigger", "tool", "instruction", "delegate", "decision",
               "switch", "loop", "http", "subflow", "transform", "approval",
-              "agent", "await", "end")
+              "agent", "await", "orchestrate", "end")
 _AGENT_PROVIDERS = ("", "claude", "codex", "api", "local")   # "" = the delegation default
 _TRIGGER_NODE_KINDS = ("manual", "schedule", "webhook", "keyword", "watch", "email")
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
@@ -157,6 +158,21 @@ def _norm_graph(graph):
             node["agents"] = str(n.get("agents", "")).strip()   # optional id list; empty = all spawned
             try:
                 node["timeout"] = max(1, min(int(n.get("timeout", 900)), 3600))    # seconds
+            except (TypeError, ValueError):
+                node["timeout"] = 900
+        elif t == "orchestrate":                      # run plugged-in agent nodes in ordered steps
+            raw_plan = n.get("plan") if isinstance(n.get("plan"), dict) else {}
+            plan = {}                                 # agent node id -> step number (same step = parallel)
+            for k, v in raw_plan.items():
+                try:
+                    plan[str(int(k))] = max(1, min(int(v), 20))
+                except (TypeError, ValueError):
+                    continue
+            node["plan"] = plan
+            node["mode"] = n.get("mode") if n.get("mode") in ("concat", "summarize") else "concat"
+            node["text"] = str(n.get("text", ""))     # compile brief (summarize mode)
+            try:
+                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 3600))    # seconds PER STEP
             except (TypeError, ValueError):
                 node["timeout"] = 900
         elif t == "decision":
@@ -831,6 +847,85 @@ def _await_approval(wf_id, prompt, timeout_min, beat):
     return a["approved"], ("approved" if a["approved"] else "rejected")
 
 
+def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
+    """Run the agent nodes plugged into an orchestrator. node['plan'] maps agent node id -> step
+    number; unlisted agents default to step 1. Each step's agents spawn in parallel and the step is
+    joined before the next starts — later steps get earlier results appended to their task (and can
+    also reference them as {{node.ID}}). Returns (ok, compiled_output); a failed/timed-out agent
+    stops the remaining steps and routes the error edge, with the partial compile as output.
+    mode 'summarize' rewrites the compile with the shared agent (same engine as an instruction
+    node), using node['text'] as the brief."""
+    from oceano import agentjobs
+    if not agents:
+        return False, "orchestrate: no agent nodes are plugged into this orchestrator"
+    plan = node.get("plan") or {}
+    steps = {}
+    for a in agents:
+        steps.setdefault(int(plan.get(str(a["id"]), 1)), []).append(a)
+    name = lambda a: a.get("label") or "agent " + str(a["id"])   # noqa: E731
+    gathered, failures = [], []      # [(step, agent node, output)] · [(step, agent node, error)]
+    for step in sorted(steps):
+        prior = ""
+        if gathered:                 # sequence semantics: this step sees everything gathered so far
+            prior = "\n\n(Context — results from earlier agents:)\n" + "\n\n".join(
+                f"== {name(an)}\n{out[:2000]}" for _s, an, out in gathered)
+        running, by_id = {}, {a["id"]: a for a in steps[step]}
+        for a in steps[step]:
+            emit({"event": "tool", "id": node["id"],
+                  "text": f"step {step} · spawning 🤖 {a.get('label') or a.get('task', '')[:40]}"})
+            rec = agentjobs.spawn(_tmpl(a.get("task", ""), ctx) + prior,
+                                  provider=a.get("provider", ""), label=a.get("label", ""),
+                                  timeout=a.get("timeout", 600),
+                                  # same read-only scope as the agent/delegate nodes
+                                  tools="Read,Glob,Grep", cwd=config.WORKSPACE)
+            running[a["id"]] = rec["id"]
+            spawned[a["id"]] = rec["id"]               # a later Await node can still see them
+        deadline = time.time() + node.get("timeout", 900)
+        done, failed = {}, {}
+        while time.time() < deadline:
+            beat()
+            left = False
+            for nid, aid in running.items():
+                if nid in done or nid in failed:
+                    continue
+                r = agentjobs.status(aid) or {"state": "lost"}
+                if r["state"] == "done":
+                    done[nid] = r.get("output") or ""
+                elif r["state"] in ("failed", "lost"):
+                    failed[nid] = r.get("error") or r["state"]
+                else:
+                    left = True
+            if not left:
+                break
+            time.sleep(2)
+        for nid in by_id:
+            if nid not in done and nid not in failed:
+                failed[nid] = "timed out (still running)"
+        for a in steps[step]:                          # keep the plugged-in order deterministic
+            nid = a["id"]
+            if nid in done:
+                ctx["nodes"][nid] = done[nid]          # {{node.ID}} of each agent = its result
+                gathered.append((step, a, done[nid]))
+                emit({"event": "tool", "id": node["id"], "text": f"step {step} · ✓ {name(a)}"})
+            else:
+                failures.append((step, a, failed[nid]))
+                emit({"event": "tool", "id": node["id"],
+                      "text": f"step {step} · ✗ {name(a)}: {failed[nid][:120]}"})
+        if failed:                                     # later steps depend on this one — stop here
+            break
+    parts = [f"== {name(an)} (step {s})\n{out}" for s, an, out in gathered]
+    parts += [f"== {name(an)} (step {s}) FAILED: {err}" for s, an, err in failures]
+    compiled = "\n\n".join(parts)
+    ok = not failures
+    if ok and node.get("mode") == "summarize" and gathered:
+        brief = (node.get("text") or "").strip() \
+            or "Synthesize the agents' results below into one coherent, complete answer."
+        compiled = ag.run(brief + "\n\n" + compiled) or compiled
+    if gathered:
+        ag.messages.append({"role": "user", "content": f"(orchestrated agents → {compiled[:1500]})"})
+    return ok, compiled
+
+
 # ---------------- execution ----------------
 def _node_label(n):
     t = n["type"]
@@ -847,6 +942,8 @@ def _node_label(n):
             + (f" ({n['provider']})" if n.get("provider") else "")
     if t == "await":
         return "⏳ await agents"
+    if t == "orchestrate":
+        return "🕸 orchestrate agents"
     if t == "decision":
         return "◆ " + (n.get("question", "")[:48] or n.get("mode", "decision"))
     if t == "switch":
@@ -935,7 +1032,15 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     graph = wf.get("graph") or {"nodes": [], "edges": []}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     succ = {}                                          # id -> [(branch, to_id)]
+    attached = {}                                      # orchestrate node id -> [plugged-in agent nodes]
     for e in graph.get("edges", []):
+        src, dst = nodes.get(e["from"]), nodes.get(e["to"])
+        if (src and dst and src["type"] == "agent" and dst["type"] == "orchestrate"
+                and e.get("branch") in (None, "next")):
+            # an agent wired into an orchestrator is an ATTACHMENT, not a flow edge: the
+            # orchestrator triggers it at its step — traversal must never walk this edge
+            attached.setdefault(dst["id"], []).append(src)
+            continue
         succ.setdefault(e["from"], []).append((e.get("branch"), e["to"]))
 
     start = next((n for n in graph.get("nodes", []) if n["type"] in ("start", "trigger")), None)
@@ -1085,6 +1190,9 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                 if done:
                                     ag.messages.append({"role": "user",
                                                         "content": f"(agents finished → {output[:1500]})"})
+                        elif t == "orchestrate":       # trigger plugged-in agents step by step, join, compile
+                            ok, output = _run_orchestrate(cur, attached.get(cur["id"], []), ctx, ag,
+                                                          spawned, emit, beat)
                         elif t == "decision":
                             fnode = {**cur, "question": _tmpl(cur.get("question", ""), ctx),
                                      "ruleValue": _tmpl(cur.get("ruleValue", ""), ctx)}
