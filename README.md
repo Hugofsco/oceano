@@ -25,14 +25,15 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **81 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **93 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser the
   agent operates (snapshot the page · fill forms · click · extract), HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
   one shot), **a gated SSH keychain** (run command batches on registered servers),
   **multi-account email** (IMAP + SMTP — read, organize, delete spam, send & reply), agent-driven
-  UI control (it opens & arranges your windows), and delegation; plus any tools from MCP servers
-  you connect.
+  UI control (it opens & arranges your windows), **daemon-owned background jobs & parallel
+  sub-agents** (results delivered back into the chat), **native desktop actions** (via the
+  OceanoDesktop app), and delegation; plus any tools from MCP servers you connect.
 - **A built-in email client.** Connect IMAP/SMTP accounts (app passwords) and get a real client —
   a folder sidebar with **unread counts**, a message reader, **multi-select** bulk move/delete,
   a compose/reply editor with a **rich-text toolbar**, and a **✨ AI-draft-reply** button. The agent
@@ -67,6 +68,14 @@ from a web UI or Telegram.
   acts as the resident mind of the local body (its tool use shows as chips in the chat, just like the
   local model). Flip back to the local model for fully-offline. See
   [Claude or Codex as the mind](#claude-or-codex-as-the-mind).
+- **Background jobs & sub-agents that outlive the turn.** `spawn_job` hands a long-running
+  command to the daemon (not the model's turn), and `spawn_agent` fires a **parallel background
+  sub-agent** — Claude, Codex, a cloud model, or the local model — while the conversation keeps
+  going; both report status on demand and **deliver their result back into the chat** when done.
+  Workflows get the same power as **agent + await nodes** (fan out mid-flow, join later).
+- **You write the persona.** Brain → **Identity** has a freeform Personality field — how Oceano
+  should sound and carry itself — injected *first* into every turn's context (five starting
+  presets included). It's user-edited only: no tool lets the model rewrite it.
 - **Watch it browse.** A multi-tab live browser streams what the agent sees; a web
   search spins up a tab per source so you can see exactly what it read.
 - **Run-aware + optional queue.** A live indicator shows every background job
@@ -77,11 +86,12 @@ from a web UI or Telegram.
   hardware** (it reads the model's GGUF + your VRAM/RAM/cores and fills in context, GPU layers,
   KV dtype, threads, and MoE-offload, each with a reason).
 - **A desktop of apps.** Floating windows: chat with dated history folders, a "Brain"
-  (memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
+  (identity · memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
   Scheduler, Calendar, Researcher, semantic Search, a Kanban Notes board, a
   System-health dashboard, a Memory graph, a Voice console, an **interactive Terminal** (a real
   bash shell in the workspace, xterm.js over a WebSocket — fenced by the systemd sandbox), and a
-  sandboxed Preview that renders web apps, markdown, Mermaid, charts, and slide decks.
+  sandboxed Preview that renders web apps, markdown, Mermaid, charts, and slide decks —
+  every window on a **remappable keyboard shortcut** (Alt+Shift+key, rebind in Settings).
 
 ---
 
@@ -91,7 +101,7 @@ from a web UI or Telegram.
                           ┌──────────────────────── oceano.service (oceano/engine.py) ───────────────────────┐
    browser / Telegram ──► │  FastAPI web UI :8800   ·   Telegram bot   ·   scheduler loop                    │
                           │        │                                                                          │
-                          │   Agent core (oceano/agent.py)  ──► tools (oceano/tools.py)                       │
+                          │   Agent core (oceano/agent.py)  ──► tools (oceano/tools/)                         │
                           │        │                              │                                           │
                           │        ▼                              ├─► llama-swap :8081  (chat models)         │
                           │   per-turn context:                   ├─► SearXNG :8080     (web search)          │
@@ -125,7 +135,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (81)
+## The agent's tools (93)
 
 | Group | Tools |
 |-------|-------|
@@ -145,6 +155,8 @@ from a web UI or Telegram.
 | **Hosts (SSH)** | `list_hosts`, `ssh_run` (run command batches on a registered server), `sftp` (list / get / put files — gated; see [Hosts](#hosts--ssh-keychain)) |
 | **Mail (IMAP/SMTP)** | `mail_accounts`, `mail_folders` (counts + which are empty), `mail_list`, `mail_read`, `mail_move`, `mail_delete` (→ Trash), `mail_flag` (read/unread/flag/spam), `mail_send`, `mail_reply` (both can attach workspace files), `mail_save_attachment` (save an incoming attachment to the workspace), `mail_folder` (create/rename/delete) — multi-account, gated; see [Mail](#mail--imap--smtp) |
 | **Delegation** | `delegate` (hand a subtask to the configured stronger assistant) |
+| **Background jobs & sub-agents** | `spawn_job` (run a long command as a **daemon-owned** background job — it survives the turn, and the result is delivered back into the chat; same gates as `run_shell`), `job_status`, `spawn_agent` (fire a **parallel background sub-agent** on Claude / Codex / a cloud model / the local model), `agent_status` |
+| **Desktop** (OceanoDesktop only) | `desktop_notify` (native OS notification), `desktop_pick_file` / `desktop_save_file` (real native file dialogs), `desktop_reveal_path` / `desktop_open_path`, `desktop_clipboard_read` / `desktop_clipboard_write`, `desktop_screenshot` (capture the screen) — only when you're connected through the OceanoDesktop app, never a browser tab; actions are injection-gated like SSH/mail |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
 
@@ -170,6 +182,13 @@ fallback. It's designed to feel like the agent actually *remembers* you:
   `identity` is Oceano's *own* first-person sense of self (written in its voice —
   "I…", with the human as "my user"), so the always-on identity block reads as the
   agent, never as a third-person "User does X".
+- **Identity & Personality** — Brain → **Identity** holds a freeform, *user-edited* persona
+  (how Oceano should sound and carry itself; five starting presets from *Direct & dry* to
+  *Formal & precise*). It's stored as plain text (`data/personality.txt`), read fresh and
+  injected as the **first** element of every turn's context — so an edit takes effect
+  immediately — and no tool exposes it to the model (unlike the identity-category memories
+  the agent writes to itself, which the same tab also surfaces). Delegates never see it —
+  a delegate runs a contained subtask, it isn't *being* Oceano.
 - **Self-correction** — the agent can `update_memory` / `forget_memory` when something
   becomes wrong or outdated.
 - **Maintenance + graph** — a locked weekly job hands the whole store to the configured
@@ -212,8 +231,11 @@ add files directly, or let the agent **learn** them:
 
 ## Workflows
 
-Named, **branching** recipes you draw on a node canvas (the Workflows window). A workflow
-is a directed graph; execution walks it from a **start** node, following edges:
+Named, **branching** recipes you draw on a node canvas (the Workflows window) — n8n-style:
+nodes are compact cards (icon + title + a live summary of their settings), clicking one slides
+open a right-hand **inspector panel** where everything is edited, and each output dot carries
+its branch label (yes/no · error · case names). A workflow is a directed graph; execution
+walks it from a **start** node, following edges:
 
 - **tool** — a chosen tool fired with preset arguments (a real form per tool, with
   searchable pickers for skills / saved workflows / workspace files — and **multi-select**
@@ -225,6 +247,12 @@ is a directed graph; execution walks it from a **start** node, following edges:
   previous step's output, the **local model**, or a **delegate**
 - **switch** — multi-branch routing (more than a yes/no — pick an edge by matching a value)
 - **loop** — foreach over a list, running its body once per element (`{{item}}` / `{{index}}`)
+- **agent** — spawn a **background sub-agent** (Claude / Codex / a cloud model / local; task
+  templated with `{{…}}`) and keep walking the flow — fan out work mid-run. Runs with the same
+  read-only tool scope as the delegate node.
+- **await** — the join point: wait for this run's spawned agents to finish (bounded by a
+  timeout), folding their results into the flow so `{{node.<id>}}` works downstream;
+  failures/timeouts route the error edge with partial results intact
 - **http** — an HTTP/REST call (SSRF-guarded: private/link-local targets blocked, redirects
   re-validated per hop)
 - **sub-workflow** — run another saved workflow as a single step
@@ -335,11 +363,14 @@ Anthropic API key:
   with its own tools (uses your existing CLI login, no key passed by Oceano). You can pick
   **which Claude model** the CLI uses (Sonnet / Opus / Haiku / CLI default) in
   **Settings → Delegation**; the choice (`claude_model` in `data/delegation.json`) applies to
-  the Claude mind, Claude-Code delegation, and Claude-pinned scheduled tasks.
+  the Claude mind, Claude-Code delegation, and Claude-pinned scheduled tasks. A separate
+  **reasoning-effort** dial (low → max, or the CLI default) sits under the model picker and
+  applies to the same three paths.
 - **Codex** — runs headless via OpenAI's `codex` CLI (`codex exec --json`, sandboxed to the
   workspace), again with **no API key stored by Oceano**: it uses your `codex login` auth, synced
   into an isolated `data/codex-home/`. Pick the **Codex model** — GPT-5.5 (recommended default) /
-  GPT-5.4 mini / GPT-5.3 Codex Spark — in **Settings → Delegation**. Install the `codex` CLI first
+  GPT-5.4 mini / GPT-5.3 Codex Spark — in **Settings → Delegation**, plus its own
+  **reasoning-effort** level (minimal → high). Install the `codex` CLI first
   (or set `OCEANO_CODEX_BIN` to its path).
 - **A cloud model** — any configured OpenAI-compatible endpoint, run through Oceano's
   *own* agent loop with *our* tools, so it can read, write, and run things — not just reason.
@@ -359,6 +390,16 @@ generous absolute cap as a backstop. If a delegation doesn't finish it returns a
 work and tells the local model *not* to attempt the whole job itself (which would overflow a
 small context). Tune with `OCEANO_DELEGATE_IDLE` (default 300s), `OCEANO_DELEGATE_MAXTOTAL`
 (3600s), `OCEANO_DELEGATE_MAXTURNS` (60).
+
+**Delegation blocks; sub-agents don't.** For work that should run *alongside* the conversation,
+`spawn_agent` fires a **background sub-agent** on a per-spawn provider — Claude, Codex, a cloud
+model, or the local model (with a weak-model warning) — owned by the daemon, not the turn. It's
+capped (`OCEANO_AGENTS_MAX`, default 3, one local slot), can't recurse (a spawned agent gets no
+spawn/delegate/workflow tools), streams progress to `data/agent-logs/`, and its result is
+**delivered back into the chat that spawned it**. `spawn_job` does the same for a plain
+long-running command (same gates as `run_shell`), and workflows fan out with the
+**agent + await** nodes. All of it shows in the background-jobs indicator, and a daemon restart
+marks orphaned runs `lost` — never a stale `running`.
 
 The same panel also sets Oceano's **primary model** — **any model from any configured
 endpoint** (local-first is opt-in; a cloud model can be your default, and it's carried to
@@ -398,6 +439,19 @@ being multimodal, it can also see images dropped into chat. It's **stateless** l
 (every turn replays Oceano's history, so `/compact`, `/truncate`, and edits take effect), runs from
 an isolated `data/codex-home/`, and needs the `codex` CLI installed plus a one-time `codex login`.
 Pick the Codex model (GPT-5.5 recommended) in **Settings → Delegation**.
+
+Two things keep a resident mind healthy over the long haul:
+
+- **A rolling context fold.** Because the mind replays the whole conversation every turn, a
+  months-long chat would grow per-turn cost without bound. Past a threshold
+  (`OCEANO_CTX_FOLD_CHARS`, default 120k chars ≈ 30k tokens) the oldest half is summarized
+  into one note that **rolls forward** (never stacks) while the newest 12 messages stay
+  verbatim — and the note points the mind at `search_chats` for anything folded away. The
+  web transcript keeps full history; `/context <n>` compaction still works on top.
+- **Daemon-owned backgrounding.** The mind's *native* backgrounding dies the instant its
+  one-shot `claude -p` / `codex exec` process exits — so "I'll let you know when it's done"
+  was structurally impossible. The bridged `spawn_job` / `spawn_agent` tools hand the work
+  to the daemon instead, and the result lands **back in your chat** when it finishes.
 
 ---
 
@@ -450,8 +504,8 @@ It's a single-page app with:
   as it works**), and speaks the reply back in a natural **Kokoro** voice (markdown/emoji stripped
   so it reads cleanly). Half-duplex, with an optional **wake word** ("Oceano …"). All local; the
   installer provisions the stack.
-- **Floating windows** — Settings, **Brain** (Memory · Knowledge · Skills · Rivers ·
-  Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
+- **Floating windows** — Settings, **Brain** (Identity · Memory · Knowledge · Skills ·
+  Rivers · Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
   upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
   (memories · documents · conversations), **Notes** (Kanban), **Health** (live system
   dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out — natural local
@@ -462,6 +516,16 @@ It's a single-page app with:
   **Live browser** (multi-tab — watch the agent research source-by-source), and a
   sandboxed **Preview**. Drag, resize, snap, minimize — and the set of open windows
   **reopens after a reload**.
+- **Remappable keyboard shortcuts** — every app window gets a default **Alt+Shift+key**
+  combo; rebind any of them in the **Shortcuts** settings page (conflicting combos *swap*
+  rather than going unreachable). A shortcut opens/surfaces its window — or minimizes it if
+  it's already front-most. The Terminal and Live-browser windows pass keys through untouched.
+- **OceanoDesktop unlocks native tools** — connect through the Electron desktop app (the
+  client identifies itself per turn) and the agent gains eight `desktop_*` tools: OS
+  notifications, real native file open/save dialogs, reveal/open a path, clipboard
+  read/write, and screen capture. They run over a request/response bridge to the desktop
+  app's main process, refuse any browser-tab client, and — like SSH and mail — anything
+  that *acts* is blocked in a turn that read untrusted content.
 - **Preview / artifacts** — when the agent writes an `.html` app, markdown, a Mermaid
   diagram, a Chart.js spec, or a `.slides` deck, a chip opens it rendered in an
   origin-isolated sandbox iframe (device presets + live reload).
@@ -501,7 +565,7 @@ It's a single-page app with:
   `workspace/journal/<date>.md`. The self-improving jobs are judged by the configured
   `improve` delegate, never the local model.
 - **Background jobs & the queue** — every unattended job (workflows, scheduled tasks,
-  research, evals, memory & index upkeep) registers in a live registry shown by a topbar
+  research, evals, memory & index upkeep, spawned jobs & sub-agents) registers in a live registry shown by a topbar
   indicator. **Settings → Tools → Execution** can *serialize* them through one gate —
   optionally including chat — so the single local model isn't hit in parallel.
 
@@ -618,6 +682,8 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 | `OCEANO_SEARXNG` | `http://127.0.0.1:8080` | web search |
 | `OCEANO_MAX_STEPS` | `25` | tool-call loop cap per turn |
 | `OCEANO_DELEGATE_IDLE` / `_MAXTOTAL` / `_MAXTURNS` | `300` / `3600` / `60` | delegation idle timeout (s), absolute cap (s), max turns |
+| `OCEANO_AGENTS_MAX` | `3` | max concurrent background sub-agents (`spawn_agent`) |
+| `OCEANO_CTX_FOLD_CHARS` | `120000` | resident-mind rolling context fold threshold (chars); `0` disables |
 | `OCEANO_CONFINE` | `1` | fence file ops to the workspace |
 | `OCEANO_AUTO_LEARN` | `1` | background self-learning memory |
 | `OCEANO_SHELL_GUARD` / `OCEANO_URL_GUARD` | `1` | safety guards |
@@ -669,7 +735,9 @@ oceano/
   engine.py          the single daemon (web + telegram + scheduler + embed supervisor)
   agent.py           the agent loop, context building, self-learning
   llm.py             OpenAI-compatible client (streaming, tools)
-  tools.py           the tool registry + built-in tools
+  tools/             the tool registry (core.py) + 15 domain modules (files, shell, web, mail_tools,
+                     browsing, desktop, calendar_tools, …) behind a full compatibility facade
+  turnctx.py         the one per-turn context (channel · client · taint · session) every entry point shares
   safety.py          shell/SSRF guards + untrusted-content fencing
   memory.py          long-term memory (SQLite + embeddings, policy, pinning, graph, maintenance)
   rag.py             document indexing + semantic search (incremental, self-pruning)
@@ -679,9 +747,13 @@ oceano/
   reindex.py         locked job: re-sync doc / memory / skill / chat indexes to disk
   workflows.py       visual branching workflows (graph engine + run history)
   jobs.py            background-job registry + optional serialization gate (queue)
+  bgjobs.py          daemon-owned background process jobs (spawn_job) + delivery back into the chat
+  agentjobs.py       daemon-owned background sub-agents (spawn_agent) — Claude / Codex / cloud / local
+  personality.py     the user-edited persona (Brain → Identity), injected first each turn
   delegate.py        delegation to Claude Code / a cloud model (per-role config) + the "mind" toggle
   mindbridge.py      Claude-as-mind: Oceano's tools exposed to the mind, executed in the daemon
   mcp_bridge_server.py  stdio MCP proxy Claude Code launches to reach those tools (token-gated)
+  desktopbridge.py   request/response RPC to the OceanoDesktop app (native file dialogs, clipboard, …)
   notes.py           Kanban scratchpad (JSON-persisted)
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
@@ -696,7 +768,9 @@ oceano/
   atomicio.py        atomic writes for the small JSON stores
   telegram_bot.py    Telegram frontend
   web/
-    server.py        FastAPI backend + all /api routes + auth
+    server.py        the FastAPI app shell (lifespan · session middleware · router mounting)
+    state.py         shared web state (sessions · auth/TOTP · per-session agents · delivery hooks)
+    routes_*.py      10 domain routers (auth · chat · brain · mail · files · browser · delegate · ops · system · content)
     static/          the SPA (index.html, app.js, style.css)
 config.py            central, env-overridable config
 scripts/

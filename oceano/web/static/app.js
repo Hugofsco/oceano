@@ -5640,7 +5640,9 @@ async function openVoice() {
 
 /* ====================================================================
    Workflows — visual, branching recipes drawn on a Drawflow canvas.
-   Nodes: start · tool · instruction · delegate · decision · end.
+   n8n-style UI: nodes are compact cards (icon tile + title + live summary);
+   selecting a node slides in the right-hand INSPECTOR panel (wfInspect) where
+   all settings are edited — nothing is edited inside the node itself.
    Decision nodes route execution down a "yes"/"no" edge (rule | model | delegate).
    The clean graph model {nodes,edges} is the source of truth; we build the canvas
    from it on open and read it back from Drawflow's export on save.
@@ -5688,11 +5690,12 @@ function wfNodeData(n) {
   if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
   if (n.type === "instruction") return { text: n.text || "", retries: String(n.retries || 0) };
   if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", retries: String(n.retries || 0) };
-  // NOTE: df-* keys must be lowercase — the DOM lowercases attribute names, so Drawflow binds to the
-  // lowercased key. Camel-cased keys here would silently lose their binding. Backend keys stay camelCase.
+  // Keys mirror what wfReadCanvas reads back — lowercase for historical df-* binding reasons;
+  // trigger's mailFolder stays camelCase to match the backend. Settings are edited in the INSPECTOR
+  // panel (wfInspect), so every type gets its full default data up front.
   if (n.type === "decision") return { mode: n.mode || "model", question: n.question || "", ruleop: n.ruleOp || "contains", ruleval: n.ruleValue || "", role: n.role || "default" };
-  if (n.type === "trigger") return {};   // wfWireTrigger builds a preset-driven form + syncs the data
-  if (n.type === "http") return {};      // wfWireHttp builds the method/url/header-rows form + syncs
+  if (n.type === "trigger") return { kind: n.kind || "manual", cron: n.cron || "", pattern: n.pattern || "", channel: n.channel || "any", folder: n.folder || "", account: n.account || "", mailFolder: n.mailFolder || "INBOX" };
+  if (n.type === "http") return { method: n.method || "GET", url: n.url || "", body: n.body || "", retries: String(n.retries || 0), headers: wfParseHeaders(n.headers).map(h => h.k + ": " + h.v).join("\n") };
   if (n.type === "switch") { const c = n.cases || []; const g = (i, k, d) => (c[i] || {})[k] || d;
     return { source: n.source || "", c1op: g(0, "op", "contains"), c1val: g(0, "value", ""), c1label: g(0, "label", ""),
       c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
@@ -5705,26 +5708,90 @@ function wfNodeData(n) {
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
   return {};
 }
-const _WF_RETRY = `<label class="wfn-mini">retries <input df-retries type="number" min="0" max="5" class="wfn-f wfn-num" placeholder="0"></label>`;
+/* ---- n8n-style cards: icon tile + friendly title + live summary. Settings moved to the inspector ---- */
+const _wfSvg = p => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+const WF_ICONS = {
+  start: _wfSvg('<polygon points="7 4 19 12 7 20 7 4"/>'),
+  end: _wfSvg('<rect x="6" y="6" width="12" height="12" rx="2"/>'),
+  trigger: _wfSvg('<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>'),
+  tool: _wfSvg('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
+  instruction: _wfSvg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>'),
+  delegate: _wfSvg('<line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/>'),
+  agent: _wfSvg('<rect x="5" y="8" width="14" height="11" rx="2.5"/><circle cx="9.5" cy="13.5" r="1"/><circle cx="14.5" cy="13.5" r="1"/><line x1="12" y1="8" x2="12" y2="5"/><circle cx="12" cy="4" r="1"/>'),
+  await: _wfSvg('<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 13.5"/>'),
+  http: _wfSvg('<circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a15.3 15.3 0 0 1 4 9 15.3 15.3 0 0 1-4 9 15.3 15.3 0 0 1-4-9 15.3 15.3 0 0 1 4-9z"/>'),
+  subflow: _wfSvg('<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'),
+  transform: _wfSvg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>'),
+  decision: _wfSvg('<line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>'),
+  switch: _wfSvg('<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>'),
+  loop: _wfSvg('<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>'),
+  approval: _wfSvg('<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>'),
+};
+const WF_META = {
+  start: { name: "Start", kicker: "flow" }, end: { name: "End", kicker: "flow" },
+  trigger: { name: "Trigger", kicker: "trigger" },
+  tool: { name: "Run Tool", kicker: "action" },
+  instruction: { name: "Instruction", kicker: "agent task" },
+  delegate: { name: "Delegate", kicker: "cloud task" },
+  agent: { name: "Agent Spawn", kicker: "background" },
+  await: { name: "Await Agents", kicker: "join" },
+  http: { name: "HTTP Request", kicker: "action" },
+  subflow: { name: "Sub-workflow", kicker: "action" },
+  transform: { name: "Transform", kicker: "data" },
+  decision: { name: "Decision", kicker: "logic" },
+  switch: { name: "Switch", kicker: "logic" },
+  loop: { name: "For Each", kicker: "logic" },
+  approval: { name: "Approval", kicker: "human" },
+};
+const WF_TRIG_TITLES = { manual: "Manual Trigger", schedule: "On Schedule", webhook: "Webhook", keyword: "Chat Keyword", watch: "File Watch", email: "New Email" };
+const _wfTrunc = (s, n = 44) => { s = String(s || "").trim().replace(/\s+/g, " "); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+// [title, subtitle] for a node card, derived from its current (stringly) Drawflow data
+function wfCardText(type, d) {
+  if (type === "trigger") {
+    const cron = (WF_CRON_PRESETS.find(p => p[0] === d.cron) || [])[1] || d.cron;
+    const sub = d.kind === "schedule" ? cron : d.kind === "keyword" ? "“" + _wfTrunc(d.pattern, 28) + "”"
+      : d.kind === "watch" ? (_wfTrunc(d.folder, 32) || "workspace folder") : d.kind === "email" ? (d.account || "mail account")
+      : d.kind === "webhook" ? "POST endpoint" : "run it yourself";
+    return [WF_TRIG_TITLES[d.kind] || "Trigger", sub];
+  }
+  if (type === "tool") return [d.tool || "Run Tool", "tool"];
+  if (type === "instruction") return ["Instruction", _wfTrunc(d.text) || "describe the task…"];
+  if (type === "delegate") return ["Delegate", _wfTrunc(d.text) || "task for Claude / cloud"];
+  if (type === "agent") return ["Agent Spawn", _wfTrunc(d.label || d.task) || "background task"];
+  if (type === "await") return ["Await Agents", "join spawned agents"];
+  if (type === "http") { let h = ""; try { h = new URL(d.url).host; } catch {} return ["HTTP Request", ((d.method || "GET") + " " + (h || _wfTrunc(d.url, 28))).trim()]; }
+  if (type === "subflow") return ["Sub-workflow", _wfTrunc(d.workflow, 32) || "pick a workflow"];
+  if (type === "transform") return ["Transform", d.mode || "template"];
+  if (type === "decision") return ["Decision", d.mode === "rule" ? (d.ruleop || "contains") + " “" + _wfTrunc(d.ruleval, 18) + "”" : (_wfTrunc(d.question) || (d.mode || "model") + " judges")];
+  if (type === "switch") { const n = [1, 2, 3].filter(i => (d["c" + i + "label"] || "").trim()).length; return ["Switch", _wfTrunc(d.source, 26) || (n ? n + " case" + (n > 1 ? "s" : "") : "route by value")]; }
+  if (type === "loop") return ["For Each", _wfTrunc(d.over, 32) || "list to iterate"];
+  if (type === "approval") return ["Approval", _wfTrunc(d.prompt) || "ask before continuing"];
+  return [(WF_META[type] || { name: type }).name, ""];
+}
+// branch label shown beside each output dot ("" = unlabeled happy path)
+function wfPortLabels(type, d) {
+  if (type === "decision") return ["yes", "no"];
+  if (type === "loop") return ["each", "done"];
+  if (type === "approval") return ["approved", "rejected"];
+  if (type === "switch") return [1, 2, 3].map(i => _wfTrunc(d["c" + i + "label"], 14) || "case " + i).concat(["default"]);
+  return (WF_PORTS[type] || [0, 1])[1] === 2 ? ["", "error"] : [""];
+}
 function wfNodeHtml(type, data) {
-  if (type === "start") return `<div class="wfn wfn-start"><b>▶ Start</b></div>`;
-  if (type === "end") return `<div class="wfn wfn-end"><b>■ End</b></div>`;
-  if (type === "tool") return `<div class="wfn wfn-tool"><b>🔧 Tool</b><select class="wfn-f wfn-tool-sel">${wfToolOptions(data.tool)}</select><div class="wfn-form"></div><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "instruction") return `<div class="wfn wfn-instruction"><b>✎ Instruction</b><textarea df-text class="wfn-f" placeholder="what should the agent do? (it may use any tool). Use {{input}}, {{last}}, {{node.ID}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "delegate") return `<div class="wfn wfn-delegate"><b>↗ Delegate</b><textarea df-text class="wfn-f" placeholder="task for Claude / cloud"></textarea><select df-role class="wfn-f"><option value="default">default</option><option value="improve">improve</option></select>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "decision") return `<div class="wfn wfn-decision"><b>◆ Decision</b><select df-mode class="wfn-f"><option value="model">model judges</option><option value="rule">rule on prev output</option><option value="delegate">delegate judges</option></select><textarea df-question class="wfn-f" placeholder="yes/no question (model & delegate)"></textarea><div class="wfn-rule"><select df-ruleop class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-ruleval class="wfn-f" placeholder="value"></div><div class="wfn-branches"><span>▸ yes</span><span>▸ no</span></div></div>`;
-  if (type === "trigger") return `<div class="wfn wfn-trigger"><b>⚡ Trigger</b><div class="wfn-trig-form"></div></div>`;
-  if (type === "switch") return `<div class="wfn wfn-switch"><b>⤳ Switch</b><input df-source class="wfn-f" placeholder="value to test · default {{last}}">` +
-    [1, 2, 3].map(i => `<div class="wfn-rule"><select df-c${i}op class="wfn-f"><option value="contains">contains</option><option value="equals">equals</option><option value="matches">matches</option><option value="gt">&gt;</option><option value="lt">&lt;</option></select><input df-c${i}val class="wfn-f" placeholder="value"><input df-c${i}label class="wfn-f" placeholder="→ label (out ${i})"></div>`).join("") +
-    `<div class="wfn-branches"><span>case1</span><span>case2</span><span>case3</span><span>default</span></div></div>`;
-  if (type === "loop") return `<div class="wfn wfn-loop"><b>↻ Loop (foreach)</b><textarea df-over class="wfn-f" placeholder="list to iterate · JSON array or newline list · e.g. {{last}}"></textarea><input df-as class="wfn-f" placeholder="item name (use {{item}}, {{index}})"><div class="wfn-branches"><span>▸ loop (body)</span><span>▸ done</span></div></div>`;
-  if (type === "http") return `<div class="wfn wfn-http"><b>🌐 HTTP request</b><div class="wfn-http-form"></div><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "subflow") return `<div class="wfn wfn-subflow"><b>▣ Sub-workflow</b><input df-workflow class="wfn-f" placeholder="workflow name or id"><textarea df-wfinput class="wfn-f" placeholder="input to pass · default {{last}}"></textarea>${_WF_RETRY}<div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "transform") return `<div class="wfn wfn-transform"><b>ƒ Transform</b><select df-mode class="wfn-f"><option value="template">template</option><option value="regex">regex extract</option><option value="jsonpath">json path</option><option value="python">python</option></select><input df-source class="wfn-f" placeholder="input · default {{last}}"><textarea df-text class="wfn-f" placeholder="template / regex / a.b.0 path / python (value holds input)"></textarea><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "approval") return `<div class="wfn wfn-approval"><b>✋ Approval</b><textarea df-prompt class="wfn-f" placeholder="what to approve?"></textarea><label class="wfn-mini">timeout (min) <input df-timeout type="number" min="1" class="wfn-f wfn-num" placeholder="60"></label><div class="wfn-branches"><span>▸ approved</span><span>▸ rejected</span></div></div>`;
-  if (type === "agent") return `<div class="wfn wfn-agent"><b>🤖 Agent (background)</b><textarea df-task class="wfn-f" placeholder="self-contained task — it runs while the flow continues; join later with an Await node"></textarea><select df-provider class="wfn-f"><option value="">delegation default</option><option value="claude">claude</option><option value="codex">codex</option><option value="api">api</option><option value="local">local (weak · serialized)</option></select><input df-label class="wfn-f" placeholder="short label"><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="600"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  if (type === "await") return `<div class="wfn wfn-await"><b>⏳ Await agents</b><div class="wf-hint">waits for all agents spawned in this run, then continues with their results ({{node.ID}} of each agent node)</div><label class="wfn-mini">timeout (s) <input df-timeout type="number" min="1" max="3600" class="wfn-f wfn-num" placeholder="900"></label><div class="wfn-branches"><span>▸ next</span><span>▸ error</span></div></div>`;
-  return `<div class="wfn"><b>${type}</b></div>`;
+  const meta = WF_META[type] || { name: type, kicker: "" };
+  const [t, s] = wfCardText(type, data || {});
+  const mini = type === "start" || type === "end";
+  return `<div class="wfn2${mini ? " wfn2-mini" : ""}"><div class="wfn2-ic">${WF_ICONS[type] || ""}</div><div class="wfn2-tx"><div class="wfn2-t">${escapeHtml(t)}</div>${mini ? "" : `<div class="wfn2-s">${escapeHtml(s || meta.kicker)}</div>`}</div></div>`;
+}
+// re-derive a card's title / summary / port labels after an inspector edit
+function wfCardRefresh(editor, dfId) {
+  const el = document.getElementById("node-" + dfId); if (!el) return;
+  const nd = editor.getNodeFromId(dfId); if (!nd) return;
+  const [t, s] = wfCardText(nd.name, nd.data || {});
+  const tt = el.querySelector(".wfn2-t"), ss = el.querySelector(".wfn2-s");
+  if (tt) tt.textContent = t;
+  if (ss) ss.textContent = s || (WF_META[nd.name] || {}).kicker || "";
+  const labs = wfPortLabels(nd.name, nd.data || {});
+  el.querySelectorAll(".outputs .output").forEach((o, i) => o.setAttribute("data-lbl", labs[i] || ""));
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
 const _WF_LONG_STR = /content|text|body|code|message|prompt|command|instruction/i;
@@ -5863,120 +5930,225 @@ function wfReadToolForm(form) {
   });
   return args;
 }
-// wire a tool node's DOM: populate the form for the chosen tool, sync edits into Drawflow's node data
-function wfWireTool(editor, dfId, toolName, argsObj) {
-  const el = document.getElementById("node-" + dfId); if (!el) return;
-  const sel = el.querySelector(".wfn-tool-sel"), form = el.querySelector(".wfn-form");
-  if (!sel || !form) return;
-  const state = { tool: sel.value || toolName, args: { ...(argsObj || {}) } };
-  const sync = () => editor.updateNodeDataFromId(dfId, { tool: state.tool, args: JSON.stringify(state.args) });
+// tool inspector: tool picker + a typed per-parameter form, synced into the node's data
+function wfInspTool(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  let args = {}; try { args = (d.args || "").trim() ? JSON.parse(d.args) : {}; } catch { args = {}; }
+  box.innerHTML = `<div class="wf-insp-row"><label class="wfn-lab">tool</label><select class="wfn-fld wfn-tool-sel">${wfToolOptions(d.tool)}</select></div><div class="wfn-form"></div>`;
+  const sel = box.querySelector(".wfn-tool-sel"), form = box.querySelector(".wfn-form");
+  const state = { tool: sel.value || d.tool || "", args };
+  const push = () => sync({ tool: state.tool, args: JSON.stringify(state.args) });
   const bindFields = () => form.querySelectorAll("[data-arg]").forEach(f => {
-    const handler = () => { state.args = wfReadToolForm(form); sync(); };
+    const handler = () => { state.args = wfReadToolForm(form); push(); };
     f.addEventListener("change", handler);                       // selects + combo picks (synthetic) + commit
     if (f.tagName !== "SELECT") f.addEventListener("input", handler);   // live typing
   });
-  const build = () => { wfBuildToolForm(form, state.tool, state.args); bindFields(); wfWireCombos(form); wfWireMulti(form); sync(); };
+  const build = () => { wfBuildToolForm(form, state.tool, state.args); bindFields(); wfWireCombos(form); wfWireMulti(form); push(); };
   build();
   sel.onchange = () => { state.tool = sel.value; state.args = {}; build(); };
 }
-// friendlier trigger node: pick a KIND, then only the relevant control(s) show — schedules use presets,
-// channel/account are dropdowns. No more a stack of empty text boxes. Data syncs into the node. (issue 8 UX)
+// trigger inspector: pick a KIND, then only the relevant control(s) show — schedules use presets,
+// channel/account are dropdowns. Data syncs straight into the node.
 const WF_TRIG_KINDS = [["manual", "Manual / scheduled only"], ["schedule", "On a schedule"], ["webhook", "Webhook (HTTP POST)"], ["keyword", "Chat keyword"], ["watch", "File / folder change"], ["email", "New email"]];
 const WF_CRON_PRESETS = [["*/15 * * * *", "Every 15 minutes"], ["0 * * * *", "Every hour"], ["0 */3 * * *", "Every 3 hours"], ["0 8 * * *", "Daily · 08:00"], ["0 0 * * *", "Daily · midnight"], ["0 9 * * 1", "Weekly · Mon 09:00"], ["0 8 1 * *", "Monthly · 1st 08:00"]];
-function wfWireTrigger(editor, dfId, cfg) {
-  const el = document.getElementById("node-" + dfId); if (!el) return;
-  const form = el.querySelector(".wfn-trig-form"); if (!form) return;
-  const state = { kind: cfg.kind || "manual", cron: cfg.cron || "", pattern: cfg.pattern || "", channel: cfg.channel || "any", folder: cfg.folder || "", account: cfg.account || "", mailFolder: cfg.mailFolder || "INBOX" };
-  const sync = () => editor.updateNodeDataFromId(dfId, { ...state });
+function wfInspTrigger(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  const state = { kind: d.kind || "manual", cron: d.cron || "", pattern: d.pattern || "", channel: d.channel || "any", folder: d.folder || "", account: d.account || "", mailFolder: d.mailFolder || "INBOX" };
+  const push = () => sync({ ...state });
+  const row = (lab, inner) => `<div class="wf-insp-row"><label class="wfn-lab">${lab}</label>${inner}</div>`;
   const render = async () => {
     const presetMatch = WF_CRON_PRESETS.some(p => p[0] === state.cron);
-    let h = `<select class="wfn-f wt-kind">${WF_TRIG_KINDS.map(([k, l]) => `<option value="${k}"${state.kind === k ? " selected" : ""}>${l}</option>`).join("")}</select>`;
-    if (state.kind === "manual") h += `<div class="wfn-hint">runs only when you hit ▶ Run, or on a schedule.</div>`;
+    let h = row("when should it run?", `<select class="wfn-fld wt-kind">${WF_TRIG_KINDS.map(([k, l]) => `<option value="${k}"${state.kind === k ? " selected" : ""}>${l}</option>`).join("")}</select>`);
+    if (state.kind === "manual") h += `<div class="wf-insp-note">runs only when you hit ▶ Run, or on a schedule.</div>`;
     else if (state.kind === "schedule") {
-      h += `<select class="wfn-f wt-cronpreset">${WF_CRON_PRESETS.map(([c, l]) => `<option value="${c}"${state.cron === c ? " selected" : ""}>${l}</option>`).join("")}<option value="__custom"${!presetMatch ? " selected" : ""}>Custom…</option></select>`;
-      if (!presetMatch) h += `<input class="wfn-f wt-cron" placeholder="min hr day mon wkday" value="${escapeHtml(state.cron)}">`;
+      h += row("schedule", `<select class="wfn-fld wt-cronpreset">${WF_CRON_PRESETS.map(([c, l]) => `<option value="${c}"${state.cron === c ? " selected" : ""}>${l}</option>`).join("")}<option value="__custom"${!presetMatch ? " selected" : ""}>Custom…</option></select>`);
+      if (!presetMatch) h += row("cron", `<input class="wfn-fld wt-cron" placeholder="min hr day mon wkday" value="${escapeHtml(state.cron)}">`);
     } else if (state.kind === "keyword") {
-      h += `<input class="wfn-f wt-pattern" placeholder="phrase that triggers it" value="${escapeHtml(state.pattern)}"><select class="wfn-f wt-channel">${["any", "web", "telegram"].map(c => `<option value="${c}"${state.channel === c ? " selected" : ""}>${c === "any" ? "any channel" : c}</option>`).join("")}</select>`;
+      h += row("phrase", `<input class="wfn-fld wt-pattern" placeholder="phrase that triggers it" value="${escapeHtml(state.pattern)}">`);
+      h += row("channel", `<select class="wfn-fld wt-channel">${["any", "web", "telegram"].map(c => `<option value="${c}"${state.channel === c ? " selected" : ""}>${c === "any" ? "any channel" : c}</option>`).join("")}</select>`);
     } else if (state.kind === "watch") {
-      h += `<input class="wfn-f wt-folder" placeholder="workspace folder · e.g. brain/inbox" value="${escapeHtml(state.folder)}"><div class="wfn-hint">fires when files change under workspace/&lt;folder&gt;.</div>`;
+      h += row("folder", `<input class="wfn-fld wt-folder" placeholder="workspace folder · e.g. brain/inbox" value="${escapeHtml(state.folder)}">`) + `<div class="wf-insp-note">fires when files change under workspace/&lt;folder&gt;.</div>`;
     } else if (state.kind === "email") {
-      h += `<select class="wfn-f wt-account"><option>loading…</option></select><input class="wfn-f wt-mailfolder" placeholder="mailbox folder" value="${escapeHtml(state.mailFolder || "INBOX")}"><div class="wfn-hint">fires for each new message.</div>`;
+      h += row("account", `<select class="wfn-fld wt-account"><option>loading…</option></select>`);
+      h += row("mailbox folder", `<input class="wfn-fld wt-mailfolder" placeholder="mailbox folder" value="${escapeHtml(state.mailFolder || "INBOX")}">`) + `<div class="wf-insp-note">fires for each new message.</div>`;
     } else if (state.kind === "webhook") {
-      h += `<div class="wfn-hint">a POST URL is generated when you Save — copy it from the workflow's ⚡ list.</div>`;
+      h += `<div class="wf-insp-note">a POST URL is generated when you Save — copy it from the workflow's ⚡ triggers list.</div>`;
     }
-    form.innerHTML = h;
-    form.querySelector(".wt-kind").onchange = e => { state.kind = e.target.value; if (state.kind === "schedule" && !state.cron) state.cron = "0 8 * * *"; sync(); render(); };
-    const cp = form.querySelector(".wt-cronpreset"); if (cp) cp.onchange = e => { state.cron = e.target.value === "__custom" ? "" : e.target.value; sync(); render(); };
-    const cron = form.querySelector(".wt-cron"); if (cron) cron.oninput = e => { state.cron = e.target.value; sync(); };
-    const pat = form.querySelector(".wt-pattern"); if (pat) pat.oninput = e => { state.pattern = e.target.value; sync(); };
-    const ch = form.querySelector(".wt-channel"); if (ch) ch.onchange = e => { state.channel = e.target.value; sync(); };
-    const fol = form.querySelector(".wt-folder"); if (fol) fol.oninput = e => { state.folder = e.target.value; sync(); };
-    const mf = form.querySelector(".wt-mailfolder"); if (mf) mf.oninput = e => { state.mailFolder = e.target.value; sync(); };
-    const acc = form.querySelector(".wt-account");
+    box.innerHTML = h;
+    box.querySelector(".wt-kind").onchange = e => { state.kind = e.target.value; if (state.kind === "schedule" && !state.cron) state.cron = "0 8 * * *"; push(); render(); };
+    const cp = box.querySelector(".wt-cronpreset"); if (cp) cp.onchange = e => { state.cron = e.target.value === "__custom" ? "" : e.target.value; push(); render(); };
+    const cron = box.querySelector(".wt-cron"); if (cron) cron.oninput = e => { state.cron = e.target.value; push(); };
+    const pat = box.querySelector(".wt-pattern"); if (pat) pat.oninput = e => { state.pattern = e.target.value; push(); };
+    const ch = box.querySelector(".wt-channel"); if (ch) ch.onchange = e => { state.channel = e.target.value; push(); };
+    const fol = box.querySelector(".wt-folder"); if (fol) fol.oninput = e => { state.folder = e.target.value; push(); };
+    const mf = box.querySelector(".wt-mailfolder"); if (mf) mf.oninput = e => { state.mailFolder = e.target.value; push(); };
+    const acc = box.querySelector(".wt-account");
     if (acc) {
       let accts = []; try { accts = await api("/api/mail"); } catch {}
       acc.innerHTML = accts.length ? accts.map(a => `<option value="${escapeHtml(a.name)}"${state.account === a.name ? " selected" : ""}>${escapeHtml(a.name)}</option>`).join("") : `<option value="">(add a mail account in Settings)</option>`;
-      if (!state.account && accts.length) { state.account = accts[0].name; sync(); }
-      acc.onchange = e => { state.account = e.target.value; sync(); };
+      if (!state.account && accts.length) { state.account = accts[0].name; push(); }
+      acc.onchange = e => { state.account = e.target.value; push(); };
     }
   };
-  sync(); render();
+  push(); render();
 }
 function wfParseHeaders(h) {
   if (!h) return [];
   if (typeof h === "object") return Object.entries(h).map(([k, v]) => ({ k, v: String(v) }));
   return String(h).split("\n").map(l => { const m = l.match(/^\s*([^:]+):\s*(.*)$/); return m ? { k: m[1].trim(), v: m[2].trim() } : null; }).filter(Boolean);
 }
-// friendlier HTTP node: method dropdown + URL, and a real add/remove header-rows editor (issue 8 UX)
-function wfWireHttp(editor, dfId, cfg) {
-  const el = document.getElementById("node-" + dfId); if (!el) return;
-  const form = el.querySelector(".wfn-http-form"); if (!form) return;
-  const state = { method: cfg.method || "GET", url: cfg.url || "", body: cfg.body || "", retries: String(cfg.retries || 0), headers: wfParseHeaders(cfg.headers) };
-  const sync = () => editor.updateNodeDataFromId(dfId, { method: state.method, url: state.url, body: state.body, retries: state.retries,
+// http inspector: method dropdown + URL, a real add/remove header-rows editor, body, retries
+function wfInspHttp(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  const state = { method: d.method || "GET", url: d.url || "", body: d.body || "", retries: String(d.retries || "0"), headers: wfParseHeaders(d.headers) };
+  const push = () => sync({ method: state.method, url: state.url, body: state.body, retries: state.retries,
     headers: state.headers.filter(h => h.k.trim()).map(h => h.k.trim() + ": " + h.v).join("\n") });
-  form.innerHTML = `
-    <select class="wfn-f wh-method">${["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].map(m => `<option${state.method === m ? " selected" : ""}>${m}</option>`).join("")}</select>
-    <input class="wfn-f wh-url" placeholder="https://api.example.com/… ({{input}})" value="${escapeHtml(state.url)}">
-    <div class="wfn-mini">headers</div><div class="wh-headers"></div><button type="button" class="wfn-addbtn wh-addh">+ header</button>
-    <textarea class="wfn-f wh-body" placeholder="request body (optional · {{last}} etc.)">${escapeHtml(state.body)}</textarea>
-    <label class="wfn-mini">retries <input type="number" min="0" max="5" class="wfn-f wfn-num wh-retries" value="${escapeHtml(state.retries)}"></label>`;
-  const hbox = form.querySelector(".wh-headers");
+  box.innerHTML = `
+    <div class="wf-insp-row"><label class="wfn-lab">method</label><select class="wfn-fld wh-method">${["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].map(m => `<option${state.method === m ? " selected" : ""}>${m}</option>`).join("")}</select></div>
+    <div class="wf-insp-row"><label class="wfn-lab">url</label><input class="wfn-fld wh-url" placeholder="https://api.example.com/… ({{input}})" value="${escapeHtml(state.url)}"></div>
+    <div class="wf-insp-row"><label class="wfn-lab">headers</label><div class="wh-headers"></div><button type="button" class="wfn-addbtn wh-addh">+ header</button></div>
+    <div class="wf-insp-row"><label class="wfn-lab">body</label><textarea class="wfn-fld wh-body" placeholder="request body (optional · {{last}} etc.)">${escapeHtml(state.body)}</textarea></div>
+    <div class="wf-insp-row"><label class="wfn-lab">retries</label><input type="number" min="0" max="5" class="wfn-fld wh-retries" value="${escapeHtml(state.retries)}"></div>`;
+  const hbox = box.querySelector(".wh-headers");
   const renderHeaders = () => {
     hbox.innerHTML = "";
     state.headers.forEach((hd, i) => {
-      const row = document.createElement("div"); row.className = "wh-hrow";
-      row.innerHTML = `<input class="wfn-f wh-hk" placeholder="Header" value="${escapeHtml(hd.k)}"><input class="wfn-f wh-hv" placeholder="value" value="${escapeHtml(hd.v)}"><button type="button" class="wh-hx" title="remove">✕</button>`;
-      row.querySelector(".wh-hk").oninput = e => { hd.k = e.target.value; sync(); };
-      row.querySelector(".wh-hv").oninput = e => { hd.v = e.target.value; sync(); };
-      row.querySelector(".wh-hx").onclick = () => { state.headers.splice(i, 1); renderHeaders(); sync(); };
-      hbox.appendChild(row);
+      const rw = document.createElement("div"); rw.className = "wh-hrow";
+      rw.innerHTML = `<input class="wfn-fld wh-hk" placeholder="Header" value="${escapeHtml(hd.k)}"><input class="wfn-fld wh-hv" placeholder="value" value="${escapeHtml(hd.v)}"><button type="button" class="wh-hx" title="remove">✕</button>`;
+      rw.querySelector(".wh-hk").oninput = e => { hd.k = e.target.value; push(); };
+      rw.querySelector(".wh-hv").oninput = e => { hd.v = e.target.value; push(); };
+      rw.querySelector(".wh-hx").onclick = () => { state.headers.splice(i, 1); renderHeaders(); push(); };
+      hbox.appendChild(rw);
     });
   };
   renderHeaders();
-  form.querySelector(".wh-method").onchange = e => { state.method = e.target.value; sync(); };
-  form.querySelector(".wh-url").oninput = e => { state.url = e.target.value; sync(); };
-  form.querySelector(".wh-body").oninput = e => { state.body = e.target.value; sync(); };
-  form.querySelector(".wh-retries").oninput = e => { state.retries = e.target.value; sync(); };
-  form.querySelector(".wh-addh").onclick = () => { state.headers.push({ k: "", v: "" }); renderHeaders(); sync(); };
-  sync();
+  box.querySelector(".wh-method").onchange = e => { state.method = e.target.value; push(); };
+  box.querySelector(".wh-url").oninput = e => { state.url = e.target.value; push(); };
+  box.querySelector(".wh-body").oninput = e => { state.body = e.target.value; push(); };
+  box.querySelector(".wh-retries").oninput = e => { state.retries = e.target.value; push(); };
+  box.querySelector(".wh-addh").onclick = () => { state.headers.push({ k: "", v: "" }); renderHeaders(); push(); };
+  push();
 }
-const wfNodeLabel = n => n.type === "tool" ? "🔧 " + (n.tool || "tool")
-  : n.type === "instruction" ? (n.text || "instruction").slice(0, 54)
-  : n.type === "delegate" ? "↗ " + (n.text || "delegate").slice(0, 48)
-  : n.type === "decision" ? "◆ " + (n.question || n.mode || "decision").slice(0, 48)
-  : n.type === "trigger" ? "⚡ " + (n.kind || "trigger")
-  : n.type === "switch" ? "⤳ switch"
-  : n.type === "loop" ? "↻ loop"
-  : n.type === "http" ? "🌐 " + (n.method || "GET")
-  : n.type === "subflow" ? "▣ " + (n.workflow || "sub-workflow")
-  : n.type === "transform" ? "ƒ " + (n.mode || "transform")
-  : n.type === "approval" ? "✋ approval"
-  : n.type === "agent" ? "🤖 " + ((n.label || n.task || "agent").slice(0, 44))
-  : n.type === "await" ? "⏳ await agents"
-  : n.type;
+/* ---- inspector: right-hand settings panel, opened by selecting a node on the canvas ---- */
+function wfInspClear(body) {
+  const insp = $("#wfInsp", body); if (!insp) return;
+  insp.classList.remove("open"); insp.dataset.node = "";
+}
+const _WF_OPS = [["contains", "contains"], ["equals", "equals"], ["matches", "regex matches"], ["gt", "greater than"], ["lt", "less than"]];
+// declarative field specs for the simple node types (tool / trigger / http / switch have custom builders)
+const WF_FIELDS = {
+  start: [{ t: "note", text: "where the run begins — connect it to the first step." }],
+  end: [{ t: "note", text: "marks the flow as finished." }],
+  instruction: [
+    { k: "text", t: "textarea", l: "task", ph: "what should the agent do? it may use any tool", hint: "use {{input}} · {{last}} · {{node.ID}}" },
+    { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
+  delegate: [
+    { k: "text", t: "textarea", l: "task", ph: "task for Claude / cloud" },
+    { k: "role", t: "select", l: "role", opts: [["default", "default"], ["improve", "improve"]] },
+    { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
+  agent: [
+    { k: "task", t: "textarea", l: "task", ph: "self-contained task — it runs in the background while the flow continues" },
+    { k: "provider", t: "select", l: "provider", opts: [["", "delegation default"], ["claude", "claude"], ["codex", "codex"], ["api", "api"], ["local", "local (weak · serialized)"]] },
+    { k: "label", t: "text", l: "label", ph: "short label" },
+    { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 },
+    { t: "note", text: "join spawned agents later with an <b>Await Agents</b> node — each result lands in its {{node.ID}}." }],
+  await: [
+    { t: "note", text: "waits for every agent spawned in this run, then continues with their results." },
+    { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 }],
+  decision: [
+    { k: "mode", t: "select", l: "how to decide", opts: [["model", "model judges"], ["rule", "rule on previous output"], ["delegate", "delegate judges"]], rr: true },
+    { k: "question", t: "textarea", l: "yes/no question", ph: "e.g. does this look ready to publish?", showIf: d => d.mode !== "rule" },
+    { k: "ruleop", t: "select", l: "operator", opts: _WF_OPS, showIf: d => d.mode === "rule" },
+    { k: "ruleval", t: "text", l: "value", showIf: d => d.mode === "rule" }],
+  loop: [
+    { k: "over", t: "textarea", l: "items", ph: "JSON array or newline list · e.g. {{last}}" },
+    { k: "as", t: "text", l: "item name", ph: "item", hint: "reference {{item}} and {{index}} inside the loop" }],
+  subflow: [
+    { k: "workflow", t: "combo", en: "workflows", l: "workflow", ph: "name or id" },
+    { k: "wfinput", t: "textarea", l: "input", ph: "input to pass · default {{last}}" },
+    { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
+  transform: [
+    { k: "mode", t: "select", l: "mode", opts: [["template", "template"], ["regex", "regex extract"], ["jsonpath", "json path"], ["python", "python"]] },
+    { k: "source", t: "text", l: "source", ph: "input · default {{last}}" },
+    { k: "text", t: "textarea", l: "expression", ph: "template / regex / a.b.0 path / python (value = input)" }],
+  approval: [
+    { k: "prompt", t: "textarea", l: "what to approve?", ph: "shown while the run waits for you" },
+    { k: "timeout", t: "number", l: "timeout (min)", min: 1 }],
+};
+function wfInspGeneric(editor, dfId, type, box, sync) {
+  const spec = WF_FIELDS[type] || [];
+  const render = () => {
+    const d = (editor.getNodeFromId(dfId) || {}).data || {};
+    box.innerHTML = spec.map(f => {
+      if (f.t === "note") return `<div class="wf-insp-note">${f.text}</div>`;
+      if (f.showIf && !f.showIf(d)) return "";
+      const v = d[f.k] != null ? String(d[f.k]) : "";
+      let inp;
+      if (f.t === "textarea") inp = `<textarea class="wfn-fld" data-k="${f.k}" placeholder="${escapeHtml(f.ph || "")}">${escapeHtml(v)}</textarea>`;
+      else if (f.t === "select") inp = `<select class="wfn-fld" data-k="${f.k}"${f.rr ? ' data-rr="1"' : ""}>${f.opts.map(([ov, ol]) => `<option value="${ov}"${v === ov ? " selected" : ""}>${ol}</option>`).join("")}</select>`;
+      else if (f.t === "number") inp = `<input class="wfn-fld" type="number" data-k="${f.k}"${f.min != null ? ` min="${f.min}"` : ""}${f.max != null ? ` max="${f.max}"` : ""} value="${escapeHtml(v)}">`;
+      else if (f.t === "combo") inp = `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-k="${f.k}" data-enum="${f.en}" autocomplete="off" placeholder="${escapeHtml(f.ph || "type to search…")}" value="${escapeHtml(v)}"><div class="wfn-acx" style="display:none"></div></div>`;
+      else inp = `<input class="wfn-fld" data-k="${f.k}" placeholder="${escapeHtml(f.ph || "")}" value="${escapeHtml(v)}">`;
+      return `<div class="wf-insp-row"><label class="wfn-lab">${escapeHtml(f.l || f.k)}</label>${inp}${f.hint ? `<div class="wfn-hint">${f.hint}</div>` : ""}</div>`;
+    }).join("") || `<div class="wf-insp-note">nothing to configure.</div>`;
+    box.querySelectorAll("[data-k]").forEach(f => {
+      const h = () => { sync({ [f.dataset.k]: f.value }); if (f.dataset.rr) render(); };
+      f.addEventListener("change", h);
+      if (f.tagName !== "SELECT") f.addEventListener("input", h);
+    });
+    wfWireCombos(box);
+  };
+  render();
+}
+function wfInspSwitch(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  const opSel = i => `<select class="wfn-fld ws-op" data-i="${i}">${_WF_OPS.map(([v, l]) => `<option value="${v}"${(d["c" + i + "op"] || "contains") === v ? " selected" : ""}>${l}</option>`).join("")}</select>`;
+  box.innerHTML = `<div class="wf-insp-row"><label class="wfn-lab">value to test</label><input class="wfn-fld ws-src" placeholder="default {{last}}" value="${escapeHtml(d.source || "")}"></div>` +
+    [1, 2, 3].map(i => `<div class="wf-insp-case"><div class="wfn-lab">case ${i} → output ${i}</div><div class="wfn-rule">${opSel(i)}<input class="wfn-fld ws-val" data-i="${i}" placeholder="value" value="${escapeHtml(d["c" + i + "val"] || "")}"></div><input class="wfn-fld ws-lbl" data-i="${i}" placeholder="branch label (blank = unused)" value="${escapeHtml(d["c" + i + "label"] || "")}"></div>`).join("") +
+    `<div class="wf-insp-note">output 4 fires when no case matches (<b>default</b>).</div>`;
+  const upd = () => {
+    const patch = { source: box.querySelector(".ws-src").value };
+    [1, 2, 3].forEach(i => {
+      patch["c" + i + "op"] = box.querySelector(`.ws-op[data-i="${i}"]`).value;
+      patch["c" + i + "val"] = box.querySelector(`.ws-val[data-i="${i}"]`).value;
+      patch["c" + i + "label"] = box.querySelector(`.ws-lbl[data-i="${i}"]`).value;
+    });
+    sync(patch);
+  };
+  box.querySelectorAll("input,select").forEach(f => { f.addEventListener("change", upd); if (f.tagName !== "SELECT") f.addEventListener("input", upd); });
+}
+function wfInspect(editor, dfId, body) {
+  const insp = $("#wfInsp", body); if (!insp) return;
+  const nd = editor.getNodeFromId(dfId); if (!nd) return;
+  const type = nd.name, meta = WF_META[type] || { name: type, kicker: "" };
+  insp.className = "wf-inspector open wf-insp-" + type;
+  insp.dataset.node = String(dfId);
+  insp.innerHTML = `
+    <div class="wf-insp-h">
+      <div class="wfn2-ic">${WF_ICONS[type] || ""}</div>
+      <div class="wf-insp-ht"><div class="wf-insp-name">${escapeHtml(meta.name)}</div><div class="wf-insp-kick">${escapeHtml(meta.kicker)}</div></div>
+      <button class="ed-btn wf-insp-del" title="delete node">🗑</button>
+      <button class="ed-btn wf-insp-x" title="close">✕</button>
+    </div>
+    <div class="wf-insp-b"></div>
+    <div class="wf-insp-f">earlier values: <code>{{input}}</code> <code>{{last}}</code> <code>{{node.ID}}</code></div>`;
+  $(".wf-insp-x", insp).onclick = () => wfInspClear(body);
+  $(".wf-insp-del", insp).onclick = () => { try { editor.removeNodeId("node-" + dfId); } catch {} wfInspClear(body); };
+  const box = $(".wf-insp-b", insp);
+  const sync = patch => {
+    const cur = (editor.getNodeFromId(dfId) || {}).data || {};
+    editor.updateNodeDataFromId(dfId, { ...cur, ...patch });
+    wfCardRefresh(editor, dfId);
+  };
+  if (type === "tool") wfInspTool(editor, dfId, box, sync);
+  else if (type === "trigger") wfInspTrigger(editor, dfId, box, sync);
+  else if (type === "http") wfInspHttp(editor, dfId, box, sync);
+  else if (type === "switch") wfInspSwitch(editor, dfId, box, sync);
+  else wfInspGeneric(editor, dfId, type, box, sync);
+}
 
 function openWorkflows() {
-  const { body, reused } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 940, height: 660, restoreKey: "workflows" });
+  const { body, reused } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 1100, height: 700, restoreKey: "workflows" });
   if (reused) return;
   body.classList.add("wf-win");
   wfRenderList(body);
@@ -6095,6 +6267,7 @@ async function wfRenderEditor(body, w) {
   await wfLoadTools();
   _wfEnumCache = {}; _wfFilesCache = null;        // refresh skill/workflow/file pickers each time the editor opens
   const inp = (w && w.input) || { enabled: false, label: "", placeholder: "", required: false, default: "" };
+  const pal = t => `<button class="wf-pal-btn" data-add="${t}"><span class="wf-pal-ic">${WF_ICONS[t] || ""}</span><span>${WF_META[t].name}</span></button>`;
   body.innerHTML = `
     <div class="wf-head"><button class="ed-btn" id="wfBack">←</button>
       <input id="wfName" class="wf-name-in" placeholder="workflow name" value="${w ? escapeHtml(w.name) : ""}">
@@ -6111,30 +6284,17 @@ async function wfRenderEditor(body, w) {
     </div>
     <div class="wf-editor-main">
       <div class="wf-sidebar" id="wfSidebar">
-        <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>
-          <button class="wf-pal-btn" data-add="trigger">⚡ Trigger</button></div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>
-          <button class="wf-pal-btn" data-add="tool">🔧 Tool</button>
-          <button class="wf-pal-btn" data-add="instruction">✎ Instruction</button>
-          <button class="wf-pal-btn" data-add="delegate">↗ Delegate</button>
-          <button class="wf-pal-btn" data-add="agent">🤖 Agent (bg)</button>
-          <button class="wf-pal-btn" data-add="http">🌐 HTTP request</button>
-          <button class="wf-pal-btn" data-add="subflow">▣ Sub-workflow</button>
-          <button class="wf-pal-btn" data-add="transform">ƒ Transform</button></div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>
-          <button class="wf-pal-btn" data-add="decision">◆ Decision</button>
-          <button class="wf-pal-btn" data-add="switch">⤳ Switch</button>
-          <button class="wf-pal-btn" data-add="loop">↻ Loop</button>
-          <button class="wf-pal-btn" data-add="approval">✋ Approval</button>
-          <button class="wf-pal-btn" data-add="await">⏳ Await agents</button></div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>
-          <button class="wf-pal-btn" data-add="end">■ End</button></div>
-        <div class="wf-pal-foot">
-          <button class="ed-btn" id="wfZoomOut">−</button><button class="ed-btn" id="wfZoomIn">+</button>
-          <div class="wf-hint">drag a node's right dot to another's left dot to connect · reference earlier values with {{input}} · {{last}} · {{node.ID}}</div>
-        </div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>${pal("trigger")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>${["tool", "instruction", "delegate", "agent", "http", "subflow", "transform"].map(pal).join("")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "approval", "await"].map(pal).join("")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>${pal("end")}</div>
+        <div class="wf-pal-foot"><div class="wf-hint">click a node to edit it in the settings panel · drag an output dot onto an input dot to connect · values: {{input}} · {{last}} · {{node.ID}}</div></div>
       </div>
-      <div class="wf-canvas" id="wfCanvas"></div>
+      <div class="wf-canvas-wrap">
+        <div class="wf-canvas" id="wfCanvas"></div>
+        <div class="wf-zoomctl"><button id="wfZoomOut" title="zoom out">−</button><button id="wfZoomReset" title="reset zoom">◎</button><button id="wfZoomIn" title="zoom in">+</button></div>
+        <aside class="wf-inspector" id="wfInsp"></aside>
+      </div>
     </div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
   const syncInpCfg = () => {                          // grey out the detail fields when input is off
@@ -6145,18 +6305,26 @@ async function wfRenderEditor(body, w) {
   $("#wfInpEn", body).onchange = syncInpCfg; syncInpCfg();
   const editor = new Drawflow($("#wfCanvas", body));
   editor.reroute = true;
+  // n8n-style connectors: horizontal-tangent cubic bézier with a minimum handle length, so short
+  // hops stay gentle and backward links bow out into a loop instead of kinking. Replaces Drawflow's
+  // stock createCurvature (same signature; used for live drag, connections and reroute segments).
+  editor.createCurvature = (x1, y1, x2, y2, cv, type) => {
+    const off = Math.max(Math.abs(x2 - x1) * 0.5, 48);
+    return ` M ${x1} ${y1} C ${x1 + off} ${y1} ${x2 - off} ${y2} ${x2} ${y2}`;
+  };
   editor.start();
+  editor.on("nodeSelected", id => wfInspect(editor, id, body));
+  editor.on("nodeUnselected", () => wfInspClear(body));
+  editor.on("nodeRemoved", id => { const insp = $("#wfInsp", body); if (insp && insp.dataset.node === String(id)) wfInspClear(body); });
   let addN = 0;
-  const place = n => { addN++; return [80 + (addN % 6) * 46, 70 + (addN % 6) * 40]; };
+  // cascade fresh nodes down-right; 96px vertical steps keep the compact cards from overlapping
+  const place = () => { addN++; return [90 + (addN % 6) * 48, 60 + (addN % 6) * 96]; };
   const addNode = (type, x, y, n) => {
     const [px, py] = (x != null) ? [x, y] : place();
     const [ins, outs] = WF_PORTS[type];
-    const cfg = n || { type };
-    const data = wfNodeData(cfg);
+    const data = wfNodeData(n || { type });
     const dfId = editor.addNode(type, ins, outs, px, py, "wf-dfn wf-dfn-" + type, data, wfNodeHtml(type, data));
-    if (type === "tool") wfWireTool(editor, dfId, data.tool, cfg.args || {});
-    else if (type === "trigger") wfWireTrigger(editor, dfId, cfg);
-    else if (type === "http") wfWireHttp(editor, dfId, cfg);
+    wfCardRefresh(editor, dfId);      // port branch labels (yes/no · error · case names)
     return dfId;
   };
   // build from the saved graph, or seed a fresh start node
@@ -6172,9 +6340,10 @@ async function wfRenderEditor(body, w) {
   } else {
     addNode("start", 40, 80, { type: "start" });
   }
-  $$(".wf-sidebar [data-add]", body).forEach(b => b.onclick = () => addNode(b.dataset.add));
+  $$(".wf-sidebar [data-add]", body).forEach(b => b.onclick = () => wfInspect(editor, addNode(b.dataset.add), body));
   $("#wfZoomIn", body).onclick = () => editor.zoom_in();
   $("#wfZoomOut", body).onclick = () => editor.zoom_out();
+  $("#wfZoomReset", body).onclick = () => editor.zoom_reset();
   $("#wfSave", body).onclick = async () => {
     const name = $("#wfName").value.trim(); if (!name) { toast("name is required", "err"); return; }
     const { graph, error } = wfReadCanvas(editor);
