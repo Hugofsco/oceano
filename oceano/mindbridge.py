@@ -68,6 +68,23 @@ _ALLOW = {
     "desktop_clipboard_read", "desktop_clipboard_write", "desktop_screenshot",   # through below (client=...)
 }
 
+# A narrower bridge for CONTAINED sub-agents (workflow Delegate / Agent Spawn / Orchestrator-
+# plugged nodes): let them reuse Oceano's published skills — so a background sub-agent doesn't
+# have to reinvent a procedure Oceano already learned — but NOTHING else from the body. No
+# memory (remember/recall/update_memory/forget_memory): a contained sub-agent's task is
+# self-contained and must not see or change what the user's own mind remembers. No learn_skill
+# either — growing the skill library is a bigger act than reusing it, left to the full bridge
+# above. A flow that genuinely needs memory (or the rest of the body) should use an Instructions
+# node instead, which runs through the full _ALLOW bridge (scope=None).
+_SCOPES = {
+    "skills": {"list_skills", "load_skill"},
+}
+
+
+def _allowset(scope):
+    return _SCOPES.get(scope, _ALLOW)
+
+
 _TOKEN = None
 
 
@@ -100,16 +117,17 @@ def daemon_url():
     return f"http://{host}:{port}"
 
 
-def tool_schemas():
-    """The Oceano tools offered to the mind: the curated body set, intersected with what's enabled."""
-    return [s for s in tools.schemas() if s["function"]["name"] in _ALLOW]
+def tool_schemas(scope=None):
+    """The Oceano tools offered to the mind: the curated body set (or, for a contained sub-agent,
+    the much narrower `scope`d set — see _SCOPES), intersected with what's enabled."""
+    return [s for s in tools.schemas() if s["function"]["name"] in _allowset(scope)]
 
 
-def tool_names():
-    return [s["function"]["name"] for s in tool_schemas()]
+def tool_names(scope=None):
+    return [s["function"]["name"] for s in tool_schemas(scope)]
 
 
-def run_tool(name, args, session=None, background=False, client="web"):
+def run_tool(name, args, session=None, background=False, client="web", scope=None):
     """Execute an Oceano tool IN THE DAEMON. Interactive mind turns run on the 'web' channel (so ui_*
     reach the live browser the user is watching); an UNATTENDED (background) mind turn runs on the
     'background' channel instead — so it can't drive the live browser or UI. Returns the tool's
@@ -124,8 +142,11 @@ def run_tool(name, args, session=None, background=False, client="web"):
 
     Carries the injection taint across the bridge: each call runs in its own request thread, so we
     reset the thread-local taint, run, and if the tool read untrusted content (web page / email /
-    doc) raise the PROCESS-WIDE bridge taint — so a later ssh_run in the same mind turn is blocked."""
-    if name not in _ALLOW:
+    doc) raise the PROCESS-WIDE bridge taint — so a later ssh_run in the same mind turn is blocked.
+
+    `scope` narrows which tools are reachable (see _SCOPES) — e.g. a contained workflow sub-agent
+    gets "skills" (list_skills/load_skill only, no memory), never the full body."""
+    if name not in _allowset(scope):
         return f"ERROR: tool {name!r} is not available to the mind"
     from oceano import safety
     with turnctx.push(session=session, channel="background" if background else "web", client=client):
@@ -136,13 +157,16 @@ def run_tool(name, args, session=None, background=False, client="web"):
         return result
 
 
-def mcp_config_path(sid=None, background=False, client="web"):
+def mcp_config_path(sid=None, background=False, client="web", scope=None):
     """Write the --mcp-config Claude Code loads to launch our stdio bridge (daemon URL + token, plus
     this TURN's attributes: the conversation `sid` so a spawn_job routes its result back to this
     chat, `background` so bridged tools run on the background channel — no live browser / UI for
-    a turn no one is watching — and `client` so oceano/tools/desktop.py's tools unlock when the
-    ORIGINAL web request that started this mind turn came from OceanoDesktop, not a browser tab).
-    Returns its path. The filename encodes all three attributes, so two concurrent turns (different
+    a turn no one is watching — `client` so oceano/tools/desktop.py's tools unlock when the
+    ORIGINAL web request that started this mind turn came from OceanoDesktop, not a browser tab,
+    and `scope` to narrow the bridge to a curated subset for a contained sub-agent (see _SCOPES) —
+    e.g. "skills" for a workflow Delegate/Agent-spawn node, so it can reuse Oceano's published
+    skills but never reach memory or the rest of the body).
+    Returns its path. The filename encodes all these attributes, so two concurrent turns (different
     sids, or a session-less scheduler turn overlapping a session-less telegram one) never clobber
     each other's config. data/ is gitignored, so nothing leaves the box."""
     import sys
@@ -159,13 +183,16 @@ def mcp_config_path(sid=None, background=False, client="web"):
         env["OCEANO_MCP_BACKGROUND"] = "1"
     if client and client != "web":
         env["OCEANO_MCP_CLIENT"] = client
+    if scope:
+        env["OCEANO_MCP_SCOPE"] = scope
     cfg = {"mcpServers": {"oceano": {
         "command": sys.executable,
         "args": ["-m", "oceano.mcp_bridge_server"],
         "env": env,
     }}}
     fname = ("mind-mcp" + (f"-{sid}" if sid else "")           # sid matches [A-Za-z0-9_-] → safe filename
-             + ("-bg" if background else "") + (f"-{client}" if client and client != "web" else "") + ".json")
+             + ("-bg" if background else "") + (f"-{client}" if client and client != "web" else "")
+             + (f"-{scope}" if scope else "") + ".json")
     path = config.WORKSPACE.parent / "data" / fname
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

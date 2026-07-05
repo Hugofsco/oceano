@@ -6147,6 +6147,7 @@ const WF_ACCESS_OPTS = [
 ];
 const WF_ACCESS_NOTE_WRITE = "✎ this node can create/edit files, run the test suite, and use git under the workspace — make sure that's intended, especially if this flow runs unattended/scheduled.";
 const WF_ACCESS_NOTE_SHELL = "⚠ this node can run ARBITRARY shell commands — real code-execution risk, not just file writes. Only enable if you trust the task (and, for a background/scheduled flow, that it'll stay unattended without incident).";
+const WF_SKILLS_NOTE = "🧩 automatically reuses Oceano's published skills (list_skills / load_skill) if one fits the task — but has no access to memory, and can't learn new skills. Need memory, or full body access? Use an Instructions node instead.";
 const WF_FIELDS = {
   start: [{ t: "note", text: "where the run begins — connect it to the first step." }],
   end: [{ t: "note", text: "marks the flow as finished." }],
@@ -6154,6 +6155,7 @@ const WF_FIELDS = {
     { k: "text", t: "textarea", l: "task", ph: "task for Claude / cloud" },
     { k: "role", t: "select", l: "role", opts: [["default", "default"], ["improve", "improve"]] },
     { k: "write", t: "select", l: "file access", rr: true, opts: WF_ACCESS_OPTS },
+    { t: "note", text: WF_SKILLS_NOTE },
     { t: "note", warn: true, showIf: d => d.write === "write", text: WF_ACCESS_NOTE_WRITE },
     { t: "note", warn: true, showIf: d => d.write === "shell", text: WF_ACCESS_NOTE_SHELL },
     { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
@@ -6265,6 +6267,7 @@ function wfInspAgent(editor, dfId, box, sync) {
     row("label", `<input class="wfn-fld" data-k="label" placeholder="short label" value="${escapeHtml(d.label || "")}">`) +
     row("timeout (s)", `<input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "600")}">`) +
     `<div class="wf-insp-note">join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}.</div>` +
+    `<div class="wf-insp-note">${WF_SKILLS_NOTE}</div>` +
     (d.write === "write" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_WRITE}</div>`
       : d.write === "shell" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_SHELL}</div>` : "");
   box.querySelectorAll("[data-k]").forEach(f => {

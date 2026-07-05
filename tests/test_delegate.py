@@ -67,6 +67,71 @@ def test_api_only_tools_translates_write_to_the_new_tool_names():
     assert names == {"write_file", "make_folder", "run_tests", "git"}
 
 
+def test_api_only_tools_skills_true_grants_list_and_load_skill_at_any_tier():
+    """skills=True (workflow Delegate/Agent-spawn nodes) must reach list_skills/load_skill even at
+    the read-only default tier — skill-reuse is orthogonal to file-access, and read-only-safe."""
+    assert delegate._api_only_tools("Read,Glob,Grep", skills=True) == {
+        "read_file", "list_files", "code_search", "list_skills", "load_skill"}
+    # never granted unless the caller opts in
+    assert "list_skills" not in delegate._api_only_tools("Read,Glob,Grep", skills=False)
+    # and it never smuggles in memory or learn_skill — those stay behind the full body bridge
+    granted = delegate._api_only_tools("Read,Glob,Grep,Write,Edit,Bash", skills=True)
+    assert "learn_skill" not in granted and "remember" not in granted and "recall" not in granted
+
+
+def test_to_claude_stream_skills_true_wires_the_scoped_bridge_not_memory(monkeypatch, tmp_path):
+    """skills=True must load mindbridge's narrow "skills" scope (list_skills/load_skill only) via
+    its own --mcp-config, and widen --allowedTools with the matching mcp__oceano__ names — but
+    never reach memory, which stays exclusive to the full-body bridge (an Instructions node)."""
+    import config
+    import oceano.tools  # noqa: F401 - ensure list_skills/load_skill are registered before we filter
+    monkeypatch.setattr(config, "WORKSPACE", tmp_path / "workspace")
+    argv_file = tmp_path / "argv.txt"
+    script = tmp_path / "fake_claude.py"
+    script.write_text(
+        "import json, sys\n"
+        f"open({str(argv_file)!r}, 'w').write(' '.join(sys.argv))\n"
+        "print(json.dumps({'type': 'result', 'result': 'ok', 'is_error': False, 'num_turns': 1}))\n")
+    shim = tmp_path / "claude"
+    shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path), tools="Read,Glob,Grep", skills=True)
+    assert r["ok"] is True
+    argv = argv_file.read_text()
+    assert "--mcp-config" in argv and "--strict-mcp-config" in argv
+    assert "mcp__oceano__list_skills" in argv and "mcp__oceano__load_skill" in argv
+    assert "mcp__oceano__remember" not in argv and "mcp__oceano__recall" not in argv
+
+
+def test_to_codex_skills_true_uses_the_subagent_home_and_keeps_the_scoped_config(monkeypatch, tmp_path):
+    """skills=True must load a SEPARATE CODEX_HOME (codex_mind.SUBAGENT_HOME) with the scoped
+    bridge's own config.toml — and must NOT pass --ignore-user-config (which would block loading
+    it), unlike the plain contained delegate path."""
+    from oceano import codex_mind
+    argv_file = tmp_path / "argv.txt"
+    script = tmp_path / "fake_codex.py"
+    script.write_text(
+        "import sys, os\n"
+        f"open({str(argv_file)!r}, 'w').write(' '.join(sys.argv) + '\\n' + os.environ.get('CODEX_HOME', ''))\n"
+        "args = sys.argv[1:]\n"
+        "if '-o' in args:\n"
+        "    open(args[args.index('-o') + 1], 'w').write('ok')\n")
+    shim = tmp_path / "codex"
+    shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr("oceano.delegate.find_codex", lambda: str(shim))
+    subhome = tmp_path / "subagent-home"
+    monkeypatch.setattr(codex_mind, "SUBAGENT_HOME", subhome)
+    monkeypatch.setattr(codex_mind, "ensure_subagent_home", lambda: {"ok": True, "home": str(subhome)})
+    r = delegate.to_codex("do it", cwd=str(tmp_path), skills=True)
+    assert r["ok"] is True
+    out = argv_file.read_text()
+    argv_line, env_home = out.split("\n", 1)
+    assert "--ignore-user-config" not in argv_line
+    assert env_home == str(subhome)
+
+
 def test_to_claude_stream_max_turns_honors_the_user_override(monkeypatch, tmp_path):
     """A user-raised max_delegate_turns override (Settings → Tools) must reach the CLI's own
     --max-turns flag — this is the actual fix for a workflow agent hitting the turn cap."""

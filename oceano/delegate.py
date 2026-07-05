@@ -419,7 +419,7 @@ def _tool_detail(inp):
 
 def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
                      max_total=None, max_turns=None, on_progress=None, append_system=None,
-                     mcp_config=None, disallow=None, cancel=None):
+                     mcp_config=None, disallow=None, cancel=None, skills=False):
     """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
 
     Three wins over the old blocking call:
@@ -428,6 +428,10 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
       2. an IDLE timeout (reset on every event) replaces the fixed wall-clock: a long build
          that's actively producing output is never killed; only a genuinely stalled one is.
       3. the final result is captured incrementally, so even a killed run keeps partial work.
+
+    `skills=True` wires Oceano's "skills"-scoped MCP bridge (list_skills/load_skill only — never
+    memory/the rest of the body) when the caller didn't already pass its own `mcp_config` (the
+    resident Claude-mind path builds its own full-body one instead — see agent.py).
 
     Returns {ok, output, error, partial, turns, cost}."""
     import queue
@@ -440,6 +444,13 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
     if not binary:
         return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
                 "or set OCEANO_CLAUDE_BIN", "partial": False, "turns": 0, "cost": 0.0}
+    if skills and not mcp_config:
+        from oceano import mindbridge
+        mcp_config = mindbridge.mcp_config_path(background=True, scope="skills")
+        if mcp_config:
+            names = mindbridge.tool_names(scope="skills")
+            if names:
+                tools = (tools + "," if tools else "") + ",".join("mcp__oceano__" + n for n in names)
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose",
            "--max-turns", str(int(max_turns))] + _claude_model_args() + _claude_effort_args()
     if tools:
@@ -659,11 +670,16 @@ def codex_sandbox_mode(desired="workspace-write"):
     return "danger-full-access"
 
 
-def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=None):
+def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=None, skills=False):
     """Run one headless Codex task as a CONTAINED worker, mirroring to_claude. `--ignore-user-config`
     means it loads only the user's auth from our CODEX_HOME, NOT the resident mind's MCP-bridge config
     — so a delegate gets Codex's own file/shell tools (confined by the sandbox mapped from `tools`),
     never Oceano's body (memory/mail/ssh). `images` attaches files to the prompt for vision (-i).
+
+    `skills=True` swaps in a SEPARATE CODEX_HOME (codex_mind.SUBAGENT_HOME) whose config.toml wires
+    a "skills"-scoped MCP bridge (list_skills/load_skill only — see mindbridge._SCOPES) — never the
+    resident mind's full-body one, which lives in a different CODEX_HOME entirely. --ignore-user-config
+    is dropped in that case since this dedicated config IS what we want Codex to load.
     Returns {ok, output, error}."""
     import tempfile
     from oceano import codex_mind
@@ -671,13 +687,21 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     if not binary:
         return {"ok": False, "output": "",
                 "error": "codex CLI not found — install Codex, or set OCEANO_CODEX_BIN"}
-    ok, err = codex_mind.ensure_auth()
-    if not ok:
-        return {"ok": False, "output": "", "error": err}
+    if skills:
+        prep = codex_mind.ensure_subagent_home()
+        if not prep.get("ok"):
+            return {"ok": False, "output": "", "error": prep.get("error") or "could not prepare Codex"}
+        home = codex_mind.SUBAGENT_HOME
+    else:
+        ok, err = codex_mind.ensure_auth()
+        if not ok:
+            return {"ok": False, "output": "", "error": err}
+        home = codex_mind.HOME
     sandbox = codex_sandbox_mode(_codex_sandbox(tools))
     fd, out_path = tempfile.mkstemp(prefix="codex-deleg-", suffix=".txt")
     os.close(fd)
-    cmd = [binary, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",
+    cmd = [binary, "exec"] + ([] if skills else ["--ignore-user-config"]) + \
+          ["--skip-git-repo-check", "--ephemeral",
            "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{sandbox}"',
            "-o", out_path] + _codex_model_args() + _codex_effort_args()
     for img in (images or []):
@@ -687,7 +711,7 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     # Pass the prompt on stdin, NOT as a positional: `-i <FILE>...` is greedy and would otherwise
     # swallow a trailing prompt argument. Codex reads instructions from stdin when none is given.
     env = dict(os.environ)
-    env["CODEX_HOME"] = str(codex_mind.HOME)
+    env["CODEX_HOME"] = str(home)
     try:
         r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE), env=env, input=instructions,
                            capture_output=True, text=True, timeout=timeout)
@@ -734,28 +758,39 @@ _API_TOOL_MAP = {
     "Bash": ("run_shell", "python_exec"),
 }
 
+# Granted on top of the CLI-style map when a caller opts into skill-reuse (skills=True below) —
+# NOT part of _API_TOOL_MAP itself, because that map is keyed by write-tier tokens (Read/Write/
+# Bash) and skill-reuse is orthogonal to file-access tier: it should reach a contained sub-agent
+# even at the read-only default. Mirrors mindbridge._SCOPES["skills"] — list_skills/load_skill
+# only, never learn_skill (that's left to the full-body bridge, e.g. an Instructions node).
+_SKILLS_TOOLS = ("list_skills", "load_skill")
 
-def _api_only_tools(tools_spec):
+
+def _api_only_tools(tools_spec, skills=False):
     """Translate a CLI tools spec into an allowlist of our tool names.
-    None → no narrowing (the full enabled surface)."""
+    None → no narrowing (the full enabled surface). `skills=True` additionally grants
+    list_skills/load_skill regardless of tier (see _SKILLS_TOOLS)."""
     if tools_spec is None:
         return None
     names = set()
     for t in (x.strip() for x in tools_spec.split(",")):
         if t:
             names.update(_API_TOOL_MAP.get(t, ()))
+    if skills:
+        names.update(_SKILLS_TOOLS)
     return names
 
 
 def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600, on_progress=None,
-           exclude=None, model="", base_url=""):
+           exclude=None, model="", base_url="", skills=False):
     """Delegate to the configured cloud model by running it through OUR agent loop — the
     SAME machinery local models use. `tools` (a Claude-CLI-style spec) is translated to
     the equivalent local tools and enforced, and `timeout` puts a wall-clock deadline on
     the loop, so this provider honours the same containment as the CLI. Scoped to `cwd`
     (a throwaway/working folder) when given. on_progress(ev) surfaces its tool calls live.
     `model`/`base_url` override the role config (a workflow agent node pinned to a specific
-    registered endpoint + model); empty → the role's configured pair as before.
+    registered endpoint + model); empty → the role's configured pair as before. `skills=True`
+    additionally grants list_skills/load_skill (see _SKILLS_TOOLS) — never memory.
     Returns {ok, output, error}. (learn=False so the task prompt is never mined into memory.)"""
     cfg = resolve(role)
     base_url, model = (base_url or cfg["base_url"]), (model or cfg["model"])
@@ -783,7 +818,7 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         # and run_workflow, so a spawned agent can't fan out further).
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
                    inject_context=False, exclude_tools=(exclude or {"delegate", "delegate_to_claude"}),
-                   only_tools=_api_only_tools(tools), on_event=_on_ev)
+                   only_tools=_api_only_tools(tools, skills=skills), on_event=_on_ev)
         deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()
         with ctx:
@@ -819,23 +854,25 @@ def _api_ping(role="default", timeout=60):
 
 # --- unified entry: honour the configured provider, per role ---------------
 def run(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=None, max_turns=None,
-        role="default", on_progress=None):
+        role="default", on_progress=None, skills=False):
     """Delegate per the role's effective provider, STREAMING progress via on_progress(ev).
       claude_cli → the Claude Code CLI (its own tools; `tools=` limits --allowedTools),
                    streamed with an idle timeout so long active builds aren't killed;
       api        → the cloud model run through OUR agent loop with OUR tools.
     `cwd` scopes the working folder for both. role='improve' for self-improving jobs.
-    `timeout` is the absolute cap (None → the generous default); idle is handled internally."""
+    `timeout` is the absolute cap (None → the generous default); idle is handled internally.
+    `skills=True` additionally grants list_skills/load_skill (reuse Oceano's published skills) —
+    never memory. Used by workflow Delegate/Agent-spawn nodes; see mindbridge._SCOPES."""
     if not enabled():
         return {"ok": False, "output": "", "error": "Delegation is turned off (Settings → Delegation)."}
     prov = resolve(role)["provider"]
     if prov == "api":
         return to_api(instructions, cwd=cwd, role=role, tools=tools,
-                      timeout=timeout or _DELEGATE_MAX, on_progress=on_progress)
+                      timeout=timeout or _DELEGATE_MAX, on_progress=on_progress, skills=skills)
     if prov == "codex_cli":                       # contained Codex worker (no live progress yet → blocking)
-        return to_codex(instructions, cwd=cwd, tools=tools, timeout=timeout or _DELEGATE_MAX)
+        return to_codex(instructions, cwd=cwd, tools=tools, timeout=timeout or _DELEGATE_MAX, skills=skills)
     return to_claude_stream(instructions, cwd=cwd, tools=tools, max_total=timeout,
-                            max_turns=max_turns, on_progress=on_progress)
+                            max_turns=max_turns, on_progress=on_progress, skills=skills)
 
 
 # --- vision: analyze an image via the configured target (the local chat model is text-only) ---

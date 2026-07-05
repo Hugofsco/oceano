@@ -18,6 +18,11 @@ from oceano import atomicio, mindbridge
 
 _HOME = config.WORKSPACE.parent / "data" / "codex-home"
 _CONFIG = _HOME / "config.toml"
+# A SEPARATE CODEX_HOME for contained delegate/agent-node runs that opt into skill-reuse (see
+# ensure_subagent_home below) — never codex_mind.HOME, the resident mind's, so its full-body
+# config.toml (written by ensure_home) can never end up loaded for a contained sub-agent.
+_SUBAGENT_HOME = config.WORKSPACE.parent / "data" / "codex-home-subagent"
+_SUBAGENT_CONFIG = _SUBAGENT_HOME / "config.toml"
 
 
 def _j(s):
@@ -29,13 +34,14 @@ def _auth_source_home():
     return Path(src).expanduser() if src else (Path.home() / ".codex")
 
 
-def _sync_auth():
+def _sync_auth(dst_home=None):
+    dst_home = dst_home or _HOME
     src_home = _auth_source_home()
     src = src_home / "auth.json"
     if not src.is_file():
         return False, f"codex auth not found at {src} — run `codex login` on this host first"
-    _HOME.mkdir(parents=True, exist_ok=True)
-    dst = _HOME / "auth.json"
+    dst_home.mkdir(parents=True, exist_ok=True)
+    dst = dst_home / "auth.json"
     try:
         if (not dst.exists()) or src.stat().st_mtime > dst.stat().st_mtime or src.stat().st_size != dst.stat().st_size:
             shutil.copy2(src, dst)
@@ -83,8 +89,10 @@ def ensure_home():
 
 # The CODEX_HOME our headless callers point at. The mind uses ensure_home() (auth + the MCP-bridge
 # config.toml); contained delegates use ensure_auth() + `codex exec --ignore-user-config`, so they
-# get the auth from here but NOT the mind's body tools.
+# get the auth from here but NOT the mind's body tools. A delegate/agent-node run that opts into
+# skill-reuse uses SUBAGENT_HOME + ensure_subagent_home() instead (its own "skills"-scoped bridge).
 HOME = _HOME
+SUBAGENT_HOME = _SUBAGENT_HOME
 
 
 def ensure_auth():
@@ -98,6 +106,53 @@ def ensure_auth():
         except OSError as e:
             return False, f"could not prepare Codex home: {e}"
     return ok, err
+
+
+def _write_subagent_config():
+    """Like _write_config, but the bridge is scoped to "skills" (list_skills/load_skill only —
+    see mindbridge._SCOPES) and the turn is always marked background (a contained sub-agent is
+    never attended). Written to _SUBAGENT_CONFIG, never _CONFIG."""
+    import sys
+    lines = [
+        'approval_policy = "never"',
+        'sandbox_mode = "workspace-write"',
+        'web_search = "disabled"',
+        '',
+        '[mcp_servers.oceano]',
+        f'command = {_j(sys.executable)}',
+        'args = ["-m", "oceano.mcp_bridge_server"]',
+        'enabled = true',
+        'required = true',
+        'startup_timeout_sec = 15',
+        'tool_timeout_sec = 600',
+        'default_tools_approval_mode = "approve"',
+        '',
+        '[mcp_servers.oceano.env]',
+        f'OCEANO_MCP_URL = {_j(mindbridge.daemon_url())}',
+        f'OCEANO_MCP_TOKEN = {_j(mindbridge.token())}',
+        f'PYTHONPATH = {_j(str(config.WORKSPACE.parent))}',
+        'OCEANO_MCP_SCOPE = "skills"',
+        'OCEANO_MCP_BACKGROUND = "1"',
+        '',
+    ]
+    atomicio.write_text(_SUBAGENT_CONFIG, "\n".join(lines))
+
+
+def ensure_subagent_home():
+    """Auth + a "skills"-scoped MCP bridge config for a CONTAINED delegate/agent-node Codex run
+    that opts into skill-reuse (list_skills/load_skill only — never memory/mail/ssh/the rest of
+    the body). Kept in its own CODEX_HOME (_SUBAGENT_HOME), separate from both the resident
+    mind's (ensure_home) and the plain contained delegate's (ensure_auth), so this scoped bridge
+    can never be confused with either."""
+    ok, err = _sync_auth(_SUBAGENT_HOME)
+    if not ok:
+        return {"ok": False, "error": err}
+    try:
+        _SUBAGENT_HOME.mkdir(parents=True, exist_ok=True)
+        _write_subagent_config()
+    except OSError as e:
+        return {"ok": False, "error": f"could not prepare Codex home: {e}"}
+    return {"ok": True, "home": str(_SUBAGENT_HOME)}
 
 
 def _agent_text(item):

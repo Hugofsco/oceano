@@ -943,7 +943,7 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
         tool_scope = _tool_scope_for(a.get("write"))
         rec = agentjobs.spawn(task, provider=a.get("provider", ""), label=a.get("label", ""),
                               model=a.get("model", ""), base_url=a.get("baseUrl", ""),
-                              timeout=a.get("timeout", 600),
+                              timeout=a.get("timeout", 600), skills=True,   # may reuse skills; never memory
                               tools=tool_scope, cwd=config.WORKSPACE)
         spawned[a["id"]] = rec["id"]               # a later Await node can still see them
         return rec["id"]
@@ -1269,7 +1269,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             from oceano import delegate
                             tool_scope = _tool_scope_for(cur.get("write"))
                             r = delegate.run(_tmpl(cur.get("text", ""), ctx), cwd=config.WORKSPACE,
-                                             tools=tool_scope, timeout=600, role=cur.get("role", "default"))
+                                             tools=tool_scope, timeout=600, role=cur.get("role", "default"),
+                                             skills=True)   # may reuse Oceano's published skills; never memory
                             ok = bool(r.get("ok"))
                             output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
                             ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
@@ -1282,7 +1283,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                                   base_url=cur.get("baseUrl", ""),
                                                   label=cur.get("label", ""),
                                                   timeout=cur.get("timeout", 600),
-                                                  tools=tool_scope,
+                                                  tools=tool_scope, skills=True,   # may reuse skills; never memory
                                                   cwd=config.WORKSPACE)   # raises on cap → error edge
                             spawned[cur["id"]] = rec["id"]
                             output = json.dumps({"agent_id": rec["id"], "label": rec["label"],

@@ -161,6 +161,43 @@ def test_run_tool_desktop_gate_follows_the_threaded_client():
     assert "couldn't show the notification" in out_desktop and "isn't connected" in out_desktop
 
 
+def test_skills_scope_exposes_only_list_and_load_skill():
+    """The contained sub-agent bridge (workflow Delegate/Agent-spawn nodes) must see list_skills/
+    load_skill and NOTHING else — no memory, no learn_skill, no web/mail/ssh/the rest of the body."""
+    names = set(mindbridge.tool_names(scope="skills"))
+    assert names == {"list_skills", "load_skill"}
+    for leaked in ("remember", "recall", "update_memory", "forget_memory", "learn_skill",
+                   "web_search", "spawn_agent"):
+        assert leaked not in names
+    # the unscoped (full) bridge still has everything, unaffected
+    assert "remember" in mindbridge.tool_names()
+
+
+def test_run_tool_scope_refuses_tools_outside_the_scope():
+    out_of_scope = mindbridge.run_tool("remember", {}, scope="skills")
+    assert "not available to the mind" in out_of_scope
+    # a tool that IS in scope actually runs (list_skills is a plain read, safe to call for real)
+    in_scope = mindbridge.run_tool("list_skills", {}, scope="skills")
+    assert "not available to the mind" not in in_scope
+
+
+def test_mcp_config_carries_the_scope(tmp_path, monkeypatch):
+    """A scoped config gets its own filename (never clobbers/is clobbered by the unscoped one) and
+    forwards OCEANO_MCP_SCOPE so the daemon narrows /api/mcp/tools + /api/mcp/call to that scope."""
+    import config
+    monkeypatch.setattr(config, "WORKSPACE", tmp_path / "workspace")
+    import json as _json
+    from pathlib import Path as _Path
+    p = mindbridge.mcp_config_path(background=True, scope="skills")
+    cfg = _json.loads(_Path(p).read_text())
+    assert p.endswith("mind-mcp-bg-skills.json")
+    assert cfg["mcpServers"]["oceano"]["env"]["OCEANO_MCP_SCOPE"] == "skills"
+    # the plain background config (no scope) must not carry it or collide with the scoped filename
+    p0 = mindbridge.mcp_config_path(background=True)
+    assert p0.endswith("mind-mcp-bg.json")
+    assert "OCEANO_MCP_SCOPE" not in _json.loads(_Path(p0).read_text())["mcpServers"]["oceano"]["env"]
+
+
 def test_run_tool_channel_is_per_call_not_global():
     """Two OVERLAPPING bridged calls — one background, one interactive — must each run on their
     own channel. This is the regression test for the old `_bg_mind_turns` process-global, where

@@ -35,11 +35,11 @@ class FakeAgentJobs:
         self._ids = iter(range(1, 100))
 
     def spawn(self, task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None,
-              model="", base_url=""):
+              model="", base_url="", skills=False):
         aid = next(self._ids)
         self.spawned.append({"id": aid, "task": task, "provider": provider,
                              "model": model, "base_url": base_url,
-                             "tools": tools, "timeout": timeout})
+                             "tools": tools, "timeout": timeout, "skills": skills})
         return {"id": aid, "label": label or task, "provider": provider or "api", "state": "running"}
 
     def status(self, aid=None):
@@ -510,7 +510,7 @@ def test_orchestrated_agent_write_opt_in_travels_with_its_own_node(monkeypatch):
 def test_delegate_node_write_opt_in(monkeypatch):
     calls = []
 
-    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default"):
+    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default", skills=False):
         calls.append(tools)
         return {"ok": True, "output": "DONE", "error": ""}
     monkeypatch.setattr("oceano.delegate.run", fake_delegate_run)
@@ -527,7 +527,7 @@ def test_delegate_node_write_opt_in(monkeypatch):
 def test_delegate_node_defaults_to_read_only(monkeypatch):
     calls = []
 
-    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default"):
+    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default", skills=False):
         calls.append(tools)
         return {"ok": True, "output": "DONE", "error": ""}
     monkeypatch.setattr("oceano.delegate.run", fake_delegate_run)
@@ -600,7 +600,7 @@ def test_agent_node_shell_tier_reaches_spawn_and_marks_the_label(monkeypatch):
 def test_delegate_node_shell_tier_reaches_delegate_run(monkeypatch):
     calls = []
 
-    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default"):
+    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default", skills=False):
         calls.append(tools)
         return {"ok": True, "output": "DONE", "error": ""}
     monkeypatch.setattr("oceano.delegate.run", fake_delegate_run)
@@ -662,3 +662,53 @@ def test_tool_node_still_works_alongside_agent_and_delegate_nodes_in_same_run(mo
     assert steps[2]["output"] == "TOOL-OUT"
     assert "AGENT-OUT" in steps[4]["output"]
     assert steps[5]["output"] == "DELEGATE-OUT"
+
+
+# ---------------- skill-reuse (never memory): agent/delegate/orchestrate nodes opt in ----------------
+def test_agent_node_reaches_spawn_with_skills_true(monkeypatch):
+    """A standalone agent node always asks agentjobs.spawn for skill-reuse (list_skills/load_skill),
+    regardless of its file-access tier — see mindbridge._SCOPES / delegate._SKILLS_TOOLS."""
+    fake = FakeAgentJobs({1: {"state": "done", "output": "X", "error": ""}})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "agent", "task": "t"},
+         {"id": 3, "type": "await", "timeout": 5},
+         {"id": 4, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3}, {"from": 3, "to": 4}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    assert fake.spawned[0]["skills"] is True
+
+
+def test_delegate_node_reaches_delegate_run_with_skills_true(monkeypatch):
+    calls = []
+
+    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default", skills=False):
+        calls.append(skills)
+        return {"ok": True, "output": "DONE", "error": ""}
+    monkeypatch.setattr("oceano.delegate.run", fake_delegate_run)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "delegate", "text": "look around"},
+         {"id": 3, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    assert calls == [True]
+
+
+def test_orchestrated_agent_reaches_spawn_with_skills_true(monkeypatch):
+    fake = FakeAgentJobs({1: {"state": "done", "output": "R1", "error": ""}})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "agent", "task": "scanner", "label": "scanner"},
+         {"id": 3, "type": "orchestrate", "plan": {"2": 1}, "timeout": 5},
+         {"id": 4, "type": "end"}],
+        [{"from": 1, "to": 3}, {"from": 2, "to": 3}, {"from": 3, "to": 4}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    assert fake.spawned[0]["skills"] is True

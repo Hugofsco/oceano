@@ -118,13 +118,15 @@ def _resolve_provider(provider):
 
 
 def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None,
-          model="", base_url=""):
+          model="", base_url="", skills=False):
     """Start a contained agent on a background daemon thread and return its record immediately.
     Refuses (RuntimeError with a user-relayable message) when the concurrency cap is hit, when a
     `local` agent is already running, or on an unknown provider. `sid` is the conversation that
     spawned it (result delivered back there); None outside a chat (workflows/scheduler).
     `model`+`base_url` pin the agent to a specific registered endpoint's model (runs through our
-    agent loop like the api provider); CLI providers (claude/codex) ignore the pin."""
+    agent loop like the api provider); CLI providers (claude/codex) ignore the pin.
+    `skills=True` additionally grants list_skills/load_skill (reuse Oceano's published skills) —
+    never memory; see mindbridge._SCOPES / delegate._SKILLS_TOOLS."""
     from oceano import delegate
     p = _resolve_provider(provider)
     if model and p not in ("claude", "codex"):   # an endpoint-pinned agent IS an api-style run
@@ -147,12 +149,12 @@ def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None
                "warning": LOCAL_WARNING if p == "local" else ""}
         _jobs[jid] = rec
     _persist()
-    threading.Thread(target=_work, args=(jid, task, p, tools, timeout, cwd, model, base_url),
+    threading.Thread(target=_work, args=(jid, task, p, tools, timeout, cwd, model, base_url, skills),
                      daemon=True).start()
     return dict(rec)
 
 
-def _work(jid, task, provider, tools, timeout, cwd, model="", base_url=""):
+def _work(jid, task, provider, tools, timeout, cwd, model="", base_url="", skills=False):
     """Owns the agent run for this job's lifetime (the thread analog of bgjobs._reap)."""
     log_path = None
     with _mx:
@@ -175,7 +177,7 @@ def _work(jid, task, provider, tools, timeout, cwd, model="", base_url=""):
             pass
 
     try:
-        r = _dispatch(provider, task, tools, timeout, cwd, on_progress, model, base_url)
+        r = _dispatch(provider, task, tools, timeout, cwd, on_progress, model, base_url, skills)
     except Exception as e:                       # a provider crash is a failed agent, not a dead thread
         r = {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
     finally:
@@ -198,7 +200,7 @@ def _work(jid, task, provider, tools, timeout, cwd, model="", base_url=""):
     _announce(snap)
 
 
-def _dispatch(provider, task, tools, timeout, cwd, on_progress, model="", base_url=""):
+def _dispatch(provider, task, tools, timeout, cwd, on_progress, model="", base_url="", skills=False):
     """Run the task on the chosen provider, reusing delegation's contained primitives directly
     (delegate.run()'s role-based resolution is deliberately untouched — these four are the seams).
     Returns the provider's {ok, output, error} dict."""
@@ -207,17 +209,17 @@ def _dispatch(provider, task, tools, timeout, cwd, on_progress, model="", base_u
     spec = tools or delegate.DEFAULT_TOOLS
     if provider == "claude":
         return delegate.to_claude_stream(task, cwd=cwd, tools=spec, max_total=timeout,
-                                         on_progress=on_progress)
+                                         on_progress=on_progress, skills=skills)
     if provider == "codex":
-        return delegate.to_codex(task, cwd=cwd, tools=spec, timeout=timeout)
+        return delegate.to_codex(task, cwd=cwd, tools=spec, timeout=timeout, skills=skills)
     if provider == "api":
         return delegate.to_api(task, cwd=cwd, tools=spec, timeout=timeout,
                                on_progress=on_progress, exclude=EXCLUDE,
-                               model=model, base_url=base_url)
-    return _run_local(task, spec, timeout, cwd, on_progress)
+                               model=model, base_url=base_url, skills=skills)
+    return _run_local(task, spec, timeout, cwd, on_progress, skills=skills)
 
 
-def _run_local(task, tools_spec, timeout, cwd, on_progress):
+def _run_local(task, tools_spec, timeout, cwd, on_progress, skills=False):
     """The task on the LOCAL primary model through OUR agent loop — delegate.to_api's shape, but
     on resolve_primary() instead of a role's cloud config, and inside the global serialization
     gate (gate=True) so it queues visibly behind other work on the one resident model."""
@@ -236,7 +238,7 @@ def _run_local(task, tools_spec, timeout, cwd, on_progress):
         from oceano.agent import Agent
         ag = Agent(model=prim["model"], base_url=prim["base_url"] or None,
                    api_key=prim["api_key"] or None, learn=False, inject_context=False,
-                   exclude_tools=EXCLUDE, only_tools=delegate._api_only_tools(tools_spec),
+                   exclude_tools=EXCLUDE, only_tools=delegate._api_only_tools(tools_spec, skills=skills),
                    on_event=_on_ev)
         deadline = (time.monotonic() + timeout) if timeout else None
         with jobs.job("agent", label=str(task)[:140], gate=True):
