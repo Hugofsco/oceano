@@ -466,6 +466,31 @@ async def chat_tools_set(req: Request):
     return {"ok": True, "tools": tools.chat_tool_state()}
 
 
+@router.get("/api/tools/limits")
+def tool_limits():
+    """Current tool-call budgets (Settings → Tools): the interactive/background agent loop's
+    turn cap, and Claude/Codex CLI delegation's own --max-turns. Each *_override is null when
+    unset (the *_default applies); set one to explicitly raise/lower it."""
+    from oceano import delegate, tools
+    return {"max_steps_override": tools.get_max_steps_override() or None, "max_steps_default": config.MAX_STEPS,
+            "max_delegate_turns_override": tools.get_max_delegate_turns() or None,
+            "max_delegate_turns_default": delegate._DELEGATE_TURNS}
+
+
+@router.post("/api/tools/limits")
+async def set_tool_limits(req: Request):
+    """body: {max_steps?, max_delegate_turns?} — either 0/null clears back to the built-in
+    default. Values are clamped (1-500) inside tools.set_max_steps/set_max_delegate_turns."""
+    from oceano import tools
+    b = await req.json()
+    if "max_steps" in b:
+        tools.set_max_steps(b["max_steps"] or 0)
+    if "max_delegate_turns" in b:
+        tools.set_max_delegate_turns(b["max_delegate_turns"] or 0)
+    return {"ok": True, "max_steps": tools.get_max_steps(),
+            "max_delegate_turns": tools.get_max_delegate_turns() or None}
+
+
 @router.get("/api/models")
 def models():
     return list_models()

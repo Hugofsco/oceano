@@ -46,8 +46,37 @@ _MAX_RUNS = 60
 _OUT_CAP = 4000
 _VISIT_CAP = 400                     # max node executions per run — loop backstop (raised for foreach)
 _LOOP_CAP = 200                      # max iterations a single loop node will run
+_SALVAGE_BACKOFF = 15                # seconds before an orchestrator's serial salvage retry
 _SUBFLOW_DEPTH = 5                   # how deep nested sub-workflows may go
 _HTTP_CAP = 200000                   # cap an HTTP node's captured response body
+_WRITE_TIERS = ("", "write", "shell")   # an agent/delegate node's "file access" opt-in level
+
+
+def _tool_scope_for(write):
+    """CLI-style tool spec for an agent/delegate node's chosen access tier. "" (default) stays
+    read-only — an unattended/scheduled flow must not be quietly MORE privileged than the user
+    intended; "write" and "shell" are explicit, escalating opt-ins (each also unlocks matching
+    built-in tools for the api/local providers via delegate._API_TOOL_MAP — e.g. "write" reaches
+    run_tests/git, so a node that can edit files can also verify them).
+    Callers: keep the result in a variable named tool_scope, NOT tools — oceano.tools is a
+    MODULE imported at file scope, and a local named `tools` anywhere in a function shadows
+    that import for the function's ENTIRE body (Python scopes per-function, not per-branch),
+    breaking every "tool" node call in run() with UnboundLocalError. This happened once already."""
+    if write == "shell":
+        return "Read,Glob,Grep,Write,Edit,Bash"
+    if write == "write":
+        return "Read,Glob,Grep,Write,Edit"
+    return "Read,Glob,Grep"
+
+
+def _access_marker(write):
+    """Suffix for a node's label/history entries so an elevated access tier stays visible
+    after the fact — the same distinction _tool_scope_for reads."""
+    if write == "shell":
+        return " ⚠"
+    if write == "write":
+        return " ✎"
+    return ""
 
 # Live run state so the GUI can RECONNECT to an in-progress run after a browser refresh
 # (works for manual AND scheduled runs). Keyed by workflow id; finished runs linger briefly.
@@ -143,13 +172,25 @@ def _norm_graph(graph):
             node["args"] = n.get("args") if isinstance(n.get("args"), dict) else {}
         elif t == "instruction":
             node["text"] = str(n.get("text", ""))
+            # "" → follow the global mind (Settings → Primary intelligence): claude/codex if set
+            # and available, else the run's own agent. An explicit value pins THIS node regardless.
+            node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
+            node["model"] = str(n.get("model", "")).strip()[:120]      # pin this node's turn to a
+            node["baseUrl"] = str(n.get("baseUrl", "")).strip()[:200]  # registered endpoint's model
         elif t == "delegate":
             node["text"] = str(n.get("text", ""))
             node["role"] = n.get("role") if n.get("role") in ("default", "improve") else "default"
+            # "" (default) = read-only, matching the sibling agent node below — a background/
+            # unattended delegate must not be quietly MORE privileged than the rest of a flow.
+            # Explicit opt-in only: "write" (+run_tests/git) or "shell" (+arbitrary commands).
+            node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""
         elif t == "agent":                            # spawn a background sub-agent; the flow continues
             node["task"] = str(n.get("task", ""))
             node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
+            node["model"] = str(n.get("model", "")).strip()[:120]      # pin to a registered
+            node["baseUrl"] = str(n.get("baseUrl", "")).strip()[:200]  # endpoint's model ("" = default)
             node["label"] = str(n.get("label", "")).strip()[:80]
+            node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""   # "" default = read-only
             try:
                 node["timeout"] = max(1, min(int(n.get("timeout", 600)), 3600))    # seconds
             except (TypeError, ValueError):
@@ -847,40 +888,68 @@ def _await_approval(wf_id, prompt, timeout_min, beat):
     return a["approved"], ("approved" if a["approved"] else "rejected")
 
 
+def _pinned_agent(node, ag):
+    """An Agent on the node's pinned endpoint model that SHARES the run's conversation (the same
+    messages list object), so cross-node context keeps accumulating no matter which model took the
+    turn. The endpoint's API key resolves like delegate.to_api's (lazy web import; '' if absent)."""
+    from oceano.agent import Agent
+    base_url = node.get("baseUrl") or ""
+    api_key = ""
+    if base_url:
+        try:
+            from oceano.web import server      # lazy: avoid an import cycle at module load
+            api_key = server.endpoint_key(base_url)
+        except Exception:
+            api_key = ""
+    pinned = Agent(model=node["model"], base_url=base_url or None,
+                   api_key=api_key or "sk-no-key-needed", learn=False,
+                   exclude_tools={"run_workflow"})
+    pinned.messages = ag.messages
+    pinned.on_event = ag.on_event
+    return pinned
+
+
 def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
     """Run the agent nodes plugged into an orchestrator. node['plan'] maps agent node id -> step
     number; unlisted agents default to step 1. Each step's agents spawn in parallel and the step is
     joined before the next starts — later steps get earlier results appended to their task (and can
-    also reference them as {{node.ID}}). Returns (ok, compiled_output); a failed/timed-out agent
-    stops the remaining steps and routes the error edge, with the partial compile as output.
-    mode 'summarize' rewrites the compile with the shared agent (same engine as an instruction
-    node), using node['text'] as the brief."""
+    also reference them as {{node.ID}}). An agent that fails or times out gets ONE serial retry
+    (endpoints with per-key concurrency limits or long first-token queues often succeed alone);
+    only then does the step fail, stopping later steps and routing the error edge with the partial
+    compile as output. mode 'summarize' rewrites the compile with the shared agent (same engine as
+    an instruction node), using node['text'] as the brief.
+    Returns (ok, compiled, step_records) — step_records is one {id,type,label,ok,output} dict per
+    attached agent that actually ran, in plugged-in order, so the caller can fold them into the
+    run's persisted step list. Without this, attached agents show up live (the diagram, the SSE
+    log) but vanish from history/reconnect-after-the-fact — only the orchestrator's own single
+    compiled entry would survive, since traversal never visits attachment nodes directly."""
     from oceano import agentjobs
     if not agents:
-        return False, "orchestrate: no agent nodes are plugged into this orchestrator"
+        return False, "orchestrate: no agent nodes are plugged into this orchestrator", []
     plan = node.get("plan") or {}
+    step_timeout = node.get("timeout", 900)
     steps = {}
     for a in agents:
         steps.setdefault(int(plan.get(str(a["id"]), 1)), []).append(a)
     name = lambda a: a.get("label") or "agent " + str(a["id"])   # noqa: E731
-    gathered, failures = [], []      # [(step, agent node, output)] · [(step, agent node, error)]
-    for step in sorted(steps):
-        prior = ""
-        if gathered:                 # sequence semantics: this step sees everything gathered so far
-            prior = "\n\n(Context — results from earlier agents:)\n" + "\n\n".join(
-                f"== {name(an)}\n{out[:2000]}" for _s, an, out in gathered)
-        running, by_id = {}, {a["id"]: a for a in steps[step]}
-        for a in steps[step]:
-            emit({"event": "tool", "id": node["id"],
-                  "text": f"step {step} · spawning 🤖 {a.get('label') or a.get('task', '')[:40]}"})
-            rec = agentjobs.spawn(_tmpl(a.get("task", ""), ctx) + prior,
-                                  provider=a.get("provider", ""), label=a.get("label", ""),
-                                  timeout=a.get("timeout", 600),
-                                  # same read-only scope as the agent/delegate nodes
-                                  tools="Read,Glob,Grep", cwd=config.WORKSPACE)
-            running[a["id"]] = rec["id"]
-            spawned[a["id"]] = rec["id"]               # a later Await node can still see them
-        deadline = time.time() + node.get("timeout", 900)
+
+    def spawn(a, task):
+        # synthetic node_start lights the plugged-in agent up on the live run diagram (attached
+        # agents are never walked by traversal, so nothing else would emit for them)
+        emit({"event": "node_start", "id": a["id"], "type": "agent", "label": _node_label(a)})
+        # same read-only-unless-opted-in scope as a standalone agent/delegate node — the
+        # attached agent's OWN "write" setting (from its inspector) travels with it into the
+        # orchestrator, so plugging an agent in doesn't change its privilege level either way.
+        tool_scope = _tool_scope_for(a.get("write"))
+        rec = agentjobs.spawn(task, provider=a.get("provider", ""), label=a.get("label", ""),
+                              model=a.get("model", ""), base_url=a.get("baseUrl", ""),
+                              timeout=a.get("timeout", 600),
+                              tools=tool_scope, cwd=config.WORKSPACE)
+        spawned[a["id"]] = rec["id"]               # a later Await node can still see them
+        return rec["id"]
+
+    def join(running):
+        deadline = time.time() + step_timeout
         done, failed = {}, {}
         while time.time() < deadline:
             beat()
@@ -898,20 +967,63 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
             if not left:
                 break
             time.sleep(2)
-        for nid in by_id:
+        for nid in running:                        # anything still running at the deadline
             if nid not in done and nid not in failed:
                 failed[nid] = "timed out (still running)"
-        for a in steps[step]:                          # keep the plugged-in order deterministic
+        return done, failed
+
+    gathered, failures = [], []      # [(step, agent node, output)] · [(step, agent node, error)]
+    step_records = []                # persisted per-agent history rows (see docstring)
+    for step in sorted(steps):
+        prior = ""
+        if gathered:                 # sequence semantics: this step sees everything gathered so far
+            prior = "\n\n(Context — results from earlier agents:)\n" + "\n\n".join(
+                f"== {name(an)}\n{out[:2000]}" for _s, an, out in gathered)
+        by_id = {a["id"]: a for a in steps[step]}
+        tasks = {a["id"]: _tmpl(a.get("task", ""), ctx) + prior for a in steps[step]}
+        running = {}
+        for a in steps[step]:
+            emit({"event": "tool", "id": node["id"],
+                  "text": f"step {step} · spawning 🤖 {a.get('label') or a.get('task', '')[:40]}"})
+            running[a["id"]] = spawn(a, tasks[a["id"]])
+        done, failed = join(running)
+        # salvage pass: retry each failed/timed-out agent ONCE, alone — a stalled endpoint (free-tier
+        # concurrency caps, long no-token queues past the client read timeout) usually recovers when
+        # the request runs serially. Only a failed retry fails the step.
+        for nid in list(failed):
+            a, first_err = by_id[nid], failed[nid]
+            emit({"event": "tool", "id": node["id"],
+                  "text": f"step {step} · ⟲ retrying {name(a)} alone (first attempt: {first_err[:80]})"})
+            for _ in range(int(_SALVAGE_BACKOFF)):     # brief backoff — an overloaded endpoint
+                beat()                                 # retried instantly tends to fail identically
+                time.sleep(1)
+            try:
+                aid = spawn(a, tasks[nid])
+            except Exception as ex:                # noqa: BLE001 — cap reached etc.
+                failed[nid] = f"{first_err} · retry refused: {ex}"
+                continue
+            d2, f2 = join({nid: aid})
+            if nid in d2:
+                done[nid] = d2[nid]
+                del failed[nid]
+            else:
+                failed[nid] = f"{f2[nid]} (on retry; first attempt: {first_err[:120]})"
+        for a in steps[step]:                      # keep the plugged-in order deterministic
             nid = a["id"]
             if nid in done:
-                ctx["nodes"][nid] = done[nid]          # {{node.ID}} of each agent = its result
+                ctx["nodes"][nid] = done[nid]      # {{node.ID}} of each agent = its result
                 gathered.append((step, a, done[nid]))
-                emit({"event": "tool", "id": node["id"], "text": f"step {step} · ✓ {name(a)}"})
+                out = done[nid][:_OUT_CAP]
+                emit({"event": "node_end", "id": nid, "ok": True, "label": _node_label(a), "output": out})
+                step_records.append({"id": nid, "type": "agent", "label": _node_label(a), "ok": True,
+                                     "branch": None, "output": out})
             else:
                 failures.append((step, a, failed[nid]))
-                emit({"event": "tool", "id": node["id"],
-                      "text": f"step {step} · ✗ {name(a)}: {failed[nid][:120]}"})
-        if failed:                                     # later steps depend on this one — stop here
+                out = failed[nid][:_OUT_CAP]
+                emit({"event": "node_end", "id": nid, "ok": False, "label": _node_label(a), "output": out})
+                step_records.append({"id": nid, "type": "agent", "label": _node_label(a), "ok": False,
+                                     "branch": None, "output": out})
+        if failed:                                 # later steps depend on this one — stop here
             break
     parts = [f"== {name(an)} (step {s})\n{out}" for s, an, out in gathered]
     parts += [f"== {name(an)} (step {s}) FAILED: {err}" for s, an, err in failures]
@@ -923,7 +1035,7 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
         compiled = ag.run(brief + "\n\n" + compiled) or compiled
     if gathered:
         ag.messages.append({"role": "user", "content": f"(orchestrated agents → {compiled[:1500]})"})
-    return ok, compiled
+    return ok, compiled, step_records
 
 
 # ---------------- execution ----------------
@@ -936,10 +1048,11 @@ def _node_label(n):
     if t == "instruction":
         return (n.get("text", "")[:54] or "instruction")
     if t == "delegate":
-        return "↗ " + (n.get("text", "")[:48] or "delegate")
+        return "↗ " + (n.get("text", "")[:48] or "delegate") + _access_marker(n.get("write"))
     if t == "agent":
         return "🤖 " + (n.get("label") or n.get("task", "")[:44] or "agent") \
-            + (f" ({n['provider']})" if n.get("provider") else "")
+            + (f" ({n['provider']})" if n.get("provider") else "") \
+            + _access_marker(n.get("write"))
     if t == "await":
         return "⏳ await agents"
     if t == "orchestrate":
@@ -1017,7 +1130,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                     if e == "node_start":
                         st["current"] = {"id": ev.get("id"), "label": ev.get("label")}
                     elif e == "node_end":
-                        st["steps"].append({"id": ev.get("id"), "label": (st.get("current") or {}).get("label", ""),
+                        st["steps"].append({"id": ev.get("id"), "label": ev.get("label") or (st.get("current") or {}).get("label", ""),
                                             "ok": ev.get("ok"), "branch": ev.get("branch"), "output": ev.get("output", "")})
                     elif e == "done":
                         r = ev.get("run") or {}
@@ -1114,8 +1227,10 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                 emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
                 attempts = 1 + int(cur.get("retries", 0) or 0)
                 ok, output, branch = True, "", None
+                orch_step_records = []            # persisted per-agent rows, only set by "orchestrate"
                 for attempt in range(attempts):
                     ok, output, branch = True, "", None
+                    orch_step_records = []
                     try:
                         if t in ("start", "trigger"):
                             output = ""
@@ -1130,25 +1245,44 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             ag.on_event = lambda kind, d, _i=cur["id"]: (
                                 emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
                                 if kind in ("tool_call", "tool_result") else None)
-                            output = ag.run(_tmpl(cur.get("text", ""), ctx)) or ""
+                            text = _tmpl(cur.get("text", ""), ctx)
+                            prov = cur.get("provider") or ""
+                            from oceano import delegate
+                            if cur.get("model"):        # pinned to an endpoint model — this node's turn only
+                                output = _pinned_agent(cur, ag).run(text) or ""
+                            elif prov == "claude" or (not prov and delegate.get_mind() == "claude"):
+                                if delegate.available():
+                                    output = ag.run_claude(text) or ""
+                                else:
+                                    ok, output = False, ("this step is pinned to Claude, but the `claude` "
+                                                         "CLI isn't available on this host")
+                            elif prov == "codex" or (not prov and delegate.get_mind() == "codex"):
+                                if delegate.codex_available():
+                                    output = ag.run_codex(text) or ""
+                                else:
+                                    ok, output = False, ("this step is pinned to Codex, but the `codex` "
+                                                         "CLI isn't available on this host")
+                            else:                        # "" following a local mind, or an explicit 'local' pin
+                                output = ag.run(text) or ""
                             ag.on_event = lambda kind, d: None
                         elif t == "delegate":
                             from oceano import delegate
+                            tool_scope = _tool_scope_for(cur.get("write"))
                             r = delegate.run(_tmpl(cur.get("text", ""), ctx), cwd=config.WORKSPACE,
-                                             tools="Read,Glob,Grep", timeout=600, role=cur.get("role", "default"))
+                                             tools=tool_scope, timeout=600, role=cur.get("role", "default"))
                             ok = bool(r.get("ok"))
                             output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
                             ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
                         elif t == "agent":             # spawn a background sub-agent — do NOT block
                             from oceano import agentjobs
+                            tool_scope = _tool_scope_for(cur.get("write"))
                             rec = agentjobs.spawn(_tmpl(cur.get("task", ""), ctx),
                                                   provider=cur.get("provider", ""),
+                                                  model=cur.get("model", ""),
+                                                  base_url=cur.get("baseUrl", ""),
                                                   label=cur.get("label", ""),
                                                   timeout=cur.get("timeout", 600),
-                                                  # same read-only tool scope as the sibling delegate
-                                                  # node above — a background agent in a flow must not
-                                                  # be quietly MORE privileged than a blocking one
-                                                  tools="Read,Glob,Grep",
+                                                  tools=tool_scope,
                                                   cwd=config.WORKSPACE)   # raises on cap → error edge
                             spawned[cur["id"]] = rec["id"]
                             output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
@@ -1191,8 +1325,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                     ag.messages.append({"role": "user",
                                                         "content": f"(agents finished → {output[:1500]})"})
                         elif t == "orchestrate":       # trigger plugged-in agents step by step, join, compile
-                            ok, output = _run_orchestrate(cur, attached.get(cur["id"], []), ctx, ag,
-                                                          spawned, emit, beat)
+                            ok, output, orch_step_records = _run_orchestrate(
+                                cur, attached.get(cur["id"], []), ctx, ag, spawned, emit, beat)
                         elif t == "decision":
                             fnode = {**cur, "question": _tmpl(cur.get("question", ""), ctx),
                                      "ruleValue": _tmpl(cur.get("ruleValue", ""), ctx)}
@@ -1225,9 +1359,13 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                 if t not in ("decision", "switch", "approval"):
                     ctx["last"] = output
                     last_output = output
+                # attached agents aren't walked by traversal, so fold their own rows in now — right
+                # before the orchestrator's compiled entry — or they'd be visible live but vanish
+                # from the persisted run history (and from a reconnect made after _LIVE_KEEP expires)
+                results.extend(orch_step_records)
                 results.append({"id": cur["id"], "type": t, "label": label, "ok": ok,
                                 "branch": branch, "output": output[:_OUT_CAP]})
-                emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "output": output[:_OUT_CAP]})
+                emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "label": label, "output": output[:_OUT_CAP]})
 
                 # routing: a failed node with an 'error' edge takes it; decision/switch/approval branch
                 err_to = next((to for (br, to) in succ.get(cur["id"], []) if br == "error"), None)

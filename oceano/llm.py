@@ -17,7 +17,10 @@ import config
 def client(base_url, api_key):
     # connect timeout fails fast on a down endpoint; read/write/pool default to LLM_TIMEOUT
     # (the per-chunk idle ceiling when streaming) so a hung socket can't stall a turn forever.
+    # max_retries: cap the SDK's silent 5xx/timeout retries (default 2) — Oceano's own retry
+    # layers are the visible ones, and each hidden retry can cost another LLM_TIMEOUT of wall clock
     return OpenAI(base_url=base_url, api_key=api_key or "sk-no-key-needed",
+                  max_retries=config.LLM_RETRIES,
                   timeout=httpx.Timeout(config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT))
 
 

@@ -420,8 +420,13 @@ body{
 .set-page .drawer-section{border-bottom:none;padding:0}
 /* tools list */
 .tool-list{display:flex;flex-direction:column;gap:7px}
-.chat-tools{border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:14px;background:rgba(var(--biolum-rgb),.04)}
-.chat-tools .ct-head{font-size:13px;font-weight:600;color:var(--foam);margin-bottom:4px}
+.chat-tools,.tool-limits{border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:14px;background:rgba(var(--biolum-rgb),.04)}
+.chat-tools .ct-head,.tool-limits .ct-head{font-size:13px;font-weight:600;color:var(--foam);margin-bottom:4px}
+.tl-row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.tl-lab{flex:1;font-size:12.5px;color:var(--foam)}
+.tl-in{width:74px;flex:none;background:var(--abyss-0);border:1px solid var(--line);border-radius:7px;color:var(--foam);font-family:var(--font-mono);font-size:13px;padding:5px 7px;text-align:center}
+.tl-in:focus{outline:none;border-color:var(--biolum)}
+.tool-limits .acct-msg{display:block;margin-top:7px}
 .ct-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
 .ct-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--line);border-radius:9px;background:rgba(var(--abyss-0-rgb),.4)}
 .ct-row.goff{opacity:.5}
@@ -1518,6 +1523,27 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .wf-canvas .drawflow-node .input::after{content:attr(data-lbl);position:absolute;right:15px;top:50%;transform:translateY(-50%);font-family:var(--font-mono);font-size:9px;color:var(--faint);white-space:nowrap;pointer-events:none}
 /* agent → orchestrator attachments (the only connections landing on an input_2) draw dashed */
 .wf-canvas .drawflow .connection.input_2 .main-path{stroke-dasharray:6 5}
+/* an agent plugged into an orchestrator: the orchestrator triggers it and owns its failures,
+   so its (unwired) flow-in dot and error port hide instead of dangling */
+.wf-canvas .drawflow-node.wf-att-in .inputs .input{display:none}
+.wf-canvas .drawflow-node.wf-att-err .outputs .output_2{display:none}
+/* live run view: the diagram on top (nodes light up as the run walks them), the step log below */
+.wf-run-main{flex:1;min-height:0;display:flex;flex-direction:column}
+.wf-run-main .wf-canvas-wrap{flex:1.6}
+.wf-run-main .wf-run-steps{flex:1;border-top:1px solid var(--line)}
+/* editor AND run view: the drawflow container is a bare inner div (Drawflow's pan/unselect
+   switch keys on classList[0] = "parent-drawflow"), sized to its styled .wf-canvas wrapper */
+.wf-canvas>.parent-drawflow{position:absolute;inset:0;outline:none}
+.wf-run-canvas>.parent-drawflow{cursor:grab}
+.wf-run-canvas>.parent-drawflow:active{cursor:grabbing}
+.wf-canvas .drawflow-node.wf-run-active{border-color:var(--biolum);animation:wfRunPulse 1.15s ease-in-out infinite}
+@keyframes wfRunPulse{0%,100%{box-shadow:0 0 0 1.5px var(--biolum),0 0 8px rgba(var(--biolum-rgb),.18)}50%{box-shadow:0 0 0 2px var(--biolum),0 0 30px rgba(var(--biolum-rgb),.5)}}
+.wf-canvas .drawflow-node.wf-run-ok{border-color:rgba(47,208,140,.6)}
+.wf-canvas .drawflow-node.wf-run-fail{border-color:var(--coral)}
+.wf-canvas .drawflow-node.wf-run-ok::after,.wf-canvas .drawflow-node.wf-run-fail::after{position:absolute;top:-9px;right:-9px;width:19px;height:19px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;box-shadow:0 3px 9px rgba(0,0,0,.45);z-index:3}
+.wf-canvas .drawflow-node.wf-run-ok::after{content:"✓";background:#2fd08c;color:#052a1c}
+.wf-canvas .drawflow-node.wf-run-fail::after{content:"✗";background:var(--coral);color:#fff}
+.wf-canvas .connection .main-path.wf-run-trace{stroke:var(--biolum);stroke-opacity:.8}
 /* connections: soft neutral curves that light up on hover/select */
 .wf-canvas .drawflow .connection .main-path{stroke:color-mix(in srgb,var(--foam) 30%,transparent);stroke-width:2px;stroke-linecap:round;transition:stroke .12s}
 .wf-canvas .drawflow .connection .main-path:hover{stroke:color-mix(in srgb,var(--biolum) 75%,var(--foam));stroke-width:2.4px}
@@ -1545,6 +1571,8 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .wf-insp-b textarea.wfn-fld{min-height:64px}
 .wf-insp-note{font-size:11.5px;color:var(--mist);line-height:1.5;background:rgba(var(--biolum-rgb),.06);border:1px solid rgba(var(--biolum-rgb),.16);border-radius:9px;padding:8px 10px}
 .wf-insp-note b{color:var(--foam)}
+/* file-access opt-in warning — a node that can write/edit files gets a louder note than the usual hint */
+.wf-insp-note.wf-insp-warn{color:var(--buoy);background:rgba(var(--buoy-rgb),.1);border-color:rgba(var(--buoy-rgb),.35)}
 .wf-insp-case{display:flex;flex-direction:column;gap:5px;border:1px solid var(--line);border-radius:10px;padding:9px}
 /* orchestrator inspector: one row per plugged-in agent (step number + name) */
 .wf-orch-row{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:9px;padding:6px 8px}

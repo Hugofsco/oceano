@@ -1441,6 +1441,19 @@ const SETTINGS_PAGES = {
     <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
       <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
+      <div class="tool-limits">
+        <div class="ct-head">Tool-call budgets</div>
+        <p class="sub">How many rounds of "reply + use tools" a single turn gets before Oceano forces a wrap-up. Raise this for large, multi-file builds (a workflow's Agent Spawn / Delegate nodes included) that need more room to work; leave blank for the built-in default.</p>
+        <div class="tl-row">
+          <label class="tl-lab" for="tlMaxSteps">Agent turns <span class="st-note">— chat &amp; background agents (api/local)</span></label>
+          <input type="number" id="tlMaxSteps" class="tl-in" min="1" max="500" placeholder="25">
+        </div>
+        <div class="tl-row">
+          <label class="tl-lab" for="tlMaxDelegate">Delegate turns <span class="st-note">— Claude / Codex CLI's own --max-turns</span></label>
+          <input type="number" id="tlMaxDelegate" class="tl-in" min="1" max="500" placeholder="60">
+        </div>
+        <span class="acct-msg" id="tlMsg"></span>
+      </div>
       <div class="chat-tools">
         <div class="ct-head">⌘ Memory in chat-only mode</div>
         <p class="sub">Even with Agent mode off, the model can use these memory tools to recall, store, edit, or forget what it knows about you. Pick which are available in plain chat — reading your memories is always on; these add deliberate actions. Uncheck all to keep chat fully tool-free.</p>
@@ -1881,6 +1894,32 @@ async function loadTools() {
     };
   });
   loadChatMemoryTools();
+  loadToolLimits();
+}
+// tool-call budgets: blank input = built-in default (placeholder shows what that default is);
+// a number = an explicit override, saved on blur/Enter (not on every keystroke)
+async function loadToolLimits() {
+  const stepsEl = $("#tlMaxSteps"), delEl = $("#tlMaxDelegate"), msg = $("#tlMsg");
+  if (!stepsEl || !delEl) return;
+  let d; try { d = await api("/api/tools/limits"); } catch { return; }
+  stepsEl.placeholder = String(d.max_steps_default);
+  stepsEl.value = d.max_steps_override != null ? String(d.max_steps_override) : "";
+  delEl.placeholder = String(d.max_delegate_turns_default);
+  delEl.value = d.max_delegate_turns_override != null ? String(d.max_delegate_turns_override) : "";
+  const save = async () => {
+    if (msg) { msg.textContent = "saving…"; msg.className = "acct-msg"; }
+    try {
+      await _postJ("/api/tools/limits", {
+        max_steps: stepsEl.value.trim() ? parseInt(stepsEl.value, 10) : 0,
+        max_delegate_turns: delEl.value.trim() ? parseInt(delEl.value, 10) : 0,
+      });
+      if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+    } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+  };
+  [stepsEl, delEl].forEach(el => {
+    el.onchange = save;
+    el.onkeydown = e => { if (e.key === "Enter") el.blur(); };
+  });
 }
 async function loadChatMemoryTools() {
   const box = $("#chatToolList"); if (!box) return;
@@ -5653,6 +5692,12 @@ async function wfLoadTools() {
   try { _wfTools = (await api("/api/tools")).filter(t => t.enabled && !t.name.startsWith("mcp__")); } catch { _wfTools = []; }
   return _wfTools;
 }
+let _wfModels = null;                         // cached endpoint→model list for agent nodes
+async function wfLoadModels() {
+  if (_wfModels) return _wfModels;
+  try { _wfModels = (await api("/api/models")).filter(m => !m.error); } catch { _wfModels = []; }
+  return _wfModels;
+}
 // [inputs, outputs]. Action nodes get a 2nd output = the "error" branch (taken when the node fails).
 // decision: yes|no · switch: case1|case2|case3|default · loop: loop(body)|done · approval: approved|rejected
 const WF_PORTS = {
@@ -5689,8 +5734,8 @@ function wfToolOptions(sel) {
 }
 function wfNodeData(n) {
   if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
-  if (n.type === "instruction") return { text: n.text || "", retries: String(n.retries || 0) };
-  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", retries: String(n.retries || 0) };
+  if (n.type === "instruction") return { text: n.text || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", retries: String(n.retries || 0) };
+  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", write: wfWriteTier(n.write), retries: String(n.retries || 0) };
   // Keys mirror what wfReadCanvas reads back — lowercase for historical df-* binding reasons;
   // trigger's mailFolder stays camelCase to match the backend. Settings are edited in the INSPECTOR
   // panel (wfInspect), so every type gets its full default data up front.
@@ -5702,7 +5747,7 @@ function wfNodeData(n) {
       c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
       c3op: g(2, "op", "contains"), c3val: g(2, "value", ""), c3label: g(2, "label", "") }; }
   if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
-  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", label: n.label || "", timeout: String(n.timeout || 600) };
+  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", label: n.label || "", write: wfWriteTier(n.write), timeout: String(n.timeout || 600) };
   if (n.type === "await") return { timeout: String(n.timeout || 900) };
   if (n.type === "orchestrate") return { plan: JSON.stringify(n.plan || {}), mode: n.mode || "concat", text: n.text || "", timeout: String(n.timeout || 900) };
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
@@ -5760,8 +5805,8 @@ function wfCardText(type, d) {
   }
   if (type === "tool") return [d.tool || "Run Tool", "tool"];
   if (type === "instruction") return ["Instruction", _wfTrunc(d.text) || "describe the task…"];
-  if (type === "delegate") return ["Delegate", _wfTrunc(d.text) || "task for Claude / cloud"];
-  if (type === "agent") return ["Agent Spawn", _wfTrunc(d.label || d.task) || "background task"];
+  if (type === "delegate") return ["Delegate", wfAccessPrefix(d.write) + (_wfTrunc(d.text) || "task for Claude / cloud")];
+  if (type === "agent") return ["Agent Spawn", wfAccessPrefix(d.write) + (_wfTrunc(d.label || d.task) || "background task")];
   if (type === "await") return ["Await Agents", "join spawned agents"];
   if (type === "orchestrate") return ["Orchestrator", "plug agents into me"];   // sub refined live in wfCardRefresh
   if (type === "http") { let h = ""; try { h = new URL(d.url).host; } catch {} return ["HTTP Request", ((d.method || "GET") + " " + (h || _wfTrunc(d.url, 28))).trim()]; }
@@ -5789,7 +5834,8 @@ function wfNodeHtml(type, data) {
 }
 // re-derive a card's title / summary / port labels after an inspector edit
 function wfCardRefresh(editor, dfId) {
-  const el = document.getElementById("node-" + dfId); if (!el) return;
+  // scope to this editor's container — the run view builds a second canvas with the same node ids
+  const el = (editor.container || document).querySelector("#node-" + dfId); if (!el) return;
   const nd = editor.getNodeFromId(dfId); if (!nd) return;
   const [t, s] = wfCardText(nd.name, nd.data || {});
   const tt = el.querySelector(".wfn2-t"), ss = el.querySelector(".wfn2-s");
@@ -5797,6 +5843,16 @@ function wfCardRefresh(editor, dfId) {
   if (ss) ss.textContent = s || (WF_META[nd.name] || {}).kicker || "";
   const labs = wfPortLabels(nd.name, nd.data || {});
   el.querySelectorAll(".outputs .output").forEach((o, i) => o.setAttribute("data-lbl", labs[i] || ""));
+  if (nd.name === "agent") {
+    // plugged into an orchestrator? Then IT does the triggering and failure handling, so the
+    // agent's flow-in dot and error port are dead weight — hide them (unless already wired)
+    const conn = p => ((p || {}).connections || []);
+    const att = conn((nd.outputs || {}).output_1).some(c => {
+      const t = editor.getNodeFromId(c.node); return t && t.name === "orchestrate";
+    });
+    el.classList.toggle("wf-att-in", att && !conn((nd.inputs || {}).input_1).length);
+    el.classList.toggle("wf-att-err", att && !conn((nd.outputs || {}).output_2).length);
+  }
   if (nd.name === "orchestrate") {
     // input_2 is the attachment port; the summary counts what's actually plugged in right now
     const ilabs = ["", "agents"];
@@ -5808,6 +5864,33 @@ function wfCardRefresh(editor, dfId) {
       ? conns.length + " agent" + (conns.length > 1 ? "s" : "") + " · " + nsteps + " step" + (nsteps > 1 ? "s" : "")
       : "plug agents into me";
   }
+}
+// n8n-style connector: horizontal-tangent cubic with a minimum handle length, so short hops stay
+// gentle and backward links bow into a loop instead of kinking (used by the editor AND the run view)
+function wfCurve(x1, y1, x2, y2) {
+  const off = Math.max(Math.abs(x2 - x1) * 0.5, 48);
+  return ` M ${x1} ${y1} C ${x1 + off} ${y1} ${x2 - off} ${y2} ${x2} ${y2}`;
+}
+// build a canvas from a saved graph with node ids PINNED to the stored ids, so {{node.ID}} refs,
+// orchestrator plans and live run events (which carry graph node ids) all line up with the DOM
+function wfBuildGraph(editor, graph) {
+  const nodes = (graph && graph.nodes) || [];
+  nodes.forEach(n => {
+    editor.nodeId = n.id;
+    const [ins, outs] = WF_PORTS[n.type] || [1, 1];
+    const data = wfNodeData(n);
+    editor.addNode(n.type, ins, outs, n.x || 60, n.y || 60, "wf-dfn wf-dfn-" + n.type, data, wfNodeHtml(n.type, data));
+  });
+  editor.nodeId = Math.max(0, ...nodes.map(n => n.id)) + 1;
+  ((graph && graph.edges) || []).forEach(e => {
+    const src = nodes.find(x => x.id === e.from) || {};
+    const dst = nodes.find(x => x.id === e.to) || {};
+    const port = wfBranchPort(src.type, e.branch, src);
+    // agent → orchestrator edges are attachments: they land on the dedicated "agents" port
+    const inPort = (src.type === "agent" && dst.type === "orchestrate" && !e.branch) ? "input_2" : "input_1";
+    try { editor.addConnection(e.from, e.to, port, inPort); } catch {}
+  });
+  nodes.forEach(n => wfCardRefresh(editor, n.id));   // summaries + port labels need the connections
 }
 // ---- tool nodes get a real form (one typed field per parameter), not a JSON box ----
 const _WF_LONG_STR = /content|text|body|code|message|prompt|command|instruction/i;
@@ -6052,22 +6135,28 @@ function wfInspClear(body) {
 }
 const _WF_OPS = [["contains", "contains"], ["equals", "equals"], ["matches", "regex matches"], ["gt", "greater than"], ["lt", "less than"]];
 // declarative field specs for the simple node types (tool / trigger / http / switch have custom builders)
+// shared across the agent/delegate node inspectors: three escalating, explicit opt-in tiers.
+// "" stays read-only by default — an unattended/scheduled flow must not be quietly MORE
+// privileged than the user intended; "write" and "shell" mirror workflows.py's _tool_scope_for.
+const wfWriteTier = v => (v === "write" || v === "shell") ? v : "";   // mirrors workflows.py's _WRITE_TIERS
+const wfAccessPrefix = v => v === "shell" ? "⚠ shell · " : v === "write" ? "✎ write · " : "";
+const WF_ACCESS_OPTS = [
+  ["", "read-only (safe default)"],
+  ["write", "read + write — can create/edit files, run tests, use git"],
+  ["shell", "read + write + shell — can also run arbitrary commands"],
+];
+const WF_ACCESS_NOTE_WRITE = "✎ this node can create/edit files, run the test suite, and use git under the workspace — make sure that's intended, especially if this flow runs unattended/scheduled.";
+const WF_ACCESS_NOTE_SHELL = "⚠ this node can run ARBITRARY shell commands — real code-execution risk, not just file writes. Only enable if you trust the task (and, for a background/scheduled flow, that it'll stay unattended without incident).";
 const WF_FIELDS = {
   start: [{ t: "note", text: "where the run begins — connect it to the first step." }],
   end: [{ t: "note", text: "marks the flow as finished." }],
-  instruction: [
-    { k: "text", t: "textarea", l: "task", ph: "what should the agent do? it may use any tool", hint: "use {{input}} · {{last}} · {{node.ID}}" },
-    { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
   delegate: [
     { k: "text", t: "textarea", l: "task", ph: "task for Claude / cloud" },
     { k: "role", t: "select", l: "role", opts: [["default", "default"], ["improve", "improve"]] },
+    { k: "write", t: "select", l: "file access", rr: true, opts: WF_ACCESS_OPTS },
+    { t: "note", warn: true, showIf: d => d.write === "write", text: WF_ACCESS_NOTE_WRITE },
+    { t: "note", warn: true, showIf: d => d.write === "shell", text: WF_ACCESS_NOTE_SHELL },
     { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
-  agent: [
-    { k: "task", t: "textarea", l: "task", ph: "self-contained task — it runs in the background while the flow continues" },
-    { k: "provider", t: "select", l: "provider", opts: [["", "delegation default"], ["claude", "claude"], ["codex", "codex"], ["api", "api"], ["local", "local (weak · serialized)"]] },
-    { k: "label", t: "text", l: "label", ph: "short label" },
-    { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 },
-    { t: "note", text: "join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}." }],
   await: [
     { t: "note", text: "waits for every agent spawned in this run, then continues with their results." },
     { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 }],
@@ -6096,8 +6185,8 @@ function wfInspGeneric(editor, dfId, type, box, sync) {
   const render = () => {
     const d = (editor.getNodeFromId(dfId) || {}).data || {};
     box.innerHTML = spec.map(f => {
-      if (f.t === "note") return `<div class="wf-insp-note">${f.text}</div>`;
       if (f.showIf && !f.showIf(d)) return "";
+      if (f.t === "note") return `<div class="wf-insp-note${f.warn ? " wf-insp-warn" : ""}">${f.text}</div>`;
       const v = d[f.k] != null ? String(d[f.k]) : "";
       let inp;
       if (f.t === "textarea") inp = `<textarea class="wfn-fld" data-k="${f.k}" placeholder="${escapeHtml(f.ph || "")}">${escapeHtml(v)}</textarea>`;
@@ -6133,6 +6222,87 @@ function wfInspSwitch(editor, dfId, box, sync) {
   };
   box.querySelectorAll("input,select").forEach(f => { f.addEventListener("change", upd); if (f.tagName !== "SELECT") f.addEventListener("input", upd); });
 }
+/* ---- shared "runs on" picker: base options + one optgroup per REGISTERED ENDPOINT listing its
+   live models. Selecting an endpoint model yields {model, baseUrl} (plus provider where used). ---- */
+const _wfMval = m => "m|" + encodeURIComponent(m.base_url) + "|" + encodeURIComponent(m.id);
+function wfWireModelSelect(editor, dfId, sel, baseOptsHtml, onPick) {
+  const fill = (models) => {
+    const d = (editor.getNodeFromId(dfId) || {}).data || {};
+    let h = baseOptsHtml;
+    const byEp = {};
+    (models || []).forEach(m => (byEp[m.endpoint] = byEp[m.endpoint] || []).push(m));
+    for (const ep in byEp)
+      h += `<optgroup label="${escapeHtml(ep)}">` +
+        byEp[ep].map(m => `<option value="${_wfMval(m)}">${escapeHtml(m.id)}</option>`).join("") + `</optgroup>`;
+    const cur = d.model ? "m|" + encodeURIComponent(d.baseUrl || "") + "|" + encodeURIComponent(d.model) : (d.provider || "");
+    // a pinned model whose endpoint is offline/removed still shows up (marked), instead of
+    // silently snapping back to the default
+    if (d.model && !(models || []).some(m => _wfMval(m) === cur))
+      h += `<option value="${cur}">${escapeHtml(d.model)} (endpoint unreachable)</option>`;
+    sel.innerHTML = h;
+    sel.value = cur;
+    if (sel.value !== cur) sel.value = "";        // stored choice no longer offered → default
+  };
+  fill(_wfModels);                                 // instant if cached; refreshed below either way
+  wfLoadModels().then(fill);
+  sel.onchange = () => {
+    const v = sel.value;
+    if (v.startsWith("m|")) {
+      const [, burl, mid] = v.split("|");
+      onPick({ model: decodeURIComponent(mid), baseUrl: decodeURIComponent(burl) }, v);
+    } else onPick({ model: "", baseUrl: "" }, v);
+  };
+}
+// agent inspector: task + a "runs on" picker folding provider AND model into one dropdown.
+// Picking an endpoint model stores {provider:"api", model, baseUrl} on the node.
+function wfInspAgent(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  const row = (lab, inner) => `<div class="wf-insp-row"><label class="wfn-lab">${lab}</label>${inner}</div>`;
+  box.innerHTML =
+    row("task", `<textarea class="wfn-fld" data-k="task" placeholder="self-contained task — it runs in the background while the flow continues">${escapeHtml(d.task || "")}</textarea>`) +
+    row("runs on", `<select class="wfn-fld wa-model"><option value="">delegation default</option></select>`) +
+    row("file access", `<select class="wfn-fld" data-k="write">${WF_ACCESS_OPTS.map(([v, l]) => `<option value="${v}"${d.write === v ? " selected" : ""}>${l}</option>`).join("")}</select>`) +
+    row("label", `<input class="wfn-fld" data-k="label" placeholder="short label" value="${escapeHtml(d.label || "")}">`) +
+    row("timeout (s)", `<input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "600")}">`) +
+    `<div class="wf-insp-note">join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}.</div>` +
+    (d.write === "write" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_WRITE}</div>`
+      : d.write === "shell" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_SHELL}</div>` : "");
+  box.querySelectorAll("[data-k]").forEach(f => {
+    const h = () => { sync({ [f.dataset.k]: f.value }); if (f.dataset.k === "write") wfInspAgent(editor, dfId, box, sync); };
+    f.addEventListener("change", h);
+    if (f.tagName !== "SELECT") f.addEventListener("input", h);
+  });
+  wfWireModelSelect(editor, dfId, box.querySelector(".wa-model"),
+    `<option value="">delegation default</option>` +
+    `<option value="claude">Claude CLI</option><option value="codex">Codex CLI</option>` +
+    `<option value="api">API · delegation role model</option>` +
+    `<option value="local">local resident model (serialized)</option>`,
+    (pick, v) => sync(pick.model ? { provider: "api", ...pick } : { provider: v, ...pick }));
+}
+// instruction inspector: like the generic form, but with the same endpoint→model "runs on" picker.
+// A pinned model/mind takes just this node's turn — the run's conversation context is still shared.
+// Left at default, the node follows Settings → Primary intelligence (local / Claude / Codex),
+// same as an interactive chat turn would.
+function wfInspInstruction(editor, dfId, box, sync) {
+  const d = (editor.getNodeFromId(dfId) || {}).data || {};
+  const row = (lab, inner) => `<div class="wf-insp-row"><label class="wfn-lab">${lab}</label>${inner}</div>`;
+  box.innerHTML =
+    row("task", `<textarea class="wfn-fld" data-k="text" placeholder="what should the agent do? it may use any tool">${escapeHtml(d.text || "")}</textarea>`) +
+    `<div class="wfn-hint">use {{input}} · {{last}} · {{node.ID}}</div>` +
+    row("runs on", `<select class="wfn-fld wa-model"><option value="">primary intelligence · default</option></select>`) +
+    row("retries", `<input class="wfn-fld" type="number" min="0" max="5" data-k="retries" value="${escapeHtml(d.retries || "0")}">`) +
+    `<div class="wf-insp-note">"default" follows whatever's set as the <b>primary intelligence</b> (Settings → local / Claude / Codex) — pin this node to override it. A pin takes only <b>this node's</b> turn — it still sees (and adds to) the run's shared context.</div>`;
+  box.querySelectorAll("[data-k]").forEach(f => {
+    const h = () => sync({ [f.dataset.k]: f.value });
+    f.addEventListener("change", h);
+    if (f.tagName !== "SELECT") f.addEventListener("input", h);
+  });
+  wfWireModelSelect(editor, dfId, box.querySelector(".wa-model"),
+    `<option value="">primary intelligence · default</option>` +
+    `<option value="claude">Claude CLI</option><option value="codex">Codex CLI</option>` +
+    `<option value="local">local resident model</option>`,
+    (pick, v) => sync(pick.model ? { provider: "api", ...pick } : { provider: v, ...pick }));
+}
 // orchestrator inspector: lists the agent nodes plugged into the "agents" port and lets each one
 // be assigned a STEP number — same step = run in parallel, steps run 1 → 2 → 3…, and every later
 // step automatically receives the earlier steps' results (they're also {{node.ID}}-addressable).
@@ -6163,7 +6333,7 @@ function wfInspOrch(editor, dfId, box, sync) {
     }
     h += `<div class="wf-insp-row"><label class="wfn-lab">when all are done</label><select class="wfn-fld" data-k="mode"><option value="concat"${d.mode !== "summarize" ? " selected" : ""}>pass the combined results onward</option><option value="summarize"${d.mode === "summarize" ? " selected" : ""}>compile with the model first</option></select></div>`;
     if (d.mode === "summarize") h += `<div class="wf-insp-row"><label class="wfn-lab">compile brief</label><textarea class="wfn-fld" data-k="text" placeholder="how to compile the results — e.g. merge into one report, dedupe, note which agent found what">${escapeHtml(d.text || "")}</textarea></div>`;
-    h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"></div>`;
+    h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"><div class="wfn-hint">an agent that fails or stalls is retried once, alone, before the step fails</div></div>`;
     box.innerHTML = h;
     box.querySelectorAll("[data-oa]").forEach(f => f.addEventListener("change", () => {
       plan[f.dataset.oa] = Math.max(1, parseInt(f.value, 10) || 1);
@@ -6205,6 +6375,8 @@ function wfInspect(editor, dfId, body) {
   else if (type === "http") wfInspHttp(editor, dfId, box, sync);
   else if (type === "switch") wfInspSwitch(editor, dfId, box, sync);
   else if (type === "orchestrate") wfInspOrch(editor, dfId, box, sync);
+  else if (type === "agent") wfInspAgent(editor, dfId, box, sync);
+  else if (type === "instruction") wfInspInstruction(editor, dfId, box, sync);
   else wfInspGeneric(editor, dfId, type, box, sync);
 }
 
@@ -6326,7 +6498,7 @@ async function wfTriggers(body, w) {
 }
 async function wfRenderEditor(body, w) {
   await wfLoadTools();
-  _wfEnumCache = {}; _wfFilesCache = null;        // refresh skill/workflow/file pickers each time the editor opens
+  _wfEnumCache = {}; _wfFilesCache = null; _wfModels = null;   // refresh pickers each time the editor opens
   const inp = (w && w.input) || { enabled: false, label: "", placeholder: "", required: false, default: "" };
   const pal = t => `<button class="wf-pal-btn" data-add="${t}"><span class="wf-pal-ic">${WF_ICONS[t] || ""}</span><span>${WF_META[t].name}</span></button>`;
   body.innerHTML = `
@@ -6352,7 +6524,11 @@ async function wfRenderEditor(body, w) {
         <div class="wf-pal-foot"><div class="wf-hint">click a node to edit it in the settings panel · drag an output dot onto an input dot to connect · values: {{input}} · {{last}} · {{node.ID}}</div></div>
       </div>
       <div class="wf-canvas-wrap">
-        <div class="wf-canvas" id="wfCanvas"></div>
+        <!-- bare inner div: Drawflow's pan/unselect switch keys on classList[0], which must end up
+             "parent-drawflow" (styling lives on the .wf-canvas wrapper, like the run view). Also
+             makes the WHOLE viewport pannable — once zoomed/panned, clicks land on the container
+             instead of the transformed precanvas, and the container case pans too. -->
+        <div class="wf-canvas"><div id="wfCanvas"></div></div>
         <div class="wf-zoomctl"><button id="wfZoomOut" title="zoom out">−</button><button id="wfZoomReset" title="reset zoom">◎</button><button id="wfZoomIn" title="zoom in">+</button></div>
         <aside class="wf-inspector" id="wfInsp"></aside>
       </div>
@@ -6366,13 +6542,7 @@ async function wfRenderEditor(body, w) {
   $("#wfInpEn", body).onchange = syncInpCfg; syncInpCfg();
   const editor = new Drawflow($("#wfCanvas", body));
   editor.reroute = true;
-  // n8n-style connectors: horizontal-tangent cubic bézier with a minimum handle length, so short
-  // hops stay gentle and backward links bow out into a loop instead of kinking. Replaces Drawflow's
-  // stock createCurvature (same signature; used for live drag, connections and reroute segments).
-  editor.createCurvature = (x1, y1, x2, y2, cv, type) => {
-    const off = Math.max(Math.abs(x2 - x1) * 0.5, 48);
-    return ` M ${x1} ${y1} C ${x1 + off} ${y1} ${x2 - off} ${y2} ${x2} ${y2}`;
-  };
+  editor.createCurvature = wfCurve;   // smoother n8n-style connectors (drag, links, reroutes)
   editor.start();
   editor.on("nodeSelected", id => wfInspect(editor, id, body));
   editor.on("nodeUnselected", () => wfInspClear(body));
@@ -6388,30 +6558,13 @@ async function wfRenderEditor(body, w) {
     wfCardRefresh(editor, dfId);      // port branch labels (yes/no · error · case names)
     return dfId;
   };
-  // build from the saved graph, or seed a fresh start node. Saved node ids are PRESERVED
-  // (editor.nodeId is pinned before each add) so {{node.ID}} references and orchestrator
-  // step plans stay valid across edit sessions instead of silently renumbering.
-  if (w && w.graph && w.graph.nodes && w.graph.nodes.length) {
-    const map = {};
-    w.graph.nodes.forEach(n => { editor.nodeId = n.id; map[n.id] = addNode(n.type, n.x || 60, n.y || 60, n); });
-    editor.nodeId = Math.max(0, ...w.graph.nodes.map(n => n.id)) + 1;
-    (w.graph.edges || []).forEach(e => {
-      const from = map[e.from], to = map[e.to]; if (from == null || to == null) return;
-      const src = w.graph.nodes.find(x => x.id === e.from) || {};
-      const dst = w.graph.nodes.find(x => x.id === e.to) || {};
-      const port = wfBranchPort(src.type, e.branch, src);
-      // agent → orchestrator edges are attachments: they land on the dedicated "agents" port
-      const inPort = (src.type === "agent" && dst.type === "orchestrate" && !e.branch) ? "input_2" : "input_1";
-      try { editor.addConnection(from, to, port, inPort); } catch {}
-    });
-    w.graph.nodes.forEach(n => { if (map[n.id] != null) wfCardRefresh(editor, map[n.id]); });  // orch summaries need the connections
-  } else {
-    addNode("start", 40, 80, { type: "start" });
-  }
-  // orchestrator cards + an open orchestrator inspector track plug/unplug live
+  // build from the saved graph (ids preserved — see wfBuildGraph), or seed a fresh start node
+  if (w && w.graph && w.graph.nodes && w.graph.nodes.length) wfBuildGraph(editor, w.graph);
+  else addNode("start", 40, 80, { type: "start" });
+  // orchestrator + agent cards and an open inspector track plug/unplug live
   const onConn = () => {
     const dd = editor.drawflow.drawflow.Home.data;
-    Object.keys(dd).forEach(k => { if (dd[k].name === "orchestrate") wfCardRefresh(editor, k); });
+    Object.keys(dd).forEach(k => { if (dd[k].name === "orchestrate" || dd[k].name === "agent") wfCardRefresh(editor, k); });
     const insp = $("#wfInsp", body);
     if (insp && insp.classList.contains("open") && insp.dataset.node) wfInspect(editor, +insp.dataset.node, body);
   };
@@ -6446,8 +6599,8 @@ function wfReadCanvas(editor) {
       node.tool = d.tool || "";
       try { node.args = (d.args || "").trim() ? JSON.parse(d.args) : {}; }
       catch { error = `invalid JSON in tool node “${node.tool || id}”`; node.args = {}; }
-    } else if (t === "instruction") { node.text = d.text || ""; node.retries = intOr0(d.retries); }
-    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.retries = intOr0(d.retries); }
+    } else if (t === "instruction") { node.text = d.text || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.retries = intOr0(d.retries); }
+    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.write = wfWriteTier(d.write); node.retries = intOr0(d.retries); }
     else if (t === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleop || "contains"; node.ruleValue = d.ruleval || ""; node.role = d.role || "default"; }
     else if (t === "trigger") { node.kind = d.kind || "manual"; node.cron = d.cron || ""; node.pattern = d.pattern || ""; node.channel = d.channel || "any"; node.folder = d.folder || ""; node.account = d.account || ""; node.mailFolder = d.mailFolder || "INBOX"; }
     else if (t === "switch") {
@@ -6463,7 +6616,7 @@ function wfReadCanvas(editor) {
     else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
-    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.label = d.label || ""; node.timeout = intOr0(d.timeout) || 600; }
+    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.label = d.label || ""; node.write = wfWriteTier(d.write); node.timeout = intOr0(d.timeout) || 600; }
     else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     else if (t === "orchestrate") {
       try { node.plan = (d.plan || "").trim() ? JSON.parse(d.plan) : {}; } catch { node.plan = {}; }
@@ -6496,15 +6649,55 @@ async function wfRenderRun(body, w) {
   body.innerHTML = `
     <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
     ${inp ? `<div class="wf-run-input" title="this run's input">⌨ ${escapeHtml(inp.length > 160 ? inp.slice(0, 160) + "…" : inp)}</div>` : ""}
-    <div class="wf-run-steps" id="wfRunSteps"></div>`;
+    <div class="wf-run-main">
+      <div class="wf-canvas-wrap">
+        <div class="wf-canvas wf-run-canvas"><div id="wfRunCanvas"></div></div>
+        <div class="wf-zoomctl"><button id="wfRZOut" title="zoom out">−</button><button id="wfRZReset" title="reset zoom">◎</button><button id="wfRZIn" title="zoom in">+</button></div>
+      </div>
+      <div class="wf-run-steps" id="wfRunSteps"></div>
+    </div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
   const host = $("#wfRunSteps", body), status = $("#wfRunStatus", body), rows = {};
+  // live diagram: the same canvas as the editor, read-only (pan/zoom), nodes light up as the
+  // run walks them — pulsing ring on the node in flight, ✓/✗ badge when it ends, and the
+  // traversed connector traces in biolum. NOTE the drawflow container is a bare classless div:
+  // fixed-mode panning switches on classList[0], which must end up "parent-drawflow" — styling
+  // classes live on the .wf-run-canvas wrapper instead.
+  const cv = $("#wfRunCanvas", body);
+  const runEd = new Drawflow(cv);
+  runEd.reroute = true;
+  runEd.createCurvature = wfCurve;
+  runEd.editor_mode = "fixed";
+  runEd.start();
+  wfBuildGraph(runEd, w.graph || { nodes: [], edges: [] });
+  $("#wfRZIn", body).onclick = () => runEd.zoom_in();
+  $("#wfRZOut", body).onclick = () => runEd.zoom_out();
+  $("#wfRZReset", body).onclick = () => runEd.zoom_reset();
+  let lastDone = null;
+  const mark = {
+    start(id) {
+      const el = cv.querySelector("#node-" + id); if (!el) return;
+      el.classList.remove("wf-run-ok", "wf-run-fail");
+      el.classList.add("wf-run-active");
+      if (lastDone != null) cv.querySelectorAll(`.connection.node_out_node-${lastDone}.node_in_node-${id} .main-path`)
+        .forEach(p => p.classList.add("wf-run-trace"));
+    },
+    end(id, ok) {
+      const el = cv.querySelector("#node-" + id);
+      if (el) { el.classList.remove("wf-run-active"); el.classList.add(ok ? "wf-run-ok" : "wf-run-fail"); }
+      // a finished orchestrated agent lights up its dashed attachment link (the only input_2 edges)
+      cv.querySelectorAll(`.connection.node_out_node-${id}.input_2 .main-path`)
+        .forEach(p => p.classList.add("wf-run-trace"));
+      lastDone = id;
+    },
+    finish() { cv.querySelectorAll(".wf-run-active").forEach(el => el.classList.remove("wf-run-active")); },
+  };
   const addRow = (id, label) => {
     const r = document.createElement("div"); r.className = "wf-run-step running";
     r.innerHTML = `<div class="wf-rs-h"><span class="wf-rs-ic">◌</span><span class="wf-rs-label">${escapeHtml(label || "")}</span><span class="wf-rs-branch"></span></div><div class="wf-rs-tools"></div><div class="wf-rs-out"></div>`;
     host.appendChild(r); host.scrollTop = host.scrollHeight; rows[id] = r; return r;
   };
-  if (liveState) return wfReconnectRun(body, w, host, status, rows, addRow, liveState);
+  if (liveState) return wfReconnectRun(body, w, host, status, rows, addRow, liveState, mark);
   try {
     const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input: inp }) });
@@ -6516,36 +6709,52 @@ async function wfRenderRun(body, w) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith("data: ")) continue;
         let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-        if (ev.event === "node_start") { const r = addRow(ev.id, ev.label); if (ev.type === "approval") wfShowApproval(r, w.id); }
+        // ALWAYS a new row — a node can legitimately run more than once in a single workflow run
+        // (a foreach loop's body, or a manual loop-back edge e.g. a decision routing back through
+        // an earlier orchestrator to reiterate); collapsing revisits onto one row silently ate the
+        // later passes' log entries
+        if (ev.event === "node_start") { mark.start(ev.id); const r = addRow(ev.id, ev.label); if (ev.type === "approval") wfShowApproval(r, w.id); }
         else if (ev.event === "tool" && rows[ev.id] && ev.text) { const t = document.createElement("div"); t.className = "wf-rs-tool"; t.textContent = ev.text; $(".wf-rs-tools", rows[ev.id]).appendChild(t); }
         else if (ev.event === "node_end" && rows[ev.id]) {
+          mark.end(ev.id, ev.ok);
           const r = rows[ev.id]; r.className = "wf-run-step " + (ev.ok ? "ok" : "fail");
           $(".wf-rs-ic", r).textContent = ev.ok ? "✓" : "✗";
           if (ev.branch) $(".wf-rs-branch", r).textContent = "→ " + ev.branch;
           $(".wf-rs-out", r).textContent = (ev.output || "").trim();
-        } else if (ev.event === "done") { status.textContent = ev.run ? ev.run.summary : "done"; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail"); }
-        else if (ev.event === "error") { status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail"; }
+        } else if (ev.event === "done") { mark.finish(); status.textContent = ev.run ? ev.run.summary : "done"; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail"); }
+        else if (ev.event === "error") { mark.finish(); status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail"; }
       }
       host.scrollTop = host.scrollHeight;
     }
   } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; }
 }
-async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
+async function wfReconnectRun(body, w, host, status, rows, addRow, initial, mark) {
   // Re-attach to a run already in progress on the server: render its accumulated steps and poll
   // the live registry until it finishes. Survives browser refreshes and works for scheduled runs.
+  // `mark` (from wfRenderRun) paints the same states onto the live diagram.
   status.textContent = "reconnected · running…"; status.className = "wf-run-status running";
   let stop = false;
   const back = $("#wfBack", body), orig = back.onclick;
   back.onclick = () => { stop = true; if (orig) orig(); };
+  // `st.steps` is the run's cumulative, append-only step log (never reordered/mutated) — each
+  // poll tick hands us the WHOLE list again, so paint by an index cursor and only render what's
+  // new since last tick. A node revisited (foreach body, a manual loop-back edge) shows up as
+  // separate entries at separate indices — a fresh row per entry, same as the live-SSE path.
+  let painted = 0;
   const paint = (st) => {
-    (st.steps || []).forEach(s => {
-      const r = rows[s.id] || addRow(s.id, s.label);
+    (st.steps || []).slice(painted).forEach(s => {
+      if (mark) { mark.start(s.id); mark.end(s.id, s.ok); }   // start→end also traces the edge walked
+      const r = addRow(s.id, s.label);
       r.className = "wf-run-step " + (s.ok ? "ok" : "fail");
       $(".wf-rs-ic", r).textContent = s.ok ? "✓" : "✗";
       if (s.branch) $(".wf-rs-branch", r).textContent = "→ " + s.branch;
       $(".wf-rs-out", r).textContent = (s.output || "").trim();
     });
-    if (st.current && !rows[st.current.id]) addRow(st.current.id, st.current.label);  // node in flight
+    painted = (st.steps || []).length;
+    if (st.current) {
+      if (mark) mark.start(st.current.id);
+      if (!rows[st.current.id]) addRow(st.current.id, st.current.label);              // node in flight
+    }
     if (st.awaiting && st.current && rows[st.current.id]) wfShowApproval(rows[st.current.id], w.id, st.awaiting.token);
     host.scrollTop = host.scrollHeight;
   };
@@ -6553,6 +6762,7 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
   while (!stop) {
     paint(st);
     if (st.status !== "running") {
+      if (mark) mark.finish();
       status.textContent = st.summary || st.status;
       status.className = "wf-run-status " + (st.status === "ok" ? "ok" : "fail");
       return;
@@ -6560,7 +6770,7 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial) {
     await new Promise(r => setTimeout(r, 1500));
     let arr; try { arr = (await api("/api/workflows/live")).running || []; } catch { return; }
     const next = arr.find(x => x.workflow_id === w.id);
-    if (!next) { status.textContent = "finished"; status.className = "wf-run-status ok"; return; }
+    if (!next) { if (mark) mark.finish(); status.textContent = "finished"; status.className = "wf-run-status ok"; return; }
     st = next;
   }
 }

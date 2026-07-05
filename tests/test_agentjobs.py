@@ -39,7 +39,7 @@ def _wait_for(aid, states, timeout=5):
 
 def _stub(result=None, delay=0.0, progress=None):
     """A fake provider dispatch: optionally emits progress, sleeps, returns `result`."""
-    def dispatch(provider, task, tools, timeout, cwd, on_progress):
+    def dispatch(provider, task, tools, timeout, cwd, on_progress, model="", base_url=""):
         if progress:
             for ev in progress:
                 on_progress(ev)
@@ -99,7 +99,8 @@ def test_api_dispatch_excludes_recursion(monkeypatch):
     """A spawned api agent must be built WITHOUT spawn/delegate/workflow tools."""
     seen = {}
 
-    def fake_to_api(task, cwd=None, tools=None, timeout=600, on_progress=None, exclude=None):
+    def fake_to_api(task, cwd=None, tools=None, timeout=600, on_progress=None, exclude=None,
+                    model="", base_url=""):
         seen["exclude"] = exclude
         return {"ok": True, "output": "x", "error": ""}
     monkeypatch.setattr("oceano.delegate.to_api", fake_to_api)

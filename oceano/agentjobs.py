@@ -117,13 +117,18 @@ def _resolve_provider(provider):
     return p
 
 
-def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None):
+def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None,
+          model="", base_url=""):
     """Start a contained agent on a background daemon thread and return its record immediately.
     Refuses (RuntimeError with a user-relayable message) when the concurrency cap is hit, when a
     `local` agent is already running, or on an unknown provider. `sid` is the conversation that
-    spawned it (result delivered back there); None outside a chat (workflows/scheduler)."""
+    spawned it (result delivered back there); None outside a chat (workflows/scheduler).
+    `model`+`base_url` pin the agent to a specific registered endpoint's model (runs through our
+    agent loop like the api provider); CLI providers (claude/codex) ignore the pin."""
     from oceano import delegate
     p = _resolve_provider(provider)
+    if model and p not in ("claude", "codex"):   # an endpoint-pinned agent IS an api-style run
+        p = "api"
     timeout = min(int(timeout) or DEFAULT_TIMEOUT, delegate._DELEGATE_MAX)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     with _mx:
@@ -136,17 +141,18 @@ def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None
                                "model — wait for it, or spawn on 'api'/'claude'/'codex' instead")
         jid = next(_counter)
         rec = {"id": jid, "label": (label or task)[:140], "task": str(task)[:4000], "provider": p,
-               "state": "running", "started": time.time(), "ended": None,
+               "model": (model or "").strip(), "state": "running", "started": time.time(), "ended": None,
                "ok": None, "output": "", "error": "",
                "log_path": str(LOG_DIR / f"{jid}.log"), "sid": sid, "delivered": False,
                "warning": LOCAL_WARNING if p == "local" else ""}
         _jobs[jid] = rec
     _persist()
-    threading.Thread(target=_work, args=(jid, task, p, tools, timeout, cwd), daemon=True).start()
+    threading.Thread(target=_work, args=(jid, task, p, tools, timeout, cwd, model, base_url),
+                     daemon=True).start()
     return dict(rec)
 
 
-def _work(jid, task, provider, tools, timeout, cwd):
+def _work(jid, task, provider, tools, timeout, cwd, model="", base_url=""):
     """Owns the agent run for this job's lifetime (the thread analog of bgjobs._reap)."""
     log_path = None
     with _mx:
@@ -169,7 +175,7 @@ def _work(jid, task, provider, tools, timeout, cwd):
             pass
 
     try:
-        r = _dispatch(provider, task, tools, timeout, cwd, on_progress)
+        r = _dispatch(provider, task, tools, timeout, cwd, on_progress, model, base_url)
     except Exception as e:                       # a provider crash is a failed agent, not a dead thread
         r = {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
     finally:
@@ -192,7 +198,7 @@ def _work(jid, task, provider, tools, timeout, cwd):
     _announce(snap)
 
 
-def _dispatch(provider, task, tools, timeout, cwd, on_progress):
+def _dispatch(provider, task, tools, timeout, cwd, on_progress, model="", base_url=""):
     """Run the task on the chosen provider, reusing delegation's contained primitives directly
     (delegate.run()'s role-based resolution is deliberately untouched — these four are the seams).
     Returns the provider's {ok, output, error} dict."""
@@ -206,7 +212,8 @@ def _dispatch(provider, task, tools, timeout, cwd, on_progress):
         return delegate.to_codex(task, cwd=cwd, tools=spec, timeout=timeout)
     if provider == "api":
         return delegate.to_api(task, cwd=cwd, tools=spec, timeout=timeout,
-                               on_progress=on_progress, exclude=EXCLUDE)
+                               on_progress=on_progress, exclude=EXCLUDE,
+                               model=model, base_url=base_url)
     return _run_local(task, spec, timeout, cwd, on_progress)
 
 

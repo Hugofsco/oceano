@@ -434,7 +434,8 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
     import threading
     idle_timeout = idle_timeout or _DELEGATE_IDLE
     max_total = max_total or _DELEGATE_MAX
-    max_turns = max_turns or _DELEGATE_TURNS
+    from oceano import tools as _tools   # lazy: avoid importing tools at delegate.py's module load
+    max_turns = max_turns or _tools.get_max_delegate_turns() or _DELEGATE_TURNS
     binary = find_claude()
     if not binary:
         return {"ok": False, "output": "", "error": "claude CLI not found — install Claude Code, "
@@ -574,7 +575,13 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
     elif capped:
         err = f"the delegate hit the {max_total}s time cap and was stopped"
     elif is_error:
-        err = "the delegate reported an error"
+        # Claude Code's own "result" event often DOES explain why (e.g. hitting --max-turns on a
+        # large multi-file build) — that detail used to be discarded here in favor of a canned
+        # phrase, which made an already-hard-to-diagnose failure (a workflow agent node's ONLY
+        # trace of what happened) untraceable. Surface it, with turn count for context, and fall
+        # back to captured stderr if the CLI's own result text was empty.
+        detail = (final or "").strip() or ("".join(errbuf)).strip()[:400]
+        err = f"the delegate reported an error after {turns} turn(s)" + (f": {detail[:500]}" if detail else "")
     elif not final:
         try:
             err = ("".join(errbuf)).strip()[:400] or "the delegate returned no output"
@@ -712,11 +719,17 @@ def _unlink_quiet(p):
 # How a Claude-CLI --allowedTools spec maps onto OUR tool names, so the api provider
 # honours the same containment callers ask of the CLI. Grep has no local tool —
 # read_file/list_files cover that ground. Unknown CLI names grant nothing.
+# code_search rides on Read/Grep (it's pure ripgrep, no side effects — same trust level as
+# read_file); run_tests/git ride on Write (verifying/versioning what you just wrote is the
+# point of write access, not a bigger ask than the Write/Edit it already sits alongside — git
+# itself refuses push/remote ops, see oceano/tools/dev.py). Purely additive to what the CLI
+# providers (claude/codex) already do on their own with native Bash — this dict only affects
+# the api/local providers, which otherwise had no path to these tools at all.
 _API_TOOL_MAP = {
-    "Read": ("read_file", "list_files"),
+    "Read": ("read_file", "list_files", "code_search"),
     "Glob": ("list_files",),
-    "Grep": ("read_file", "list_files"),
-    "Write": ("write_file", "make_folder"),
+    "Grep": ("read_file", "list_files", "code_search"),
+    "Write": ("write_file", "make_folder", "run_tests", "git"),
     "Edit": ("edit_file",),
     "Bash": ("run_shell", "python_exec"),
 }
@@ -735,15 +748,17 @@ def _api_only_tools(tools_spec):
 
 
 def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=600, on_progress=None,
-           exclude=None):
+           exclude=None, model="", base_url=""):
     """Delegate to the configured cloud model by running it through OUR agent loop — the
     SAME machinery local models use. `tools` (a Claude-CLI-style spec) is translated to
     the equivalent local tools and enforced, and `timeout` puts a wall-clock deadline on
     the loop, so this provider honours the same containment as the CLI. Scoped to `cwd`
     (a throwaway/working folder) when given. on_progress(ev) surfaces its tool calls live.
+    `model`/`base_url` override the role config (a workflow agent node pinned to a specific
+    registered endpoint + model); empty → the role's configured pair as before.
     Returns {ok, output, error}. (learn=False so the task prompt is never mined into memory.)"""
     cfg = resolve(role)
-    base_url, model = cfg["base_url"], cfg["model"]
+    base_url, model = (base_url or cfg["base_url"]), (model or cfg["model"])
     if not (base_url and model):
         return {"ok": False, "output": "",
                 "error": "no delegate model configured — pick one in Settings → Delegation"}

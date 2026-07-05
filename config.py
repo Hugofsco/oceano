@@ -18,6 +18,11 @@ MODEL = os.environ.get("OCEANO_MODEL", "")
 # connection but never cuts off a slow-but-live generation or a cold model swap.
 LLM_CONNECT_TIMEOUT = float(os.environ.get("OCEANO_LLM_CONNECT_TIMEOUT", "10"))
 LLM_TIMEOUT = float(os.environ.get("OCEANO_LLM_TIMEOUT", "300"))
+# How often the OpenAI SDK may SILENTLY retry a failed request (5xx/timeouts) before the error
+# surfaces. Oceano has its own visible retry layers (node retries, orchestrator salvage), and each
+# hidden retry can burn another LLM_TIMEOUT of wall clock — e.g. a gateway that 504s after 5min
+# would eat 15min at the SDK default of 2. One quick recovery retry, then fail loudly.
+LLM_RETRIES = int(os.environ.get("OCEANO_LLM_RETRIES", "1"))
 
 # --- Workspace: the folder the agent actually works in ---
 WORKSPACE = Path(os.environ.get("OCEANO_WORKSPACE", Path(__file__).parent / "workspace")).resolve()

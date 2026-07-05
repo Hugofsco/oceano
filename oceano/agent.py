@@ -621,7 +621,7 @@ class Agent:
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
         allowed = {s["function"]["name"] for s in self._tool_schemas()}
-        for _ in range(config.MAX_STEPS):
+        for _ in range(tools.get_max_steps()):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("delegate run hit its time limit")
             msg = self._chat(with_tools=True)
@@ -962,7 +962,7 @@ class Agent:
         total_tok = 0                    # tokens generated across the whole turn (incl. tool steps)
         turn_tools = self._tool_schemas(only=only_tools)
         allowed = {s["function"]["name"] for s in turn_tools}
-        for _ in range(config.MAX_STEPS):
+        for _ in range(tools.get_max_steps()):
             seg_first = None             # time the first token of THIS segment arrived (for decode rate)
             content, reason, calls, ntok, ptok = "", "", None, 0, 0
             try:

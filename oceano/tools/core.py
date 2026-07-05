@@ -140,6 +140,13 @@ def unregister_prefix(prefix):
 _STATE_PATH = config.WORKSPACE.parent / "data" / "tools.json"
 _DISABLED = set()      # tools withheld from the model entirely (both modes)
 _CHAT_OFF = set()      # memory tools the user turned OFF for plain chat mode specifically
+# User-configurable tool-call budgets (Settings → Tools). 0 = unset → the env-var default
+# (config.MAX_STEPS / delegate's OCEANO_DELEGATE_MAXTURNS) applies, unchanged from before
+# these existed. Kept here (not oceano.web.state) since this IS the tools store, and giving
+# the user this knob is what closes the gap where a large workflow build (many file edits,
+# each needing its own turn) silently hit a hardcoded ceiling with no way to raise it.
+_MAX_STEPS = 0             # tool-call loop cap per turn: chat + background api/local agents
+_MAX_DELEGATE_TURNS = 0    # Claude/Codex CLI's own --max-turns, for CLI-provider delegation
 
 # Memory tools that may be exposed in plain chat mode (Agent mode off), so the model can
 # still recall/manage what it knows about the user without full tool access.
@@ -147,18 +154,27 @@ MEMORY_TOOLS = ("recall", "remember", "update_memory", "forget_memory")
 
 
 def _load_state():
-    global _DISABLED, _CHAT_OFF
+    global _DISABLED, _CHAT_OFF, _MAX_STEPS, _MAX_DELEGATE_TURNS
     try:
         d = json.loads(_STATE_PATH.read_text())
     except (OSError, ValueError):
         d = {}
     _DISABLED = set(d.get("disabled", []))
     _CHAT_OFF = set(d.get("chat_off", []))
+    try:
+        _MAX_STEPS = max(0, min(int(d.get("max_steps", 0)), 500))
+    except (TypeError, ValueError):
+        _MAX_STEPS = 0
+    try:
+        _MAX_DELEGATE_TURNS = max(0, min(int(d.get("max_delegate_turns", 0)), 500))
+    except (TypeError, ValueError):
+        _MAX_DELEGATE_TURNS = 0
 
 
 def _save_state():
     try:
-        atomicio.write_text(_STATE_PATH, json.dumps({"disabled": sorted(_DISABLED), "chat_off": sorted(_CHAT_OFF)}))
+        atomicio.write_text(_STATE_PATH, json.dumps({"disabled": sorted(_DISABLED), "chat_off": sorted(_CHAT_OFF),
+                                                      "max_steps": _MAX_STEPS, "max_delegate_turns": _MAX_DELEGATE_TURNS}))
     except OSError:
         pass
 
@@ -211,6 +227,42 @@ def set_chat_tool(name, on):
     if name not in MEMORY_TOOLS:
         return
     _CHAT_OFF.discard(name) if on else _CHAT_OFF.add(name)
+    _save_state()
+
+
+def get_max_steps():
+    """Tool-call loop cap per turn — how many rounds of (LLM reply + its tool calls) a single
+    turn may take before Oceano forces a wrap-up. Applies to the interactive mind AND every
+    background api/local agent (workflow nodes included). 0/unset → config.MAX_STEPS."""
+    return _MAX_STEPS or config.MAX_STEPS
+
+
+def set_max_steps(n):
+    """0 (or negative) clears the override (falls back to config.MAX_STEPS / OCEANO_MAX_STEPS)."""
+    global _MAX_STEPS
+    n = int(n or 0)
+    _MAX_STEPS = min(n, 500) if n > 0 else 0
+    _save_state()
+
+
+def get_max_steps_override():
+    """Raw override (0 = unset) — for the Settings UI to distinguish "using the built-in
+    default" from "explicitly set to N". Agents should call get_max_steps() instead."""
+    return _MAX_STEPS
+
+
+def get_max_delegate_turns():
+    """User override for Claude/Codex CLI delegation's own --max-turns budget. 0/unset → the
+    caller's own default (delegate._DELEGATE_TURNS / OCEANO_DELEGATE_MAXTURNS) — kept as a bare
+    int here (not delegate._DELEGATE_TURNS itself) so this module never imports oceano.delegate."""
+    return _MAX_DELEGATE_TURNS
+
+
+def set_max_delegate_turns(n):
+    """0 (or negative) clears the override (falls back to delegate's own default)."""
+    global _MAX_DELEGATE_TURNS
+    n = int(n or 0)
+    _MAX_DELEGATE_TURNS = min(n, 500) if n > 0 else 0
     _save_state()
 
 
