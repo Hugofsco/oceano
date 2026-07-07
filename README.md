@@ -34,6 +34,18 @@ from a web UI or Telegram.
   UI control (it opens & arranges your windows), **daemon-owned background jobs & parallel
   sub-agents** (results delivered back into the chat), **native desktop actions** (via the
   OceanoDesktop app), and delegation; plus any tools from MCP servers you connect.
+- **MCP servers, one click away.** A dedicated **MCP Servers** window connects remote
+  (streamable-HTTP/SSE, auto-negotiated) or local MCP servers — pick from **14 verified
+  common-server presets** (Cloudflare docs, DeepWiki, Slack, Linear, Notion, Sentry, Asana,
+  Intercom, PayPal, Square, GitHub, Stripe, Atlassian, Neon) or add a custom URL, paste a
+  token if one's needed, and its tools appear to the agent immediately — no JSON to hand-edit.
+  See [MCP](#mcp-model-context-protocol).
+- **Give a workflow step its own persona.** Any instruction / delegate / agent node can name
+  a **persona skill** (`skills/persona-*/SKILL.md`) whose identity, principles, and rules get
+  prefixed onto that step — so a growth-strategist, a finance-lead, a devil's-advocate, and a
+  backend engineer can genuinely argue different angles in the same orchestrated run, instead
+  of one shared voice doing all the reasoning. Ships with a 9-persona starter library. See
+  [Workflows](#workflows).
 - **A built-in email client.** Connect IMAP/SMTP accounts (app passwords) and get a real client —
   a folder sidebar with **unread counts**, a message reader, **multi-select** bulk move/delete,
   a compose/reply editor with a **rich-text toolbar**, and a **✨ AI-draft-reply** button. The agent
@@ -253,12 +265,28 @@ walks it from a **start** node, following edges:
 - **await** — the join point: wait for this run's spawned agents to finish (bounded by a
   timeout), folding their results into the flow so `{{node.<id>}}` works downstream;
   failures/timeouts route the error edge with partial results intact
+- **orchestrate** — plug in several **agent** nodes and run them as ordered *steps*: agents in
+  the same step run in parallel, steps run in sequence, and each step automatically sees the
+  results of the ones before it. A failed/stalled agent gets one serial retry before its step
+  fails. Compile the results by simple concatenation, or have the shared agent **summarize**
+  them into one coherent answer.
 - **http** — an HTTP/REST call (SSRF-guarded: private/link-local targets blocked, redirects
   re-validated per hop)
 - **sub-workflow** — run another saved workflow as a single step
 - **transform** — reshape the data flowing between nodes (no agent turn)
 - **approval** — pause for **human-in-the-loop** sign-off before continuing
 - **start / end**
+
+**Personas.** An **instruction**, **delegate**, or **agent** node can also name a **persona** —
+a published skill (by convention `skills/persona-*/SKILL.md`) whose body is prefixed onto that
+step's task, giving it a distinct identity, principles, and rules instead of the one shared
+system prompt every step otherwise runs with. This is what makes an **orchestrate** run feel
+like a real panel instead of one voice repeating itself from different angles: plug in a
+growth-strategist, a finance-lead, and a backend-engineer persona as parallel agents in step
+one, a devil's-advocate persona as step two (it automatically sees the others' takes), then
+summarize into a verdict. Nine starter personas ship in `skills/` (devils-advocate,
+growth-strategist, finance-lead, backend-engineer, product-manager, solo-founder, startup-cto,
+content-strategist, devops-engineer) — write your own the same way any skill is authored.
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
 runaway loops. A node can also declare **retries** and an **on-error** edge, so a flaky step
@@ -573,17 +601,31 @@ It's a single-page app with:
 
 ## MCP (Model Context Protocol)
 
-Connect external tool servers in `data/mcp.json`; their tools appear to the agent
-alongside the built-ins. Graceful no-op when none are configured.
+Connect external tool servers from the **MCP Servers** window (sidebar) — no JSON to
+hand-edit. Add a **remote** server by URL (streamable-HTTP, with automatic fallback to
+SSE for older servers) or a **local** one by command, paste a bearer token if it needs
+one, and its tools appear to the agent immediately (named `mcp__<server>__<tool>`),
+enable/disable/remove live, no restart required. A **common-servers gallery** ships
+with **14 network-verified presets** — Cloudflare docs and DeepWiki need no token at
+all; Linear, Notion, Sentry, Asana, Intercom, PayPal, Square, GitHub, Stripe, Atlassian,
+Neon, and Slack need one from that provider.
+
+Under the hood it's still just `data/mcp.json` (the window edits it for you; scripting
+it directly still works):
 
 ```json
 {
   "servers": [
+    { "name": "linear", "url": "https://mcp.linear.app/mcp", "transport": "auto",
+      "token": "", "enabled": true },
     { "name": "fs", "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/Oceano/workspace"] }
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/Oceano/workspace"],
+      "enabled": true }
   ]
 }
 ```
+
+Graceful no-op when none are configured.
 
 ---
 
@@ -761,7 +803,7 @@ oceano/
   mail.py            email — IMAP read/organize + SMTP send/reply (multi-account, gated)
   voice.py           speech-in (faster-whisper) / speech-out (Kokoro → Piper → espeak) for web + Telegram
   rivers.py          Hugging Face model catalog + hardware-fit + serve
-  mcp_client.py      optional MCP server connections
+  mcp_client.py      optional MCP server connections — local (stdio) or remote (streamable-HTTP/SSE)
   browser.py         agent browser surface (SSRF-guarded)
   livebrowser.py     persistent multi-tab headless Chromium (CDP screencast)
   embeddings.py      shared embedding client (:8082)
@@ -770,7 +812,7 @@ oceano/
   web/
     server.py        the FastAPI app shell (lifespan · session middleware · router mounting)
     state.py         shared web state (sessions · auth/TOTP · per-session agents · delivery hooks)
-    routes_*.py      10 domain routers (auth · chat · brain · mail · files · browser · delegate · ops · system · content)
+    routes_*.py      11 domain routers (auth · chat · brain · mail · mcp · files · browser · delegate · ops · system · content)
     static/          the SPA (index.html, app.js, style.css)
 config.py            central, env-overridable config
 scripts/
