@@ -82,6 +82,14 @@ _SCOPES = {
 
 
 def _allowset(scope):
+    if scope is None:
+        # the full body bridge: the curated set PLUS whatever MCP servers are connected right
+        # now — MCP connections are part of Oceano's body, so the mind sees the same ones the
+        # local model does. Computed fresh (not cached) since servers connect/disconnect at
+        # runtime (oceano.mcp_client.reload()); a narrow sub-agent `scope` deliberately does NOT
+        # get this — see the _SCOPES docstring above.
+        return _ALLOW | {s["function"]["name"] for s in tools.schemas()
+                         if s["function"]["name"].startswith("mcp__")}
     return _SCOPES.get(scope, _ALLOW)
 
 
@@ -118,8 +126,9 @@ def daemon_url():
 
 
 def tool_schemas(scope=None):
-    """The Oceano tools offered to the mind: the curated body set (or, for a contained sub-agent,
-    the much narrower `scope`d set — see _SCOPES), intersected with what's enabled."""
+    """The Oceano tools offered to the mind: the curated body set plus every connected MCP
+    server's tools (or, for a contained sub-agent, the much narrower `scope`d set with no MCP
+    access — see _SCOPES), intersected with what's enabled."""
     return [s for s in tools.schemas() if s["function"]["name"] in _allowset(scope)]
 
 
