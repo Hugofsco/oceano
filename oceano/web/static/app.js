@@ -1299,6 +1299,7 @@ const APP_SHORTCUTS = [
   { id: "notes",     label: "Notes",        icon: "❏", open: openNotes,             win: "win-notes",      defKey: { alt: true, shift: true, key: "n" } },
   { id: "logs",      label: "Logs",         icon: "▤", open: openLogs,              win: "win-logs",       defKey: { alt: true, shift: true, key: "g" } },
   { id: "hosts",     label: "Hosts",        icon: "⌗", open: openHosts,             win: "win-hosts",      defKey: { alt: true, shift: true, key: "o" } },
+  { id: "mcp",       label: "MCP Servers",  icon: "⛓", open: openMcp,               win: "win-mcp",        defKey: { alt: true, shift: true, key: "j" } },
   { id: "mail",      label: "Mail",         icon: "✉", open: openMail,              win: "win-mail",       defKey: { alt: true, shift: true, key: "m" } },
   { id: "terminal",  label: "Terminal",     icon: "▸", open: () => openTerminal(),  win: "win-terminal",   defKey: { alt: true, shift: true, key: "t" } },
   { id: "health",    label: "Health",       icon: "◉", open: openHealth,            win: "win-health",     defKey: { alt: true, shift: true, key: "h" } },
@@ -4730,6 +4731,139 @@ function hostsRenderEditor(body, h) {
   };
 }
 
+/* ---------------- MCP servers (Model Context Protocol client) ---------------- */
+function openMcp() {
+  const { body, reused } = createWindow({ id: "win-mcp", title: "MCP Servers", icon: "⛓", width: 720, height: 640, restoreKey: "mcp" });
+  if (reused) return;
+  body.classList.add("set-win");
+  mcpRenderList(body);
+}
+function mcpStatusDot(row) {
+  if (row.enabled === false) return `<span class="dot" title="disabled"></span>`;
+  if (row.ok === true) return `<span class="dot up" title="connected"></span>`;
+  if (row.ok === false) return `<span class="dot down" title="${escapeHtml(row.error || "failed")}"></span>`;
+  return `<span class="dot" title="connecting…"></span>`;
+}
+async function mcpRenderList(body) {
+  body.innerHTML = `
+    <div class="wf-head"><h3>MCP Servers</h3><span class="fe-spacer"></span><button class="ed-btn" id="mcpRefresh" title="refresh connection status">↻</button><button class="primary sm" id="mcpNew">+ Add server</button></div>
+    <div class="host-note">Remote or local <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">MCP</a> servers — each tool a server exposes becomes an ordinary tool the agent can call (named <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>). Most hosted servers need an access token from that provider — paste it in when adding.</div>
+    <div class="host-list" id="mcpList"><div class="empty-note">loading…</div></div>
+    <div class="mcp-presets" id="mcpPresets"><div class="empty-note">loading…</div></div>`;
+  $("#mcpNew", body).onclick = () => mcpRenderEditor(body, null);
+  $("#mcpRefresh", body).onclick = () => mcpRenderList(body);
+  let data; try { data = await api("/api/mcp/servers"); } catch { return; }
+  const list = $("#mcpList", body);
+  const servers = data.servers || [];
+  if (!servers.length) { list.innerHTML = `<div class="empty-note">No servers yet. Add one below, or pick a common server to get started.</div>`; }
+  else {
+    list.innerHTML = "";
+    servers.forEach(s => {
+      const el = document.createElement("div"); el.className = "host-card";
+      const kind = s.command ? `local · ${escapeHtml(s.command)}` : `${escapeHtml(s.transport || "auto")} · ${escapeHtml(s.url || "")}`;
+      const toolsNote = s.ok === true ? `${s.tools || 0} tool${s.tools === 1 ? "" : "s"}` : (s.ok === false ? "not connected" : "connecting…");
+      el.innerHTML = `
+        <div class="host-main">
+          <div class="host-name">${mcpStatusDot(s)} ${escapeHtml(s.name)} ${s.has_token ? `<span class="host-pin" title="token set">⚷ token</span>` : ""}</div>
+          <div class="host-addr">${kind} · ${toolsNote}</div>
+        </div>
+        <div class="host-actions">
+          <button class="ed-btn mcp-toggle">${s.enabled === false ? "Enable" : "Disable"}</button>
+          <button class="ed-btn mcp-edit">Edit</button>
+          <button class="ed-btn mcp-del" title="delete">✕</button>
+        </div>`;
+      $(".mcp-toggle", el).onclick = async () => { await fetch("/api/mcp/servers/" + encodeURIComponent(s.name), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: s.enabled === false }) }); mcpRenderList(body); };
+      $(".mcp-edit", el).onclick = () => mcpRenderEditor(body, s);
+      $(".mcp-del", el).onclick = async () => { if (!await confirmAction("Remove MCP server?", `“${s.name}” and its tools will be disconnected.`)) return; await fetch("/api/mcp/servers/" + encodeURIComponent(s.name), { method: "DELETE" }); mcpRenderList(body); };
+      list.appendChild(el);
+    });
+  }
+  let presets; try { presets = (await api("/api/mcp/presets")).presets || []; } catch { presets = []; }
+  const have = new Set(servers.map(x => x.name));
+  const gal = $("#mcpPresets", body);
+  gal.innerHTML = presets.map(p => `
+    <div class="mcp-preset-card${have.has(p.name) ? " added" : ""}" data-name="${escapeHtml(p.name)}">
+      <div class="mcp-preset-name">${escapeHtml(p.name)}${p.needs_token ? "" : ` <span class="host-pin" title="no token needed">public</span>`}</div>
+      <div class="mcp-preset-desc">${escapeHtml(p.description || "")}</div>
+    </div>`).join("") || `<div class="empty-note">none available</div>`;
+  gal.querySelectorAll(".mcp-preset-card").forEach(el => {
+    if (el.classList.contains("added")) return;
+    el.onclick = () => {
+      const p = presets.find(x => x.name === el.dataset.name);
+      mcpRenderEditor(body, null, p);
+    };
+  });
+}
+function mcpRenderEditor(body, s, preset) {
+  const seed = s || preset || {};
+  const isLocal = !!(s && s.command);
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="mcpBack">←</button><h3>${s ? "Edit server" : "Add server"}</h3></div>
+    <div class="drawer-section">
+      <label class="field-label">Name <span class="lbl-sub">used as the tool prefix — can't be changed later</span></label>
+      <input id="mName" placeholder="linear" value="${escapeHtml(seed.name || "")}"${s ? " disabled" : ""}>
+      <label class="field-label"><input type="checkbox" id="mLocal"${isLocal ? " checked" : ""}> run a local command instead of a remote URL</label>
+      <div id="mRemoteBox">
+        <label class="field-label">URL</label>
+        <input id="mUrl" placeholder="https://mcp.example.com/sse" value="${escapeHtml(seed.url || "")}">
+        <label class="field-label">Transport</label>
+        <select id="mTransport" class="te-model">
+          <option value="auto"${(seed.transport || "auto") === "auto" ? " selected" : ""}>auto (try streamable-HTTP, then SSE)</option>
+          <option value="http"${seed.transport === "http" ? " selected" : ""}>streamable-HTTP</option>
+          <option value="sse"${seed.transport === "sse" ? " selected" : ""}>SSE</option>
+        </select>
+        <label class="field-label">Access token <span class="lbl-sub">optional — sent as a Bearer Authorization header</span></label>
+        <input id="mToken" type="password" placeholder="${s && s.has_token ? "•••••••• (leave blank to keep)" : "paste a token if the server needs one"}">
+      </div>
+      <div id="mLocalBox" style="display:none">
+        <label class="field-label">Command</label>
+        <input id="mCommand" placeholder="npx" value="${escapeHtml((s && s.command) || "")}">
+        <label class="field-label">Arguments <span class="lbl-sub">comma-separated</span></label>
+        <input id="mArgs" placeholder="-y, @modelcontextprotocol/server-filesystem, /path" value="${((s && s.args) || []).map(escapeHtml).join(", ")}">
+      </div>
+      <label class="field-label"><input type="checkbox" id="mEnabled"${(s ? s.enabled !== false : true) ? " checked" : ""}> enabled</label>
+      <div class="acct-actions"><span class="acct-msg" id="mMsg"></span>
+        <span class="te-btns"><button class="ghost-btn sm te-cancel" id="mCancel">Cancel</button>
+        <button class="primary sm" id="mSave">${s ? "Save" : "Add server"}</button></span></div>
+    </div>`;
+  $("#mcpBack", body).onclick = () => mcpRenderList(body);
+  $("#mCancel", body).onclick = () => mcpRenderList(body);
+  const syncMode = () => {
+    const local = $("#mLocal", body).checked;
+    $("#mRemoteBox", body).style.display = local ? "none" : "";
+    $("#mLocalBox", body).style.display = local ? "" : "none";
+  };
+  $("#mLocal", body).onchange = syncMode; syncMode();
+  $("#mSave", body).onclick = async () => {
+    const msg = $("#mMsg", body);
+    const name = $("#mName", body).value.trim();
+    if (!name) { msg.textContent = "name is required"; msg.className = "acct-msg err"; return; }
+    const local = $("#mLocal", body).checked;
+    const payload = { name, enabled: $("#mEnabled", body).checked };
+    if (local) {
+      const command = $("#mCommand", body).value.trim();
+      if (!command) { msg.textContent = "command is required"; msg.className = "acct-msg err"; return; }
+      payload.command = command;
+      payload.args = $("#mArgs", body).value.split(",").map(a => a.trim()).filter(Boolean);
+    } else {
+      const url = $("#mUrl", body).value.trim();
+      if (!url) { msg.textContent = "url is required"; msg.className = "acct-msg err"; return; }
+      payload.url = url;
+      payload.transport = $("#mTransport", body).value;
+      const tok = $("#mToken", body).value;
+      if (tok) payload.token = tok;
+    }
+    const res = s
+      ? await (await fetch("/api/mcp/servers/" + encodeURIComponent(s.name), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })).json()
+      : await _postJ("/api/mcp/servers", payload);
+    if (!res.ok) { msg.textContent = res.detail || res.error || "save failed"; msg.className = "acct-msg err"; return; }
+    mcpRenderList(body);
+    // the connect attempt runs in the background — one follow-up refresh usually catches it
+    // going from "connecting…" to a real status; the ↻ button covers anything slower.
+    setTimeout(() => { if (document.body.contains(body) && $("#mcpList", body)) mcpRenderList(body); }, 2500);
+  };
+}
+
 /* ---------------- Mail (IMAP + SMTP) ---------------- */
 function openMail() {
   const { body, reused } = createWindow({ id: "win-mail", title: "Mail", icon: "✉", width: 1000, height: 700, restoreKey: "mail" });
@@ -5734,8 +5868,8 @@ function wfToolOptions(sel) {
 }
 function wfNodeData(n) {
   if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
-  if (n.type === "instruction") return { text: n.text || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", retries: String(n.retries || 0) };
-  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", write: wfWriteTier(n.write), retries: String(n.retries || 0) };
+  if (n.type === "instruction") return { text: n.text || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", persona: n.persona || "", retries: String(n.retries || 0) };
+  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", write: wfWriteTier(n.write), persona: n.persona || "", retries: String(n.retries || 0) };
   // Keys mirror what wfReadCanvas reads back — lowercase for historical df-* binding reasons;
   // trigger's mailFolder stays camelCase to match the backend. Settings are edited in the INSPECTOR
   // panel (wfInspect), so every type gets its full default data up front.
@@ -5747,7 +5881,7 @@ function wfNodeData(n) {
       c2op: g(1, "op", "contains"), c2val: g(1, "value", ""), c2label: g(1, "label", ""),
       c3op: g(2, "op", "contains"), c3val: g(2, "value", ""), c3label: g(2, "label", "") }; }
   if (n.type === "loop") return { over: n.over || "", as: n.as || "item" };
-  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", label: n.label || "", write: wfWriteTier(n.write), timeout: String(n.timeout || 600) };
+  if (n.type === "agent") return { task: n.task || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", label: n.label || "", write: wfWriteTier(n.write), persona: n.persona || "", timeout: String(n.timeout || 600) };
   if (n.type === "await") return { timeout: String(n.timeout || 900) };
   if (n.type === "orchestrate") return { plan: JSON.stringify(n.plan || {}), mode: n.mode || "concat", text: n.text || "", timeout: String(n.timeout || 900) };
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
@@ -6148,11 +6282,14 @@ const WF_ACCESS_OPTS = [
 const WF_ACCESS_NOTE_WRITE = "✎ this node can create/edit files, run the test suite, and use git under the workspace — make sure that's intended, especially if this flow runs unattended/scheduled.";
 const WF_ACCESS_NOTE_SHELL = "⚠ this node can run ARBITRARY shell commands — real code-execution risk, not just file writes. Only enable if you trust the task (and, for a background/scheduled flow, that it'll stay unattended without incident).";
 const WF_SKILLS_NOTE = "🧩 automatically reuses Oceano's published skills (list_skills / load_skill) if one fits the task — but has no access to memory, and can't learn new skills. Need memory, or full body access? Use an Instructions node instead.";
+const WF_PERSONA_NOTE = "🎭 optional: prefixes the task with a persona skill's identity, principles and rules (e.g. persona-devils-advocate, persona-finance-lead) — leave blank to run the plain task. Search by typing \"persona-\".";
 const WF_FIELDS = {
   start: [{ t: "note", text: "where the run begins — connect it to the first step." }],
   end: [{ t: "note", text: "marks the flow as finished." }],
   delegate: [
     { k: "text", t: "textarea", l: "task", ph: "task for Claude / cloud" },
+    { k: "persona", t: "combo", en: "skills", l: "persona", ph: "optional — e.g. persona-finance-lead" },
+    { t: "note", text: WF_PERSONA_NOTE },
     { k: "role", t: "select", l: "role", opts: [["default", "default"], ["improve", "improve"]] },
     { k: "write", t: "select", l: "file access", rr: true, opts: WF_ACCESS_OPTS },
     { t: "note", text: WF_SKILLS_NOTE },
@@ -6262,6 +6399,8 @@ function wfInspAgent(editor, dfId, box, sync) {
   const row = (lab, inner) => `<div class="wf-insp-row"><label class="wfn-lab">${lab}</label>${inner}</div>`;
   box.innerHTML =
     row("task", `<textarea class="wfn-fld" data-k="task" placeholder="self-contained task — it runs in the background while the flow continues">${escapeHtml(d.task || "")}</textarea>`) +
+    row("persona", `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-k="persona" data-enum="skills" autocomplete="off" placeholder="optional — e.g. persona-growth-strategist" value="${escapeHtml(d.persona || "")}"><div class="wfn-acx" style="display:none"></div></div>`) +
+    `<div class="wf-insp-note">${WF_PERSONA_NOTE}</div>` +
     row("runs on", `<select class="wfn-fld wa-model"><option value="">delegation default</option></select>`) +
     row("file access", `<select class="wfn-fld" data-k="write">${WF_ACCESS_OPTS.map(([v, l]) => `<option value="${v}"${d.write === v ? " selected" : ""}>${l}</option>`).join("")}</select>`) +
     row("label", `<input class="wfn-fld" data-k="label" placeholder="short label" value="${escapeHtml(d.label || "")}">`) +
@@ -6275,6 +6414,7 @@ function wfInspAgent(editor, dfId, box, sync) {
     f.addEventListener("change", h);
     if (f.tagName !== "SELECT") f.addEventListener("input", h);
   });
+  wfWireCombos(box);
   wfWireModelSelect(editor, dfId, box.querySelector(".wa-model"),
     `<option value="">delegation default</option>` +
     `<option value="claude">Claude CLI</option><option value="codex">Codex CLI</option>` +
@@ -6292,6 +6432,8 @@ function wfInspInstruction(editor, dfId, box, sync) {
   box.innerHTML =
     row("task", `<textarea class="wfn-fld" data-k="text" placeholder="what should the agent do? it may use any tool">${escapeHtml(d.text || "")}</textarea>`) +
     `<div class="wfn-hint">use {{input}} · {{last}} · {{node.ID}}</div>` +
+    row("persona", `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-k="persona" data-enum="skills" autocomplete="off" placeholder="optional — e.g. persona-devils-advocate" value="${escapeHtml(d.persona || "")}"><div class="wfn-acx" style="display:none"></div></div>`) +
+    `<div class="wf-insp-note">${WF_PERSONA_NOTE}</div>` +
     row("runs on", `<select class="wfn-fld wa-model"><option value="">primary intelligence · default</option></select>`) +
     row("retries", `<input class="wfn-fld" type="number" min="0" max="5" data-k="retries" value="${escapeHtml(d.retries || "0")}">`) +
     `<div class="wf-insp-note">"default" follows whatever's set as the <b>primary intelligence</b> (Settings → local / Claude / Codex) — pin this node to override it. A pin takes only <b>this node's</b> turn — it still sees (and adds to) the run's shared context.</div>`;
@@ -6300,6 +6442,7 @@ function wfInspInstruction(editor, dfId, box, sync) {
     f.addEventListener("change", h);
     if (f.tagName !== "SELECT") f.addEventListener("input", h);
   });
+  wfWireCombos(box);
   wfWireModelSelect(editor, dfId, box.querySelector(".wa-model"),
     `<option value="">primary intelligence · default</option>` +
     `<option value="claude">Claude CLI</option><option value="codex">Codex CLI</option>` +
@@ -6334,6 +6477,17 @@ function wfInspOrch(editor, dfId, box, sync) {
       }).join("");
       h += `<div class="wfn-hint">same step = run in parallel · steps run 1 → 2 → 3… · later steps automatically receive the earlier results</div>`;
     }
+    // local-model agents share ONE resident model — Oceano runs only one at a time, so >1 of
+    // them in the same (parallel) step will fail. Warn, don't block: real multi-GPU rigs can
+    // genuinely run several local models in parallel.
+    const byStep = {};
+    agents.forEach(a => { const s = plan[a.id]; (byStep[s] = byStep[s] || []).push(a); });
+    const localClashes = Object.entries(byStep)
+      .filter(([, as]) => as.filter(a => a.data.provider === "local").length > 1)
+      .map(([s]) => s);
+    if (localClashes.length) {
+      h += `<div class="wf-insp-note wf-insp-warn">⚠ step${localClashes.length > 1 ? "s" : ""} ${localClashes.join(", ")} ${localClashes.length > 1 ? "have" : "has"} more than one agent pinned to the <b>local resident model</b> running in the same (parallel) step. Oceano only runs one local-model agent at a time by default, so the extra ones will likely fail with "agent limit reached" — move them to separate steps (serialize) instead. Only skip this if your hardware can genuinely run several local models in parallel (e.g. a multi-GPU rig).</div>`;
+    }
     h += `<div class="wf-insp-row"><label class="wfn-lab">when all are done</label><select class="wfn-fld" data-k="mode"><option value="concat"${d.mode !== "summarize" ? " selected" : ""}>pass the combined results onward</option><option value="summarize"${d.mode === "summarize" ? " selected" : ""}>compile with the model first</option></select></div>`;
     if (d.mode === "summarize") h += `<div class="wf-insp-row"><label class="wfn-lab">compile brief</label><textarea class="wfn-fld" data-k="text" placeholder="how to compile the results — e.g. merge into one report, dedupe, note which agent found what">${escapeHtml(d.text || "")}</textarea></div>`;
     h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"><div class="wfn-hint">an agent that fails or stalls is retried once, alone, before the step fails</div></div>`;
@@ -6341,6 +6495,7 @@ function wfInspOrch(editor, dfId, box, sync) {
     box.querySelectorAll("[data-oa]").forEach(f => f.addEventListener("change", () => {
       plan[f.dataset.oa] = Math.max(1, parseInt(f.value, 10) || 1);
       sync({ plan: JSON.stringify(plan) });
+      render();          // step reassignment can clear/create a local-model parallel clash — refresh the warning
     }));
     box.querySelectorAll("[data-k]").forEach(f => {
       const h2 = () => { sync({ [f.dataset.k]: f.value }); if (f.dataset.k === "mode") render(); };
@@ -6602,8 +6757,8 @@ function wfReadCanvas(editor) {
       node.tool = d.tool || "";
       try { node.args = (d.args || "").trim() ? JSON.parse(d.args) : {}; }
       catch { error = `invalid JSON in tool node “${node.tool || id}”`; node.args = {}; }
-    } else if (t === "instruction") { node.text = d.text || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.retries = intOr0(d.retries); }
-    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.write = wfWriteTier(d.write); node.retries = intOr0(d.retries); }
+    } else if (t === "instruction") { node.text = d.text || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.persona = d.persona || ""; node.retries = intOr0(d.retries); }
+    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; node.retries = intOr0(d.retries); }
     else if (t === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleop || "contains"; node.ruleValue = d.ruleval || ""; node.role = d.role || "default"; }
     else if (t === "trigger") { node.kind = d.kind || "manual"; node.cron = d.cron || ""; node.pattern = d.pattern || ""; node.channel = d.channel || "any"; node.folder = d.folder || ""; node.account = d.account || ""; node.mailFolder = d.mailFolder || "INBOX"; }
     else if (t === "switch") {
@@ -6619,7 +6774,7 @@ function wfReadCanvas(editor) {
     else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
-    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.label = d.label || ""; node.write = wfWriteTier(d.write); node.timeout = intOr0(d.timeout) || 600; }
+    else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.label = d.label || ""; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; node.timeout = intOr0(d.timeout) || 600; }
     else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     else if (t === "orchestrate") {
       try { node.plan = (d.plan || "").trim() ? JSON.parse(d.plan) : {}; } catch { node.plan = {}; }
@@ -6971,6 +7126,7 @@ function wire() {
     else if (v === "notes") openNotes();
     else if (v === "logs") openLogs();
     else if (v === "hosts") openHosts();
+    else if (v === "mcp") openMcp();
     else if (v === "mail") openMail();
     else if (v === "terminal") openTerminal();
     else if (v === "health") openHealth();

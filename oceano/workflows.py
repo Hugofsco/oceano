@@ -177,6 +177,7 @@ def _norm_graph(graph):
             node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
             node["model"] = str(n.get("model", "")).strip()[:120]      # pin this node's turn to a
             node["baseUrl"] = str(n.get("baseUrl", "")).strip()[:200]  # registered endpoint's model
+            node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
         elif t == "delegate":
             node["text"] = str(n.get("text", ""))
             node["role"] = n.get("role") if n.get("role") in ("default", "improve") else "default"
@@ -184,6 +185,7 @@ def _norm_graph(graph):
             # unattended delegate must not be quietly MORE privileged than the rest of a flow.
             # Explicit opt-in only: "write" (+run_tests/git) or "shell" (+arbitrary commands).
             node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""
+            node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
         elif t == "agent":                            # spawn a background sub-agent; the flow continues
             node["task"] = str(n.get("task", ""))
             node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
@@ -191,6 +193,7 @@ def _norm_graph(graph):
             node["baseUrl"] = str(n.get("baseUrl", "")).strip()[:200]  # endpoint's model ("" = default)
             node["label"] = str(n.get("label", "")).strip()[:80]
             node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""   # "" default = read-only
+            node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
             try:
                 node["timeout"] = max(1, min(int(n.get("timeout", 600)), 3600))    # seconds
             except (TypeError, ValueError):
@@ -319,6 +322,22 @@ def _tmpl(value, ctx):
     if isinstance(value, list):
         return [_tmpl(v, ctx) for v in value]
     return value
+
+
+def _persona_prefix(persona):
+    """An instruction/delegate/agent node's optional `persona` field names a published skill
+    (e.g. "persona-devils-advocate") whose body is prepended to that node's task/text as an
+    identity/voice/rules brief. "" (default) is a no-op — this never changes existing workflows.
+    A missing/unpublished skill also degrades to a no-op rather than leaking the lookup-failure
+    message into a real prompt."""
+    persona = (persona or "").strip()
+    if not persona:
+        return ""
+    from oceano import skills
+    body = (skills.load_skill(persona) or "").strip()
+    if not body or body.startswith("(no such skill") or body.startswith("(skill "):
+        return ""
+    return body + "\n\n---\n\n"
 
 
 # ---------------- CRUD ----------------
@@ -980,7 +999,8 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
             prior = "\n\n(Context — results from earlier agents:)\n" + "\n\n".join(
                 f"== {name(an)}\n{out[:2000]}" for _s, an, out in gathered)
         by_id = {a["id"]: a for a in steps[step]}
-        tasks = {a["id"]: _tmpl(a.get("task", ""), ctx) + prior for a in steps[step]}
+        tasks = {a["id"]: _persona_prefix(a.get("persona", "")) + _tmpl(a.get("task", ""), ctx) + prior
+                 for a in steps[step]}
         running = {}
         for a in steps[step]:
             emit({"event": "tool", "id": node["id"],
@@ -1245,7 +1265,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             ag.on_event = lambda kind, d, _i=cur["id"]: (
                                 emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
                                 if kind in ("tool_call", "tool_result") else None)
-                            text = _tmpl(cur.get("text", ""), ctx)
+                            text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
                             prov = cur.get("provider") or ""
                             from oceano import delegate
                             if cur.get("model"):        # pinned to an endpoint model — this node's turn only
@@ -1268,7 +1288,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                         elif t == "delegate":
                             from oceano import delegate
                             tool_scope = _tool_scope_for(cur.get("write"))
-                            r = delegate.run(_tmpl(cur.get("text", ""), ctx), cwd=config.WORKSPACE,
+                            text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
+                            r = delegate.run(text, cwd=config.WORKSPACE,
                                              tools=tool_scope, timeout=600, role=cur.get("role", "default"),
                                              skills=True)   # may reuse Oceano's published skills; never memory
                             ok = bool(r.get("ok"))
@@ -1277,7 +1298,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                         elif t == "agent":             # spawn a background sub-agent — do NOT block
                             from oceano import agentjobs
                             tool_scope = _tool_scope_for(cur.get("write"))
-                            rec = agentjobs.spawn(_tmpl(cur.get("task", ""), ctx),
+                            task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
+                            rec = agentjobs.spawn(task,
                                                   provider=cur.get("provider", ""),
                                                   model=cur.get("model", ""),
                                                   base_url=cur.get("baseUrl", ""),

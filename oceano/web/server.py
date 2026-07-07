@@ -143,6 +143,7 @@ from oceano.web import (  # noqa: E402
     routes_delegate,
     routes_files,
     routes_mail,
+    routes_mcp,
     routes_ops,
     routes_system,
 )
@@ -156,6 +157,7 @@ app.include_router(routes_content.router)
 app.include_router(routes_files.router)
 app.include_router(routes_browser.router)
 app.include_router(routes_mail.router)
+app.include_router(routes_mcp.router)
 app.include_router(routes_ops.router)
 
 

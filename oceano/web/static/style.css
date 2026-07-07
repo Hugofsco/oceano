@@ -1818,6 +1818,12 @@ html.density-compact{font-size:14px} html.density-spacious{font-size:17.5px}
 .host-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .host-row{display:flex;gap:10px}
 .host-keynote{font-size:11.5px;color:var(--biolum);margin:6px 0}
+.mcp-presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:9px;margin-top:14px}
+.mcp-preset-card{padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:var(--panel);cursor:pointer;transition:border-color .15s}
+.mcp-preset-card:hover{border-color:var(--biolum)}
+.mcp-preset-card.added{opacity:.45;cursor:default}
+.mcp-preset-name{font-weight:600;color:var(--foam);font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.mcp-preset-desc{font-size:11px;color:var(--mist);margin-top:4px;line-height:1.4}
 .set-win input[type=file]{font-size:12px;color:var(--mist);width:100%;padding:6px 0;cursor:pointer}
 .host-del:hover{border-color:var(--coral);color:var(--coral)}
 
