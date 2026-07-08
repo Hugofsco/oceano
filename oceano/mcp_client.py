@@ -28,7 +28,7 @@ import time
 import traceback
 
 import config
-from oceano import atomicio, tools
+from oceano import atomicio, safety, tools
 
 CONFIG = config.WORKSPACE.parent / "data" / "mcp.json"
 CALL_TIMEOUT = 120
@@ -119,6 +119,10 @@ def _register_tools(name, listed_tools):
 
 def _call_sync(server, tool_name, kwargs):
     """Synchronous bridge the agent's tool layer calls — hops onto the MCP loop."""
+    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+        return ("Blocked for safety: this turn already read external content (a web page, email, or "
+                 "document), so calling connected MCP tools is disabled — injected text must not "
+                 "reach them. Ask the user to send a fresh message to use MCP tools.")
     sess = _sessions.get(server)
     if sess is None or _loop is None:
         return f"ERROR: MCP server {server!r} is not connected"
