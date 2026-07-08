@@ -13,6 +13,13 @@ def test_remember_rejects_empty(tmp_path, monkeypatch):
     assert "nothing to remember" in memory.remember("   ")
 
 
+def test_db_file_is_not_world_or_group_readable(tmp_path, monkeypatch):
+    db_path = tmp_path / "mem.db"
+    monkeypatch.setattr(memory, "DB_PATH", db_path)
+    memory._db()
+    assert oct(db_path.stat().st_mode)[-3:] == "600"
+
+
 def test_remember_skips_near_duplicate(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
     # deterministic stand-ins for the embed server: every item embeds the same and

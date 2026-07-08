@@ -162,6 +162,8 @@ def _work(jid, task, provider, tools, timeout, cwd, model="", base_url="", skill
         if rec:
             log_path = rec["log_path"]
     logf = open(log_path, "a", encoding="utf-8", errors="replace") if log_path else None
+    if logf is not None:
+        atomicio.secure(log_path)
 
     def on_progress(ev):
         if logf is None:

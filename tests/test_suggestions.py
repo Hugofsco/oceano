@@ -25,6 +25,13 @@ def test_extract_proposals_tolerates_no_block():
     assert clean == "just prose, no proposals block"
 
 
+def test_db_file_is_not_world_or_group_readable(tmp_path, monkeypatch):
+    db_path = tmp_path / "s.db"
+    monkeypatch.setattr(suggestions, "DB_PATH", db_path)
+    suggestions._db()
+    assert oct(db_path.stat().st_mode)[-3:] == "600"
+
+
 def test_add_lists_and_dedupes(tmp_path, monkeypatch):
     monkeypatch.setattr(suggestions, "DB_PATH", tmp_path / "s.db")
     a = suggestions.add("research", "study X", "detail")

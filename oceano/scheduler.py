@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import requests
 
 import config
+from oceano import atomicio
 
 DB_PATH = config.WORKSPACE.parent / "data" / "tasks.db"
 HEARTBEAT = config.WORKSPACE.parent / "data" / "heartbeat"
@@ -63,6 +64,7 @@ def _parse_when(s):
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
     con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS tasks ("
@@ -122,6 +124,7 @@ def notify(message, title="Oceano"):
 def beat():
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
     HEARTBEAT.write_text(str(time.time()))
+    atomicio.secure(HEARTBEAT)
 
 
 def last_beat():

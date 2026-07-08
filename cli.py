@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 import config
-from oceano import chats
+from oceano import atomicio, chats
 from oceano.agent import Agent
 
 # rich (output) — markdown, spinner, diffs, live stream. A hard dependency (requirements.txt).
@@ -308,6 +308,8 @@ def _session():
     if _SESSION is None and _HAS_PT:
         try:
             _HISTORY.parent.mkdir(parents=True, exist_ok=True)
+            _HISTORY.touch(exist_ok=True)   # exist at 0600 before FileHistory ever writes to it
+            atomicio.secure(_HISTORY)
         except OSError:
             pass
         _SESSION = PromptSession(history=FileHistory(str(_HISTORY)),

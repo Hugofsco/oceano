@@ -13,6 +13,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import config
+from oceano import atomicio
 
 DB_PATH = config.WORKSPACE.parent / "data" / "suggestions.db"
 KINDS = ("research", "workflow", "memory", "skill", "setting", "other")
@@ -21,6 +22,7 @@ KINDS = ("research", "workflow", "memory", "skill", "setting", "other")
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("CREATE TABLE IF NOT EXISTS suggestions ("

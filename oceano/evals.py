@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 
 import config
+from oceano import atomicio
 
 DB_PATH = config.WORKSPACE.parent / "data" / "evals.db"
 RUN_DIR = config.WORKSPACE / ".eval-runs"          # throwaway per-case workspaces
@@ -35,6 +36,7 @@ _CANCEL = threading.Event()                        # set by cancel() to stop an 
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
     con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS cases ("

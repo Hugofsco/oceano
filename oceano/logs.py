@@ -10,6 +10,7 @@ import subprocess
 from datetime import datetime, timezone
 
 import config
+from oceano import atomicio
 
 # The systemd units we'll surface (allowlisted — never read an arbitrary unit's journal).
 _UNITS = {"oceano": "oceano.service", "llama-swap": "oceano-llama-swap.service"}
@@ -21,6 +22,7 @@ _MAX = 1000                       # keep the most recent N runs; older ones are 
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(DB_PATH), timeout=10)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, "

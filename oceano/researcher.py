@@ -12,6 +12,7 @@ import threading
 from datetime import datetime, timezone
 
 import config
+from oceano import atomicio
 
 DB_PATH = config.WORKSPACE.parent / "data" / "research.db"
 PREFIX = "[ RESEARCH ] "
@@ -24,6 +25,7 @@ _RUN_LOCK = threading.Lock()
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
     con.execute("PRAGMA journal_mode=WAL")     # the drain worker writes while the Researcher view reads
     con.execute("CREATE TABLE IF NOT EXISTS topics ("

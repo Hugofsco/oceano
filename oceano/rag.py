@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 import config
-from oceano import embeddings, rerank
+from oceano import atomicio, embeddings, rerank
 
 DB_PATH = config.WORKSPACE.parent / "data" / "rag.db"
 CHUNK_WORDS = 250
@@ -20,6 +20,7 @@ RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes i
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
     con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS chunks ("

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import config
-from oceano import safety
+from oceano import atomicio, safety
 
 DB_PATH = config.WORKSPACE.parent / "data" / "calendar.db"
 SYNC_INTERVAL = int(os.environ.get("OCEANO_CAL_SYNC", "900"))   # seconds between feed refreshes
@@ -50,6 +50,7 @@ _LOCAL_TZ = _local_zone()
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    atomicio.secure(DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")    # wait (don't error) when another writer holds the db
     con.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer: web+telegram+scheduler+calendar
     con.execute("CREATE TABLE IF NOT EXISTS feeds ("

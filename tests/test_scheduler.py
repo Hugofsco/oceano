@@ -36,6 +36,20 @@ def test_cron_due_logic():
     assert scheduler.is_due("0 8 * * *", last, now=now) is False
 
 
+def test_db_file_is_not_world_or_group_readable(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(scheduler, "DB_PATH", db_path)
+    scheduler._db()
+    assert oct(db_path.stat().st_mode)[-3:] == "600"
+
+
+def test_heartbeat_file_is_not_world_or_group_readable(tmp_path, monkeypatch):
+    hb_path = tmp_path / "heartbeat"
+    monkeypatch.setattr(scheduler, "HEARTBEAT", hb_path)
+    scheduler.beat()
+    assert oct(hb_path.stat().st_mode)[-3:] == "600"
+
+
 def test_schedule_one_shot_creates_pending_disabling_task(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
     msg = scheduler.schedule_task("", "ping once", run_once_at="2030-01-01 09:00")

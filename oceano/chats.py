@@ -249,6 +249,7 @@ def _prune_empty():
 def _vdb():
     VEC_DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(VEC_DB)
+    atomicio.secure(VEC_DB)
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("CREATE TABLE IF NOT EXISTS chatvec ("
