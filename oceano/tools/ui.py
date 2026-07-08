@@ -8,7 +8,8 @@ from oceano.tools.core import live_browser_available, tool
 # safe window openers — never arbitrary code.
 _UI_WINDOWS = {"files", "explorer", "preview", "calendar", "brain", "memory", "knowledge", "skills",
                "rivers", "evals", "memory-graph", "scheduler", "researcher", "notes", "health",
-               "search", "voice", "workflows", "live", "logs", "hosts", "terminal", "settings"}
+               "search", "voice", "workflows", "live", "logs", "hosts", "mail", "mcp", "terminal",
+               "settings"}
 # whole-desktop modes + single-window modes (the positional ones snap to a half/quarter/maximize)
 _UI_POS = {"left", "right", "top", "bottom", "maximize",
            "top-left", "top-right", "bottom-left", "bottom-right"}
@@ -38,8 +39,8 @@ def _ui_push(action, **payload):
             "window": {"type": "string", "description": "one of: files, preview, calendar, brain, "
                        "memory, knowledge, skills, rivers, evals, memory-graph, scheduler, researcher, "
                        "notes, health, search, voice, workflows, live, logs (activity & system journal), "
-                       "hosts (SSH servers), terminal (a workspace shell, or a live SSH session if you "
-                       "pass `host`), settings"},
+                       "hosts (SSH servers), mail, mcp (MCP servers), terminal (a workspace shell, or a "
+                       "live SSH session if you pass `host`), settings"},
             "path": {"type": "string", "description": "a workspace file (opens a preview if renderable, "
                      "else the editor) or a folder (opens the Files explorer there)"},
             "host": {"type": "string", "description": "for window='terminal': a registered host name to "

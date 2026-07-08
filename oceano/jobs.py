@@ -24,8 +24,9 @@ STATE_PATH = config.WORKSPACE.parent / "data" / "jobs.json"
 # THREAD (e.g. a chat turn or a scheduled task whose agent calls run_workflow). A plain Lock
 # would self-deadlock there; an RLock lets the same thread re-enter while still blocking others.
 _gate = threading.RLock()
-_mx = threading.Lock()           # guards _jobs
+_mx = threading.Lock()           # guards _jobs and _cancels
 _jobs = {}                       # id -> {id, kind, label, ref, state, since}
+_cancels = {}                    # id -> threading.Event, set by cancel() to stop that job's work
 _counter = itertools.count(1)
 
 
@@ -96,6 +97,8 @@ def job(kind, label="", ref=None, gate=None):
             "state": "queued" if gated else "running", "since": time.time(), "result": ""}
     with _mx:
         _jobs[jid] = info
+        _cancels[jid] = threading.Event()   # exists from registration, so a cancel while still
+                                             # queued is already set by the time the job starts
     held = False
     err = None
     try:
@@ -115,6 +118,7 @@ def job(kind, label="", ref=None, gate=None):
         ran = round(time.time() - info["since"], 1)
         with _mx:
             _jobs.pop(jid, None)
+            _cancels.pop(jid, None)
         if kind != "chat":                     # interactive chat isn't an unattended "run" — don't log it
             try:
                 from oceano import logs
@@ -133,3 +137,22 @@ def set_result(jid, text):
         j = _jobs.get(jid)
         if j is not None:
             j["result"] = (str(text) or "")[:8000]
+
+
+def cancel_event(jid):
+    """The threading.Event a job's own code should check (and pass into Agent.run/run_claude/
+    run_codex as `cancel`) to know when the user asked it to stop. None if `jid` isn't live."""
+    with _mx:
+        return _cancels.get(jid)
+
+
+def cancel(jid):
+    """Ask a live job to stop. Sets its Event — the job's own code decides how/when it notices
+    (between steps for the local model, a killed subprocess for Claude/Codex). Returns False if
+    `jid` isn't a currently-tracked job (already finished, or never existed)."""
+    with _mx:
+        ev = _cancels.get(jid)
+    if ev is None:
+        return False
+    ev.set()
+    return True

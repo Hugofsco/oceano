@@ -18,6 +18,10 @@ import config
 from oceano import llm, safety, tools
 
 
+class Cancelled(RuntimeError):
+    """Raised by Agent.run() when its `cancel` Event was set mid-turn (see jobs.cancel())."""
+
+
 def _date_note():
     """A fresh 'today is …' line so the model anchors to the real present, not its
     training cutoff (otherwise it searches for stale years like '2024')."""
@@ -611,10 +615,11 @@ class Agent:
         return s
 
     # --- blocking (CLI / Telegram / scheduler) -----------------------------
-    def run(self, user_message: str, deadline=None) -> str:
+    def run(self, user_message: str, deadline=None, cancel=None) -> str:
         """`deadline` (a time.monotonic() instant) bounds a delegated run: checked
         between steps, so it can't interrupt one in-flight LLM/tool call, but it stops
-        the loop from running on. Raises TimeoutError when hit."""
+        the loop from running on. Raises TimeoutError when hit. `cancel` (a threading.Event,
+        e.g. from jobs.cancel_event()) is checked at the same point and raises Cancelled."""
         if not self.model:
             self.on_event("answer", _NO_MODEL_MSG)
             return _NO_MODEL_MSG
@@ -624,6 +629,8 @@ class Agent:
         for _ in range(tools.get_max_steps()):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("delegate run hit its time limit")
+            if cancel is not None and cancel.is_set():
+                raise Cancelled("cancelled")
             msg = self._chat(with_tools=True)
             self.messages.append(msg.model_dump(exclude_none=True))
             if not msg.tool_calls:
@@ -644,21 +651,26 @@ class Agent:
         self._learn(user_message, text)
         return text
 
-    def run_claude(self, user_message: str) -> str:
+    def run_claude(self, user_message: str, cancel=None) -> str:
         """Run one turn through the Claude mind (its subscription, wearing Oceano's persona + memory +
         body tools) and return the collected answer. A BLOCKING entry point for callers like the
-        scheduler that want a specific task done by Claude regardless of the global mind setting."""
+        scheduler that want a specific task done by Claude regardless of the global mind setting.
+        `cancel` (a threading.Event) kills the underlying `claude` subprocess promptly — the same
+        mechanism chat's Stop button already uses — and the call returns whatever text streamed
+        before that, rather than raising."""
         parts = []
-        for ev in self._claude_mind_stream(user_message):
+        for ev in self._claude_mind_stream(user_message, cancel=cancel):
             if ev.get("type") == "token":
                 parts.append(ev.get("text", ""))
         return "".join(parts).strip() or "(Claude returned no output)"
 
-    def run_codex(self, user_message: str) -> str:
+    def run_codex(self, user_message: str, cancel=None) -> str:
         """Run one turn through the Codex mind (the local Codex CLI, via the user's auth) and return
-        the collected answer. Blocking helper for unattended callers that explicitly target Codex."""
+        the collected answer. Blocking helper for unattended callers that explicitly target Codex.
+        `cancel` (a threading.Event) kills the underlying `codex` process tree promptly, same as
+        chat's Stop button; the call returns whatever text streamed before that, not an exception."""
         parts = []
-        for ev in self._codex_mind_stream(user_message):
+        for ev in self._codex_mind_stream(user_message, cancel=cancel):
             if ev.get("type") == "token":
                 parts.append(ev.get("text", ""))
         return "".join(parts).strip() or "(Codex returned no output)"

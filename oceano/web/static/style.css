@@ -1613,6 +1613,8 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .jb-l{flex:1;font-size:12.5px;color:var(--foam);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .jb-m{font-family:var(--font-mono);font-size:11px;color:var(--faint);flex:none}
 .jb-item.jb-queued .jb-m{color:var(--buoy)}
+.jb-cancel{flex:none;width:20px;height:20px;border-radius:6px;border:none;background:transparent;color:var(--faint);font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.jb-cancel:hover{background:rgba(var(--coral-rgb),.15);color:var(--coral)}
 
 /* "a job for this entity is running" highlight, driven by the poller */
 .wf-card.job-running{border-color:var(--biolum);box-shadow:0 0 0 1px rgba(var(--biolum-rgb),.25)}

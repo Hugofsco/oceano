@@ -338,6 +338,7 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
     task is wrapped here. `model`/`base_url` (a per-task override; empty → the system default)
     apply only to that plain agent task."""
     from oceano.agent import Agent
+    from oceano.agent import Cancelled as AgentCancelled
     from oceano import tools, jobs
     with tools.background():
         if source and source.startswith("research:"):        # Researcher-owned entry
@@ -366,30 +367,34 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
             from oceano import workflows
             return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule").get("summary", "workflow ran")
         with jobs.job("task", instruction, ref=ref) as jid:
-            if model == "claude":              # run this task via the Claude mind (its own subscription)
-                from oceano import delegate
-                if delegate.available():
-                    answer = Agent().run_claude(instruction)
+            ce = jobs.cancel_event(jid)        # set by a ✕ click in the jobs popup while this runs
+            try:
+                if model == "claude":          # run this task via the Claude mind (its own subscription)
+                    from oceano import delegate
+                    if delegate.available():
+                        answer = Agent().run_claude(instruction, cancel=ce)
+                    else:
+                        answer = "⚠️ This task is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
+                elif model == "codex":         # run this task via the Codex mind (its own auth/session)
+                    from oceano import delegate
+                    if delegate.codex_available():
+                        answer = Agent().run_codex(instruction, cancel=ce)
+                    else:
+                        answer = "⚠️ This task is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
                 else:
-                    answer = "⚠️ This task is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
-            elif model == "codex":             # run this task via the Codex mind (its own auth/session)
-                from oceano import delegate
-                if delegate.codex_available():
-                    answer = Agent().run_codex(instruction)
-                else:
-                    answer = "⚠️ This task is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
-            else:
-                ag = Agent()
-                if model:                      # per-task model override (else Agent's configured default)
-                    ag.model = model
-                    if base_url:
-                        ag.base_url = base_url
-                        try:
-                            from oceano.web import server
-                            ag.api_key = server.endpoint_key(base_url)
-                        except Exception:
-                            pass
-                answer = ag.run(instruction)
+                    ag = Agent()
+                    if model:                  # per-task model override (else Agent's configured default)
+                        ag.model = model
+                        if base_url:
+                            ag.base_url = base_url
+                            try:
+                                from oceano.web import server
+                                ag.api_key = server.endpoint_key(base_url)
+                            except Exception:
+                                pass
+                    answer = ag.run(instruction, cancel=ce)
+            except AgentCancelled:
+                answer = "⏹️ cancelled by user"
             jobs.set_result(jid, answer)       # so the activity log shows what the task actually produced
             return answer
 

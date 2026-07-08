@@ -1190,6 +1190,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     loop_state = {}                                    # loop node id -> {items, cursor}
     spawned = {}                                       # agent node id -> agentjobs id (this run's spawns)
     results, last_output, visits = [], "", 0
+    cancelled = False
     cur = start
     if not nested:
         with _LIVE_LOCK:
@@ -1202,11 +1203,15 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     stack = contextlib.ExitStack()
     try:
         _jid = stack.enter_context(jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}")) if not nested else None
+        ce = jobs.cancel_event(_jid) if _jid is not None else None   # set by a ✕ click in the jobs popup
         if not nested:
             stack.enter_context(tools.background())
         with stack:
             while cur and visits < _VISIT_CAP:
                 visits += 1
+                if ce is not None and ce.is_set():
+                    cancelled = True
+                    break
                 t = cur["type"]
                 if t == "end":
                     break
@@ -1401,7 +1406,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                     nxt = _route(cur, succ, branch)
                 cur = nodes.get(nxt) if nxt is not None else None
 
-            status = "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error")
+            status = "cancelled" if cancelled else (
+                "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error"))
             done = sum(1 for r in results if r["ok"])
             summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
             rec = _record_run(wf["id"], trigger, status, results, summary)

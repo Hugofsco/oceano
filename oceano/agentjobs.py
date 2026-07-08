@@ -225,6 +225,8 @@ def _run_local(task, tools_spec, timeout, cwd, on_progress, skills=False):
     gate (gate=True) so it queues visibly behind other work on the one resident model."""
     from oceano import delegate, jobs
     from oceano import tools as _tools
+    from oceano.agent import Agent
+    from oceano.agent import Cancelled as AgentCancelled
     prim = delegate.resolve_primary()
     if not prim["model"]:
         return {"ok": False, "output": "",
@@ -235,19 +237,21 @@ def _run_local(task, tools_spec, timeout, cwd, on_progress, skills=False):
             on_progress({"kind": "tool", "tool": (data or {}).get("name", "tool"), "detail": ""})
 
     try:
-        from oceano.agent import Agent
         ag = Agent(model=prim["model"], base_url=prim["base_url"] or None,
                    api_key=prim["api_key"] or None, learn=False, inject_context=False,
                    exclude_tools=EXCLUDE, only_tools=delegate._api_only_tools(tools_spec, skills=skills),
                    on_event=_on_ev)
         deadline = (time.monotonic() + timeout) if timeout else None
-        with jobs.job("agent", label=str(task)[:140], gate=True):
+        with jobs.job("agent", label=str(task)[:140], gate=True) as jid:
+            ce = jobs.cancel_event(jid)        # set by a ✕ click in the jobs popup while this runs
             ctx = _tools.background_workspace(cwd) if cwd else _tools.background()
             with ctx:
-                out = ag.run(str(task), deadline=deadline)
+                out = ag.run(str(task), deadline=deadline, cancel=ce)
         return {"ok": True, "output": (out or "").strip(), "error": ""}
     except TimeoutError:
         return {"ok": False, "output": "", "error": f"local agent timed out after {timeout}s"}
+    except AgentCancelled:
+        return {"ok": False, "output": "", "error": "cancelled by user"}
     except Exception as e:
         return {"ok": False, "output": "", "error": f"local agent error: {type(e).__name__}: {e}"}
 

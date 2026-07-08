@@ -1022,6 +1022,27 @@ function selectMind(kind, persist = true) {
   $("#depthReadout").textContent = kind === "claude" ? "mind · Claude (your subscription)" : "mind · Codex (your auth)";
   if (persist) api("/api/mind", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mind: kind }) }).catch(() => {});
   buildModelMenu();
+  _appendMindModelLabel(kind);
+}
+// pin (Settings → Delegation) shows as "🧠 Claude - Sonnet" etc. in the topbar — including on the
+// CLI/subscription default, e.g. "🧠 Codex - GPT-5.5" (its option label names what the default
+// currently resolves to; Claude's default doesn't, so that one falls back to "Default"). Re-called
+// from selectMind() (covers both a manual mind pick and boot-time restore) and from the Settings
+// dropdowns below on change.
+async function _appendMindModelLabel(kind) {
+  const endpoint = kind === "claude" ? "/api/claude-model" : "/api/codex-model";
+  let d; try { d = await api(endpoint); } catch { return; }
+  if (state.mind !== kind) return;                 // the mind changed again before this resolved
+  const base = kind === "claude" ? "🧠 Claude" : "🧠 Codex";
+  const opt = (d.options || []).find(o => o.id === d.model);
+  let label;
+  if (opt) {
+    const resolved = opt.label.match(/\(currently ([^)]+)\)/i);   // e.g. "…(currently GPT-5.5)"
+    label = resolved ? resolved[1] : opt.label.split("—")[0].replace(/\s*\([^)]*\)\s*$/, "").trim();
+  } else {
+    label = d.model || "Default";                  // an unlisted raw id, or nothing pinned at all
+  }
+  $("#modelLabel").textContent = `${base} - ${label}`;
 }
 function flashModel() { const p = $("#modelPill"); p.style.borderColor = "var(--coral)"; setTimeout(() => p.style.borderColor = "", 700); $("#modelMenu").classList.add("open"); }
 const setStatus = up => { $("#statusDot").className = "dot " + (up ? "up" : "down"); $("#statusText").textContent = up ? "local stack online" : "local offline"; };
@@ -1658,7 +1679,8 @@ async function loadClaudeModel() {
   sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
   sel.onchange = async () => {
     try { const r = await _postJ("/api/claude-model", { model: sel.value });
-      toast("Claude model → " + (r.model || "default"), "info"); }
+      toast("Claude model → " + (r.model || "default"), "info");
+      if (state.mind === "claude") _appendMindModelLabel("claude"); }
     catch { toast("couldn't set the Claude model", "err"); }
   };
   _wireEffort("claudeEffortSel", "/api/claude-effort", "Claude");
@@ -1671,7 +1693,8 @@ async function loadCodexModel() {
   sel.innerHTML = (d.options || []).map(o => `<option value="${escapeHtml(o.id)}"${o.id === d.model ? " selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
   sel.onchange = async () => {
     try { const r = await _postJ("/api/codex-model", { model: sel.value });
-      toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info"); }
+      toast("Codex model → " + (r.model || "recommended default: GPT-5.5"), "info");
+      if (state.mind === "codex") _appendMindModelLabel("codex"); }
     catch { toast("couldn't set the Codex model", "err"); }
   };
   _wireEffort("codexEffortSel", "/api/codex-effort", "Codex");
@@ -2142,7 +2165,8 @@ function _setWinMin(id, on) { const a = _winOpen(), w = a.find(x => x.id === id)
 function restoreWindows() {
   const RESTORERS = { settings: openSettings, live: openLiveView, explorer: openExplorer,
                       brain: openBrain, workflows: openWorkflows, preview: openPreview,
-                      file: openFileWindow, cal: openCalendar, hosts: openHosts, mail: openMail, terminal: openTerminal };
+                      file: openFileWindow, cal: openCalendar, hosts: openHosts, mail: openMail,
+                      mcp: openMcp, terminal: openTerminal };
   _winOpen().forEach(w => {
     const fn = RESTORERS[w.key];
     if (!fn) return;
@@ -6995,8 +7019,18 @@ async function pollJobDeliveries() {
 }
 function renderJobsPop(pop) {
   if (!_jobsLast.length) { pop.innerHTML = `<div class="jb-empty">No background jobs running.</div>`; return; }
-  pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j =>
-    `<div class="jb-item jb-${j.state}"><span class="jb-k">${escapeHtml(j.kind)}</span><span class="jb-l">${escapeHtml(j.label)}</span><span class="jb-m">${j.state === "queued" ? "queued" : Math.round(j.elapsed) + "s"}</span></div>`).join("");
+  // only workflow/task/research/local-agent jobs (a real numeric id from jobs.py) can be
+  // cancelled today — a spawn_job OS-process or a non-local spawn_agent (merged in under a
+  // synthetic "bg"/"ag" id) can't yet, so no cancel button for those rather than a dead one.
+  pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j => {
+    const cancellable = typeof j.id === "number";
+    return `<div class="jb-item jb-${j.state}"><span class="jb-k">${escapeHtml(j.kind)}</span><span class="jb-l">${escapeHtml(j.label)}</span><span class="jb-m">${j.state === "queued" ? "queued" : Math.round(j.elapsed) + "s"}</span>${cancellable ? `<button class="jb-cancel" title="cancel" onclick="jobCancel(${j.id}, event)">✕</button>` : ""}</div>`;
+  }).join("");
+}
+async function jobCancel(jid, e) {
+  if (e) e.stopPropagation();
+  try { await fetch("/api/jobs/" + jid + "/cancel", { method: "POST" }); } catch {}
+  pollJobs();
 }
 async function pollJobs() {
   let d; try { d = await api("/api/jobs"); } catch { return; }
@@ -7143,7 +7177,8 @@ function wire() {
   { const cb = $("#chatsBack"); if (cb) cb.onclick = sideShowMain; }
   wireAttach();
   wireAppShortcuts();
-  { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open"); if (p.classList.contains("open")) renderJobsPop(p); }; }
+  { const jb = $("#jobsBadge"); if (jb) jb.onclick = e => { e.stopPropagation(); const p = $("#jobsPop"); p.classList.toggle("open");
+      if (p.classList.contains("open")) { p.style.zIndex = String(++_winZ); renderJobsPop(p); } }; }
   document.addEventListener("click", () => { const p = $("#jobsPop"); if (p) p.classList.remove("open"); });
   pollJobs(); _jobsTimer = setInterval(pollJobs, 2500);
 
@@ -7230,7 +7265,7 @@ const UI_OPENERS = {
   researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
   search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
   live: () => openLiveView(), settings: () => openSettings(), hosts: () => openHosts(),
-  logs: () => openLogs(), terminal: () => openTerminal(),
+  logs: () => openLogs(), terminal: () => openTerminal(), mail: () => openMail(), mcp: () => openMcp(),
 };
 const UI_WINIDS = {
   files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
@@ -7238,7 +7273,7 @@ const UI_WINIDS = {
   rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
   researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
   voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
-  hosts: "win-hosts", logs: "win-logs", terminal: "win-terminal",
+  hosts: "win-hosts", logs: "win-logs", terminal: "win-terminal", mail: "win-mail", mcp: "win-mcp",
 };
 function startUiStream() {
   if (_uiES) return;                                   // one stream; survives re-login (idempotent init)

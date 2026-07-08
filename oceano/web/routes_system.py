@@ -357,6 +357,16 @@ def jobs_snapshot():
     return s
 
 
+@router.post("/api/jobs/{jid}/cancel")
+def jobs_cancel(jid: int):
+    """Stop a running/queued job from the jobs popup — workflow, scheduled task, research, or a
+    LOCAL spawn_agent (the kinds that live in jobs.py's own registry with a real numeric id; a
+    spawn_job OS-process or a non-local spawn_agent, merged into /api/jobs under a synthetic
+    "bg"/"ag" id, aren't covered yet). False if `jid` already finished or never existed."""
+    from oceano import jobs
+    return {"ok": jobs.cancel(jid)}
+
+
 @router.get("/api/bgjobs")
 def bgjobs_list(session: str = ""):
     """Background OS-jobs (spawn_job) AND sub-agents (spawn_agent). `pending` = terminal items

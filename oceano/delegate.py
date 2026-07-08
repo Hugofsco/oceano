@@ -62,6 +62,7 @@ CLAUDE_MODELS = (
     {"id": "sonnet", "label": "Sonnet — balanced, recommended for the agent"},
     {"id": "opus", "label": "Opus — most capable, slower/costlier"},
     {"id": "haiku", "label": "Haiku — fastest, lightest"},
+    {"id": "fable", "label": "Fable — newest addition to the Claude family"},
 )
 CODEX_MODELS = (
     {"id": "", "label": "Recommended default (currently GPT-5.5)"},

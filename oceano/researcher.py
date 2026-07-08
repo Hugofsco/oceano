@@ -197,27 +197,28 @@ def run_topic(rid):
     """One research run, registered as a background job so the UI can show it running."""
     from oceano import jobs
     with jobs.job("research", f"research #{rid}", ref=f"research:{rid}") as jid:
-        r = _run_topic(rid)
+        r = _run_topic(rid, cancel=jobs.cancel_event(jid))  # set by a ✕ click in the jobs popup
         jobs.set_result(jid, r)                          # surface the research result in the activity log
         return r
 
 
-def _run_with_model(prompt, model, base_url):
+def _run_with_model(prompt, model, base_url, cancel=None):
     """Run the research prompt on the topic's chosen model — '' = system default, 'claude'/'codex'
     drive that resident mind, anything else is an endpoint model id (resolved via base_url). Mirrors
-    the scheduler's per-task model dispatch so research honours the same choice."""
+    the scheduler's per-task model dispatch so research honours the same choice. `cancel` (a
+    threading.Event) is passed straight through to whichever Agent entry point runs."""
     from oceano.agent import Agent
     model = (model or "").strip()
     if model == "claude":
         from oceano import delegate
         if not delegate.available():
             return "⚠️ This topic is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
-        return Agent().run_claude(prompt)
+        return Agent().run_claude(prompt, cancel=cancel)
     if model == "codex":
         from oceano import delegate
         if not delegate.codex_available():
             return "⚠️ This topic is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
-        return Agent().run_codex(prompt)
+        return Agent().run_codex(prompt, cancel=cancel)
     ag = Agent()
     if model:                              # an endpoint model id (else Agent's configured default)
         ag.model = model
@@ -228,12 +229,13 @@ def _run_with_model(prompt, model, base_url):
                 ag.api_key = server.endpoint_key(base_url)
             except Exception:
                 pass
-    return ag.run(prompt)
+    return ag.run(prompt, cancel=cancel)
 
 
-def _run_topic(rid):
+def _run_topic(rid, cancel=None):
     """Drive the agent, then re-index the docs into RAG. Called by the scheduler when its
     [ RESEARCH ] task is due, or by Run-now."""
+    from oceano.agent import Cancelled as AgentCancelled
     con = _db()
     row = con.execute("SELECT topic, focus, doc, model, base_url FROM topics WHERE id=?", (rid,)).fetchone()
     con.close()
@@ -249,7 +251,7 @@ def _run_topic(rid):
         focus_block = f"FOCUS / GUIDANCE FROM THE USER: {focus}\n" if focus else ""
         prompt = _RUN_PROMPT.format(topic=topic, focus_block=focus_block, doc=doc, doc_dir=DOC_DIR)
         with tools.background():       # unattended → never drive the user's live browser
-            answer = _run_with_model(prompt, model, base_url)
+            answer = _run_with_model(prompt, model, base_url, cancel=cancel)
         try:                                  # re-embed only THIS topic's doc, not the whole folder
             from oceano import rag
             rag.index_docs(DOC_DIR, only=doc)
@@ -261,6 +263,8 @@ def _run_topic(rid):
         # in the Researcher UI list) is truncated.
         summary = (answer or "").strip()
         report = f"🔬 {topic} → workspace/{doc}\n\n{summary}" if summary else f"🔬 {topic} — (no summary produced)"
+    except AgentCancelled:
+        summary = report = "⏹️ cancelled by user"
     except Exception as e:
         summary = report = f"run failed: {type(e).__name__}: {e}"
     finally:
