@@ -104,7 +104,10 @@ app = FastAPI(title="Oceano", lifespan=lifespan)
 async def _require_auth(request: Request, call_next):
     path = request.url.path
     webhook = path.startswith("/api/workflows/") and "/webhook/" in path   # gated by its secret token
-    mcp = path.startswith("/api/mcp/")                                      # gated by the mindbridge token
+    # Only the mind-bridge routes are gated by the mind token (_mcp_authed() in routes_delegate.py) —
+    # every other /api/mcp/* route (server registration, presets) needs the normal session cookie
+    # like any other authenticated endpoint.
+    mcp = path in ("/api/mcp/tools", "/api/mcp/call")
     if path.startswith("/api/") and path not in _PUBLIC_API and not webhook and not mcp:
         auth = load().get("auth", {})
         if not _token_user(request.cookies.get(SESSION_COOKIE, ""), auth):
