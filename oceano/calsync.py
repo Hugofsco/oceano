@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import config
-from oceano import atomicio, safety
+from oceano import atomicio, safety, secretcrypto
 
 DB_PATH = config.WORKSPACE.parent / "data" / "calendar.db"
 SYNC_INTERVAL = int(os.environ.get("OCEANO_CAL_SYNC", "900"))   # seconds between feed refreshes
@@ -214,7 +214,7 @@ def feeds():
     rows = con.execute("SELECT id, name, url, last_sync, last_error, event_count "
                        "FROM feeds ORDER BY id").fetchall()
     con.close()
-    return [{"id": r[0], "name": r[1], "url": r[2], "last_sync": r[3],
+    return [{"id": r[0], "name": r[1], "url": secretcrypto.decrypt(r[2]), "last_sync": r[3],
              "last_error": r[4], "event_count": r[5]} for r in rows]
 
 
@@ -228,7 +228,7 @@ def add_feed(name, url):
         return None
     con = _db()
     cur = con.execute("INSERT INTO feeds (name, url) VALUES (?,?)",
-                      ((name or "Calendar").strip(), url))
+                      ((name or "Calendar").strip(), secretcrypto.encrypt(url)))
     con.commit()
     fid = cur.lastrowid
     con.close()
@@ -385,7 +385,7 @@ def sync_feed(fid):
         return {"ok": False, "error": "no such feed"}
     now = datetime.now(timezone.utc).isoformat()
     try:
-        occurrences = _expand(_parse_ics(_fetch_ics(row[0])))
+        occurrences = _expand(_parse_ics(_fetch_ics(secretcrypto.decrypt(row[0]))))
     except Exception as e:
         con.execute("UPDATE feeds SET last_sync=?, last_error=? WHERE id=?",
                     (now, f"{type(e).__name__}: {e}"[:300], fid))

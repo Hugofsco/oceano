@@ -33,3 +33,7 @@ feedparser>=6.0
 # is stdlib. 2FA is off unless enabled in Settings → Account.
 segno>=1.5
 paramiko
+# encryption-at-rest for secret fields in data/ (mail passwords, SSH creds, API keys, calendar
+# feed URL) — already an installed transitive dep of paramiko, promoted to direct since we now
+# import it ourselves (oceano/secretcrypto.py).
+cryptography>=42

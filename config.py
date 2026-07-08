@@ -100,3 +100,10 @@ KOKORO_SPEED = float(os.environ.get("OCEANO_KOKORO_SPEED", "1.0"))
 WAKE_WORD = os.environ.get("OCEANO_WAKE_WORD", "oceano")
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+# Encryption-at-rest key for the secret fields in ./data (mail passwords, SSH credentials,
+# API keys, the calendar feed URL). Resolved/generated once, here, so a bad key-file write
+# fails loudly at boot instead of surfacing later when a user first saves a secret.
+# Local import: secretcrypto imports nothing from config, so this can't cycle.
+from oceano.secretcrypto import load_key as _load_data_key  # noqa: E402
+DATA_KEY = _load_data_key()

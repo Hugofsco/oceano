@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 import config
-from oceano import atomicio
+from oceano import atomicio, secretcrypto
 
 DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 # Delegation timeouts. The old model used ONE fixed wall-clock that killed long-but-active
@@ -144,7 +144,7 @@ def get_primary():
     d = _raw()
     return {"model": (d.get(_MODEL_KEY) or "").strip(),
             "base_url": (d.get(_BASE_KEY) or "").strip(),
-            "api_key": (d.get(_KEY_KEY) or "").strip()}
+            "api_key": secretcrypto.decrypt((d.get(_KEY_KEY) or "").strip())}
 
 
 def set_primary(model, base_url="", api_key=""):
@@ -153,7 +153,7 @@ def set_primary(model, base_url="", api_key=""):
     d = _raw()
     d[_MODEL_KEY] = (model or "").strip()
     d[_BASE_KEY] = (base_url or "").strip()
-    d[_KEY_KEY] = (api_key or "").strip()
+    d[_KEY_KEY] = secretcrypto.encrypt((api_key or "").strip())
     try:
         atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
     except OSError:

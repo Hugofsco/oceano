@@ -28,7 +28,7 @@ import time
 import traceback
 
 import config
-from oceano import atomicio, safety, tools
+from oceano import atomicio, safety, secretcrypto, tools
 
 CONFIG = config.WORKSPACE.parent / "data" / "mcp.json"
 CALL_TIMEOUT = 120
@@ -96,9 +96,17 @@ def _cfg_hash(s):
     return json.dumps(s, sort_keys=True)
 
 
+def _encrypt_dict(d):
+    return {k: secretcrypto.encrypt(v) if isinstance(v, str) else v for k, v in (d or {}).items()}
+
+
+def _decrypt_dict(d):
+    return {k: secretcrypto.decrypt(v) if isinstance(v, str) else v for k, v in (d or {}).items()}
+
+
 def _auth_headers(server):
-    headers = dict(server.get("headers") or {})
-    token = (server.get("token") or "").strip()
+    headers = _decrypt_dict(server.get("headers"))
+    token = secretcrypto.decrypt(server.get("token") or "").strip()
     if token:
         headers.setdefault("Authorization", f"Bearer {token}")
     return headers
@@ -166,7 +174,7 @@ async def _connect(server, cfg_hash):
             if kind == "stdio":
                 from mcp.client.stdio import StdioServerParameters, stdio_client
                 params = StdioServerParameters(command=server["command"], args=server.get("args", []),
-                                               env=server.get("env") or None)
+                                               env=_decrypt_dict(server.get("env")) or None)
                 cm = stdio_client(params)
             elif kind == "http":
                 from mcp.client.streamable_http import streamablehttp_client
@@ -284,9 +292,9 @@ def add_server(cfg):
     servers.append({
         "name": name, "url": (cfg.get("url") or "").strip(),
         "transport": cfg.get("transport") if cfg.get("transport") in ("auto", "http", "sse") else "auto",
-        "token": cfg.get("token") or "", "headers": cfg.get("headers") or {},
+        "token": secretcrypto.encrypt(cfg.get("token") or ""), "headers": _encrypt_dict(cfg.get("headers")),
         "command": (cfg.get("command") or "").strip(), "args": cfg.get("args") or [],
-        "env": cfg.get("env") or {}, "enabled": cfg.get("enabled", True),
+        "env": _encrypt_dict(cfg.get("env")), "enabled": cfg.get("enabled", True),
     })
     _write_config(servers)
     reload()
@@ -299,7 +307,12 @@ def update_server(name, patch):
         if s["name"] == name:
             for k in ("url", "transport", "token", "headers", "command", "args", "env", "enabled"):
                 if k in patch:
-                    s[k] = patch[k]
+                    if k == "token":
+                        s[k] = secretcrypto.encrypt(patch[k] or "")
+                    elif k in ("headers", "env"):
+                        s[k] = _encrypt_dict(patch[k])
+                    else:
+                        s[k] = patch[k]
             found = True
     if not found:
         raise ValueError(f"no such server: {name}")

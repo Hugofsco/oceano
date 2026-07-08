@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from oceano import atomicio
+from oceano import atomicio, secretcrypto
 
 STORE = config.WORKSPACE.parent / "data" / "hosts.json"
 KEY_DIR = config.WORKSPACE.parent / "data" / "hosts"
@@ -70,8 +70,8 @@ def _norm_auth(a):
             "key_file": a.get("key_file") or None,
             "key_path": (a.get("key_path") or None),
             "has_passphrase": bool(a.get("has_passphrase")),
-            "passphrase": a.get("passphrase") or None,   # only if user chose to remember
-            "password": a.get("password") or None}        # only if user chose to remember
+            "passphrase": secretcrypto.encrypt(a.get("passphrase") or "") or None,   # only if user chose to remember
+            "password": secretcrypto.encrypt(a.get("password") or "") or None}        # only if user chose to remember
 
 
 def _needs_secret(h):
@@ -352,9 +352,9 @@ def _open(h, secret, pin_mode):
           "timeout": _CONNECT_TIMEOUT, "auth_timeout": _CONNECT_TIMEOUT,
           "banner_timeout": _CONNECT_TIMEOUT, "look_for_keys": False, "allow_agent": False}
     if a.get("type") == "password":
-        kw["password"] = secret or a.get("password") or ""
+        kw["password"] = secret or secretcrypto.decrypt(a.get("password") or "")
     else:
-        kw["pkey"] = _load_pkey(_read_key_text(h), secret or a.get("passphrase"))
+        kw["pkey"] = _load_pkey(_read_key_text(h), secret or secretcrypto.decrypt(a.get("passphrase")))
     cli.connect(**kw)
     captured = f"{cap.key.get_name()} {cap.key.get_base64()}" if (cap and cap.key) else None
     return cli, captured

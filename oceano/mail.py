@@ -28,7 +28,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import config
-from oceano import atomicio
+from oceano import atomicio, secretcrypto
 
 STORE = config.WORKSPACE.parent / "data" / "mail.json"
 POLICIES = ("readonly", "active", "trusted")
@@ -156,7 +156,7 @@ def create(name, email_addr, imap_host, smtp_host, user="", password="", imap_po
     rec = {"id": _next_id(d["accounts"]), "name": name, "email": email_addr,
            "imap_host": imap_host.strip(), "imap_port": int(imap_port or 993), "imap_ssl": bool(imap_ssl),
            "smtp_host": smtp_host.strip(), "smtp_port": int(smtp_port or 465), "smtp_ssl": bool(smtp_ssl),
-           "user": (user or "").strip() or email_addr, "password": password or "",
+           "user": (user or "").strip() or email_addr, "password": secretcrypto.encrypt(password or ""),
            "policy": policy if policy in POLICIES else "active",
            "primary": False, "description": (description or "").strip(),
            "created": _now(), "last_used": None}
@@ -189,7 +189,7 @@ def update(aid, **fields):
     if fields.get("policy") in POLICIES:
         a["policy"] = fields["policy"]
     if fields.get("password"):                  # only replace when a new one is actually supplied
-        a["password"] = fields["password"]
+        a["password"] = secretcrypto.encrypt(fields["password"])
     _save(d)
     return _public(a)
 
@@ -508,7 +508,7 @@ def _imap(a):
                 pass
             raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
                              f"unencrypted connection. Use the SSL port (993), or fix the server's TLS.")
-    conn.login(a.get("user") or a["email"], a.get("password") or "")
+    conn.login(a.get("user") or a["email"], secretcrypto.decrypt(a.get("password") or ""))
     return conn
 
 
@@ -1099,7 +1099,7 @@ def _smtp_send_msg(a, msg, recipients):
             raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over an "
                              f"unencrypted connection. Use the SSL port (465), or fix the server's TLS.")
     try:
-        srv.login(a.get("user") or a["email"], a.get("password") or "")
+        srv.login(a.get("user") or a["email"], secretcrypto.decrypt(a.get("password") or ""))
         srv.send_message(msg, from_addr=a["email"], to_addrs=recipients)
     finally:
         try:
@@ -1188,7 +1188,7 @@ def test(a):
                 raise ValueError(f"STARTTLS failed ({str(e)[:80]}) — refusing to send the password over "
                                  f"an unencrypted connection. Use the SSL port (465), or fix the TLS.")
         try:
-            srv.login(a.get("user") or a["email"], a.get("password") or "")
+            srv.login(a.get("user") or a["email"], secretcrypto.decrypt(a.get("password") or ""))
         finally:
             try:
                 srv.quit()

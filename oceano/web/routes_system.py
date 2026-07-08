@@ -10,7 +10,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request, WebSocket
 
 import config
-from oceano import chats, embeddings, memory, rag, rerank, rivers, scheduler, skills
+from oceano import chats, embeddings, memory, rag, rerank, rivers, scheduler, secretcrypto, skills
 from oceano.web import telegram_runtime
 from oceano.web.state import (
     PROVIDERS,
@@ -56,7 +56,7 @@ async def add_endpoint(req: Request):
     data = load()
     data["endpoints"] = [e for e in data["endpoints"] if e["name"] != body["name"]]
     data["endpoints"].append({"name": body["name"], "base_url": body["base_url"].rstrip("/"),
-                              "api_key": body.get("api_key", "")})
+                              "api_key": secretcrypto.encrypt(body.get("api_key", ""))})
     save(data)
     return {"ok": True}
 

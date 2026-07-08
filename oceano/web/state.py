@@ -23,7 +23,7 @@ import requests
 from fastapi import HTTPException
 
 import config
-from oceano import atomicio, chats, embeddings
+from oceano import atomicio, chats, embeddings, secretcrypto
 from oceano.agent import Agent
 from oceano.web import telegram_runtime
 
@@ -379,7 +379,8 @@ def list_models():
     data, out = load(), []
     for e in data["endpoints"]:
         try:
-            headers = {"Authorization": f"Bearer {e['api_key']}"} if e.get("api_key") else {}
+            key = secretcrypto.decrypt(e.get("api_key") or "")
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
             r = requests.get(e["base_url"].rstrip("/") + "/models", headers=headers, timeout=8)
             for m in r.json().get("data", []):
                 out.append({"id": m["id"], "endpoint": e["name"], "base_url": e["base_url"]})
@@ -391,8 +392,9 @@ def list_models():
 
 def endpoint_key(base_url):
     """The API key configured for the endpoint serving `base_url` (or '')."""
-    return next((e.get("api_key", "") for e in load()["endpoints"]
-                 if e["base_url"] == base_url), "")
+    raw = next((e.get("api_key", "") for e in load()["endpoints"]
+                if e["base_url"] == base_url), "")
+    return secretcrypto.decrypt(raw)
 
 
 # ---------------- workspace files (fenced) ----------------

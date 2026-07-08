@@ -6,6 +6,7 @@ import asyncio
 from fastapi import APIRouter, File, Form, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 
+from oceano import secretcrypto
 from oceano.web.state import load, save
 
 router = APIRouter()
@@ -197,7 +198,7 @@ async def mail_attachment_virustotal(aid: int, req: Request):
     a = mail._raw(aid)
     if not a:
         return {"ok": False, "error": "no such account"}
-    key = (load().get("virustotal_key") or "").strip()
+    key = secretcrypto.decrypt((load().get("virustotal_key") or "").strip())
     if not key:
         return {"ok": False, "error": "no VirusTotal API key set — add one in Settings → Mail"}
     b = await req.json()
@@ -219,7 +220,7 @@ async def virustotal_key_set(req: Request):
     """Set or clear the VirusTotal API key (stored in web.json, chmod 600 like the other secrets)."""
     b = await req.json()
     data = load()
-    data["virustotal_key"] = (b.get("key") or "").strip()
+    data["virustotal_key"] = secretcrypto.encrypt((b.get("key") or "").strip())
     save(data)
     return {"ok": True, "has_key": bool(data["virustotal_key"])}
 

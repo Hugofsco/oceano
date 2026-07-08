@@ -1,5 +1,6 @@
 # --- secrets & runtime config (NEVER commit) ---
 oceano.env
+oceano.env.key
 .env
 
 # --- runtime data: dbs, heartbeat, persisted web config (holds the bot token) ---
