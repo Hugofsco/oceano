@@ -126,7 +126,7 @@ def test_local_runs_under_the_serialization_gate(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def run(self, task, deadline=None):
+        def run(self, task, deadline=None, cancel=None):
             return "local says hi"
     monkeypatch.setattr("oceano.agent.Agent", FakeAgent)
     rec = agentjobs.spawn("t", provider="local")
