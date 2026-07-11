@@ -5969,7 +5969,7 @@ async function wfLoadModels() {
 // decision: yes|no · switch: case1|case2|case3|default · loop: loop(body)|done · approval: approved|rejected
 const WF_PORTS = {
   start: [0, 1], trigger: [0, 1], end: [1, 0],
-  decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2], wait: [1, 1],
+  decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2], wait: [1, 1], merge: [1, 1],
   tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
   http: [1, 2], subflow: [1, 2], transform: [1, 2],
   agent: [1, 2], await: [1, 2],
@@ -6021,6 +6021,7 @@ function wfNodeData(n) {
   if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
   if (n.type === "wait") return { minutes: String(n.minutes || 1), until: n.until || "" };
+  if (n.type === "merge") return { mode: n.mode || "concat" };
   return {};
 }
 /* ---- n8n-style cards: icon tile + friendly title + live summary. Settings moved to the inspector ---- */
@@ -6043,6 +6044,7 @@ const WF_ICONS = {
   loop: _wfSvg('<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>'),
   approval: _wfSvg('<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>'),
   wait: _wfSvg('<path d="M6 3h12"/><path d="M6 21h12"/><path d="M7 3v3.5L12 12 7 17.5V21"/><path d="M17 3v3.5L12 12l5 5.5V21"/>'),
+  merge: _wfSvg('<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>'),
 };
 const WF_META = {
   start: { name: "Start", kicker: "flow" }, end: { name: "End", kicker: "flow" },
@@ -6061,6 +6063,7 @@ const WF_META = {
   loop: { name: "For Each", kicker: "logic" },
   approval: { name: "Approval", kicker: "human" },
   wait: { name: "Wait", kicker: "logic" },
+  merge: { name: "Merge", kicker: "join" },
 };
 const WF_TRIG_TITLES = { manual: "Manual Trigger", schedule: "On Schedule", webhook: "Webhook", keyword: "Chat Keyword", watch: "File Watch", email: "New Email" };
 const _wfTrunc = (s, n = 44) => { s = String(s || "").trim().replace(/\s+/g, " "); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
@@ -6087,6 +6090,7 @@ function wfCardText(type, d) {
   if (type === "loop") return ["For Each", _wfTrunc(d.over, 32) || "list to iterate"];
   if (type === "approval") return ["Approval", _wfTrunc(d.prompt) || "ask before continuing"];
   if (type === "wait") return ["Wait", d.until ? "until " + d.until : (d.minutes || "1") + " min"];
+  if (type === "merge") return ["Merge", d.mode === "json" ? "join → JSON list" : "join → concatenate"];
   return [(WF_META[type] || { name: type }).name, ""];
 }
 // branch label shown beside each output dot ("" = unlabeled happy path)
@@ -6443,7 +6447,8 @@ const WF_FIELDS = {
     { k: "ruleval", t: "text", l: "value", showIf: d => d.mode === "rule" }],
   loop: [
     { k: "over", t: "textarea", l: "items", ph: "JSON array or newline list · e.g. {{last}}" },
-    { k: "as", t: "text", l: "item name", ph: "item", hint: "reference {{item}} and {{index}} inside the loop" }],
+    { k: "as", t: "text", l: "item name", ph: "item", hint: "reference {{item}} and {{index}} inside the loop" },
+    { t: "note", text: "after the <b>done</b> edge, every iteration's result is collected into a JSON list — it becomes {{last}} and this node's {{node.ID}} (dig in with e.g. {{node.ID.0}})." }],
   subflow: [
     { k: "workflow", t: "combo", en: "workflows", l: "workflow", ph: "name or id" },
     { k: "wfinput", t: "textarea", l: "input", ph: "input to pass · default {{last}}" },
@@ -6459,6 +6464,9 @@ const WF_FIELDS = {
     { k: "minutes", t: "number", l: "wait (minutes)", min: 1, max: 1440 },
     { k: "until", t: "text", l: "…or until (HH:MM)", ph: "e.g. 09:00 — takes over when set" },
     { t: "note", text: "pauses the run, then continues down its edge. The pause keeps the run alive (it shows in the jobs popup, where ✕ cancels it) — but it does NOT survive an Oceano restart." }],
+  merge: [
+    { k: "mode", t: "select", l: "join as", opts: [["concat", "concatenated text"], ["json", "a JSON list"]] },
+    { t: "note", text: "the join point for <b>forked</b> branches: draw several unlabeled edges out of one node and each target runs as its own branch (one at a time — the run shares a single agent); wire them all into me and I wait for every branch, then pass the combined results onward. Branches that die on a decision/error path don't block the join." }],
 };
 function wfInspGeneric(editor, dfId, type, box, sync) {
   const spec = WF_FIELDS[type] || [];
@@ -6871,7 +6879,7 @@ async function wfRenderEditor(body, w) {
       <div class="wf-sidebar" id="wfSidebar">
         <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>${pal("trigger")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>${["tool", "instruction", "delegate", "agent", "orchestrate", "http", "subflow", "transform"].map(pal).join("")}</div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "wait", "approval", "await"].map(pal).join("")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "merge", "wait", "approval", "await"].map(pal).join("")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>${pal("end")}</div>
         <div class="wf-pal-foot"><div class="wf-hint">click a node to edit it in the settings panel · drag an output dot onto an input dot to connect · values: {{input}} · {{last}} · {{node.ID}}</div></div>
       </div>
@@ -6970,6 +6978,7 @@ function wfReadCanvas(editor) {
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
     else if (t === "wait") { node.minutes = intOr0(d.minutes) || 1; node.until = (d.until || "").trim(); }
+    else if (t === "merge") { node.mode = d.mode || "concat"; }
     else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.label = d.label || ""; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; node.timeout = intOr0(d.timeout) || 600; }
     else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     else if (t === "orchestrate") {

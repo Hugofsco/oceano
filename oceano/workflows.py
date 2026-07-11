@@ -33,10 +33,10 @@ SOURCE_PREFIX = "workflow:"
 SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
 # switch=multi-branch, loop=foreach, http/subflow/transform=connectivity+data, approval=human-in-the-loop,
-# wait=delay (a duration or a clock time), agent/await/orchestrate=multi-agent (orchestrate =
-# plugged-in agent nodes run in ordered steps).
+# wait=delay (a duration or a clock time), merge=the join for forked parallel branches,
+# agent/await/orchestrate=multi-agent (orchestrate = plugged-in agent nodes run in ordered steps).
 NODE_TYPES = ("start", "trigger", "tool", "instruction", "delegate", "decision",
-              "switch", "loop", "http", "subflow", "transform", "approval", "wait",
+              "switch", "loop", "merge", "http", "subflow", "transform", "approval", "wait",
               "agent", "await", "orchestrate", "end")
 _AGENT_PROVIDERS = ("", "claude", "codex", "api", "local")   # "" = the delegation default
 _TRIGGER_NODE_KINDS = ("manual", "schedule", "webhook", "keyword", "watch", "email")
@@ -241,6 +241,8 @@ def _norm_graph(graph):
         elif t == "loop":
             node["over"] = str(n.get("over", ""))                 # expression → JSON list or newline list
             node["as"] = str(n.get("as", "item")).strip()[:40] or "item"
+        elif t == "merge":
+            node["mode"] = n.get("mode") if n.get("mode") in ("concat", "json") else "concat"
         elif t == "http":
             node["method"] = n.get("method") if n.get("method") in _HTTP_METHODS else "GET"
             node["url"] = str(n.get("url", "")).strip()
@@ -1163,6 +1165,8 @@ def _node_label(n):
         return "⤳ switch"
     if t == "loop":
         return "↻ loop " + (n.get("over", "")[:30])
+    if t == "merge":
+        return "⧉ merge" + (" → json" if n.get("mode") == "json" else "")
     if t == "http":
         return "🌐 " + (n.get("method", "GET")) + " " + (n.get("url", "")[:36])
     if t == "subflow":
@@ -1266,6 +1270,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     graph = wf.get("graph") or {"nodes": [], "edges": []}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     succ = {}                                          # id -> [(branch, to_id)]
+    inbound = {}                                       # id -> flow-edge fan-in (a merge node's quorum)
     attached = {}                                      # orchestrate node id -> [plugged-in agent nodes]
     for e in graph.get("edges", []):
         src, dst = nodes.get(e["from"]), nodes.get(e["to"])
@@ -1276,6 +1281,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
             attached.setdefault(dst["id"], []).append(src)
             continue
         succ.setdefault(e["from"], []).append((e.get("branch"), e["to"]))
+        inbound[e["to"]] = inbound.get(e["to"], 0) + 1
 
     start = next((n for n in graph.get("nodes", []) if n["type"] in ("start", "trigger")), None)
     if not start:                                      # tolerate a missing start: first node with no inbound edge
@@ -1288,7 +1294,11 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
         ag.messages.append({"role": "user", "content": f"(workflow input)\n{inp}"})
     # ctx powers {{...}} templating between nodes (issue 8 A)
     ctx = {"input": inp, "last": "", "nodes": {}, "item": None, "index": None}
-    loop_state = {}                                    # loop node id -> {items, cursor}
+    loop_state = {}                                    # loop node id -> {items, cursor, results}
+    # forking: a node with several plain out-edges runs EVERY branch — sequentially (the run
+    # shares one Agent by design), each with its own {{last}} — and a merge node joins them.
+    branch_q = []                                      # parked branches: (node id, that branch's last)
+    merge_got, merge_done, force_merge = {}, set(), set()
     spawned = {}                                       # agent node id -> agentjobs id (this run's spawns)
     results, last_output, visits = [], "", 0
     cancelled = False
@@ -1308,14 +1318,31 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
         if not nested:
             stack.enter_context(tools.background())
         with stack:
-            while cur and visits < _VISIT_CAP:
+            while visits < _VISIT_CAP:
+                if cur is None:                        # this branch ended — resume a forked one,
+                    if branch_q:                       # restoring ITS branch-local {{last}}
+                        nid, blast = branch_q.pop(0)
+                        cur = nodes.get(nid)
+                        if cur is not None:
+                            ctx["last"] = blast
+                        continue
+                    # nothing left to run: force any merge still waiting whose other branches
+                    # died along the way (decision/error/end), so a fork can never hang the run
+                    mid = next((m for m, got in merge_got.items()
+                                if got and m not in merge_done and m in nodes), None)
+                    if mid is None:
+                        break
+                    force_merge.add(mid)
+                    cur = nodes[mid]
+                    continue
                 visits += 1
                 if ce is not None and ce.is_set():
                     cancelled = True
                     break
                 t = cur["type"]
-                if t == "end":
-                    break
+                if t == "end":                         # ends THIS branch; forked siblings continue
+                    cur = None
+                    continue
                 # ---- loop node: foreach over a list, with a "loop" body edge and a "done" exit edge ----
                 if t == "loop":
                     ls = loop_state.get(cur["id"])
@@ -1330,7 +1357,9 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             items = None
                         if items is None:
                             items = [ln for ln in raw.splitlines() if ln.strip()]
-                        ls = loop_state[cur["id"]] = {"items": items[:_LOOP_CAP], "cursor": 0}
+                        ls = loop_state[cur["id"]] = {"items": items[:_LOOP_CAP], "cursor": 0, "results": []}
+                    else:                              # back from an iteration: collect the body's output
+                        ls["results"].append(ctx["last"])
                     if ls["cursor"] < len(ls["items"]):
                         ctx["item"] = ls["items"][ls["cursor"]]
                         ctx["index"] = ls["cursor"]
@@ -1342,12 +1371,56 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                         nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == "loop"), None))
                         cur = nodes.get(nxt) if nxt is not None else None
                         continue
-                    else:                              # loop exhausted → take the 'done' edge
-                        ctx["item"] = ctx["index"] = None
+                    else:                              # exhausted → aggregate every iteration's result
+                        ctx["item"] = ctx["index"] = None   # (a JSON list) and take the 'done' edge
+                        agg = json.dumps(ls["results"])
+                        ctx["nodes"][cur["id"]] = agg
+                        ctx["last"] = agg
+                        last_output = agg
+                        label = f"↻ loop done · {len(ls['results'])} result{'s' if len(ls['results']) != 1 else ''}"
+                        results.append({"id": cur["id"], "type": t, "label": label, "ok": True,
+                                        "branch": "done", "output": agg[:_OUT_CAP]})
+                        emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": "done",
+                              "label": label, "output": agg[:_OUT_CAP]})
+                        loop_state.pop(cur["id"], None)     # a revisit (cycle) starts a fresh pass
                         nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == "done"), None)
                                or next((to for (br, to) in succ.get(cur["id"], []) if br is None), None))
                         cur = nodes.get(nxt) if nxt is not None else None
                         continue
+
+                # ---- merge node: the join for forked branches — waits for its whole fan-in ----
+                if t == "merge":
+                    got = merge_got.setdefault(cur["id"], [])
+                    if cur["id"] not in force_merge:   # a forced entry brings no new arrival
+                        got.append(ctx["last"])
+                    need = inbound.get(cur["id"], 1)
+                    if len(got) < need and branch_q and cur["id"] not in force_merge:
+                        # visible like a loop iteration: one small completed row per arrival
+                        emit({"event": "node_start", "id": cur["id"], "type": t,
+                              "label": f"⧉ merge {len(got)}/{need}"})
+                        emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": None,
+                              "output": f"{len(got)}/{need} branches arrived — waiting for the rest"})
+                        cur = None                     # park: resume the next forked branch
+                        continue
+                    label = _node_label(cur)
+                    emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
+                    if len(got) < need:                # forced or last-branch-standing: partial join
+                        emit({"event": "tool", "id": cur["id"],
+                              "text": f"⧉ merged {len(got)}/{need} branches (the rest never arrived)"})
+                    output = json.dumps(got) if cur.get("mode") == "json" else "\n\n".join(got)
+                    merge_done.add(cur["id"])
+                    merge_got.pop(cur["id"], None)     # a revisit (cycle) collects fresh arrivals
+                    force_merge.discard(cur["id"])
+                    ctx["nodes"][cur["id"]] = output
+                    ctx["last"] = output
+                    last_output = output
+                    results.append({"id": cur["id"], "type": t, "label": label, "ok": True,
+                                    "branch": None, "output": output[:_OUT_CAP]})
+                    emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": None,
+                          "label": label, "output": output[:_OUT_CAP]})
+                    nxt = _route(cur, succ, None)
+                    cur = nodes.get(nxt) if nxt is not None else None
+                    continue
 
                 label = _node_label(cur)
                 emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
@@ -1518,7 +1591,15 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                     nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == branch), None)
                            or next((to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")), None))
                 else:
-                    nxt = _route(cur, succ, branch)
+                    plain = [to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")]
+                    if ok and len(plain) > 1 and t not in ("decision", "switch"):
+                        # fork: every plain out-edge runs — the first now, the rest parked with
+                        # THIS node's output as their own {{last}} — and a merge node joins them
+                        for to in plain[1:]:
+                            branch_q.append((to, ctx["last"]))
+                        nxt = plain[0]
+                    else:
+                        nxt = _route(cur, succ, branch)
                 cur = nodes.get(nxt) if nxt is not None else None
 
             status = "cancelled" if cancelled else (

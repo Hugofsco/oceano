@@ -258,7 +258,14 @@ walks it from a **start** node, following edges:
 - **decision** — routes **yes / no** down different edges, judged by a **rule** over the
   previous step's output, the **local model**, or a **delegate**
 - **switch** — multi-branch routing (more than a yes/no — pick an edge by matching a value)
-- **loop** — foreach over a list, running its body once per element (`{{item}}` / `{{index}}`)
+- **loop** — foreach over a list, running its body once per element (`{{item}}` / `{{index}}`);
+  at the **done** edge every iteration's result is collected into a **JSON list** (it becomes
+  `{{last}}` and the loop's own `{{node.<id>}}`)
+- **merge** — the join for **forked branches**: draw several unlabeled edges out of one node
+  and each target runs as its own branch (sequentially — the run shares one agent — each with
+  its own `{{last}}`); wire them into a merge and it waits for its whole fan-in, then passes
+  the combined results on (concatenated, or as a JSON list). A branch that dies on a
+  decision/error path can't hang the join.
 - **agent** — spawn a **background sub-agent** (Claude / Codex / a cloud model / local; task
   templated with `{{…}}`) and keep walking the flow — fan out work mid-run. Runs with the same
   read-only tool scope as the delegate node.
