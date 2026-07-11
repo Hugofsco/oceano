@@ -23,7 +23,7 @@ import re
 import secrets
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 from oceano import atomicio, tools
@@ -33,9 +33,10 @@ SOURCE_PREFIX = "workflow:"
 SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
 # switch=multi-branch, loop=foreach, http/subflow/transform=connectivity+data, approval=human-in-the-loop,
-# agent/await/orchestrate=multi-agent (orchestrate = plugged-in agent nodes run in ordered steps).
+# wait=delay (a duration or a clock time), agent/await/orchestrate=multi-agent (orchestrate =
+# plugged-in agent nodes run in ordered steps).
 NODE_TYPES = ("start", "trigger", "tool", "instruction", "delegate", "decision",
-              "switch", "loop", "http", "subflow", "transform", "approval",
+              "switch", "loop", "http", "subflow", "transform", "approval", "wait",
               "agent", "await", "orchestrate", "end")
 _AGENT_PROVIDERS = ("", "claude", "codex", "api", "local")   # "" = the delegation default
 _TRIGGER_NODE_KINDS = ("manual", "schedule", "webhook", "keyword", "watch", "email")
@@ -258,6 +259,13 @@ def _norm_graph(graph):
                 node["timeout"] = max(1, min(int(n.get("timeout", 60)), 1440))   # minutes
             except (TypeError, ValueError):
                 node["timeout"] = 60
+        elif t == "wait":
+            try:
+                node["minutes"] = max(1, min(int(n.get("minutes", 1)), 1440))
+            except (TypeError, ValueError):
+                node["minutes"] = 1
+            until = str(n.get("until", "")).strip()               # HH:MM beats minutes when set
+            node["until"] = until if re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", until) else ""
         nodes.append(node)
     ids = {n["id"] for n in nodes}
     edges = []
@@ -293,23 +301,57 @@ def _norm_input(d):
 #   {{last}}             the previous node's output
 #   {{node.<id>}}        a specific earlier node's output (also {{node.<id>.output}}, {{step.<id>}})
 #   {{item}} {{index}}   the current element/position inside a loop (foreach) node
+# input/last/item/node.<id> also take a dotted path that digs into JSON output — case-sensitive
+# keys, integer parts index lists: {{last.result.url}} · {{node.7.items.0.name}} · {{item.email}}.
+# ({{node.<id>.output}} stays the WHOLE output for backward compatibility, even if the JSON has
+# an "output" key — use {{node.<id>.output.<path>}} to dig past it.)
 # Unknown tokens render empty (never leak the literal braces or internal state).
 _TMPL_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
+def _walk_path(cur, path):
+    """Walk a dotted/bracketed path (a.b.0.c or a[0].b) through parsed JSON; None when a hop
+    is missing — the caller turns that into the usual silent-empty render."""
+    for part in [p for p in re.split(r"[.\[\]]", path) if p]:
+        try:
+            cur = cur[int(part)] if part.lstrip("-").isdigit() else cur[part]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return cur
+
+
+def _dig(raw, path):
+    """JSON-parse a value's (string) output and walk `path` into it. '' when the value isn't
+    JSON or the path is absent; non-string leaves render as compact JSON."""
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    val = _walk_path(obj, path)
+    if val is None:
+        return ""
+    return val if isinstance(val, str) else json.dumps(val)
+
+
 def _resolve_token(expr, ctx):
-    low = expr.strip().lower()
-    if low == "input":
-        return str(ctx.get("input", ""))
-    if low in ("last", "prev", "previous", "output"):
-        return str(ctx.get("last", ""))
-    if low in ("item", "loop.item"):
-        return str(ctx.get("item", ""))
+    expr = expr.strip()
+    low = expr.lower()
     if low in ("index", "loop.index", "i"):
         return str(ctx.get("index", ""))
-    m = re.match(r"(?:nodes?|step|steps)\.(\d+)(?:\.output)?$", low)
+    if low == "loop.item":
+        return str(ctx.get("item") or "")
+    m = re.match(r"(input|last|prev|previous|output|item)(?:\.(.+))?$", expr, re.IGNORECASE)
     if m:
-        return str(ctx.get("nodes", {}).get(int(m.group(1)), ""))
+        base = {"input": "input", "item": "item"}.get(m.group(1).lower(), "last")
+        raw = str(ctx.get(base) or "")
+        return _dig(raw, m.group(2)) if m.group(2) else raw
+    m = re.match(r"(?:nodes?|steps?)\.(\d+)(?:\.(.+))?$", expr, re.IGNORECASE)
+    if m:
+        raw = str(ctx.get("nodes", {}).get(int(m.group(1)), ""))
+        path = m.group(2)
+        if not path or path.lower() == "output":     # bare/.output → the whole value (compat)
+            return raw
+        return _dig(raw, path)
     return ""
 
 
@@ -341,6 +383,11 @@ def _persona_prefix(persona):
 
 
 # ---------------- CRUD ----------------
+# what a second run starting while one is in flight does: "skip" (default) records a skipped
+# run instead of racing the live one; "allow" is the explicit opt-in to overlapping runs.
+_OVERLAP = ("skip", "allow")
+
+
 def list_all():
     return _load()["workflows"]
 
@@ -354,11 +401,12 @@ def get_by_name(name):
     return next((w for w in _load()["workflows"] if w["name"].strip().lower() == name), None)
 
 
-def create(name, description="", graph=None, input_cfg=None):
+def create(name, description="", graph=None, input_cfg=None, overlap=None):
     data = _load()
     wf = {"id": _next_id(data["workflows"]), "name": (name or "Untitled").strip(),
           "description": (description or "").strip(), "graph": _norm_graph(graph or {}),
-          "input": _norm_input(input_cfg), "triggers": [], "created": _now()}
+          "input": _norm_input(input_cfg), "triggers": [], "created": _now(),
+          "overlap": overlap if overlap in _OVERLAP else "skip"}
     _apply_graph_triggers(wf)
     cron = wf.pop("_graph_cron", None)
     data["workflows"].append(wf)
@@ -368,7 +416,7 @@ def create(name, description="", graph=None, input_cfg=None):
     return wf
 
 
-def update(wid, name=None, description=None, graph=None, input_cfg=None):
+def update(wid, name=None, description=None, graph=None, input_cfg=None, overlap=None):
     data = _load()
     wf = next((w for w in data["workflows"] if w["id"] == wid), None)
     if not wf:
@@ -377,6 +425,8 @@ def update(wid, name=None, description=None, graph=None, input_cfg=None):
         wf["name"] = name.strip()
     if description is not None:
         wf["description"] = description.strip()
+    if overlap in _OVERLAP:
+        wf["overlap"] = overlap
     cron = None
     if graph is not None:
         wf["graph"] = _norm_graph(graph)
@@ -849,11 +899,9 @@ def _run_transform(node, ctx):
             cur = json.loads(src)
         except Exception:                            # noqa: BLE001
             return False, "input is not JSON"
-        for part in [p for p in re.split(r"[.\[\]]", _tmpl(text, ctx).strip()) if p]:
-            try:
-                cur = cur[int(part)] if part.lstrip("-").isdigit() else cur[part]
-            except (KeyError, IndexError, TypeError):
-                return True, ""
+        cur = _walk_path(cur, _tmpl(text, ctx).strip())
+        if cur is None:
+            return True, ""
         return True, cur if isinstance(cur, str) else json.dumps(cur)
     if mode == "python":
         # run via the existing workspace-confined + guarded python_exec tool; `value` holds the input
@@ -875,6 +923,21 @@ def _run_subflow(node, ctx, depth):
     rec = run(sub, trigger="subflow", inp=sub_inp, _depth=depth + 1, nested=True)
     out = (rec or {}).get("output") or (rec or {}).get("summary", "")
     return (rec or {}).get("status") == "ok", out
+
+
+# ---------------- wait node: pause for a duration or until a clock time ----------------
+def _wait_seconds(node):
+    """A wait node's delay: seconds until the next occurrence of `until` (HH:MM, local clock)
+    when set, else `minutes`. _norm_graph caps both at a day."""
+    until = node.get("until") or ""
+    if until:
+        h, m = until.split(":")
+        now = datetime.now()
+        target = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
+    return max(1, int(node.get("minutes", 1))) * 60
 
 
 # ---------------- human-in-the-loop approval (issue 8 D) ----------------
@@ -1108,6 +1171,8 @@ def _node_label(n):
         return "ƒ " + (n.get("mode", "transform"))
     if t == "approval":
         return "✋ " + (n.get("prompt", "")[:40] or "approval")
+    if t == "wait":
+        return "⏲ wait " + (("until " + n["until"]) if n.get("until") else f"{n.get('minutes', 1)}m")
     return t
 
 
@@ -1178,6 +1243,25 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                 on_step(ev)
             except Exception:
                 pass
+
+    # overlap guard: unless this workflow opts in ("overlap": "allow"), a run starting while one
+    # is already in flight is recorded as 'skipped' instead of racing it — stacked watch/email/cron
+    # fires would otherwise pile up threads and fight over the single live-view slot per workflow.
+    if not nested and (wf.get("overlap") or "skip") != "allow":
+        with _LIVE_LOCK:
+            _prune_live()
+            st = _LIVE.get(wf_id)
+            busy = bool(st and st.get("status") == "running")
+        if busy:
+            rec = _record_run(wf_id, trigger, "skipped", [],
+                              "skipped — a run of this workflow is already in progress")
+            rec["output"] = ""
+            if on_step:
+                try:
+                    on_step({"event": "done", "status": "skipped", "run": rec})
+                except Exception:
+                    pass
+            return rec
 
     graph = wf.get("graph") or {"nodes": [], "edges": []}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
@@ -1392,6 +1476,18 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             ok = approved
                             branch = "approved" if approved else "rejected"
                             output = detail
+                        elif t == "wait":              # sleep in short slices: heartbeat + cancellable
+                            secs = int(_wait_seconds(cur))
+                            deadline = time.time() + secs
+                            while time.time() < deadline:
+                                beat()
+                                if ce is not None and ce.is_set():   # ✕ in the jobs popup
+                                    break
+                                time.sleep(min(30.0, max(0.0, deadline - time.time())))
+                            if ce is not None and ce.is_set():       # the loop head turns this into 'cancelled'
+                                output = f"wait interrupted by cancel after {max(0, secs - int(deadline - time.time()))}s"
+                            else:
+                                output = f"waited {secs}s" + (f" (until {cur['until']})" if cur.get("until") else "")
                     except Exception as ex:            # noqa: BLE001
                         ok, output = False, f"{type(ex).__name__}: {ex}"
                     if ok or attempt + 1 >= attempts:
@@ -1399,9 +1495,11 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                     emit({"event": "tool", "id": cur["id"], "text": f"retry {attempt + 1}/{attempts - 1}…"})
                     time.sleep(1)
 
-                # record output as this node's value, and as 'last' for plain (non-branching) nodes
+                # record output as this node's value, and as 'last' for plain (non-branching)
+                # nodes — wait joins the exceptions so "waited 300s" never clobbers the value
+                # the node AFTER the pause actually wants to reference
                 ctx["nodes"][cur["id"]] = output
-                if t not in ("decision", "switch", "approval"):
+                if t not in ("decision", "switch", "approval", "wait"):
                     ctx["last"] = output
                     last_output = output
                 # attached agents aren't walked by traversal, so fold their own rows in now — right

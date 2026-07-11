@@ -352,7 +352,8 @@ async def workflows_create(req: Request):
     b = await req.json()
     return {"ok": True, "workflow": workflows.create(b.get("name", "Untitled"),
                                                       b.get("description", ""), b.get("graph"),
-                                                      input_cfg=b.get("input"))}
+                                                      input_cfg=b.get("input"),
+                                                      overlap=b.get("overlap"))}
 
 
 @router.patch("/api/workflows/{wid}")
@@ -360,7 +361,8 @@ async def workflows_update(wid: int, req: Request):
     from oceano import workflows
     b = await req.json()
     wf = workflows.update(wid, name=b.get("name"), description=b.get("description"),
-                          graph=b.get("graph"), input_cfg=b.get("input"))
+                          graph=b.get("graph"), input_cfg=b.get("input"),
+                          overlap=b.get("overlap"))
     return {"ok": wf is not None, "workflow": wf}
 
 

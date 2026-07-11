@@ -275,6 +275,8 @@ walks it from a **start** node, following edges:
 - **sub-workflow** — run another saved workflow as a single step
 - **transform** — reshape the data flowing between nodes (no agent turn)
 - **approval** — pause for **human-in-the-loop** sign-off before continuing
+- **wait** — pause for a duration (minutes) or **until a clock time** (HH:MM), then continue;
+  cancellable from the jobs popup, and it never clobbers `{{last}}`
 - **start / end**
 
 **Personas.** An **instruction**, **delegate**, or **agent** node can also name a **persona** —
@@ -297,7 +299,13 @@ value** (Editor → *Takes an input*). Reference it as `{{input}}` anywhere — 
 instruction text, a delegate prompt, or a tool's arguments — and it's also seeded into the
 agent's context. Nodes also pass data **between** each other: `{{last}}` (the previous step's
 output), `{{node.<id>}}` (any earlier node's output by id), and inside a **loop** `{{item}}` /
-`{{index}}`. The same graph then processes a different value each run: ▶ Run prompts for
+`{{index}}`. When a value is JSON, add a **dotted path** to dig straight into it —
+`{{last.result.url}}`, `{{node.7.items.0.name}}`, `{{item.email}}` — no transform node needed
+(keys are case-sensitive, integer parts index lists, a missing path renders empty). And you
+don't have to memorize node ids: the inspector's footer is a **reference picker** — one
+clickable chip per upstream node (labelled by its card title) plus `{{input}}` / `{{last}}`
+(and `{{item}}` / `{{index}}` inside a loop body); clicking inserts the token at your cursor.
+The same graph then processes a different value each run: ▶ Run prompts for
 it, the agent can pass it via `run_workflow(name, input=…)`, a **webhook** body carries it
 (`{"input": …}` or raw text), a **chat keyword** hands the whole message in, and a **chain**
 passes the upstream workflow's output down as the next one's input. A stored **default** feeds
@@ -307,7 +315,9 @@ unattended (scheduled) runs.
 on a **cron** (managed in the Scheduler), or on an **event** — a watched workspace folder
 changing, an incoming **webhook** (a secret-token URL), a **chat keyword** (web / Telegram),
 an incoming **email** (new mail in a watched account/folder), or **another workflow finishing**
-(chaining, loop-guarded). Every run is recorded (live,
+(chaining, loop-guarded). If a trigger fires while a run of the same workflow is still going,
+the new run is recorded as **skipped** instead of racing it — stacked watch/email/cron fires
+can't pile up (tick *allow overlapping runs* in the editor to opt out). Every run is recorded (live,
 node-by-node over SSE), and a run still in progress when you **refresh the browser reconnects**
 to its live state. The agent can also trigger saved workflows with `run_workflow`, but you
 author them in the UI. Stored in `data/workflows.json`; the canvas is a vendored

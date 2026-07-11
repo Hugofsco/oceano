@@ -1404,6 +1404,7 @@ button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:
 .wf-ic-en,.wf-ic-req{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mist);white-space:nowrap;cursor:pointer}
 .wf-ic-en{color:var(--biolum)}
 .wf-input-cfg .wf-ic-f{width:auto;flex:1;min-width:120px;max-width:230px}
+.wf-ic-ov{margin-left:auto;color:var(--mist)}
 .wf-ic-hint{font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
 .wf-ic-hint code{background:rgba(var(--abyss-0-rgb),.7);color:var(--biolum);padding:1px 5px;border-radius:5px}
 .wf-inp-badge{font-family:var(--font-mono);font-size:11px;color:var(--biolum);background:rgba(var(--biolum-rgb),.12);border-radius:7px;padding:1px 7px;font-weight:400}
@@ -1580,7 +1581,15 @@ textarea.wfn-fld{resize:vertical;min-height:34px}
 .wf-orch-step:focus{outline:none;border-color:var(--biolum)}
 .wf-orch-name{flex:1;min-width:0;font-size:12px;color:var(--foam);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .wf-insp-f{flex:0 0 auto;padding:9px 12px;border-top:1px solid var(--line);font-family:var(--font-mono);font-size:9.5px;color:var(--faint);line-height:1.6}
+.wf-insp-f:empty{display:none}
 .wf-insp-f code{color:var(--biolum);background:rgba(var(--abyss-0-rgb),.7);border-radius:4px;padding:0 4px}
+/* reference picker: clickable {{…}} chips for values earlier in the flow */
+.wf-ref-h{color:var(--mist);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}
+.wf-ref-chips{display:flex;flex-wrap:wrap;gap:4px;max-height:96px;overflow-y:auto}
+.wf-ref-chip{background:rgba(var(--biolum-rgb),.07);border:1px solid rgba(var(--biolum-rgb),.22);border-radius:6px;padding:2px 6px;cursor:pointer;line-height:1.4}
+.wf-ref-chip:hover{background:rgba(var(--biolum-rgb),.16);border-color:rgba(var(--biolum-rgb),.45)}
+.wf-ref-chip code{background:none;padding:0}
+.wf-ref-hint{margin-top:5px;color:var(--faint)}
 
 /* settings toggle switch (serialize) */
 .set-toggle{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}

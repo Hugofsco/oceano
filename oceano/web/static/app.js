@@ -5969,7 +5969,7 @@ async function wfLoadModels() {
 // decision: yes|no · switch: case1|case2|case3|default · loop: loop(body)|done · approval: approved|rejected
 const WF_PORTS = {
   start: [0, 1], trigger: [0, 1], end: [1, 0],
-  decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2],
+  decision: [1, 2], switch: [1, 4], loop: [1, 2], approval: [1, 2], wait: [1, 1],
   tool: [1, 2], instruction: [1, 2], delegate: [1, 2],
   http: [1, 2], subflow: [1, 2], transform: [1, 2],
   agent: [1, 2], await: [1, 2],
@@ -6020,6 +6020,7 @@ function wfNodeData(n) {
   if (n.type === "subflow") return { workflow: n.workflow || "", wfinput: n.wfInput || "", retries: String(n.retries || 0) };
   if (n.type === "transform") return { mode: n.mode || "template", source: n.source || "", text: n.text || "" };
   if (n.type === "approval") return { prompt: n.prompt || "", timeout: String(n.timeout || 60) };
+  if (n.type === "wait") return { minutes: String(n.minutes || 1), until: n.until || "" };
   return {};
 }
 /* ---- n8n-style cards: icon tile + friendly title + live summary. Settings moved to the inspector ---- */
@@ -6041,6 +6042,7 @@ const WF_ICONS = {
   switch: _wfSvg('<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>'),
   loop: _wfSvg('<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>'),
   approval: _wfSvg('<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>'),
+  wait: _wfSvg('<path d="M6 3h12"/><path d="M6 21h12"/><path d="M7 3v3.5L12 12 7 17.5V21"/><path d="M17 3v3.5L12 12l5 5.5V21"/>'),
 };
 const WF_META = {
   start: { name: "Start", kicker: "flow" }, end: { name: "End", kicker: "flow" },
@@ -6058,6 +6060,7 @@ const WF_META = {
   switch: { name: "Switch", kicker: "logic" },
   loop: { name: "For Each", kicker: "logic" },
   approval: { name: "Approval", kicker: "human" },
+  wait: { name: "Wait", kicker: "logic" },
 };
 const WF_TRIG_TITLES = { manual: "Manual Trigger", schedule: "On Schedule", webhook: "Webhook", keyword: "Chat Keyword", watch: "File Watch", email: "New Email" };
 const _wfTrunc = (s, n = 44) => { s = String(s || "").trim().replace(/\s+/g, " "); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
@@ -6083,6 +6086,7 @@ function wfCardText(type, d) {
   if (type === "switch") { const n = [1, 2, 3].filter(i => (d["c" + i + "label"] || "").trim()).length; return ["Switch", _wfTrunc(d.source, 26) || (n ? n + " case" + (n > 1 ? "s" : "") : "route by value")]; }
   if (type === "loop") return ["For Each", _wfTrunc(d.over, 32) || "list to iterate"];
   if (type === "approval") return ["Approval", _wfTrunc(d.prompt) || "ask before continuing"];
+  if (type === "wait") return ["Wait", d.until ? "until " + d.until : (d.minutes || "1") + " min"];
   return [(WF_META[type] || { name: type }).name, ""];
 }
 // branch label shown beside each output dot ("" = unlabeled happy path)
@@ -6451,6 +6455,10 @@ const WF_FIELDS = {
   approval: [
     { k: "prompt", t: "textarea", l: "what to approve?", ph: "shown while the run waits for you" },
     { k: "timeout", t: "number", l: "timeout (min)", min: 1 }],
+  wait: [
+    { k: "minutes", t: "number", l: "wait (minutes)", min: 1, max: 1440 },
+    { k: "until", t: "text", l: "…or until (HH:MM)", ph: "e.g. 09:00 — takes over when set" },
+    { t: "note", text: "pauses the run, then continues down its edge. The pause keeps the run alive (it shows in the jobs popup, where ✕ cancels it) — but it does NOT survive an Oceano restart." }],
 };
 function wfInspGeneric(editor, dfId, type, box, sync) {
   const spec = WF_FIELDS[type] || [];
@@ -6638,6 +6646,57 @@ function wfInspOrch(editor, dfId, box, sync) {
   };
   render();
 }
+// every node whose output can feed THIS one (walks incoming edges transitively) — the reference
+// picker below lists them so {{node.ID}} tokens can be inserted without memorizing canvas ids
+function wfUpstream(editor, dfId) {
+  const dd = editor.drawflow.drawflow.Home.data;
+  const rev = {};                                   // node id -> ids wired into it
+  Object.keys(dd).forEach(k => {
+    const outs = dd[k].outputs || {};
+    for (const o in outs) (outs[o].connections || []).forEach(c => (rev[c.node] = rev[c.node] || []).push(k));
+  });
+  const seen = new Set(), q = [...(rev[String(dfId)] || [])];
+  while (q.length) {
+    const id = q.shift();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    (rev[id] || []).forEach(p => q.push(p));
+  }
+  return [...seen].map(id => dd[id]).filter(Boolean);
+}
+// inspector footer: clickable {{…}} chips for the values THIS node can actually reference — the
+// run input, the previous output, item/index when downstream of a loop, and one chip per upstream
+// node (labelled by its card title, not just an id). Click inserts at the cursor of the focused field.
+function wfRefChips(editor, dfId, insp) {
+  const foot = insp.querySelector(".wf-insp-f"); if (!foot) return;
+  const ups = wfUpstream(editor, dfId);
+  const chips = [["{{input}}", "this run's input value"], ["{{last}}", "the previous node's output"]];
+  if (ups.some(n => n.name === "loop")) chips.push(["{{item}}", "the current loop element"], ["{{index}}", "the current loop position (0-based)"]);
+  ups.filter(n => !["start", "end", "trigger", "loop"].includes(n.name)).forEach(n => {
+    const [t, s] = wfCardText(n.name, n.data || {});
+    chips.push([`{{node.${n.id}}}`, t + (s ? " · " + s : "")]);
+  });
+  foot.innerHTML = `<div class="wf-ref-h">insert an earlier value</div><div class="wf-ref-chips">` +
+    chips.map(([tok, tip]) => `<button type="button" class="wf-ref-chip" data-tok="${escapeHtml(tok)}" title="${escapeHtml(tip)}"><code>${escapeHtml(tok)}</code></button>`).join("") +
+    `</div><div class="wf-ref-hint">click to insert · add a path to dig into JSON — e.g. <code>{{node.ID.items.0.url}}</code></div>`;
+  let focused = null;                               // last text field the user was editing
+  insp.addEventListener("focusin", e => {
+    const f = e.target;
+    if (f.classList && f.classList.contains("wfn-fld") && (f.tagName === "TEXTAREA" || (f.tagName === "INPUT" && f.type === "text")))
+      focused = f;
+  });
+  foot.querySelectorAll(".wf-ref-chip").forEach(c => c.addEventListener("mousedown", e => {
+    e.preventDefault();                             // keep focus (and the cursor) in the field
+    const f = (focused && insp.contains(focused)) ? focused
+      : insp.querySelector(".wf-insp-b textarea.wfn-fld, .wf-insp-b input.wfn-fld:not([type=number]):not([type=hidden])");
+    if (!f) return;
+    const tok = c.dataset.tok, s = f.selectionStart ?? f.value.length, en = f.selectionEnd ?? s;
+    if (f.setRangeText) f.setRangeText(tok, s, en, "end"); else f.value += tok;
+    f.dispatchEvent(new Event("input", { bubbles: true }));    // run the same sync the inspector binds
+    f.dispatchEvent(new Event("change", { bubbles: true }));
+    f.focus();
+  }));
+}
 function wfInspect(editor, dfId, body) {
   const insp = $("#wfInsp", body); if (!insp) return;
   const nd = editor.getNodeFromId(dfId); if (!nd) return;
@@ -6652,7 +6711,8 @@ function wfInspect(editor, dfId, body) {
       <button class="ed-btn wf-insp-x" title="close">✕</button>
     </div>
     <div class="wf-insp-b"></div>
-    <div class="wf-insp-f">earlier values: <code>{{input}}</code> <code>{{last}}</code> <code>{{node.ID}}</code></div>`;
+    <div class="wf-insp-f"></div>`;
+  if (!["start", "end", "trigger", "await"].includes(type)) wfRefChips(editor, dfId, insp);
   $(".wf-insp-x", insp).onclick = () => wfInspClear(body);
   $(".wf-insp-del", insp).onclick = () => { try { editor.removeNodeId("node-" + dfId); } catch {} wfInspClear(body); };
   const box = $(".wf-insp-b", insp);
@@ -6805,12 +6865,13 @@ async function wfRenderEditor(body, w) {
       <label class="wf-ic-req"><input type="checkbox" id="wfInpReq"${inp.required ? " checked" : ""}> required</label>
       <input id="wfInpDef" class="wfn-fld wf-ic-f" placeholder="default for scheduled/auto runs" value="${escapeHtml(inp.default || "")}">
       <span class="wf-ic-hint">reference it as <code>{{input}}</code> in any node's text or args</span>
+      <label class="wf-ic-en wf-ic-ov" title="off (default): if a trigger fires while a run of this workflow is still going, the new run is skipped instead of racing it"><input type="checkbox" id="wfOverlap"${w && w.overlap === "allow" ? " checked" : ""}> allow overlapping runs</label>
     </div>
     <div class="wf-editor-main">
       <div class="wf-sidebar" id="wfSidebar">
         <div class="wf-pal-group"><div class="wf-pal-h">Triggers</div>${pal("trigger")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Actions</div>${["tool", "instruction", "delegate", "agent", "orchestrate", "http", "subflow", "transform"].map(pal).join("")}</div>
-        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "approval", "await"].map(pal).join("")}</div>
+        <div class="wf-pal-group"><div class="wf-pal-h">Logic</div>${["decision", "switch", "loop", "wait", "approval", "await"].map(pal).join("")}</div>
         <div class="wf-pal-group"><div class="wf-pal-h">Flow</div>${pal("end")}</div>
         <div class="wf-pal-foot"><div class="wf-hint">click a node to edit it in the settings panel · drag an output dot onto an input dot to connect · values: {{input}} · {{last}} · {{node.ID}}</div></div>
       </div>
@@ -6872,7 +6933,8 @@ async function wfRenderEditor(body, w) {
     const input = { enabled: $("#wfInpEn", body).checked, label: $("#wfInpLabel", body).value.trim(),
       placeholder: $("#wfInpPh", body).value.trim(), required: $("#wfInpReq", body).checked,
       default: $("#wfInpDef", body).value.trim() };
-    const payload = { name, description: $("#wfDesc").value.trim(), graph, input };
+    const payload = { name, description: $("#wfDesc").value.trim(), graph, input,
+      overlap: $("#wfOverlap", body).checked ? "allow" : "skip" };
     if (w) await fetch("/api/workflows/" + w.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     else await _postJ("/api/workflows", payload);
     wfRenderList(body);
@@ -6907,6 +6969,7 @@ function wfReadCanvas(editor) {
     else if (t === "subflow") { node.workflow = d.workflow || ""; node.wfInput = d.wfinput || ""; node.retries = intOr0(d.retries); }
     else if (t === "transform") { node.mode = d.mode || "template"; node.source = d.source || ""; node.text = d.text || ""; }
     else if (t === "approval") { node.prompt = d.prompt || ""; node.timeout = intOr0(d.timeout) || 60; }
+    else if (t === "wait") { node.minutes = intOr0(d.minutes) || 1; node.until = (d.until || "").trim(); }
     else if (t === "agent") { node.task = d.task || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.label = d.label || ""; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; node.timeout = intOr0(d.timeout) || 600; }
     else if (t === "await") { node.timeout = intOr0(d.timeout) || 900; }
     else if (t === "orchestrate") {
