@@ -1,0 +1,29 @@
+{
+  "name": "Research fan-out",
+  "description": "Take a topic, research it down two branches at once — a fresh web search AND your local document library — then merge both and write a one-page brief. Shows: forked branches (two plain edges out of one node), the merge join, workflow input, search_docs (local RAG).",
+  "overlap": "skip",
+  "input": {"enabled": true, "label": "Topic to research", "placeholder": "e.g. solid-state batteries", "required": true, "default": ""},
+  "triggers": [],
+  "graph": {
+    "nodes": [
+      {"id": 1, "type": "trigger", "kind": "manual", "x": 40, "y": 200},
+      {"id": 2, "type": "tool", "tool": "web_search", "args": {"query": "{{input}} — latest developments"}, "x": 280, "y": 110},
+      {"id": 3, "type": "tool", "tool": "search_docs", "args": {"query": "{{input}}"}, "x": 280, "y": 300},
+      {"id": 4, "type": "merge", "mode": "concat", "x": 530, "y": 200},
+      {"id": 5, "type": "instruction", "text": "Write a one-page research brief on “{{input}}”, in Markdown.\nYou have two sources above: a fresh web search ({{node.2}}) and my local document library ({{node.3}}).\nStructure: 3-sentence summary · what's new · what my own documents add or contradict · 3 open questions. Cite which source each point came from.", "x": 770, "y": 200},
+      {"id": 6, "type": "tool", "tool": "write_file", "args": {"path": "research/brief.md", "content": "{{last}}"}, "x": 1020, "y": 200},
+      {"id": 7, "type": "tool", "tool": "notify", "args": {"title": "🔬 Research brief", "message": "Brief on “{{input}}” saved — workspace/research/brief.md"}, "x": 1250, "y": 200},
+      {"id": 8, "type": "end", "x": 1480, "y": 200}
+    ],
+    "edges": [
+      {"from": 1, "to": 2, "branch": null},
+      {"from": 1, "to": 3, "branch": null},
+      {"from": 2, "to": 4, "branch": null},
+      {"from": 3, "to": 4, "branch": null},
+      {"from": 4, "to": 5, "branch": null},
+      {"from": 5, "to": 6, "branch": null},
+      {"from": 6, "to": 7, "branch": null},
+      {"from": 7, "to": 8, "branch": null}
+    ]
+  }
+}

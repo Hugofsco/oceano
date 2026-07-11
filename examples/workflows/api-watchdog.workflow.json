@@ -1,0 +1,32 @@
+{
+  "name": "API watchdog",
+  "description": "Every 15 minutes: hit a health-check URL; on failure wait 5 minutes and try once more before alerting — so a transient blip never pages you. Shows: cron trigger, http node with retries + error edges, rule-judged decisions, the wait node, and the overlap guard (a run mid-wait can't stack with the next tick).",
+  "overlap": "skip",
+  "input": {"enabled": true, "label": "Health-check URL", "placeholder": "https://api.example.com/health", "required": false, "default": "https://example.com/health"},
+  "triggers": [],
+  "graph": {
+    "nodes": [
+      {"id": 1, "type": "trigger", "kind": "schedule", "cron": "*/15 * * * *", "x": 40, "y": 200},
+      {"id": 2, "type": "http", "method": "GET", "url": "{{input}}", "headers": {}, "body": "", "retries": 1, "x": 270, "y": 200},
+      {"id": 3, "type": "decision", "mode": "rule", "ruleOp": "contains", "ruleValue": "HTTP 200", "question": "", "x": 520, "y": 200},
+      {"id": 4, "type": "wait", "minutes": 5, "until": "", "x": 520, "y": 340},
+      {"id": 5, "type": "http", "method": "GET", "url": "{{input}}", "headers": {}, "body": "", "x": 750, "y": 340},
+      {"id": 6, "type": "decision", "mode": "rule", "ruleOp": "contains", "ruleValue": "HTTP 200", "question": "", "x": 990, "y": 340},
+      {"id": 7, "type": "tool", "tool": "notify", "args": {"title": "🚨 API watchdog", "message": "Health check failed twice for {{input}} — latest response: {{node.5}}"}, "x": 1230, "y": 340},
+      {"id": 8, "type": "end", "x": 1230, "y": 140}
+    ],
+    "edges": [
+      {"from": 1, "to": 2, "branch": null},
+      {"from": 2, "to": 3, "branch": null},
+      {"from": 2, "to": 4, "branch": "error"},
+      {"from": 3, "to": 8, "branch": "yes"},
+      {"from": 3, "to": 4, "branch": "no"},
+      {"from": 4, "to": 5, "branch": null},
+      {"from": 5, "to": 6, "branch": null},
+      {"from": 5, "to": 7, "branch": "error"},
+      {"from": 6, "to": 8, "branch": "yes"},
+      {"from": 6, "to": 7, "branch": "no"},
+      {"from": 7, "to": 8, "branch": null}
+    ]
+  }
+}

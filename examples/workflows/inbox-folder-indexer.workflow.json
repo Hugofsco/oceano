@@ -1,0 +1,20 @@
+{
+  "name": "Inbox folder indexer",
+  "description": "Drop files into workspace/inbox and they're automatically indexed into document search (then a notification confirms it). The simplest event-driven flow — shows: file-watch trigger, index_docs. Baselines persist across restarts, so files dropped while Oceano was down still index on startup.",
+  "overlap": "skip",
+  "input": {"enabled": false, "label": "", "placeholder": "", "required": false, "default": ""},
+  "triggers": [],
+  "graph": {
+    "nodes": [
+      {"id": 1, "type": "trigger", "kind": "watch", "folder": "inbox", "x": 40, "y": 160},
+      {"id": 2, "type": "tool", "tool": "index_docs", "args": {"folder": "inbox"}, "x": 290, "y": 160},
+      {"id": 3, "type": "tool", "tool": "notify", "args": {"title": "📚 Docs indexed", "message": "workspace/inbox changed — its documents were re-indexed for search."}, "x": 540, "y": 160},
+      {"id": 4, "type": "end", "x": 790, "y": 160}
+    ],
+    "edges": [
+      {"from": 1, "to": 2, "branch": null},
+      {"from": 2, "to": 3, "branch": null},
+      {"from": 3, "to": 4, "branch": null}
+    ]
+  }
+}
