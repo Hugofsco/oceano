@@ -6750,21 +6750,43 @@ async function wfRenderList(body) {
   body.innerHTML = `
     <div class="wf-head"><h3>Workflows</h3><span class="fe-spacer"></span>
       <button class="ed-btn" id="wfSecrets" title="named secrets for HTTP nodes — {{secret.NAME}}">🔑 Secrets</button>
-      <button class="ed-btn" id="wfImport" title="import a workflow JSON export">⤒ Import</button>
+      <button class="ed-btn" id="wfImport" title="import workflow JSON exports (choose several at once)">⤒ Import</button>
       <button class="primary sm" id="wfNew">+ New workflow</button></div>
     <div class="wf-list" id="wfList"><div class="empty-note">loading…</div></div>`;
   $("#wfNew", body).onclick = () => wfRenderEditor(body, null);
   $("#wfSecrets", body).onclick = () => wfRenderSecrets(body);
   $("#wfImport", body).onclick = () => {
     const inp = document.createElement("input");
-    inp.type = "file"; inp.accept = ".json,application/json";
+    inp.type = "file"; inp.accept = ".json,application/json"; inp.multiple = true;
     inp.onchange = async () => {
-      const f = inp.files && inp.files[0]; if (!f) return;
-      try {
-        const r = await _postJ("/api/workflows/import", JSON.parse(await f.text()));
-        if (!r.ok) throw new Error(r.error || "import failed");
-        toast(`imported “${r.workflow.name}”`, "ok");
-      } catch (e) { toast("import failed: " + (e.message || e), "err"); }
+      const files = [...(inp.files || [])]; if (!files.length) return;
+      // never mint "name (2)" copies silently: a name collision asks, then replaces in place
+      let existing;
+      try { existing = new Set((await api("/api/workflows")).map(x => x.name.trim().toLowerCase())); }
+      catch { existing = new Set(); }
+      let added = 0, replaced = 0, skipped = 0, failed = 0;
+      for (const f of files) {
+        try {
+          const payload = JSON.parse(await f.text());
+          const name = String(payload.name || "").trim();
+          let replace = false;
+          if (name && existing.has(name.toLowerCase())) {
+            if (!await confirmAction("Overwrite workflow?",
+                `“${name}” already exists — importing ${f.name} will replace its definition, triggers and schedule (its run history is kept).`,
+                "Overwrite")) { skipped++; continue; }
+            replace = true;
+          }
+          const r = await _postJ("/api/workflows/import" + (replace ? "?replace=1" : ""), payload);
+          if (!r.ok) throw new Error(r.detail || r.error || "import failed");
+          existing.add(r.workflow.name.trim().toLowerCase());
+          if (replace) replaced++; else added++;
+        } catch (e) { failed++; toast(`${f.name}: ${e.message || e}`, "err"); }
+      }
+      const parts = [];
+      if (added) parts.push(`imported ${added}`);
+      if (replaced) parts.push(`replaced ${replaced}`);
+      if (skipped) parts.push(`skipped ${skipped}`);
+      if (parts.length) toast(parts.join(" · "), failed ? "err" : "ok");
       wfRenderList(body);
     };
     inp.click();

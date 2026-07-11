@@ -598,23 +598,36 @@ def export_wf(wid):
     return out
 
 
-def import_wf(payload):
-    """Create a workflow from an export_wf document. The name is de-duped ("x (2)"), webhook
-    tokens are regenerated, and an exported cron is re-registered. Returns the new workflow,
+def import_wf(payload, replace=False):
+    """Create a workflow from an export_wf document. Webhook tokens are regenerated and an
+    exported cron is re-registered. A name that's already taken is de-duped ("x (2)") — or,
+    with replace=True, the existing workflow is UPDATED in place instead: same id, run history
+    kept, definition/triggers/schedule taken wholesale from the document. Returns the workflow,
     or None if the payload isn't workflow-shaped."""
     if not isinstance(payload, dict) or not isinstance(payload.get("graph"), dict):
         return None
-    existing = {w["name"].strip().lower() for w in list_all()}
     base = str(payload.get("name") or "Imported workflow").strip() or "Imported workflow"
+    cron = str(payload.get("cron") or "").strip()
+    trigs = _norm_triggers(payload.get("triggers"))
+    old = get_by_name(base) if replace else None
+    if old:
+        wf = update(old["id"], description=str(payload.get("description") or ""),
+                    graph=payload.get("graph"), input_cfg=payload.get("input"),
+                    overlap=payload.get("overlap"))
+        # graph trigger nodes (if any) won on update; otherwise the document's side-panel
+        # triggers and cron replace whatever the old definition had — replace means replace
+        if not any(n.get("type") == "trigger" for n in wf["graph"]["nodes"]):
+            set_triggers(wf["id"], trigs)
+            set_schedule(wf["id"], cron)
+        return get(wf["id"])
+    existing = {w["name"].strip().lower() for w in list_all()}
     name, i = base, 2
     while name.strip().lower() in existing:
         name, i = f"{base} ({i})", i + 1
     wf = create(name, str(payload.get("description") or ""), payload.get("graph"),
                 input_cfg=payload.get("input"), overlap=payload.get("overlap"))
-    trigs = _norm_triggers(payload.get("triggers"))
     if trigs and not wf.get("triggers"):     # graph trigger nodes (if any) already won on create
         set_triggers(wf["id"], trigs)
-    cron = str(payload.get("cron") or "").strip()
     if cron and not _task_for(wf["id"]):
         set_schedule(wf["id"], cron)
     return get(wf["id"])

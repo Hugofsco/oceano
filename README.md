@@ -339,8 +339,10 @@ re-baselined away. Every run is recorded (live, node-by-node over SSE), history 
 workflow** (last 25 each, in `data/workflow_runs.json` — a busy flow can't starve the others),
 and a run still in progress when you **refresh the browser reconnects** to its live state.
 Workflows are portable, too: **⤓ export** downloads one as JSON (webhook secrets stripped —
-fresh ones are minted on import), **⤒ import** loads it (name de-duped, cron restored), and
-**⧉ duplicate** copies a workflow without its history. The agent can also trigger saved
+fresh ones are minted on import), **⤒ import** loads one — or **several at once** — with the
+cron restored, and a name that already exists **asks before overwriting** (replace keeps the
+workflow's id and run history; decline and that file is skipped, so you never silently
+accumulate "name (2)" copies). **⧉ duplicate** copies a workflow without its history. The agent can also trigger saved
 workflows with `run_workflow`, but you author them in the UI. Stored in
 `data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).

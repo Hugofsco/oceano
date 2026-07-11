@@ -396,9 +396,11 @@ def workflows_export(wid: int):
 
 
 @router.post("/api/workflows/import")
-async def workflows_import(req: Request):
+async def workflows_import(req: Request, replace: int = 0):
+    """?replace=1: a name collision updates the existing workflow in place (same id, run
+    history kept) instead of creating a de-duped copy."""
     from oceano import workflows
-    wf = workflows.import_wf(await req.json())
+    wf = workflows.import_wf(await req.json(), replace=bool(replace))
     if not wf:
         raise HTTPException(400, "not a workflow export (a graph is required)")
     return {"ok": True, "workflow": wf}

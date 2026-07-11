@@ -73,6 +73,37 @@ def test_duplicate_copies_definition_not_history():
     assert workflows.runs(dup["id"]) == []                    # history stays with the original
 
 
+def test_import_replace_updates_in_place_keeping_id_and_history(monkeypatch, tmp_path):
+    from oceano import scheduler
+    monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
+    wf = workflows.create("digest", description="old", graph=_GRAPH)
+    workflows.set_schedule(wf["id"], "0 7 * * *")
+    workflows._record_run(wf["id"], "manual", "ok", [], "old run")
+    doc = workflows.export_wf(wf["id"])
+    doc["description"] = "new"
+    doc["cron"] = "0 9 * * *"
+    doc["graph"]["nodes"][1]["text"] = "bye {{input}}"
+    out = workflows.import_wf(doc, replace=True)
+    assert out["id"] == wf["id"] and out["description"] == "new"        # same workflow, updated
+    assert out["graph"]["nodes"][1]["text"] == "bye {{input}}"
+    assert workflows.schedule_info(wf["id"])["cron"] == "0 9 * * *"     # schedule replaced too
+    assert len(workflows.runs(wf["id"])) == 1                           # history survived
+    assert len(workflows.list_all()) == 1                               # no "digest (2)" copy
+
+
+def test_import_without_replace_still_dedupes_the_name():
+    workflows.create("digest", graph=_GRAPH)
+    out = workflows.import_wf({"name": "digest", "graph": _GRAPH})
+    assert out["name"] == "digest (2)"
+    assert len(workflows.list_all()) == 2
+
+
+def test_import_replace_with_no_existing_name_just_creates():
+    out = workflows.import_wf({"name": "fresh", "graph": _GRAPH}, replace=True)
+    assert out["name"] == "fresh"
+    assert len(workflows.list_all()) == 1
+
+
 # ---------------- run history: own store, per-workflow pruning ----------------
 def test_runs_prune_per_workflow_not_globally():
     for i in range(workflows._RUNS_PER_WF + 10):
