@@ -310,6 +310,32 @@ def workflows_live():
     return {"running": workflows.live()}
 
 
+# NB: registered BEFORE the /{wid}/… routes — "secrets" must never be parsed as a wid
+@router.get("/api/workflows/secrets")
+def wf_secrets_list():
+    """Names only. Values are write-only: they never come back out through the API."""
+    from oceano import workflows
+    return {"secrets": workflows.list_secrets()}
+
+
+@router.put("/api/workflows/secrets/{name}")
+async def wf_secrets_set(name: str, req: Request):
+    from oceano import workflows
+    b = await req.json()
+    if not workflows.set_secret(name, str(b.get("value") or "")):
+        raise HTTPException(400, "a value is required, and names are letters/digits/._- "
+                                 "starting with a letter (max 64)")
+    return {"ok": True, "secrets": workflows.list_secrets()}
+
+
+@router.delete("/api/workflows/secrets/{name}")
+def wf_secrets_delete(name: str):
+    from oceano import workflows
+    if not workflows.delete_secret(name):
+        raise HTTPException(404, "no such secret")
+    return {"ok": True, "secrets": workflows.list_secrets()}
+
+
 @router.get("/api/workflows/{wid}/triggers")
 def workflows_triggers_get(wid: int):
     from oceano import workflows
@@ -324,11 +350,12 @@ async def workflows_triggers_set(wid: int, req: Request):
 
 
 @router.post("/api/workflows/{wid}/webhook/{token}")
-async def workflows_webhook(wid: int, token: str, req: Request):
+async def workflows_webhook(wid: int, token: str, req: Request, wait: int = 0):
     """Fire a workflow from an external POST. Auth-exempt — the secret token IS the auth.
     The server is localhost-bound by default; only reachable remotely if you tunnel it.
     An optional input value (the workflow's argument) is read from the body: JSON {"input": …}
-    or the raw request body as text."""
+    or the raw request body as text. `?wait=1` runs it synchronously and returns the final
+    output (202 with the run still going if it outlasts the 120s budget) — a workflow as an API."""
     from oceano import workflows
     inp = ""
     try:
@@ -340,10 +367,50 @@ async def workflows_webhook(wid: int, token: str, req: Request):
                 inp = raw.decode("utf-8", "replace")[:4000]
     except Exception:
         inp = ""
+    if wait:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, lambda: workflows.webhook_run_sync(wid, token, inp=inp))
+        try:
+            rec = await asyncio.wait_for(asyncio.shield(fut), timeout=120)
+        except asyncio.TimeoutError:                   # keep running detached; it's still recorded
+            return JSONResponse({"ok": True, "started": True,
+                                 "note": "still running — result not ready within 120s"}, status_code=202)
+        if rec is None:
+            raise HTTPException(404, "no matching/enabled webhook trigger")
+        return {"ok": rec.get("status") == "ok", "status": rec.get("status"),
+                "summary": rec.get("summary", ""), "output": rec.get("output", "")}
     wf = workflows.webhook_run(wid, token, inp=inp)
     if not wf:
         raise HTTPException(404, "no matching/enabled webhook trigger")
     return JSONResponse({"ok": True, "started": wf["name"]}, status_code=202)
+
+
+@router.get("/api/workflows/{wid}/export")
+def workflows_export(wid: int):
+    """The workflow as a portable JSON document (webhook secrets stripped — see export_wf)."""
+    from oceano import workflows
+    data = workflows.export_wf(wid)
+    if not data:
+        raise HTTPException(404, "no such workflow")
+    return data
+
+
+@router.post("/api/workflows/import")
+async def workflows_import(req: Request):
+    from oceano import workflows
+    wf = workflows.import_wf(await req.json())
+    if not wf:
+        raise HTTPException(400, "not a workflow export (a graph is required)")
+    return {"ok": True, "workflow": wf}
+
+
+@router.post("/api/workflows/{wid}/duplicate")
+def workflows_duplicate(wid: int):
+    from oceano import workflows
+    wf = workflows.duplicate(wid)
+    if not wf:
+        raise HTTPException(404, "no such workflow")
+    return {"ok": True, "workflow": wf}
 
 
 @router.post("/api/workflows")

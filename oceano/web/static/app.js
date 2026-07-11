@@ -6382,7 +6382,8 @@ function wfInspHttp(editor, dfId, box, sync) {
     <div class="wf-insp-row"><label class="wfn-lab">url</label><input class="wfn-fld wh-url" placeholder="https://api.example.com/… ({{input}})" value="${escapeHtml(state.url)}"></div>
     <div class="wf-insp-row"><label class="wfn-lab">headers</label><div class="wh-headers"></div><button type="button" class="wfn-addbtn wh-addh">+ header</button></div>
     <div class="wf-insp-row"><label class="wfn-lab">body</label><textarea class="wfn-fld wh-body" placeholder="request body (optional · {{last}} etc.)">${escapeHtml(state.body)}</textarea></div>
-    <div class="wf-insp-row"><label class="wfn-lab">retries</label><input type="number" min="0" max="5" class="wfn-fld wh-retries" value="${escapeHtml(state.retries)}"></div>`;
+    <div class="wf-insp-row"><label class="wfn-lab">retries</label><input type="number" min="0" max="5" class="wfn-fld wh-retries" value="${escapeHtml(state.retries)}"></div>
+    <div class="wf-insp-note">🔑 use <code>{{secret.NAME}}</code> (URL · header value · body) for stored API keys — managed via the <b>🔑 Secrets</b> button on the workflow list. Header values are encrypted at rest, and resolved secrets are redacted from the run's recorded output.</div>`;
   const hbox = box.querySelector(".wh-headers");
   const renderHeaders = () => {
     hbox.innerHTML = "";
@@ -6747,9 +6748,27 @@ function openWorkflows() {
 }
 async function wfRenderList(body) {
   body.innerHTML = `
-    <div class="wf-head"><h3>Workflows</h3><span class="fe-spacer"></span><button class="primary sm" id="wfNew">+ New workflow</button></div>
+    <div class="wf-head"><h3>Workflows</h3><span class="fe-spacer"></span>
+      <button class="ed-btn" id="wfSecrets" title="named secrets for HTTP nodes — {{secret.NAME}}">🔑 Secrets</button>
+      <button class="ed-btn" id="wfImport" title="import a workflow JSON export">⤒ Import</button>
+      <button class="primary sm" id="wfNew">+ New workflow</button></div>
     <div class="wf-list" id="wfList"><div class="empty-note">loading…</div></div>`;
   $("#wfNew", body).onclick = () => wfRenderEditor(body, null);
+  $("#wfSecrets", body).onclick = () => wfRenderSecrets(body);
+  $("#wfImport", body).onclick = () => {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.accept = ".json,application/json";
+    inp.onchange = async () => {
+      const f = inp.files && inp.files[0]; if (!f) return;
+      try {
+        const r = await _postJ("/api/workflows/import", JSON.parse(await f.text()));
+        if (!r.ok) throw new Error(r.error || "import failed");
+        toast(`imported “${r.workflow.name}”`, "ok");
+      } catch (e) { toast("import failed: " + (e.message || e), "err"); }
+      wfRenderList(body);
+    };
+    inp.click();
+  };
   let wfs; try { wfs = await api("/api/workflows"); } catch { return; }
   const list = $("#wfList", body);
   if (!wfs.length) { list.innerHTML = `<div class="empty-note">No workflows yet. Build one on the canvas — wire up tool, instruction, delegate and decision nodes, then run it on demand or on a schedule.</div>`; return; }
@@ -6774,6 +6793,8 @@ async function wfRenderList(body) {
         <button class="ed-btn wf-sched-btn" title="schedule">⏱</button>
         <button class="ed-btn wf-trig-btn" title="triggers">⚡</button>
         <button class="ed-btn wf-runs" title="run history">⟲</button>
+        <button class="ed-btn wf-dup" title="duplicate">⧉</button>
+        <button class="ed-btn wf-exp" title="export JSON">⤓</button>
         <button class="ed-btn wf-del" title="delete">✕</button>
       </div>`;
     $(".wf-run", el).onclick = () => wfRenderRun(body, w);
@@ -6781,6 +6802,15 @@ async function wfRenderList(body) {
     $(".wf-sched-btn", el).onclick = () => wfSchedule(body, w);
     $(".wf-trig-btn", el).onclick = () => wfTriggers(body, w);
     $(".wf-runs", el).onclick = () => wfRenderRuns(body, w);
+    $(".wf-dup", el).onclick = async () => { await _postJ("/api/workflows/" + w.id + "/duplicate", {}); wfRenderList(body); };
+    $(".wf-exp", el).onclick = async () => {
+      const data = await api("/api/workflows/" + w.id + "/export");
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = (w.name || "workflow").replace(/[^\w.-]+/g, "-").toLowerCase() + ".workflow.json";
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    };
     $(".wf-del", el).onclick = async () => { if (!await confirmAction("Delete workflow?", `“${w.name}” and its schedule will be removed.`)) return; await fetch("/api/workflows/" + w.id, { method: "DELETE" }); wfRenderList(body); };
     list.appendChild(el);
   });
@@ -6806,6 +6836,56 @@ async function wfSchedule(body, w) {
   if (cron === null) return;
   await _postJ("/api/workflows/" + w.id + "/schedule", { cron });
   wfRenderList(body);
+}
+// named secrets management: names listed, values write-only (set/replace/delete, never shown)
+async function wfRenderSecrets(body) {
+  body.innerHTML = `
+    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>🔑 Workflow secrets</h3></div>
+    <div class="wf-sec-wrap">
+      <div class="wf-insp-note">Store API keys and tokens once, then reference them from an
+        <b>HTTP Request</b> node as <code>{{secret.NAME}}</code> (URL, headers, or body).
+        Values are <b>encrypted at rest</b> and write-only — they never appear in the editor, the
+        API, or a run's recorded output (resolved values are redacted). Only the HTTP node can
+        resolve them: instruction/agent steps can't be tricked into reading one out loud.</div>
+      <div class="wf-sec-list" id="wfSecList"><div class="empty-note">loading…</div></div>
+      <div class="wf-sec-add">
+        <input class="wfn-fld" id="wfSecName" placeholder="NAME · e.g. GITHUB_TOKEN" autocomplete="off">
+        <input class="wfn-fld" id="wfSecVal" type="password" placeholder="value (write-only)" autocomplete="new-password">
+        <button class="primary sm" id="wfSecSave">Save</button>
+        <span class="acct-msg" id="wfSecMsg"></span>
+      </div>
+    </div>`;
+  $("#wfBack", body).onclick = () => wfRenderList(body);
+  const list = $("#wfSecList", body), msg = $("#wfSecMsg", body);
+  const render = names => {
+    if (!names.length) { list.innerHTML = `<div class="empty-note">No secrets yet.</div>`; return; }
+    list.innerHTML = "";
+    names.forEach(n => {
+      const row = document.createElement("div"); row.className = "wf-sec-row";
+      row.innerHTML = `<code>{{secret.${escapeHtml(n)}}}</code><span class="wf-sec-set">value set ✓</span>
+        <span class="fe-spacer"></span><button class="ed-btn wf-sec-del" title="delete">✕</button>`;
+      $(".wf-sec-del", row).onclick = async () => {
+        if (!await confirmAction("Delete secret?", `“${n}” — any HTTP node referencing it will render it empty.`)) return;
+        const r = await (await fetch("/api/workflows/secrets/" + encodeURIComponent(n), { method: "DELETE" })).json();
+        render(r.secrets || []);
+      };
+      list.appendChild(row);
+    });
+  };
+  try { render((await api("/api/workflows/secrets")).secrets || []); } catch { list.innerHTML = ""; }
+  $("#wfSecSave", body).onclick = async () => {
+    const name = $("#wfSecName", body).value.trim(), value = $("#wfSecVal", body).value;
+    msg.textContent = ""; msg.className = "acct-msg";
+    try {
+      const resp = await fetch("/api/workflows/secrets/" + encodeURIComponent(name),
+        { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value }) });
+      const r = await resp.json();
+      if (!resp.ok) throw new Error(r.detail || "save failed");
+      render(r.secrets || []);
+      $("#wfSecName", body).value = ""; $("#wfSecVal", body).value = "";
+      msg.textContent = "saved ✓"; msg.className = "acct-msg ok";
+    } catch (e) { msg.textContent = e.message || "save failed"; msg.className = "acct-msg err"; }
+  };
 }
 async function wfTriggers(body, w) {
   body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Triggers · ${escapeHtml(w.name)}</h3></div>

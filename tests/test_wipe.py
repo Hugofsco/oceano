@@ -81,6 +81,8 @@ def test_research_wipe_removes_topics_and_their_schedules_but_keeps_docs(tmp_pat
 def test_workflows_wipe_removes_definitions_runs_and_schedules(tmp_path, monkeypatch):
     from oceano import scheduler, workflows
     monkeypatch.setattr(workflows, "STORE", tmp_path / "workflows.json")
+    monkeypatch.setattr(workflows, "RUNS_STORE", tmp_path / "workflow_runs.json")
+    monkeypatch.setattr(workflows, "TRIG_STATE", tmp_path / "trigger_state.json")
     monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
     a = workflows.create("digest", description="daily digest")
     workflows.create("triage", description="mail triage")

@@ -18,6 +18,7 @@ stops any accidental loop from running forever. Runs are recorded so scheduled, 
 runs stay observable. Storage is one JSON file (atomic); a workflow's cron schedule lives in
 the scheduler as a managed task tagged `workflow:<id>`.
 """
+import hashlib
 import json
 import re
 import secrets
@@ -26,9 +27,12 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import config
-from oceano import atomicio, tools
+from oceano import atomicio, secretcrypto, tools
 
 STORE = config.WORKSPACE.parent / "data" / "workflows.json"
+RUNS_STORE = config.WORKSPACE.parent / "data" / "workflow_runs.json"      # history, split out so
+TRIG_STATE = config.WORKSPACE.parent / "data" / "trigger_state.json"      # the hot store stays small
+SECRETS_STORE = config.WORKSPACE.parent / "data" / "wf_secrets.json"      # named {{secret.X}} values
 SOURCE_PREFIX = "workflow:"
 SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
@@ -43,7 +47,7 @@ _TRIGGER_NODE_KINDS = ("manual", "schedule", "webhook", "keyword", "watch", "ema
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 _TRANSFORM_MODES = ("template", "regex", "jsonpath", "python")
 _SWITCH_OPS = ("contains", "equals", "matches", "gt", "lt")
-_MAX_RUNS = 60
+_RUNS_PER_WF = 25                    # run history kept per workflow (was one 60-run global cap)
 _OUT_CAP = 4000
 _VISIT_CAP = 400                     # max node executions per run — loop backstop (raised for foreach)
 _LOOP_CAP = 200                      # max iterations a single loop node will run
@@ -100,13 +104,90 @@ def _load():
     if not isinstance(data, dict):
         data = {}
     data.setdefault("workflows", [])
-    data.setdefault("runs", [])
+    legacy = data.pop("runs", None)      # one-time: run history moved to its own store, so the
+    if legacy:                           # hot store (read on every trigger poll) stays small
+        _save_runs(_load_runs() + legacy)
+        _save(data)
     data["workflows"] = [_migrate(w) for w in data["workflows"]]
     return data
 
 
 def _save(data):
+    data.pop("runs", None)               # runs live in RUNS_STORE — never write them back here
     atomicio.write_text(STORE, json.dumps(data, indent=2))
+
+
+def _load_runs():
+    try:
+        d = json.loads(RUNS_STORE.read_text())
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    return d.get("runs", []) if isinstance(d, dict) else []
+
+
+def _save_runs(rs):
+    atomicio.write_text(RUNS_STORE, json.dumps({"runs": rs}, indent=2))
+
+
+# ---------------- named secrets ({{secret.NAME}} — HTTP nodes only) ----------------
+# A small write-only store for API keys and tokens a flow's HTTP node needs: values are
+# encrypted at rest (secretcrypto) and NEVER surface through the API or the templating engine —
+# {{secret.X}} resolves exclusively inside _run_http (url/headers/body), so a prompt-injected
+# instruction node can't exfiltrate one, and the resolved value is redacted from the recorded
+# output. Names: letters/digits/._-, starting with a letter.
+_SECRET_NAME_RE = re.compile(r"[A-Za-z][\w.-]{0,63}")
+_SECRET_RE = re.compile(r"\{\{\s*secret\.([\w.-]+)\s*\}\}")
+
+
+def _load_secrets():
+    try:
+        d = json.loads(SECRETS_STORE.read_text())
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    return d.get("secrets", {}) if isinstance(d, dict) else {}
+
+
+def list_secrets():
+    """Names only — a stored value never leaves through this (or any) API."""
+    return sorted(_load_secrets().keys())
+
+
+def set_secret(name, value):
+    name = (name or "").strip()
+    if not _SECRET_NAME_RE.fullmatch(name) or not str(value or ""):
+        return False
+    s = _load_secrets()
+    s[name] = secretcrypto.encrypt(str(value))
+    atomicio.write_text(SECRETS_STORE, json.dumps({"secrets": s}, indent=2))
+    return True
+
+
+def delete_secret(name):
+    s = _load_secrets()
+    if name not in s:
+        return False
+    del s[name]
+    atomicio.write_text(SECRETS_STORE, json.dumps({"secrets": s}, indent=2))
+    return True
+
+
+def _fill_secrets(text, used):
+    """Substitute {{secret.NAME}} tokens; every resolved value is appended to `used` so the
+    caller can redact them from whatever it records. Unknown names render empty, like any
+    other unknown token."""
+    def sub(m):
+        v = secretcrypto.decrypt(_load_secrets().get(m.group(1), ""))
+        if v:
+            used.append(v)
+        return v
+    return _SECRET_RE.sub(sub, str(text or ""))
+
+
+def _redact(text, used):
+    for v in used:
+        if v:
+            text = text.replace(v, "•••")
+    return text
 
 
 def _next_id(items):
@@ -246,7 +327,10 @@ def _norm_graph(graph):
         elif t == "http":
             node["method"] = n.get("method") if n.get("method") in _HTTP_METHODS else "GET"
             node["url"] = str(n.get("url", "")).strip()
-            node["headers"] = n.get("headers") if isinstance(n.get("headers"), dict) else {}
+            raw_h = n.get("headers") if isinstance(n.get("headers"), dict) else {}
+            # header values (Authorization tokens etc.) are encrypted at rest, like the MCP
+            # client's; the read path (_open_secrets) hands plaintext back to the editor/run
+            node["headers"] = {str(k): secretcrypto.encrypt(str(v)) for k, v in raw_h.items()}
             node["body"] = str(n.get("body", ""))
         elif t == "subflow":
             node["workflow"] = str(n.get("workflow", "")).strip()         # target name or id
@@ -390,17 +474,30 @@ def _persona_prefix(persona):
 _OVERLAP = ("skip", "allow")
 
 
+def _open_secrets(wf):
+    """Decrypt the at-rest-encrypted fields (http header values) of a freshly-loaded workflow.
+    Every read path (list_all/get/get_by_name and create/update's return) goes through this, so
+    the editor round-trips plaintext while the store keeps ciphertext. Legacy plaintext passes
+    through unchanged (secretcrypto.decrypt's contract)."""
+    if wf:
+        for n in (wf.get("graph") or {}).get("nodes", []):
+            if n.get("type") == "http" and isinstance(n.get("headers"), dict):
+                n["headers"] = {k: secretcrypto.decrypt(v) if isinstance(v, str) else v
+                                for k, v in n["headers"].items()}
+    return wf
+
+
 def list_all():
-    return _load()["workflows"]
+    return [_open_secrets(w) for w in _load()["workflows"]]
 
 
 def get(wid):
-    return next((w for w in _load()["workflows"] if w["id"] == wid), None)
+    return _open_secrets(next((w for w in _load()["workflows"] if w["id"] == wid), None))
 
 
 def get_by_name(name):
     name = (name or "").strip().lower()
-    return next((w for w in _load()["workflows"] if w["name"].strip().lower() == name), None)
+    return _open_secrets(next((w for w in _load()["workflows"] if w["name"].strip().lower() == name), None))
 
 
 def create(name, description="", graph=None, input_cfg=None, overlap=None):
@@ -415,7 +512,7 @@ def create(name, description="", graph=None, input_cfg=None, overlap=None):
     _save(data)
     if cron is not None:                              # a schedule trigger node → register/clear the cron task
         set_schedule(wf["id"], cron)
-    return wf
+    return _open_secrets(wf)
 
 
 def update(wid, name=None, description=None, graph=None, input_cfg=None, overlap=None):
@@ -444,15 +541,15 @@ def update(wid, name=None, description=None, graph=None, input_cfg=None, overlap
         if t:
             from oceano import scheduler
             scheduler.update_task(t["id"], instruction=SCHED_PREFIX + wf["name"], allow_managed=True)
-    return wf
+    return _open_secrets(wf)
 
 
 def remove(wid):
     data = _load()
     before = len(data["workflows"])
     data["workflows"] = [w for w in data["workflows"] if w["id"] != wid]
-    data["runs"] = [r for r in data["runs"] if r.get("workflow_id") != wid]
     _save(data)
+    _save_runs([r for r in _load_runs() if r.get("workflow_id") != wid])
     t = _task_for(wid)
     if t:
         from oceano import scheduler
@@ -467,14 +564,65 @@ def wipe():
     many workflows were removed."""
     data = _load()
     ids = [w["id"] for w in data["workflows"]]
-    data["workflows"], data["runs"] = [], []
+    data["workflows"] = []
     _save(data)
+    _save_runs([])
+    _WATCH_SIG.clear()
+    _EMAIL_SEEN.clear()
+    _trig_save()
     from oceano import scheduler
     for wid in ids:
         t = _task_for(wid)
         if t:
             scheduler.delete_task(t["id"], allow_managed=True)
     return len(ids)
+
+
+# ---------------- export / import / duplicate ----------------
+def export_wf(wid):
+    """A workflow as a portable JSON document: definition + triggers + cron, minus anything
+    machine-local — ids, run history, and every webhook secret (minted fresh on import, so a
+    shared export can never carry a live trigger URL)."""
+    wf = get(wid)
+    if not wf:
+        return None
+    out = json.loads(json.dumps({k: wf.get(k) for k in
+                                 ("name", "description", "graph", "input", "triggers", "overlap")}))
+    for t in out.get("triggers") or []:
+        t.pop("token", None)
+    for n in (out.get("graph") or {}).get("nodes", []):
+        if n.get("type") == "trigger":
+            n.pop("token", None)
+    sched = schedule_info(wid)
+    out["cron"] = (sched or {}).get("cron", "")
+    return out
+
+
+def import_wf(payload):
+    """Create a workflow from an export_wf document. The name is de-duped ("x (2)"), webhook
+    tokens are regenerated, and an exported cron is re-registered. Returns the new workflow,
+    or None if the payload isn't workflow-shaped."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("graph"), dict):
+        return None
+    existing = {w["name"].strip().lower() for w in list_all()}
+    base = str(payload.get("name") or "Imported workflow").strip() or "Imported workflow"
+    name, i = base, 2
+    while name.strip().lower() in existing:
+        name, i = f"{base} ({i})", i + 1
+    wf = create(name, str(payload.get("description") or ""), payload.get("graph"),
+                input_cfg=payload.get("input"), overlap=payload.get("overlap"))
+    trigs = _norm_triggers(payload.get("triggers"))
+    if trigs and not wf.get("triggers"):     # graph trigger nodes (if any) already won on create
+        set_triggers(wf["id"], trigs)
+    cron = str(payload.get("cron") or "").strip()
+    if cron and not _task_for(wf["id"]):
+        set_schedule(wf["id"], cron)
+    return get(wf["id"])
+
+
+def duplicate(wid):
+    src = export_wf(wid)
+    return import_wf(src) if src else None
 
 
 # ---------------- scheduling ----------------
@@ -509,7 +657,8 @@ def set_schedule(wid, cron):
 
 # ---------------- run history ----------------
 def runs(workflow_id=None, limit=40):
-    rs = _load()["runs"]
+    _load()                              # the one-time legacy-runs migration lives in _load()
+    rs = _load_runs()
     if workflow_id is not None:
         rs = [r for r in rs if r.get("workflow_id") == workflow_id]
     return list(reversed(rs[-limit:]))
@@ -538,6 +687,42 @@ def live(workflow_id=None):
 _TRIGGER_TYPES = ("watch", "webhook", "keyword", "chain", "email")
 _WATCH_SIG = {}                      # (wid, folder) -> last signature; baseline on first sight
 _EMAIL_SEEN = {}                     # (wid, account, folder) -> highest seen uid; baseline on first sight
+_trig_loaded = False
+
+
+def _trig_load():
+    """Restore the watch/email baselines persisted by the last process, so a restart neither
+    re-baselines (silently swallowing anything that happened while Oceano was down) nor
+    replays old state. Keys are JSON-encoded tuples (JSON objects can't key on tuples)."""
+    global _trig_loaded
+    if _trig_loaded:
+        return
+    _trig_loaded = True
+    try:
+        d = json.loads(TRIG_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    for k, v in (d.get("watch") or {}).items():
+        try:
+            wid, folder = json.loads(k)
+            _WATCH_SIG[(wid, folder)] = v
+        except (ValueError, TypeError):
+            continue
+    for k, v in (d.get("email") or {}).items():
+        try:
+            wid, acct, folder = json.loads(k)
+            _EMAIL_SEEN[(wid, acct, folder)] = v
+        except (ValueError, TypeError):
+            continue
+
+
+def _trig_save():
+    d = {"watch": {json.dumps(list(k)): v for k, v in _WATCH_SIG.items()},
+         "email": {json.dumps(list(k)): v for k, v in _EMAIL_SEEN.items()}}
+    try:
+        atomicio.write_text(TRIG_STATE, json.dumps(d))
+    except OSError:
+        pass
 
 
 def _norm_triggers(items):
@@ -648,13 +833,17 @@ def _folder_sig(folder):
                 items.append((str(p), int(st.st_mtime), st.st_size))
             except OSError:
                 pass
-    return hash(tuple(items))
+    # stable digest, NOT hash(): per-process hash salting would make every persisted baseline
+    # mismatch after a restart, firing every watch trigger spuriously
+    return hashlib.md5(repr(items).encode()).hexdigest()
 
 
 def poll_watch_triggers():
     """Run workflows whose watched folder changed since the last tick (called by the engine).
-    First sight of a folder records a baseline only, so a restart can't spuriously fire."""
-    fired = 0
+    First sight of a folder records a baseline only — but baselines PERSIST across restarts
+    (data/trigger_state.json), so a change made while Oceano was down still fires."""
+    _trig_load()
+    fired, dirty = 0, False
     for wf in list_all():
         for tr in wf.get("triggers", []):
             if tr.get("type") != "watch" or not tr.get("enabled"):
@@ -664,18 +853,25 @@ def poll_watch_triggers():
                 continue
             key = (wf["id"], tr["folder"])
             prev = _WATCH_SIG.get(key, "__new__")
-            _WATCH_SIG[key] = sig
+            if sig != prev:
+                _WATCH_SIG[key] = sig
+                dirty = True
             if prev != "__new__" and sig != prev:
                 run_async(wf, trigger="watch"); fired += 1
+    if dirty:
+        _trig_save()
     return fired
 
 
 def poll_email_triggers():
     """Run workflows whose email trigger sees NEW mail since the last tick (called by the engine).
-    First sight records a baseline (the current newest uid) so a restart can't replay old mail; each
-    genuinely new message fires the workflow once, with a compact From/Subject/body as the run input."""
+    First sight records a baseline (the current newest uid) so old mail is never replayed — and
+    baselines PERSIST across restarts (data/trigger_state.json), so mail that arrived while
+    Oceano was down still fires. Each genuinely new message fires the workflow once, with a
+    compact From/Subject/body as the run input."""
     from oceano import mail
-    fired = 0
+    _trig_load()
+    fired, dirty = 0, False
     for wf in list_all():
         for tr in wf.get("triggers", []):
             if tr.get("type") != "email" or not tr.get("enabled"):
@@ -694,8 +890,10 @@ def poll_email_triggers():
             except (ValueError, KeyError):
                 newest = 0
             prev = _EMAIL_SEEN.get(key)
-            _EMAIL_SEEN[key] = newest
-            if prev is None:                           # baseline only on first sight
+            if _EMAIL_SEEN.get(key) != newest:
+                _EMAIL_SEEN[key] = newest
+                dirty = True
+            if prev is None:                           # baseline only on very first sight
                 continue
             for m in sorted(msgs, key=lambda x: int(x.get("uid", 0))):
                 try:
@@ -709,6 +907,8 @@ def poll_email_triggers():
                        f"{full.get('body','')}" if full.get("ok")
                        else f"From: {m.get('from','')}\nSubject: {m.get('subject','')}")
                 run_async(wf, trigger="email", inp=inp); fired += 1
+    if dirty:
+        _trig_save()
     return fired
 
 
@@ -748,24 +948,41 @@ def fire_chain(after_wid, status, seen=frozenset(), out=""):
 def webhook_run(wid, token, inp=""):
     """Run a workflow if `token` matches one of its enabled webhook triggers. The POST body may
     carry an input value (see the web endpoint) that the workflow processes."""
+    wf = _webhook_match(wid, token)
+    if wf:
+        run_async(wf, trigger="webhook", inp=inp)
+    return wf
+
+
+def webhook_run_sync(wid, token, inp=""):
+    """The synchronous flavour (webhook ?wait=1): runs the workflow inline and returns its run
+    record, so the HTTP caller gets the final output back. None if the token doesn't match."""
+    wf = _webhook_match(wid, token)
+    return run(wf, trigger="webhook", inp=inp) if wf else None
+
+
+def _webhook_match(wid, token):
     wf = get(wid)
     if not wf:
         return None
     for tr in wf.get("triggers", []):
         if (tr.get("type") == "webhook" and tr.get("enabled")
                 and secrets.compare_digest(str(tr.get("token", "")), str(token))):
-            run_async(wf, trigger="webhook", inp=inp)
             return wf
     return None
 
 
 def _record_run(workflow_id, trigger, status, steps, summary):
-    data = _load()
-    rec = {"id": _next_id(data["runs"]), "workflow_id": workflow_id, "ts": _now(),
+    rs = _load_runs()
+    rec = {"id": _next_id(rs), "workflow_id": workflow_id, "ts": _now(),
            "trigger": trigger, "status": status, "summary": summary, "steps": steps}
-    data["runs"].append(rec)
-    data["runs"] = data["runs"][-_MAX_RUNS:]
-    _save(data)
+    rs.append(rec)
+    by = {}                              # prune per workflow — a busy flow can't starve the rest
+    for r in rs:
+        by.setdefault(r.get("workflow_id"), []).append(r)
+    keep = [r for group in by.values() for r in group[-_RUNS_PER_WF:]]
+    keep.sort(key=lambda r: r["id"])
+    _save_runs(keep)
     return rec
 
 
@@ -855,11 +1072,14 @@ def _run_switch(node, ctx):
 def _run_http(node, ctx):
     from oceano import safety
     method = node.get("method", "GET")
-    url = _tmpl(node.get("url", ""), ctx).strip()
+    # {{secret.X}} fills FIRST (only _run_http ever resolves it), then normal templating; every
+    # resolved secret is redacted from whatever this node returns/records
+    used = []
+    url = _tmpl(_fill_secrets(node.get("url", ""), used), ctx).strip()
     if not url:
         return False, "no URL"
-    headers = {str(k): _tmpl(str(v), ctx) for k, v in (node.get("headers") or {}).items()}
-    body = _tmpl(node.get("body", ""), ctx)
+    headers = {str(k): _tmpl(_fill_secrets(str(v), used), ctx) for k, v in (node.get("headers") or {}).items()}
+    body = _tmpl(_fill_secrets(node.get("body", ""), used), ctx)
     import requests
     # SSRF guard: the URL may be templated from untrusted upstream data ({{last}}, an email body…),
     # so a public URL that redirects to a loopback/metadata address would slip past a one-time check.
@@ -869,17 +1089,17 @@ def _run_http(node, ctx):
         for _ in range(6):
             refusal = safety.check_url(cur)
             if refusal:
-                return False, refusal
+                return False, _redact(refusal, used)
             resp = requests.request(method, cur, headers=headers or None,
                                     data=body.encode("utf-8") if body else None,
                                     timeout=30, allow_redirects=False)
             if resp.is_redirect and resp.headers.get("Location"):
                 cur = requests.compat.urljoin(cur, resp.headers["Location"])
                 continue
-            return resp.ok, f"HTTP {resp.status_code}\n{resp.text[:_HTTP_CAP]}"
+            return resp.ok, _redact(f"HTTP {resp.status_code}\n{resp.text[:_HTTP_CAP]}", used)
         return False, "too many redirects"
     except Exception as e:                           # noqa: BLE001
-        return False, f"request failed: {e}"
+        return False, _redact(f"request failed: {e}", used)
 
 
 # ---------------- transform / code node (issue 8 B) ----------------

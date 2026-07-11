@@ -1405,6 +1405,14 @@ button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:
 .wf-ic-en{color:var(--biolum)}
 .wf-input-cfg .wf-ic-f{width:auto;flex:1;min-width:120px;max-width:230px}
 .wf-ic-ov{margin-left:auto;color:var(--mist)}
+/* workflow secrets manager */
+.wf-sec-wrap{display:flex;flex-direction:column;gap:12px;padding:14px;overflow-y:auto}
+.wf-sec-list{display:flex;flex-direction:column;gap:6px}
+.wf-sec-row{display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:rgba(var(--abyss-0-rgb),.4)}
+.wf-sec-row code{color:var(--biolum);background:rgba(var(--abyss-0-rgb),.7);border-radius:4px;padding:1px 6px;font-size:12px}
+.wf-sec-set{font-size:11px;color:var(--mist)}
+.wf-sec-add{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.wf-sec-add .wfn-fld{width:auto;flex:1;min-width:140px;max-width:280px}
 .wf-ic-hint{font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
 .wf-ic-hint code{background:rgba(var(--abyss-0-rgb),.7);color:var(--biolum);padding:1px 5px;border-radius:5px}
 .wf-inp-badge{font-family:var(--font-mono);font-size:11px;color:var(--biolum);background:rgba(var(--biolum-rgb),.12);border-radius:7px;padding:1px 7px;font-weight:400}

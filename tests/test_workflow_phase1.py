@@ -16,7 +16,9 @@ from oceano import workflows  # noqa: E402 - after the sys.path bootstrap
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    monkeypatch.setattr(workflows, "STORE", tmp_path / "workflows.json")   # never touch real runs
+    monkeypatch.setattr(workflows, "STORE", tmp_path / "workflows.json")   # never touch real data
+    monkeypatch.setattr(workflows, "RUNS_STORE", tmp_path / "workflow_runs.json")
+    monkeypatch.setattr(workflows, "TRIG_STATE", tmp_path / "trigger_state.json")
     monkeypatch.setattr(workflows, "_LIVE", {})                            # nor the live registry
     monkeypatch.setattr("oceano.logs.log_run", lambda *a, **k: None)
     yield

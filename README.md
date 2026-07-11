@@ -278,7 +278,13 @@ walks it from a **start** node, following edges:
   fails. Compile the results by simple concatenation, or have the shared agent **summarize**
   them into one coherent answer.
 - **http** — an HTTP/REST call (SSRF-guarded: private/link-local targets blocked, redirects
-  re-validated per hop)
+  re-validated per hop). API keys go in as **named secrets** — store one via the workflow
+  list's **🔑 Secrets** button and reference it as `{{secret.NAME}}` in the URL, a header
+  value, or the body. Secrets are encrypted at rest and **write-only** (never shown back);
+  only the HTTP node can resolve them — the templating engine used by instruction/agent steps
+  can't, so a prompt-injected step can't read one out loud — and resolved values are
+  **redacted** from the run's recorded output even if the remote API echoes them. Literal
+  header values you type are also encrypted at rest in the store.
 - **sub-workflow** — run another saved workflow as a single step
 - **transform** — reshape the data flowing between nodes (no agent turn)
 - **approval** — pause for **human-in-the-loop** sign-off before continuing
@@ -316,7 +322,9 @@ The same graph then processes a different value each run: ▶ Run prompts for
 it, the agent can pass it via `run_workflow(name, input=…)`, a **webhook** body carries it
 (`{"input": …}` or raw text), a **chat keyword** hands the whole message in, and a **chain**
 passes the upstream workflow's output down as the next one's input. A stored **default** feeds
-unattended (scheduled) runs.
+unattended (scheduled) runs. A webhook can also be called **synchronously** — add `?wait=1`
+and the POST returns the workflow's final output (or a 202 if it outlasts the 120s budget) —
+turning any workflow into a callable API.
 
 **Triggers** (the ⚡ panel) decide *when* a workflow fires: manually (▶ Run),
 on a **cron** (managed in the Scheduler), or on an **event** — a watched workspace folder
@@ -324,10 +332,17 @@ changing, an incoming **webhook** (a secret-token URL), a **chat keyword** (web 
 an incoming **email** (new mail in a watched account/folder), or **another workflow finishing**
 (chaining, loop-guarded). If a trigger fires while a run of the same workflow is still going,
 the new run is recorded as **skipped** instead of racing it — stacked watch/email/cron fires
-can't pile up (tick *allow overlapping runs* in the editor to opt out). Every run is recorded (live,
-node-by-node over SSE), and a run still in progress when you **refresh the browser reconnects**
-to its live state. The agent can also trigger saved workflows with `run_workflow`, but you
-author them in the UI. Stored in `data/workflows.json`; the canvas is a vendored
+can't pile up (tick *allow overlapping runs* in the editor to opt out). Watch/email trigger
+baselines **persist across restarts** (`data/trigger_state.json`), so a file dropped or a mail
+that arrived while Oceano was down still fires when it comes back — nothing is silently
+re-baselined away. Every run is recorded (live, node-by-node over SSE), history is kept **per
+workflow** (last 25 each, in `data/workflow_runs.json` — a busy flow can't starve the others),
+and a run still in progress when you **refresh the browser reconnects** to its live state.
+Workflows are portable, too: **⤓ export** downloads one as JSON (webhook secrets stripped —
+fresh ones are minted on import), **⤒ import** loads it (name de-duped, cron restored), and
+**⧉ duplicate** copies a workflow without its history. The agent can also trigger saved
+workflows with `run_workflow`, but you author them in the UI. Stored in
+`data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).
 
 ---
