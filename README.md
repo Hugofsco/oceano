@@ -347,12 +347,17 @@ workflows with `run_workflow`, but you author them in the UI. Stored in
 `data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).
 
-**Examples.** Seven ready-to-import workflows live in
+**Examples.** Eleven ready-to-import workflows live in
 [`examples/workflows/`](examples/workflows/) — a scheduled morning briefing, an urgent-email
 sentry, an API watchdog (wait + retry before alerting), a fork/merge research fan-out, a
-multi-persona review board with approval, a watched-folder document indexer, and a GitHub
-release digest (http → transform → loop). Each deliberately shows off a different set of
-node types; import one via **⤒ Import** and open it in the editor to see how it's wired.
+multi-persona review board with approval, a watched-folder document indexer, a GitHub
+release digest (http → transform → loop), a **full software-development cycle** (PM
+requirements → CTO architecture → a multi-persona design-review panel → sign-off →
+implement → test → fix-until-green → code review → release-readiness → dossier), a weekday
+standup note, a content studio (draft → adversarial critique → revision → publish with
+audio narration), and a weekly competitor watch. Each deliberately shows off a different
+set of node types; import them via **⤒ Import** (multi-select works) and open one in the
+editor to see how it's wired.
 
 ---
 
