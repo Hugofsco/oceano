@@ -52,8 +52,26 @@ def list_tasks():
         }, "required": ["id"]},
     },
 })
+def _managed_guard(tid):
+    """The task's record if it is MANAGED (a `source`-tagged entry: the self-maintenance
+    built-ins — reflection, skills review/distill, evals, memory hygiene, reindex — plus
+    researcher- and workflow-owned schedules), else None. The agent's tools refuse to touch
+    those: pausing the nightly reflection persists across restarts (the bootstrap only
+    recreates MISSING tasks), so a single bad turn — or text injected into something the
+    agent read — could silently switch off the whole self-improvement loop. The user manages
+    them in the Scheduler window; these tools only manage plain agent tasks."""
+    t = next((t for t in scheduler.all_tasks() if t["id"] == tid), None)
+    return t if (t and t.get("managed")) else None
+
+
 def update_task(id, cron=None, instruction=None, enabled=None):
-    ok = scheduler.update_task(int(id), cron=cron, instruction=instruction, enabled=enabled)
+    tid = int(id)
+    m = _managed_guard(tid)
+    if m:
+        return (f"refused: task #{tid} ({(m.get('instruction') or '')[:70]!r}) is a managed entry "
+                "(a built-in maintenance job, or a researcher/workflow schedule). Those are managed "
+                "by the user in the Scheduler window — this tool only edits plain agent tasks.")
+    ok = scheduler.update_task(tid, cron=cron, instruction=instruction, enabled=enabled)
     if not ok:
         return f"could not update task #{id} (no such task, or invalid cron expression)"
     return f"updated task #{id}"
@@ -65,8 +83,8 @@ def update_task(id, cron=None, instruction=None, enabled=None):
         "name": "cancel_task",
         "description": "Delete a scheduled task by its id (from list_tasks) so it stops running. "
                        "To pause a task but keep it, use update_task with enabled=false instead. "
-                       "(Built-in maintenance jobs come back on the next restart — pause those rather "
-                       "than cancelling.)",
+                       "Managed entries (built-in maintenance jobs, researcher/workflow schedules) are "
+                       "refused — only the user can change those, in the Scheduler window.",
         "parameters": {"type": "object", "properties": {
             "id": {"type": "integer", "description": "the task id shown by list_tasks"},
         }, "required": ["id"]},
@@ -76,6 +94,11 @@ def cancel_task(id):
     tid = int(id)
     if tid not in {t["id"] for t in scheduler.all_tasks()}:
         return f"no task #{tid} — use list_tasks to see the current ids"
+    m = _managed_guard(tid)
+    if m:
+        return (f"refused: task #{tid} ({(m.get('instruction') or '')[:70]!r}) is a managed entry "
+                "(a built-in maintenance job, or a researcher/workflow schedule). Only the user can "
+                "remove or pause those, in the Scheduler window.")
     scheduler.delete_task(tid)
     return f"cancelled task #{tid}"
 

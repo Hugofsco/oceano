@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from oceano import evals, researcher, skills
+from oceano import evals, researcher, skills, suggestions
 from oceano.web.state import _sse
 
 router = APIRouter()
@@ -57,6 +57,35 @@ def evaluate_skills_api():
 @router.get("/api/skills-eval")
 def skills_eval_state():
     return skills.eval_state()
+
+
+# ---------------- suggestions: the self-evolution queue ----------------
+# Nightly reflection files proposals here (suggestions.add); until now they were only
+# reachable by asking the agent in chat, so the queue accumulated unseen. Brain →
+# Suggestions renders these.
+@router.get("/api/suggestions")
+def suggestions_list(status: str = "pending"):
+    """Also reports the health of the queue's ONLY producer — the [ SELF ] reflection task —
+    so the panel can warn when it's switched off (a disabled producer starves the queue
+    silently; that must be loud, not indistinguishable from 'no ideas')."""
+    from oceano import reflect, scheduler
+    t = next((t for t in scheduler.all_tasks() if t.get("source") == reflect.SOURCE), None)
+    return {"suggestions": suggestions.all_suggestions(status or "pending"),
+            "pending": len(suggestions.all_suggestions("pending")),
+            "reflection": {"exists": bool(t), "enabled": bool(t and t.get("enabled")),
+                           "last_filed": suggestions.last_filed()}}
+
+
+@router.post("/api/suggestions/{sid}/accept")
+def suggestions_accept(sid: int):
+    """Accept = ACT: auto-creates the artifact for the safe kinds (research topic /
+    workflow draft / memory); skill & setting are marked for manual follow-up."""
+    return suggestions.accept(sid)
+
+
+@router.post("/api/suggestions/{sid}/dismiss")
+def suggestions_dismiss(sid: int):
+    return suggestions.dismiss(sid)
 
 
 # ---------------- evals: model eval harness ----------------
@@ -115,8 +144,8 @@ def evals_state():
 
 
 @router.get("/api/evals/leaderboard")
-def evals_leaderboard(run_id: int = None):
-    return evals.leaderboard(run_id)
+def evals_leaderboard(run_id: int = None, category: str = None):
+    return evals.leaderboard(run_id, category=category or None)
 
 
 @router.get("/api/evals/runs")

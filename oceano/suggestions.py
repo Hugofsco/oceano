@@ -75,6 +75,15 @@ def all_suggestions(status="pending"):
     return [_row(r) for r in rows]
 
 
+def last_filed():
+    """ISO stamp of the most recently filed suggestion (any status), or None — the panel's
+    staleness signal for the reflection→suggestions pipeline."""
+    con = _db()
+    r = con.execute("SELECT MAX(ts) FROM suggestions").fetchone()
+    con.close()
+    return r[0] if r and r[0] else None
+
+
 def get(sid):
     con = _db()
     r = con.execute(f"SELECT {_COLS} FROM suggestions WHERE id=?", (sid,)).fetchone()

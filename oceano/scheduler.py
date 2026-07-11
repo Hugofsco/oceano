@@ -246,16 +246,42 @@ def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=Fa
     return True
 
 
+# Sources no one may delete — not the UI, not the agent. The nightly [ SELF ] reflection is the
+# SOLE producer of the Brain → Suggestions queue (the action half of the self-evolution loop):
+# severing it doesn't error anywhere, the queue just silently never fills again, which is
+# indistinguishable from "no ideas". It can still be toggled OFF — an explicit, visible state
+# the Suggestions panel warns about — just never removed.
+PROTECTED_SOURCES = ("self:reflect",)
+
+
 def delete_task(tid, allow_managed=False):
-    """Delete a task — any task can be removed from the Scheduler now. The built-in jobs
-    (skills/evals/memory/reflect/reindex) are recreated on the next server start by their
-    ensure_*() bootstrap, so deleting one only clears it until restart; toggle it OFF instead
-    to keep it gone for good. `allow_managed` is retained for the owner modules' delete path."""
+    """Delete a task — any task EXCEPT the delete-protected built-ins (PROTECTED_SOURCES) can
+    be removed from the Scheduler. The other built-in jobs (skills/evals/memory/reindex) are
+    recreated on the next server start by their ensure_*() bootstrap, so deleting one only
+    clears it until restart; toggle it OFF instead to keep it gone for good. `allow_managed`
+    is retained for the owner modules' delete path (it does NOT bypass the protection)."""
     con = _db()
+    row = con.execute("SELECT source FROM tasks WHERE id=?", (tid,)).fetchone()
+    if row and row[0] in PROTECTED_SOURCES:
+        con.close()
+        return False
     con.execute("DELETE FROM tasks WHERE id=?", (tid,))
     con.commit()
     con.close()
     return True
+
+
+def wipe():
+    """Delete every PLAIN scheduled task (Settings → Wipe) — the ones you or the agent created.
+    Managed entries (source-tagged) are kept: the maintenance built-ins would only be recreated
+    on the next restart, and researcher/workflow schedules belong to their owner features (wipe
+    those from the Researcher / Workflows windows). Returns how many tasks were removed."""
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM tasks WHERE source IS NULL OR source=''").fetchone()[0]
+    con.execute("DELETE FROM tasks WHERE source IS NULL OR source=''")
+    con.commit()
+    con.close()
+    return n
 
 
 # --- the actual runner (driven by the engine's loop) ----------------------

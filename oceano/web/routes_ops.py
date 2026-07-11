@@ -42,7 +42,8 @@ async def update_task_api(tid: int, req: Request):
 @router.delete("/api/tasks/{tid}")
 def delete_task_api(tid: int):
     ok = scheduler.delete_task(tid)
-    return {"ok": ok, **({} if ok else {"error": "could not delete task"})}
+    return {"ok": ok, **({} if ok else {"error": "this task is delete-protected — the nightly "
+            "[ SELF ] reflection is what fills Brain → Suggestions. Switch it OFF instead."})}
 
 
 @router.post("/api/tasks/{tid}/run")

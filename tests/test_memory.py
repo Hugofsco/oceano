@@ -1,5 +1,6 @@
 """Memory: remember() skips near-identical duplicates (semantic, high bar) so explicit
 saves don't pile up copies between the weekly maintenance runs."""
+import json
 import os
 import sys
 
@@ -68,3 +69,69 @@ def test_vector_cache_results_and_invalidation(tmp_path, monkeypatch):
     assert memory._VEC_CACHE
     memory.reindex(force=True)                                # re-embeds → must clear the cache
     assert memory._VEC_CACHE == {}
+
+
+# --- the weekly maintenance run: applies a DELEGATE-authored plan, so parse + apply defensively ---
+def _memories(monkeypatch, tmp_path, n=10, pinned=()):
+    monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
+    monkeypatch.setattr(memory, "_embed", lambda text, kind="document": None)   # keyword mode: always saves
+    memory._invalidate()
+    for i in range(1, n + 1):
+        memory.remember(f"fact number {i}", pinned=(i in pinned))
+    return {m["text"]: m["id"] for m in memory.list_all()}
+
+
+def _plan(monkeypatch, plan, ok=True):
+    out = "Here is the plan:\n" + json.dumps(plan) if isinstance(plan, dict) else plan
+    monkeypatch.setattr("oceano.delegate.run",
+                        lambda prompt, **kw: {"ok": ok, "output": out, "error": "" if ok else out})
+
+
+def test_parse_plan_rejects_garbage_and_non_objects():
+    assert memory._parse_plan("no json here") is None
+    assert memory._parse_plan(None) is None
+    assert memory._parse_plan('{"delete": [1], "notes": "x"') is None      # truncated
+    assert memory._parse_plan("prose then {\"delete\": []} more prose") == {"delete": []}
+
+
+def test_maintain_refuses_a_plan_that_guts_the_store(monkeypatch, tmp_path):
+    ids = _memories(monkeypatch, tmp_path, n=10)
+    _plan(monkeypatch, {"delete": list(ids.values())[:8], "notes": "everything is redundant"})
+    summary = memory._maintain()
+    assert "aborted" in summary and "over half" in summary
+    assert memory.count() == 10                                            # nothing was deleted
+
+
+def test_maintain_never_deletes_pinned_memories(monkeypatch, tmp_path):
+    ids = _memories(monkeypatch, tmp_path, n=6, pinned=(1, 2))
+    pinned_ids = [ids["fact number 1"], ids["fact number 2"]]
+    _plan(monkeypatch, {"delete": pinned_ids + [ids["fact number 3"]], "notes": "cleanup"})
+    summary = memory._maintain()
+    assert "removed 1" in summary                                          # only the unpinned one
+    left = {m["text"] for m in memory.list_all()}
+    assert "fact number 1" in left and "fact number 2" in left and "fact number 3" not in left
+
+
+def test_maintain_ignores_malformed_plan_entries(monkeypatch, tmp_path):
+    ids = _memories(monkeypatch, tmp_path, n=4)
+    _plan(monkeypatch, {
+        "delete": ["not-an-int", 999999, None],                 # wrong type / unknown id
+        "update": [{"id": 999999, "text": "x"}, {"text": "no id"}, "garbage",
+                   {"id": ids["fact number 1"], "text": "fact number 1 (clarified)"}],
+        "recategorize": [{"id": ids["fact number 2"], "category": "project"}, {"id": "x"}],
+        "notes": "mixed-quality plan"})
+    summary = memory._maintain()
+    assert "removed 0" in summary and "rewrote 1" in summary and "recategorized 1" in summary
+    assert memory.count() == 4
+    texts = {m["id"]: m for m in memory.list_all()}
+    assert texts[ids["fact number 1"]]["text"] == "fact number 1 (clarified)"
+    assert texts[ids["fact number 2"]]["category"] == "project"
+
+
+def test_maintain_skips_cleanly_when_the_delegate_is_down(monkeypatch, tmp_path):
+    _memories(monkeypatch, tmp_path, n=3)
+    _plan(monkeypatch, "usage limit reached", ok=False)
+    assert "delegate unavailable" in memory._maintain()
+    assert memory.count() == 3
+    _plan(monkeypatch, "I think these all look fine!")          # no parsable JSON plan
+    assert "no parsable plan" in memory._maintain()

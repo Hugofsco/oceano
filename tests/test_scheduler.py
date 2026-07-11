@@ -76,3 +76,57 @@ def test_run_status_is_recorded_and_listed(tmp_path, monkeypatch):
     listing = scheduler.list_tasks()
     assert "last run FAILED" in listing
     assert scheduler.all_tasks()[0]["last_status"] == "error"
+
+
+def test_agent_tools_refuse_to_touch_managed_tasks(tmp_path, monkeypatch):
+    """The agent's update_task/cancel_task must not reach source-tagged (managed) entries:
+    pausing e.g. the nightly [ SELF ] reflection PERSISTS across restarts (the bootstrap only
+    recreates missing tasks), so a bad turn — or injected text — could silently switch off the
+    self-improvement loop. Only plain agent tasks are the agent's to manage."""
+    from oceano.tools import sched as tools_sched
+    monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
+    self_id = scheduler.add_task("30 23 * * *", "[ SELF ] Nightly reflection", source="self:reflect")
+    plain_id = scheduler.add_task("0 8 * * *", "check the news")
+
+    assert "refused" in tools_sched.update_task(self_id, enabled=False)
+    assert "refused" in tools_sched.cancel_task(self_id)
+    kept = next(t for t in scheduler.all_tasks() if t["id"] == self_id)
+    assert kept["enabled"] is True                     # untouched: still there, still on
+
+    assert "updated" in tools_sched.update_task(plain_id, enabled=False)
+    assert "cancelled" in tools_sched.cancel_task(plain_id)
+
+    # the user's own paths: toggling/retiming a managed task from the Scheduler UI stays fine
+    assert scheduler.update_task(self_id, enabled=False) is True
+
+
+def test_self_reflection_is_delete_protected_for_everyone(tmp_path, monkeypatch):
+    """[ SELF ] is the SOLE producer of the suggestions queue — deleting it starves the queue
+    silently. No path may delete it (UI, agent, owner modules); toggling OFF is the sanctioned
+    way to stop it, and the Suggestions panel warns about that state."""
+    monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
+    self_id = scheduler.add_task("30 23 * * *", "[ SELF ] Nightly reflection", source="self:reflect")
+    other_id = scheduler.add_task("0 5 * * *", "[ SKILLS ] Evaluate", source="skills:eval")
+
+    assert scheduler.delete_task(self_id) is False
+    assert scheduler.delete_task(self_id, allow_managed=True) is False    # no bypass
+    assert any(t["id"] == self_id for t in scheduler.all_tasks())
+    assert scheduler.update_task(self_id, enabled=False) is True          # OFF stays allowed
+
+    assert scheduler.delete_task(other_id) is True     # other built-ins: deletable, self-healing
+                                                       # (recreated by ensure_*() on restart)
+
+
+def test_wipe_removes_plain_tasks_and_keeps_managed(tmp_path, monkeypatch):
+    """Settings → Wipe → Scheduled tasks clears what you/the agent scheduled, but never the
+    source-tagged entries — maintenance built-ins and researcher/workflow schedules belong to
+    their owner features (and [ SELF ] is delete-protected besides)."""
+    monkeypatch.setattr(scheduler, "DB_PATH", tmp_path / "tasks.db")
+    scheduler.add_task("0 8 * * *", "plain repeating task")
+    scheduler.add_task("", "one-shot reminder", run_once_at="2026-07-12 09:00")
+    scheduler.add_task("30 23 * * *", "[ SELF ] reflection", source="self:reflect")
+    scheduler.add_task("0 5 * * *", "[ SKILLS ] evaluate", source="skills:eval")
+    scheduler.add_task("0 9 * * *", "research topic", source="research:3")
+    assert scheduler.wipe() == 2
+    assert {t["source"] for t in scheduler.all_tasks()} == {"self:reflect", "skills:eval", "research:3"}
+    assert scheduler.wipe() == 0                       # idempotent
