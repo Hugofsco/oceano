@@ -1372,8 +1372,13 @@ const WIPE_TARGETS = [
   ["chats", "Chats", "Every saved conversation (all dated folders).", "All chat history will be permanently deleted."],
   ["documents", "Documents", "Everything inside the workspace folder.", "All files & folders in the workspace will be deleted."],
   ["knowledge", "Indexed knowledge", "The RAG store of embedded document chunks.", "All indexed document chunks will be removed (re-index to restore)."],
-  ["skills", "Learnt skills", "Skills the agent taught itself (not your published ones).", "All learning/staged skills will be deleted; published skills are kept."],
+  ["skills", "Learnt skills", "Skills the agent taught itself (not built-in or user-made ones).", "All self-learnt skills will be deleted — learning, staged AND published; built-in and user-made skills are kept."],
   ["memory", "Memories", "All long-term memories about you.", "Every stored memory will be permanently deleted."],
+  ["tasks", "Scheduled tasks", "Every task you or the agent scheduled. Built-in maintenance jobs and researcher/workflow schedules are kept.", "All plain scheduled tasks will be deleted; managed entries (maintenance, researcher, workflows) stay."],
+  ["mcp", "MCP servers", "Every connected MCP server (urls, commands, tokens) — their tools disappear from the agent immediately.", "All registered MCP servers will be removed and disconnected."],
+  ["mail", "Mail accounts", "Every connected email account (addresses, servers, app passwords). Your mailboxes themselves are untouched.", "All mail accounts will be removed from Oceano — nothing on the mail servers is deleted."],
+  ["research", "Research topics", "Every scheduled research topic and its schedule. The living research documents are kept.", "All research topics and their schedules will be deleted; the accumulated documents in workspace/research stay (wipe Documents to remove those)."],
+  ["workflows", "Workflows", "Every workflow you built on the canvas, plus their run history, schedules, and event triggers.", "All workflows will be permanently deleted — definitions, run history, schedules, webhooks and other triggers."],
 ];
 const SETTINGS_PAGES = {
   account: `
@@ -1524,6 +1529,9 @@ const SETTINGS_PAGES = {
           <span class="dg-probe" id="dgDefaultMsg"></span>
         </div>
         <div class="dg-hint">Saved on change and used immediately by new conversations and jobs. Pick from models your local stack serves.</div>
+        <label class="dg-toggle"><input type="checkbox" id="dgRouteEvals"> <b>Follow the eval leaderboard</b>
+          <span class="lbl-sub">— when no primary is pinned above, run the top scorer of the latest eval run (among served models) instead of the first served one. Brain → Evals runs the suite.</span></label>
+        <div class="dg-hint" id="dgRouteEvalsMsg"></div>
       </div>
 
       <div class="dg-role">
@@ -1658,6 +1666,11 @@ async function wipeTarget(key) {
     if (key === "memory") { if (typeof loadBrainMem === "function") loadBrainMem(); }
     if (key === "documents" && typeof expLoad === "function" && typeof _expCwd === "string") expLoad("");
     if (key === "skills" && typeof loadBrainSkills === "function") loadBrainSkills();
+    if (key === "tasks" && typeof loadScheduler === "function") loadScheduler();
+    if (key === "mcp") { const w = document.getElementById("win-mcp"); if (w) mcpRenderList($(".win-body", w)); }
+    if (key === "mail") { const w = document.getElementById("win-mail"); if (w) mailRenderMain($(".win-body", w)); }
+    if (key === "research" && typeof loadResearch === "function") loadResearch();
+    if (key === "workflows") { const w = document.getElementById("win-workflows"); if (w) wfRenderList($(".win-body", w)); }
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
 function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadBrowserSetting(); loadVoiceSettings(); }
@@ -2009,6 +2022,23 @@ async function loadDefaultModel() {
       if (msg) { msg.textContent = "✓ now using " + (r.current || model || "default"); msg.className = "dg-probe ok"; }
     } catch { if (msg) { msg.textContent = "save failed"; msg.className = "dg-probe err"; } }
   };
+  const route = $("#dgRouteEvals");
+  if (route) {
+    route.checked = !!cur.route_by_evals;
+    dgRouteEvalsNote(cur.route_by_evals, cur.evals_winner);
+    route.onchange = async () => {
+      try {
+        const r = await _postJ("/api/delegate/route-by-evals", { enabled: route.checked });
+        dgRouteEvalsNote(r.route_by_evals, r.evals_winner);
+      } catch { route.checked = !route.checked; }
+    };
+  }
+}
+function dgRouteEvalsNote(on, winner) {
+  const msg = $("#dgRouteEvalsMsg"); if (!msg) return;
+  msg.textContent = !on ? ""
+    : winner ? `current leaderboard winner: ${winner}`
+    : "no finished eval run yet (or its winner isn't served) — routing falls back to the first served model until one completes";
 }
 function dgInitRole(role, cfg) {
   $$(`input[name="dg-${role}"]`).forEach(r => { r.checked = (r.value === cfg.provider); r.onchange = () => dgSyncRole(role); });
@@ -2918,7 +2948,7 @@ function maybePreviewChip(card, name, argsJson) {
 }
 
 /* ---------- Brain window (memory + skills) ---------- */
-const BRAIN_TABS = [["mem", "✶", "Memory"], ["id", "🪪", "Identity"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
+const BRAIN_TABS = [["mem", "✶", "Memory"], ["id", "🪪", "Identity"], ["kn", "◈", "Knowledge"], ["skills", "⚒", "Skills"], ["sug", "💡", "Suggestions"], ["rivers", "🌊", "Rivers"], ["evals", "⚖", "Evals"]];
 function openBrain(tab) {
   const { body, reused } = createWindow({ id: "win-brain", title: "Brain", icon: "✶", width: 720, height: 580,
     restoreKey: "brain", restoreArg: tab,
@@ -2959,6 +2989,8 @@ function brainTab(which) {
     renderIdentity(c);
   } else if (which === "kn") {
     renderKnowledge(c);
+  } else if (which === "sug") {
+    renderSuggestions(c);
   } else if (which === "rivers") {
     renderRivers(c);
   } else if (which === "evals") {
@@ -2987,6 +3019,75 @@ function brainTab(which) {
     loadBrainSkills(); refreshSkillEval(false);
   }
 }
+/* ---------- Brain → Suggestions (the ACTION half of the self-evolution loop) ---------- */
+// Nightly reflection files proposals into suggestions.db; until this panel they were only
+// reachable by asking the agent in chat, so the queue accumulated unseen. Accepting one
+// auto-creates the artifact (research topic / workflow draft / memory) server-side.
+let _sugFilter = "pending";
+const _SUG_ICON = { research: "🔭", workflow: "⚙", memory: "✶", skill: "⚒", setting: "🎛", other: "•" };
+function renderSuggestions(c) {
+  c.innerHTML = `
+    <div class="brain-head">
+      <div class="sk-tabs">
+        <button class="sk-tab on" data-f="pending">Pending<span class="sk-cnt" id="sugCntPend"></span></button>
+        <button class="sk-tab" data-f="all">History</button>
+      </div>
+    </div>
+    <div class="kn-note">Ideas the nightly reflection proposed for itself. <b>Accept</b> creates the real thing — a research topic, a workflow draft, a saved memory; skill/setting ideas are marked for manual follow-up.</div>
+    <div id="sugWarn"></div>
+    <div class="mem-list" id="sugList"></div>`;
+  $$(".sk-tab", c).forEach(b => b.onclick = () => {
+    $$(".sk-tab", c).forEach(x => x.classList.toggle("on", x === b));
+    _sugFilter = b.dataset.f; loadSuggestions();
+  });
+  _sugFilter = "pending";
+  loadSuggestions();
+}
+async function loadSuggestions() {
+  const list = $("#sugList"); if (!list) return;
+  let d; try { d = await api("/api/suggestions?status=" + _sugFilter); } catch { return; }
+  const cnt = $("#sugCntPend"); if (cnt) cnt.textContent = d.pending ? ` ${d.pending}` : "";
+  const warn = $("#sugWarn");
+  if (warn) {                                    // the queue's ONLY producer is [ SELF ] — a dead
+    const r = d.reflection || {};                // producer must be loud, not look like "no ideas"
+    const last = r.last_filed ? ` Last suggestion filed: ${r.last_filed.slice(0, 10)}.` : "";
+    warn.innerHTML = (r.exists && r.enabled) ? ""
+      : `<div class="dg-hint warn">⚠ The nightly [ SELF ] reflection that fills this queue is currently ${r.exists ? "switched OFF" : "missing (it will be recreated on the next restart)"} — no new suggestions will appear${r.exists ? " until you re-enable it in the Scheduler" : ""}.${last}</div>`;
+  }
+  list.innerHTML = "";
+  if (!(d.suggestions || []).length) {
+    list.innerHTML = `<div class="empty-note">${_sugFilter === "pending"
+      ? "No pending suggestions — the nightly reflection files new ones here when it spots something worth doing."
+      : "No suggestion history yet."}</div>`;
+    return;
+  }
+  d.suggestions.forEach(s => {
+    const row = document.createElement("div"); row.className = "mem-row";
+    const status = s.status === "pending" ? "" : `<span class="mr-src">${escapeHtml(s.status)}</span>`;
+    const result = s.result ? `<div class="mr-meta">→ ${escapeHtml(s.result)}</div>` : "";
+    row.innerHTML = `<span class="mr-pin" style="cursor:default" title="${escapeHtml(s.kind)}">${_SUG_ICON[s.kind] || "•"}</span>
+      <div class="mr-body"><div class="mr-text">${escapeHtml(s.title)}</div>
+        ${s.detail ? `<div class="mr-meta">${escapeHtml(s.detail)}</div>` : ""}${result}
+        <div class="mr-meta">${status}<span class="mr-src" title="what filed it">↪ ${escapeHtml(s.source || "reflection")}</span><span class="mr-date">${(s.ts || "").slice(0, 10)}</span></div>
+      </div>` + (s.status === "pending"
+        ? `<button class="exp-btn sug-ok" title="accept — create the real thing">✓ Accept</button><button class="mr-del" title="dismiss">✕</button>` : "");
+    const ok = $(".sug-ok", row), del = $(".mr-del", row);
+    if (ok) ok.onclick = async () => {
+      ok.disabled = true; ok.textContent = "…";
+      try {
+        const r = await _postJ(`/api/suggestions/${s.id}/accept`, {});
+        toast(r.ok ? (r.result || "accepted") : (r.error || "accept failed"), r.ok ? "ok" : "err");
+      } catch { toast("accept failed", "err"); }
+      loadSuggestions();
+    };
+    if (del) del.onclick = async () => {
+      try { await _postJ(`/api/suggestions/${s.id}/dismiss`, {}); } catch {}
+      loadSuggestions();
+    };
+    list.appendChild(row);
+  });
+}
+
 // Shared row for a single memory — used by both the Memory tab (all categories) and
 // the Identity tab (category === "identity" only). `onChange` re-renders the caller's
 // list, so e.g. re-categorizing a memory out of "identity" drops it from that filtered view.
@@ -3634,7 +3735,9 @@ async function loadScheduler() {
       <div class="sr-body"><div class="sr-instr">${escapeHtml(t.instruction)}</div><div class="sr-meta"><code>${escapeHtml(t.cron)}</code> · next ${escapeHtml(nxt)}${modelTag}</div></div>` +
       `<button class="sr-btn sr-run" title="run now, ignoring the schedule">▶ Run</button>` +
       `<button class="sr-btn sr-edit">edit</button>` +
-      `<button class="sr-btn sr-del">✕</button>`;
+      (t.source === "self:reflect"
+        ? `<span class="sr-btn" style="cursor:default;opacity:.6" title="delete-protected — this reflection fills Brain → Suggestions; switch it off instead">🔒</span>`
+        : `<button class="sr-btn sr-del">✕</button>`);
     $("input", row).onchange = async e => { await fetch("/api/tasks/" + t.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: e.target.checked }) }); loadScheduler(); };
     $(".sr-run", row).onclick = async ev => {
       const b = ev.currentTarget; if (b.disabled) return;
@@ -3647,7 +3750,13 @@ async function loadScheduler() {
       row.classList.remove("running"); loadScheduler();
     };
     $(".sr-edit", row).onclick = () => openTaskEditor(t);
-    $(".sr-del", row).onclick = async () => { if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return; await fetch("/api/tasks/" + t.id, { method: "DELETE" }); loadScheduler(); };
+    const del = $(".sr-del", row);
+    if (del) del.onclick = async () => {
+      if (!await confirmAction("Delete task?", t.instruction.slice(0, 90))) return;
+      let r = {}; try { r = await fetch("/api/tasks/" + t.id, { method: "DELETE" }).then(x => x.json()); } catch {}
+      if (r && r.ok === false) toast(r.error || "delete refused", "err");   // server-side guard is the boundary
+      loadScheduler();
+    };
     list.appendChild(row);
   });
 }

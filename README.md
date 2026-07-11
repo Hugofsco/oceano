@@ -98,7 +98,7 @@ from a web UI or Telegram.
   hardware** (it reads the model's GGUF + your VRAM/RAM/cores and fills in context, GPU layers,
   KV dtype, threads, and MoE-offload, each with a reason).
 - **A desktop of apps.** Floating windows: chat with dated history folders, a "Brain"
-  (identity · memory · knowledge · skills · rivers · evals), Workflows, file explorer + editor,
+  (identity · memory · knowledge · skills · suggestions · rivers · evals), Workflows, file explorer + editor,
   Scheduler, Calendar, Researcher, semantic Search, a Kanban Notes board, a
   System-health dashboard, a Memory graph, a Voice console, an **interactive Terminal** (a real
   bash shell in the workspace, xterm.js over a WebSocket — fenced by the systemd sandbox), and a
@@ -419,6 +419,13 @@ work and tells the local model *not* to attempt the whole job itself (which woul
 small context). Tune with `OCEANO_DELEGATE_IDLE` (default 300s), `OCEANO_DELEGATE_MAXTOTAL`
 (3600s), `OCEANO_DELEGATE_MAXTURNS` (60).
 
+Delegation also **survives the subscription's rate limit**: a run killed by a usage/rate limit
+(routine on a Claude subscription — and previously fatal to a whole night of unattended
+self-improvement jobs) waits for the window to reset, then **resumes the same session**
+(`--resume`) so completed work isn't redone. Bounded: at most `OCEANO_DELEGATE_RL_RETRIES` (2)
+waits of up to `OCEANO_DELEGATE_RL_WAIT` (1800s) each — a reset further out fails fast with the
+reset time in the error, and partial work from earlier attempts is kept.
+
 **Delegation blocks; sub-agents don't.** For work that should run *alongside* the conversation,
 `spawn_agent` fires a **background sub-agent** on a per-spawn provider — Claude, Codex, a cloud
 model, or the local model (with a weak-model warning) — owned by the daemon, not the turn. It's
@@ -533,7 +540,7 @@ It's a single-page app with:
   so it reads cleanly). Half-duplex, with an optional **wake word** ("Oceano …"). All local; the
   installer provisions the stack.
 - **Floating windows** — Settings, **Brain** (Identity · Memory · Knowledge · Skills ·
-  Rivers · Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
+  Suggestions · Rivers · Evals), **Workflows** (node canvas), Files explorer + editor (drag-and-drop **file/folder
   upload** into the workspace), Scheduler, Calendar, Researcher, semantic **Search**
   (memories · documents · conversations), **Notes** (Kanban), **Health** (live system
   dashboard), **Memory graph**, **Voice** (push-to-talk in / spoken replies out — natural local
@@ -584,14 +591,30 @@ It's a single-page app with:
 - **Scheduler** — cron tasks run by the agent autonomously; results pushed to your phone
   via [ntfy](https://ntfy.sh). Manage in the Scheduler window, or hit **▶ Run** to fire
   any job on demand (locked jobs and workflows included).
-- **Locked maintenance jobs** — schedulable/toggleable (but not deletable) entries keep
+- **Managed maintenance jobs** — schedulable/toggleable entries keep
   Oceano healthy: a skills review, a **skills-distillation feeder** (mines recently-active
   chats into `learning` skills that flow into the review/publish pipeline), the eval suite,
   memory hygiene, a nightly **`[ INDEX ]` reindex** that re-syncs the doc / memory / skill /
   chat embeddings to disk (pruning what's gone, re-embedding what changed), and a nightly
   **`[ SELF ]` self-reflection** that digests the day's runs and writes
   `workspace/journal/<date>.md`. The self-improving jobs are judged by the configured
-  `improve` delegate, never the local model.
+  `improve` delegate, never the local model. The agent's own scheduling tools **can't touch
+  any managed entry** (pause/retime/delete are user-only, in the Scheduler window — so a bad
+  turn or injected text can't switch the self-improvement loop off), deleting a built-in
+  from the UI only lasts until the next restart (its bootstrap recreates it), and `[ SELF ]`
+  is fully **delete-protected** — it's the sole producer of the Suggestions queue; switch it
+  OFF instead, and the Suggestions panel warns while it's off.
+- **Suggestions queue** — the reflection's actionable proposals land in **Brain →
+  Suggestions** as pending items; **Accept** creates the real artifact (a research topic,
+  a workflow draft, a saved memory — skill/setting ideas are noted for manual follow-up),
+  **✕** dismisses. The agent can work the same queue in chat (`list_suggestions` /
+  `accept_suggestion` / `dismiss_suggestion`).
+- **Eval-driven model routing** — the eval suite's leaderboard can actually *steer* the
+  agent: turn on **Settings → Delegation → Follow the eval leaderboard** and, whenever no
+  primary model is pinned, Oceano runs the top scorer of the latest finished eval run
+  (among currently served models, per-category boards via
+  `/api/evals/leaderboard?category=`) instead of llama-swap file order. Stale runs
+  (>45 days) never route; an explicit primary always wins.
 - **Background jobs & the queue** — every unattended job (workflows, scheduled tasks,
   research, evals, memory & index upkeep, spawned jobs & sub-agents) registers in a live registry shown by a topbar
   indicator. **Settings → Tools → Execution** can *serialize* them through one gate —
