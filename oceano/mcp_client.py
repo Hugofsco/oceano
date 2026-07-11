@@ -324,3 +324,14 @@ def remove_server(name):
     servers = [s for s in _read_config() if s["name"] != name]
     _write_config(servers)
     _disconnect_one(name)
+
+
+def wipe():
+    """Remove EVERY registered MCP server (Settings → Wipe): clears the stored config
+    (urls/commands/tokens) and disconnects each live session so its tools disappear from
+    the agent immediately. Returns how many servers were removed."""
+    servers = _read_config()
+    _write_config([])
+    for s in servers:
+        _disconnect_one(s.get("name", ""))
+    return len(servers)

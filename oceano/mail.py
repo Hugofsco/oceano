@@ -216,6 +216,19 @@ def remove(aid):
     return len(d["accounts"]) < before
 
 
+def wipe():
+    """Remove EVERY connected mail account (Settings → Wipe): clears the stored accounts
+    (addresses, servers, app passwords) and drops any active 30-min arm windows. Returns
+    how many accounts were removed."""
+    d = _load()
+    n = len(d["accounts"])
+    for a in d["accounts"]:
+        disarm(a["id"])
+    d["accounts"] = []
+    _save(d)
+    return n
+
+
 def _stamp_used(aid):
     d = _load()
     a = next((x for x in d["accounts"] if x["id"] == aid), None)

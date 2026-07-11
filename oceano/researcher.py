@@ -157,6 +157,23 @@ def delete_topic(rid):
     return True
 
 
+def wipe():
+    """Remove EVERY research topic and its scheduler entry (Settings → Wipe). Like
+    delete_topic, the living docs under workspace/research/ are kept — they're the user's
+    accumulated knowledge (wipe Documents, or use Files, to remove those). Returns how
+    many topics were removed."""
+    con = _db()
+    rows = con.execute("SELECT task_id FROM topics").fetchall()
+    con.execute("DELETE FROM topics")
+    con.commit()
+    con.close()
+    from oceano import scheduler
+    for (task_id,) in rows:
+        if task_id:
+            scheduler.delete_task(task_id, allow_managed=True)
+    return len(rows)
+
+
 # ============================ running ============================
 _RUN_PROMPT = """You are running a RECURRING research job whose whole purpose is to DEEPEN a body of
 knowledge over many runs — to DRILL DOWN, not to re-summarize the same overview each time. Work

@@ -6,6 +6,7 @@ Each skill is  skills/<name>/SKILL.md  with frontmatter + a body of instructions
     name: research-report
     description: when & how to write a cited research report
     status: published          # learning | staged | published
+    origin: learned            # only on agent-learnt skills; absent on built-in/user ones
     notes: <one-line review verdict>
     ---
     <step-by-step instructions the agent should follow>
@@ -57,10 +58,12 @@ def _oneline(s):
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _write(slug, name, description, body, status, notes=""):
+def _write(slug, name, description, body, status, notes="", origin=""):
     d = SKILLS_DIR / slug
     d.mkdir(parents=True, exist_ok=True)
     fm = f"---\nname: {name}\ndescription: {_oneline(description)}\nstatus: {status}\n"
+    if origin:
+        fm += f"origin: {_oneline(origin)}\n"
     if notes:
         fm += f"notes: {_oneline(notes)[:300]}\n"
     (d / "SKILL.md").write_text(fm + f"---\n{body.strip()}\n", encoding="utf-8")
@@ -80,7 +83,8 @@ def all_skills():
         meta, body = _parse(sk.read_text(encoding="utf-8"))
         out.append({"dir": sk.parent.name, "name": meta.get("name", sk.parent.name),
                     "description": meta.get("description", ""), "body": body,
-                    "status": _norm_status(meta.get("status")), "notes": meta.get("notes", "")})
+                    "status": _norm_status(meta.get("status")), "notes": meta.get("notes", ""),
+                    "origin": meta.get("origin", "")})
     return out
 
 
@@ -183,18 +187,26 @@ def _free_slug(name):
 
 def save_skill(name, description, body, dir=None, status="published", notes=""):
     """Create or update a skill. UI/user-authored skills default to published
-    (the user is trusted); the agent's learn_skill goes through `learning`."""
+    (the user is trusted); the agent's learn_skill goes through `learning`.
+    Updating an existing skill keeps its `origin` — editing a learned skill
+    doesn't relabel it as user-authored (it would dodge the learnt-skills wipe)."""
     slug = dir or _free_slug(name)
-    return _write(slug, name, description, body, _norm_status(status), notes)
+    origin = ""
+    path = SKILLS_DIR / slug / "SKILL.md"
+    if path.exists():
+        meta, _ = _parse(path.read_text(encoding="utf-8"))
+        origin = meta.get("origin", "")
+    return _write(slug, name, description, body, _norm_status(status), notes, origin)
 
 
 def learn_skill(name, description, body):
-    """Agent self-improvement entry point: saved as LEARNING, never overwrites an
-    existing skill (a new slug is allocated), reviewed before it goes live."""
+    """Agent self-improvement entry point: saved as LEARNING with origin=learned
+    (so it stays wipeable even once published), never overwrites an existing
+    skill (a new slug is allocated), reviewed before it goes live."""
     if not (name or "").strip() or not (body or "").strip():
         return "refused: a skill needs at least a name and instructions"
     slug = _free_slug(name)
-    _write(slug, name.strip(), description, body, "learning")
+    _write(slug, name.strip(), description, body, "learning", origin="learned")
     return (f"saved {slug!r} as a LEARNING skill. It will be reviewed by an independent "
             f"model before being published into your active skills.")
 
@@ -250,7 +262,7 @@ def set_status(dir, status, notes=None):
         return False
     meta, body = _parse(path.read_text(encoding="utf-8"))
     _write(dir, meta.get("name", dir), meta.get("description", ""), body, status,
-           meta.get("notes", "") if notes is None else notes)
+           meta.get("notes", "") if notes is None else notes, meta.get("origin", ""))
     return True
 
 

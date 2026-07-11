@@ -522,8 +522,9 @@ def wipe(target: str):
             except OSError:
                 pass
         return {"ok": True, "removed": n, "what": "workspace items"}
-    if target == "skills":                          # the agent's self-learned (non-published) skills
-        learnt = [s for s in skills.all_skills() if s.get("status") != "published"]
+    if target == "skills":                          # every self-learnt skill, published or not
+        learnt = [s for s in skills.all_skills()
+                  if s.get("origin") == "learned" or s.get("status") != "published"]
         for s in learnt:
             skills.delete_skill(s["dir"])
         return {"ok": True, "removed": len(learnt), "what": "learnt skills"}
@@ -531,4 +532,18 @@ def wipe(target: str):
         return {"ok": True, "removed": memory.wipe(), "what": "memories"}
     if target == "knowledge":
         return {"ok": True, "removed": rag.wipe(), "what": "indexed chunks"}
+    if target == "tasks":                           # plain tasks only — managed entries are kept
+        return {"ok": True, "removed": scheduler.wipe(), "what": "scheduled tasks"}
+    if target == "mcp":
+        from oceano import mcp_client               # lazy: not otherwise used in this module
+        return {"ok": True, "removed": mcp_client.wipe(), "what": "MCP servers"}
+    if target == "mail":
+        from oceano import mail                     # lazy: not otherwise used in this module
+        return {"ok": True, "removed": mail.wipe(), "what": "mail accounts"}
+    if target == "research":                        # topics + schedules; living docs are kept
+        from oceano import researcher               # lazy: not otherwise used in this module
+        return {"ok": True, "removed": researcher.wipe(), "what": "research topics"}
+    if target == "workflows":                       # definitions + run history + their schedules
+        from oceano import workflows                # lazy: not otherwise used in this module
+        return {"ok": True, "removed": workflows.wipe(), "what": "workflows"}
     raise HTTPException(400, f"unknown wipe target: {target}")

@@ -408,6 +408,23 @@ def remove(wid):
     return len(data["workflows"]) < before
 
 
+def wipe():
+    """Remove EVERY workflow (Settings → Wipe): the definitions, all run history, and each
+    workflow's mirrored scheduler entry. Event triggers (watched folders, webhooks, chat
+    keywords, mail watches) die with the store — they're read from it live. Returns how
+    many workflows were removed."""
+    data = _load()
+    ids = [w["id"] for w in data["workflows"]]
+    data["workflows"], data["runs"] = [], []
+    _save(data)
+    from oceano import scheduler
+    for wid in ids:
+        t = _task_for(wid)
+        if t:
+            scheduler.delete_task(t["id"], allow_managed=True)
+    return len(ids)
+
+
 # ---------------- scheduling ----------------
 def _task_for(wid):
     from oceano import scheduler
