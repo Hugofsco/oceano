@@ -306,7 +306,10 @@ def _judge(case, run):
         v = json.loads(m.group(0))
     except ValueError:
         return {"score": 0, "pass": False, "reasoning": "judge verdict was not valid JSON", "judge_error": True}
-    v["score"] = max(0, min(100, int(v.get("score", 0))))
+    try:                                     # the judge is an LLM: "85.5", "high", null all happen —
+        v["score"] = max(0, min(100, int(float(v.get("score", 0)))))
+    except (TypeError, ValueError):          # a bad score must grade 0, not crash the whole run
+        v["score"] = 0
     v["pass"] = bool(v.get("pass"))
     return v
 
@@ -478,8 +481,10 @@ def clear_runs():
     return n
 
 
-def leaderboard(run_id=None):
-    """Per-model aggregate for a run (default: the latest finished run)."""
+def leaderboard(run_id=None, category=None):
+    """Per-model aggregate for a run (default: the latest finished run). `category` narrows
+    the aggregate to that case category (results join their case row for it), so the board
+    can answer 'which model is best at code?' — the signal best_model() routes on."""
     con = _db()
     if run_id is None:
         row = con.execute("SELECT id FROM runs WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
@@ -487,15 +492,43 @@ def leaderboard(run_id=None):
     if run_id is None:
         con.close()
         return {"run_id": None, "rows": []}
-    rows = con.execute(
-        "SELECT model, AVG(score), AVG(passed)*100, SUM(tokens), AVG(ms), AVG(steps), COUNT(*) "
-        "FROM results WHERE run_id=? GROUP BY model", (run_id,)).fetchall()
+    q = ("SELECT r.model, AVG(r.score), AVG(r.passed)*100, SUM(r.tokens), AVG(r.ms), AVG(r.steps), COUNT(*) "
+         "FROM results r LEFT JOIN cases c ON c.id = r.case_id WHERE r.run_id=?")
+    args = [run_id]
+    if category:
+        q += " AND c.category=?"
+        args.append(category)
+    rows = con.execute(q + " GROUP BY r.model", args).fetchall()
     con.close()
     board = [{"model": r[0], "score": round(r[1], 1), "pass_rate": round(r[2], 0),
               "tokens": int(r[3] or 0), "avg_ms": int(r[4] or 0), "avg_steps": round(r[5], 1),
               "cases": r[6]} for r in rows]
     board.sort(key=lambda x: x["score"], reverse=True)
     return {"run_id": run_id, "rows": board}
+
+
+def best_model(among=None, category=None, max_age_days=45):
+    """The top-scoring model from the latest FINISHED run — the piece that closes the eval loop
+    (nightly leaderboard → actual routing, consumed by delegate.resolve_primary when the user
+    turns routing on). `among` restricts to currently-servable ids, `category` narrows to one
+    case category, and a run older than `max_age_days` yields None (never route on stale data,
+    e.g. after evals were left off for months). None when there's no usable signal."""
+    con = _db()
+    row = con.execute("SELECT id, ts FROM runs WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    if not row:
+        return None
+    try:
+        ts = datetime.fromisoformat(row[1])
+        if (datetime.now(timezone.utc) - ts).days > max_age_days:
+            return None
+    except (TypeError, ValueError):
+        pass                                           # unparsable stamp → treat as fresh
+    allowed = set(among) if among is not None else None
+    for r in leaderboard(row[0], category=category)["rows"]:
+        if allowed is None or r["model"] in allowed:
+            return r["model"]
+    return None
 
 
 def results(run_id):

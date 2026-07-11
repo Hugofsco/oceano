@@ -26,6 +26,7 @@ unless a caller explicitly grants it.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -42,6 +43,7 @@ DEFAULT_TOOLS = "Read,Glob,Grep,Write,Edit"
 _DELEGATE_IDLE = int(os.environ.get("OCEANO_DELEGATE_IDLE", "300"))       # secs with NO output → stalled
 _DELEGATE_MAX = int(os.environ.get("OCEANO_DELEGATE_MAXTOTAL", "3600"))   # absolute cap (1h default)
 _DELEGATE_TURNS = int(os.environ.get("OCEANO_DELEGATE_MAXTURNS", "60"))   # agent turns for a heavy build
+_RL_MIN_WAIT = 15.0   # floor on the rate-limit wait — a "reset" already in the past still backs off a beat
 _CONFIG_PATH = config.WORKSPACE.parent / "data" / "delegation.json"
 _MODEL_KEY = "oceano_default_model"        # primary model id the agent uses everywhere
 _BASE_KEY = "oceano_default_base_url"      # its endpoint (empty = the default local endpoint)
@@ -53,8 +55,10 @@ _CLAUDE_EFFORT_KEY = "claude_effort"       # Claude `--effort` reasoning level; 
 _CODEX_EFFORT_KEY = "codex_effort"         # Codex model_reasoning_effort; "" = CLI default
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # accepted by `claude --effort`
 CODEX_EFFORTS = ("minimal", "low", "medium", "high")         # codex model_reasoning_effort values
-_RESERVED = ("oceano_default_model", "oceano_default_base_url", "oceano_default_api_key",
-             "delegation_enabled", "claude_model", "codex_model")
+_ROUTE_KEY = "route_by_evals"              # un-pinned primary follows the eval leaderboard winner
+# Legacy pre-roles flat keys: dropped on the next set_config write (they were migrated into the
+# 'default' role by _load_all and would otherwise linger at the top level forever).
+_LEGACY = ("provider", "base_url", "model")
 # Claude models the user can pick for the CLI (mind + delegation). Aliases track the latest of each
 # tier, so they stay valid across releases; "" means don't pass --model (use the CLI's own default).
 CLAUDE_MODELS = (
@@ -117,11 +121,11 @@ def set_config(d, role="default"):
     allcfg[role] = {"provider": prov if prov in valid else ("claude_cli" if role == "default" else "inherit"),
                     "base_url": (d.get("base_url", cur.get("base_url", "")) or "").strip(),
                     "model": (d.get("model", cur.get("model", "")) or "").strip()}
-    out = dict(allcfg)
-    raw = _raw()                                     # don't clobber the primary-model / enabled keys
-    for k in _RESERVED:
-        if k in raw:
-            out[k] = raw[k]
+    # Preserve every non-role key (primary model, enabled, mind, model/effort pins, routing…).
+    # This used to keep only a whitelist, so saving a role config silently WIPED any stored key
+    # the list had fallen behind on — the mind reset to local, the effort pins vanished.
+    out = {k: v for k, v in _raw().items() if k not in ROLES and k not in _LEGACY}
+    out.update(allcfg)
     try:
         atomicio.write_text(_CONFIG_PATH, json.dumps(out))
     except OSError:
@@ -263,11 +267,40 @@ def served_models():
         return []
 
 
+def get_route_by_evals():
+    """When ON (default off) and no primary is pinned, resolve_primary() picks the eval
+    leaderboard's top scorer among the served models instead of llama-swap file order —
+    the eval suite's verdict actually steering which model answers."""
+    return bool(_raw().get(_ROUTE_KEY, False))
+
+
+def set_route_by_evals(on):
+    d = _raw()
+    d[_ROUTE_KEY] = bool(on)
+    try:
+        atomicio.write_text(_CONFIG_PATH, json.dumps(d, indent=2))
+    except OSError:
+        pass
+    return get_route_by_evals()
+
+
+def _eval_winner(served):
+    """The leaderboard's best model among `served`, or None (no finished run / stale data /
+    winner no longer served). Never raises — routing must degrade to file order, not break
+    model resolution."""
+    try:
+        from oceano import evals                     # lazy: keep delegate import-light
+        return evals.best_model(among=served)
+    except Exception:
+        return None
+
+
 def resolve_primary():
     """Resolve the model + endpoint Oceano should use, in priority order:
       1. the user-set primary (Settings → Delegation, or Rivers 'set as default')
       2. an OCEANO_MODEL env override (config.MODEL), if one is pinned
-      3. a model served locally via Rivers (auto-picked, so Oceano just works once you've
+      3. with route-by-evals ON: the eval leaderboard's top scorer among the served models
+      4. a model served locally via Rivers (auto-picked, so Oceano just works once you've
          served one — no separate "make it primary" step)
     Returns {model, base_url, api_key, source}. There is NO hardcoded model: model == '' means
     nothing is configured at all, and the caller should tell the user to download/serve a model
@@ -279,6 +312,10 @@ def resolve_primary():
         return {"model": config.MODEL, "base_url": "", "api_key": "", "source": "env"}
     served = served_models()
     if served:
+        if get_route_by_evals():
+            best = _eval_winner(served)
+            if best:
+                return {"model": best, "base_url": "", "api_key": "", "source": "evals"}
         return {"model": served[0], "base_url": "", "api_key": "", "source": "served"}
     return {"model": "", "base_url": "", "api_key": "", "source": "none"}
 
@@ -407,6 +444,32 @@ def to_claude(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, max_turn
     return {"ok": True, "output": (r.stdout or "").strip(), "error": ""}
 
 
+# A failed run that LOOKS like the provider's rate/usage limit (subscription window exhausted,
+# API 429/529) — checked against the run's ERROR text only, never a successful result, so a task
+# that merely talks about rate limits can't trip it.
+_RL_ERROR = re.compile(r"usage limit|rate.?limit|too many requests|\b429\b|overloaded", re.I)
+
+
+def _rl_reset_at(info):
+    """Best-effort epoch-seconds reset time from a stream rate_limit_event payload. The schema
+    has shifted across CLI releases, so scan for any *reset* key: a value > 1e9 is an absolute
+    epoch (ms or s), a small positive one a relative 'resets in N seconds'."""
+    for k, v in (info or {}).items():
+        if "reset" not in str(k).lower():
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v > 1e12:
+            return v / 1000.0
+        if v > 1e9:
+            return v
+        if v > 0:
+            return time.time() + v
+    return None
+
+
 def _tool_detail(inp):
     """A short human label for a Claude tool_use input (a file path / command / pattern)."""
     if not isinstance(inp, dict):
@@ -470,138 +533,205 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             except Exception:
                 pass
 
-    try:
-        # Feed the prompt on stdin, NOT as a positional arg: Linux caps a single argv string at
-        # MAX_ARG_STRLEN (128 KB), so a long transcript (e.g. continuing a big chat, or one grown
-        # under the Codex mind before switching to Claude) overflows it and execve fails with E2BIG
-        # ("Argument list too long"). `claude -p` reads the prompt from stdin when none is given.
-        proc = subprocess.Popen(cmd, cwd=str(cwd or config.WORKSPACE), stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    except OSError as e:
-        return {"ok": False, "output": "", "error": f"could not launch claude: {e}",
-                "partial": False, "turns": 0, "cost": 0.0}
-
-    # Write the prompt on its own thread, then close stdin: a multi-hundred-KB transcript can exceed
-    # the OS pipe buffer, and a single blocking write here would deadlock against claude (which
-    # interleaves reading stdin with writing the stdout the reader below drains). Mirrors codex_mind.
-    def feed():
+    def _attempt(prompt, resume_id=None):
+        """One CLI run. Returns the usual result dict plus three internal keys the retry loop
+        consumes: _session (this run's session id, for --resume), _rl (the failure looks like
+        the provider's rate/usage limit) and _reset (epoch when that limit lifts, or None)."""
         try:
-            proc.stdin.write(instructions)
-        except Exception:
-            pass
-        finally:
+            # Feed the prompt on stdin, NOT as a positional arg: Linux caps a single argv string at
+            # MAX_ARG_STRLEN (128 KB), so a long transcript (e.g. continuing a big chat, or one grown
+            # under the Codex mind before switching to Claude) overflows it and execve fails with E2BIG
+            # ("Argument list too long"). `claude -p` reads the prompt from stdin when none is given.
+            proc = subprocess.Popen(cmd + (["--resume", resume_id] if resume_id else []),
+                                    cwd=str(cwd or config.WORKSPACE), stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as e:
+            return {"ok": False, "output": "", "error": f"could not launch claude: {e}", "partial": False,
+                    "turns": 0, "cost": 0.0, "_session": resume_id, "_rl": False, "_reset": None}
+
+        # Write the prompt on its own thread, then close stdin: a multi-hundred-KB transcript can exceed
+        # the OS pipe buffer, and a single blocking write here would deadlock against claude (which
+        # interleaves reading stdin with writing the stdout the reader below drains). Mirrors codex_mind.
+        def feed():
             try:
-                proc.stdin.close()
+                proc.stdin.write(prompt)
             except Exception:
                 pass
-    threading.Thread(target=feed, daemon=True).start()
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+        threading.Thread(target=feed, daemon=True).start()
 
-    q = queue.Queue()
+        q = queue.Queue()
 
-    def reader():
+        def reader():
+            try:
+                for line in proc.stdout:             # blocks in this thread, never the main loop
+                    q.put(line)
+            finally:
+                q.put(None)                          # EOF sentinel
+        threading.Thread(target=reader, daemon=True).start()
+
+        errbuf = []                                  # drained continuously: a chatty stderr (>64KB) would
+        def errreader():                             # otherwise fill the OS pipe, block the child's writes,
+            try:                                     # stall its stdout, and trip the idle-timeout on a
+                for line in proc.stderr:             # perfectly healthy run.
+                    errbuf.append(line)
+                    if len(errbuf) > 400:            # bounded memory — keep the tail, drop old noise
+                        del errbuf[:200]
+            except Exception:
+                pass
+        threading.Thread(target=errreader, daemon=True).start()
+
+        final, is_error, turns, cost, cancelled = "", False, 0, 0.0, False
+        session_id, rl_rejected, rl_reset = resume_id, False, None
+        started = last_evt = time.monotonic()
+        stalled, capped = False, False
+        poll = 0.5 if cancel is not None else idle_timeout   # short polls so a Stop is honoured promptly
+        while True:
+            now = time.monotonic()
+            if cancel is not None and cancel.is_set():   # the user hit Stop → kill the run now
+                cancelled = True
+                break
+            if now - started > max_total:
+                capped = True
+                break
+            if now - last_evt > idle_timeout:        # genuinely idle (the clock resets on every event)
+                stalled = True
+                break
+            try:
+                line = q.get(timeout=poll)
+            except queue.Empty:
+                continue                             # loop back to re-check cancel / cap / idle
+            last_evt = time.monotonic()
+            if line is None:
+                break                                # process finished, stream closed
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            session_id = ev.get("session_id") or session_id
+            t = ev.get("type")
+            if t == "assistant":
+                for block in (ev.get("message", {}).get("content") or []):
+                    bt = block.get("type")
+                    if bt == "text" and block.get("text"):
+                        emit({"kind": "text", "text": block["text"]})
+                    elif bt == "tool_use":
+                        emit({"kind": "tool", "tool": block.get("name", "tool"),
+                              "detail": _tool_detail(block.get("input") or {})})
+            elif t == "user":                          # tool results come back as a 'user' message
+                for block in (ev.get("message", {}).get("content") or []):
+                    if block.get("type") == "tool_result":
+                        c = block.get("content")
+                        if isinstance(c, list):        # content can be a list of text blocks or a string
+                            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+                        emit({"kind": "tool_result", "text": (c or "").strip()})
+            elif t == "result":
+                final = ev.get("result") or final
+                is_error = bool(ev.get("is_error"))
+                turns = ev.get("num_turns") or turns
+                cost = ev.get("total_cost_usd") or cost
+            elif t == "rate_limit_event":              # the subscription window ran out mid-run
+                info = ev.get("rate_limit") if isinstance(ev.get("rate_limit"), dict) else ev
+                st = str((info or {}).get("status") or "").lower()
+                if st in ("rejected", "blocked", "exceeded", "limit_reached"):
+                    rl_rejected = True
+                rl_reset = _rl_reset_at(info) or rl_reset
+            # system / hook_* → not surfaced
+
+        if stalled or capped or cancelled:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         try:
-            for line in proc.stdout:                 # blocks in this thread, never the main loop
-                q.put(line)
-        finally:
-            q.put(None)                              # EOF sentinel
-    threading.Thread(target=reader, daemon=True).start()
-
-    errbuf = []                                      # drained continuously: a chatty stderr (>64KB) would
-    def errreader():                                 # otherwise fill the OS pipe, block the child's writes,
-        try:                                         # stall its stdout, and trip the idle-timeout on a
-            for line in proc.stderr:                 # perfectly healthy run.
-                errbuf.append(line)
-                if len(errbuf) > 400:                # bounded memory — keep the tail, drop old noise
-                    del errbuf[:200]
+            proc.wait(timeout=5)
         except Exception:
             pass
-    threading.Thread(target=errreader, daemon=True).start()
 
-    final, is_error, turns, cost, cancelled = "", False, 0, 0.0, False
-    started = last_evt = time.monotonic()
-    stalled, capped = False, False
-    poll = 0.5 if cancel is not None else idle_timeout   # short polls so a Stop is honoured promptly
+        err = ""
+        if cancelled:
+            err = "stopped by the user"
+        elif stalled:
+            err = f"the delegate produced no output for {idle_timeout}s and was stopped (looked stalled)"
+        elif capped:
+            err = f"the delegate hit the {max_total}s time cap and was stopped"
+        elif is_error:
+            # Claude Code's own "result" event often DOES explain why (e.g. hitting --max-turns on a
+            # large multi-file build) — that detail used to be discarded here in favor of a canned
+            # phrase, which made an already-hard-to-diagnose failure (a workflow agent node's ONLY
+            # trace of what happened) untraceable. Surface it, with turn count for context, and fall
+            # back to captured stderr if the CLI's own result text was empty.
+            detail = (final or "").strip() or ("".join(errbuf)).strip()[:400]
+            err = f"the delegate reported an error after {turns} turn(s)" + (f": {detail[:500]}" if detail else "")
+        elif not final:
+            try:
+                err = ("".join(errbuf)).strip()[:400] or "the delegate returned no output"
+            except Exception:
+                err = "the delegate returned no output"
+        ok = bool(final) and not is_error and not stalled and not capped
+        rl = not ok and not cancelled and (rl_rejected or bool(_RL_ERROR.search(err)))
+        if rl and rl_reset is None:                    # "…usage limit reached|<epoch>" error format
+            m = re.search(r"\|(\d{10,13})\b", err)
+            if m:
+                v = float(m.group(1))
+                rl_reset = v / 1000.0 if v > 1e12 else v
+        return {"ok": ok, "output": (final or "").strip(), "error": "" if ok else err,
+                "partial": bool(final) and not ok, "turns": turns, "cost": cost,
+                "_session": session_id, "_rl": rl, "_reset": rl_reset}
+
+    # Retry loop: a run killed by the provider's rate/usage limit (routine on a subscription —
+    # and fatal to a whole night of unattended jobs if we just give up) waits for the window to
+    # reset, then RESUMES the same session (--resume) so completed work isn't redone. Bounded:
+    # at most _RL_RETRIES waits, each no longer than _RL_WAIT — a reset further out fails fast
+    # with the reset time in the error so the caller/scheduler can decide. Read per call so the
+    # env can be tuned without a restart (and tests can patch it).
+    retries = max(0, int(os.environ.get("OCEANO_DELEGATE_RL_RETRIES", "2")))
+    wait_cap = int(os.environ.get("OCEANO_DELEGATE_RL_WAIT", "1800"))
+    attempt, turns_total, cost_total, best, sid = 0, 0, 0.0, "", None
     while True:
-        now = time.monotonic()
-        if cancel is not None and cancel.is_set():   # the user hit Stop → kill the run now
-            cancelled = True
+        if attempt == 0:
+            r = _attempt(instructions)
+        elif sid:
+            r = _attempt("You were interrupted by a rate limit. Continue the task exactly where "
+                         "you left off; if it was already complete, restate the final result.",
+                         resume_id=sid)
+        else:
+            r = _attempt(instructions)                 # no session captured → start over
+        turns_total += r["turns"]
+        cost_total += r["cost"]
+        best = r["output"] or best
+        sid = r.pop("_session") or sid
+        rl, reset = r.pop("_rl"), r.pop("_reset")
+        if r["ok"] or not rl or attempt >= retries:
             break
-        if now - started > max_total:
-            capped = True
+        wait = max(_RL_MIN_WAIT, (reset - time.time() + 10) if reset else 60.0 * (attempt + 1))
+        if wait > wait_cap:
+            resets = time.strftime("%H:%M", time.localtime(time.time() + wait))
+            r["error"] += (f" — the usage window doesn't reset until ~{resets}, beyond the "
+                           f"{wait_cap}s wait cap (OCEANO_DELEGATE_RL_WAIT), so not retrying")
             break
-        if now - last_evt > idle_timeout:            # genuinely idle (the clock resets on every event)
-            stalled = True
+        attempt += 1
+        emit({"kind": "text", "text": f"⏳ hit the provider's usage/rate limit — waiting "
+                                      f"~{max(1, int(wait // 60))}m, then resuming (retry {attempt}/{retries})"})
+        end = time.monotonic() + wait
+        while time.monotonic() < end:                  # cancel-aware sleep: Stop works mid-wait
+            if cancel is not None and cancel.is_set():
+                r["error"] = "stopped by the user"
+                break
+            time.sleep(0.5)
+        if cancel is not None and cancel.is_set():
             break
-        try:
-            line = q.get(timeout=poll)
-        except queue.Empty:
-            continue                                 # loop back to re-check cancel / cap / idle
-        last_evt = time.monotonic()
-        if line is None:
-            break                                    # process finished, stream closed
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        t = ev.get("type")
-        if t == "assistant":
-            for block in (ev.get("message", {}).get("content") or []):
-                bt = block.get("type")
-                if bt == "text" and block.get("text"):
-                    emit({"kind": "text", "text": block["text"]})
-                elif bt == "tool_use":
-                    emit({"kind": "tool", "tool": block.get("name", "tool"),
-                          "detail": _tool_detail(block.get("input") or {})})
-        elif t == "user":                              # tool results come back as a 'user' message
-            for block in (ev.get("message", {}).get("content") or []):
-                if block.get("type") == "tool_result":
-                    c = block.get("content")
-                    if isinstance(c, list):            # content can be a list of text blocks or a string
-                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-                    emit({"kind": "tool_result", "text": (c or "").strip()})
-        elif t == "result":
-            final = ev.get("result") or final
-            is_error = bool(ev.get("is_error"))
-            turns = ev.get("num_turns") or turns
-            cost = ev.get("total_cost_usd") or cost
-        # system / hook_* / rate_limit_event / user(tool_result) → not surfaced
-
-    if stalled or capped or cancelled:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    try:
-        proc.wait(timeout=5)
-    except Exception:
-        pass
-
-    err = ""
-    if cancelled:
-        err = "stopped by the user"
-    elif stalled:
-        err = f"the delegate produced no output for {idle_timeout}s and was stopped (looked stalled)"
-    elif capped:
-        err = f"the delegate hit the {max_total}s time cap and was stopped"
-    elif is_error:
-        # Claude Code's own "result" event often DOES explain why (e.g. hitting --max-turns on a
-        # large multi-file build) — that detail used to be discarded here in favor of a canned
-        # phrase, which made an already-hard-to-diagnose failure (a workflow agent node's ONLY
-        # trace of what happened) untraceable. Surface it, with turn count for context, and fall
-        # back to captured stderr if the CLI's own result text was empty.
-        detail = (final or "").strip() or ("".join(errbuf)).strip()[:400]
-        err = f"the delegate reported an error after {turns} turn(s)" + (f": {detail[:500]}" if detail else "")
-    elif not final:
-        try:
-            err = ("".join(errbuf)).strip()[:400] or "the delegate returned no output"
-        except Exception:
-            err = "the delegate returned no output"
-    ok = bool(final) and not is_error and not stalled and not capped
-    return {"ok": ok, "output": (final or "").strip(), "error": "" if ok else err,
-            "partial": bool(final) and not ok, "turns": turns, "cost": round(cost, 4)}
+    r["turns"], r["cost"] = turns_total, round(cost_total, 4)
+    if not r["ok"] and best and not r["output"]:       # keep partial work from an earlier attempt
+        r["output"], r["partial"] = best, True
+    return r
 
 
 def claude_version():

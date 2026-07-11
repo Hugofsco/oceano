@@ -168,7 +168,9 @@ def get_default_model_api():
     r = delegate.resolve_primary()
     implicit = config.MODEL or (delegate.served_models()[:1] or [""])[0]
     return {"model": p["model"], "base_url": p["base_url"],
-            "current": r["model"], "source": r["source"], "fallback": implicit}
+            "current": r["model"], "source": r["source"], "fallback": implicit,
+            "route_by_evals": delegate.get_route_by_evals(),
+            "evals_winner": delegate._eval_winner(delegate.served_models())}
 
 
 @router.post("/api/default-model")
@@ -182,6 +184,17 @@ async def set_default_model_api(req: Request):
     api_key = endpoint_key(base_url) if base_url else ""
     delegate.set_primary(model, base_url, api_key)
     return {"ok": True, "current": delegate.get_default_model()}
+
+
+@router.post("/api/delegate/route-by-evals")
+async def set_route_by_evals_api(req: Request):
+    """Toggle eval-leaderboard routing: with no primary pinned, the agent runs the top scorer
+    of the latest finished eval run (among served models) instead of llama-swap file order."""
+    from oceano import delegate
+    b = await req.json()
+    on = delegate.set_route_by_evals(bool(b.get("enabled")))
+    return {"ok": True, "route_by_evals": on,
+            "evals_winner": delegate._eval_winner(delegate.served_models())}
 
 
 @router.post("/api/delegate/enabled")

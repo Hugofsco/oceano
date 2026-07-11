@@ -52,6 +52,154 @@ def test_is_error_falls_back_to_stderr_when_clis_result_text_is_empty(monkeypatc
     assert "boom: something went wrong" in r["error"]
 
 
+def _fake_claude_two_calls(tmp_path, first_lines, second_lines):
+    """A stateful shim: emits `first_lines` (stream-json) on its first invocation,
+    `second_lines` on any later one, and appends each invocation's argv to argv.txt."""
+    import json
+    calls = tmp_path / "calls.txt"
+    argv = tmp_path / "argv.txt"
+    script = tmp_path / "fake_claude.py"
+    script.write_text(
+        "import json, sys, os\n"
+        f"calls, argv = {str(calls)!r}, {str(argv)!r}\n"
+        "n = int(open(calls).read()) if os.path.exists(calls) else 0\n"
+        "open(calls, 'w').write(str(n + 1))\n"
+        "open(argv, 'a').write(' '.join(sys.argv) + '\\n')\n"
+        f"first, second = {first_lines!r}, {second_lines!r}\n"
+        "for ev in (first if n == 0 else second):\n"
+        "    print(json.dumps(ev))\n")
+    shim = tmp_path / "claude"
+    shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
+    shim.chmod(0o755)
+    return shim, argv, calls
+
+
+def test_rate_limited_run_waits_then_resumes_the_same_session(monkeypatch, tmp_path):
+    """A usage-limit failure (routine on a subscription) must not kill an unattended job: the
+    stream retries after the reset and RESUMES the session so completed work isn't redone."""
+    shim, argv, calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[
+            {"type": "system", "subtype": "init", "session_id": "sess-123"},
+            {"type": "result", "result": "Claude AI usage limit reached|1751000000",
+             "is_error": True, "num_turns": 2, "total_cost_usd": 0.1}],
+        second_lines=[
+            {"type": "result", "result": "all done", "is_error": False,
+             "num_turns": 3, "total_cost_usd": 0.2}])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    monkeypatch.setattr("oceano.delegate._RL_MIN_WAIT", 0.01)   # the |epoch is in the past → floor applies
+    events = []
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path), on_progress=events.append)
+    assert r["ok"] is True and r["output"] == "all done"
+    assert calls.read_text() == "2"
+    assert "--resume sess-123" in argv.read_text().splitlines()[1]
+    assert r["turns"] == 5 and r["cost"] == 0.3                 # both attempts accounted
+    assert any("usage/rate limit" in e.get("text", "") for e in events if e["kind"] == "text")
+
+
+def test_rate_limit_event_rejection_triggers_the_retry_even_without_error_text(monkeypatch, tmp_path):
+    """The structured rate_limit_event (status rejected + a relative reset) must classify the
+    failure as rate-limited even when the CLI's own error text doesn't say so."""
+    shim, argv, calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[
+            {"type": "system", "subtype": "init", "session_id": "sess-9"},
+            {"type": "rate_limit_event", "rate_limit": {"status": "rejected", "resetsInSeconds": 1}},
+            {"type": "result", "result": "", "is_error": True, "num_turns": 1}],
+        second_lines=[{"type": "result", "result": "recovered", "is_error": False, "num_turns": 1}])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    monkeypatch.setattr("oceano.delegate._RL_MIN_WAIT", 0.01)
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path))
+    assert r["ok"] is True and r["output"] == "recovered"
+    assert calls.read_text() == "2"
+
+
+def test_a_plain_error_is_not_retried(monkeypatch, tmp_path):
+    """Only rate/usage-limit failures re-run — an ordinary error (bad task, max-turns) must
+    surface immediately, exactly once."""
+    shim, argv, calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[{"type": "result", "result": "Reached maximum number of turns (60)",
+                      "is_error": True, "num_turns": 60}],
+        second_lines=[{"type": "result", "result": "should never run", "is_error": False, "num_turns": 1}])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    monkeypatch.setattr("oceano.delegate._RL_MIN_WAIT", 0.01)
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path))
+    assert r["ok"] is False and calls.read_text() == "1"
+    assert "Reached maximum number of turns" in r["error"]
+
+
+def test_a_reset_beyond_the_wait_cap_fails_fast_with_the_reset_in_the_error(monkeypatch, tmp_path):
+    """A window that only resets hours out must NOT block the thread — fail fast, and tell the
+    caller when it lifts so a scheduler can requeue."""
+    import time as _time
+    far = int(_time.time()) + 7200
+    shim, argv, calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[{"type": "result", "result": f"Claude AI usage limit reached|{far}",
+                      "is_error": True, "num_turns": 1}],
+        second_lines=[{"type": "result", "result": "should never run", "is_error": False, "num_turns": 1}])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    monkeypatch.setenv("OCEANO_DELEGATE_RL_WAIT", "60")
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path))
+    assert r["ok"] is False and calls.read_text() == "1"
+    assert "not retrying" in r["error"] and "OCEANO_DELEGATE_RL_WAIT" in r["error"]
+
+
+def test_retries_are_bounded_and_partial_work_from_an_earlier_attempt_survives(monkeypatch, tmp_path):
+    """Every attempt rate-limited → give up after OCEANO_DELEGATE_RL_RETRIES, keeping the best
+    partial output instead of returning empty-handed."""
+    shim, argv, calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[{"type": "result", "result": "half the report… usage limit reached|1751000000",
+                      "is_error": True, "num_turns": 1}],
+        second_lines=[{"type": "result", "result": "", "is_error": True, "num_turns": 0},
+                      {"type": "rate_limit_event", "status": "rejected"}])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    monkeypatch.setattr("oceano.delegate._RL_MIN_WAIT", 0.01)
+    monkeypatch.setenv("OCEANO_DELEGATE_RL_RETRIES", "1")
+    r = delegate.to_claude_stream("do the thing", cwd=str(tmp_path))
+    assert r["ok"] is False and calls.read_text() == "2"        # 1 original + 1 retry, then stop
+    assert r["partial"] is True and "half the report" in r["output"]
+
+
+def test_set_config_preserves_every_non_role_key(monkeypatch, tmp_path):
+    """Saving a role's provider config rewrites delegation.json — it used to keep only a
+    whitelist of keys, silently wiping any stored key the list had fallen behind on (the mind
+    reset to local, the claude/codex effort pins vanished). Now every non-role key survives."""
+    monkeypatch.setattr(delegate, "_CONFIG_PATH", tmp_path / "delegation.json")
+    delegate.set_claude_effort("high")
+    delegate.set_mind("claude")
+    delegate.set_route_by_evals(True)
+    delegate.set_config({"provider": "codex_cli"}, role="improve")
+    assert delegate.get_claude_effort() == "high"
+    assert delegate.get_mind() == "claude"
+    assert delegate.get_route_by_evals() is True
+    assert delegate.get_config("improve")["provider"] == "codex_cli"
+
+
+def test_resolve_primary_routes_to_the_eval_winner_when_enabled(monkeypatch, tmp_path):
+    """Route-by-evals closes the eval loop: with no pinned primary, the leaderboard's top
+    scorer among SERVED models wins over llama-swap file order — and degrades to file order
+    when there's no usable signal or the toggle is off."""
+    import config
+    monkeypatch.setattr(delegate, "_CONFIG_PATH", tmp_path / "delegation.json")
+    monkeypatch.setattr(config, "MODEL", "")
+    monkeypatch.setattr(delegate, "served_models", lambda: ["first-served", "eval-champ"])
+    monkeypatch.setattr("oceano.evals.best_model",
+                        lambda among=None, category=None, max_age_days=45: "eval-champ")
+    assert delegate.resolve_primary()["source"] == "served"       # toggle off → file order
+    delegate.set_route_by_evals(True)
+    r = delegate.resolve_primary()
+    assert (r["model"], r["source"]) == ("eval-champ", "evals")
+    monkeypatch.setattr("oceano.evals.best_model",
+                        lambda among=None, category=None, max_age_days=45: None)
+    r = delegate.resolve_primary()                                # no signal → fall back, never break
+    assert (r["model"], r["source"]) == ("first-served", "served")
+    delegate.set_primary("pinned-model")                          # an explicit pin always wins
+    assert delegate.resolve_primary()["source"] == "primary"
+
+
 def test_api_tool_map_grants_code_search_and_run_tests_git():
     """The api/local providers had no path to code_search/run_tests/git at all — folding them
     into the existing Read/Grep/Write CLI-style buckets closes that gap without adding a new
