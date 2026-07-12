@@ -28,5 +28,12 @@ Before running:
   itself, give *iteration* a chat-keyword trigger (e.g. "iterate on the app") or a chain
   trigger after another workflow.
 
+## Everyday automations
+
+| File | What it does |
+|---|---|
+| `inbox-sentry` | Fires on every **new email**: a model-judged decision separates urgent/personal mail from newsletters and notifications; urgent mail becomes a two-line alert notification. After importing, **select your mail account on the trigger node** (accounts are added in Settings → Mail), then Save. |
+| `daily-standup` | Weekday mornings at 09:00: yesterday's commits (`git log`), test-suite health (`run_tests`), and today's calendar, compiled into a standup note at `workspace/dev/standup.md` with suggested top-3 priorities. Point your workspace at a git project first; the schedule imports enabled — pause it from the ⏱ dialog if you're just exploring. |
+
 These files are covered by `tests/test_example_workflows.py`, which imports each one and
 checks every tool and persona it references actually exists — so they can't silently rot.

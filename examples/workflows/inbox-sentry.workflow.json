@@ -1,0 +1,23 @@
+{
+  "name": "Inbox sentry",
+  "description": "Fires on every NEW email (set the mail account on the trigger node after importing). A model-judged decision separates urgent/personal mail from noise; urgent mail becomes a two-line alert notification. Shows: email trigger, model-judged decision, {{input}} carrying the message.",
+  "overlap": "skip",
+  "input": {"enabled": false, "label": "", "placeholder": "", "required": false, "default": ""},
+  "triggers": [],
+  "graph": {
+    "nodes": [
+      {"id": 1, "type": "trigger", "kind": "email", "account": "", "mailFolder": "INBOX", "x": 40, "y": 180},
+      {"id": 2, "type": "decision", "mode": "model", "question": "Does this email look urgent or personally addressed to me (not a newsletter, automated notification, or promotion)?\n\nEmail:\n{{input}}", "x": 300, "y": 180},
+      {"id": 3, "type": "instruction", "text": "Write a two-line alert for this email.\nLine 1: sender and subject. Line 2: what they're asking for and any deadline.\n\nEmail:\n{{input}}", "x": 570, "y": 100},
+      {"id": 4, "type": "tool", "tool": "notify", "args": {"title": "📬 Urgent email", "message": "{{last}}"}, "x": 830, "y": 100},
+      {"id": 5, "type": "end", "x": 1090, "y": 180}
+    ],
+    "edges": [
+      {"from": 1, "to": 2, "branch": null},
+      {"from": 2, "to": 3, "branch": "yes"},
+      {"from": 2, "to": 5, "branch": "no"},
+      {"from": 3, "to": 4, "branch": null},
+      {"from": 4, "to": 5, "branch": null}
+    ]
+  }
+}
