@@ -28,7 +28,7 @@ def _isolate(tmp_path, monkeypatch):
 
 
 def test_examples_exist():
-    assert len(EXAMPLES) >= 7
+    assert len(EXAMPLES) >= 2
 
 
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)

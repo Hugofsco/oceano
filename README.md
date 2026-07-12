@@ -351,18 +351,14 @@ workflows with `run_workflow`, but you author them in the UI. Stored in
 `data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).
 
-**Examples.** Twelve ready-to-import workflows live in
-[`examples/workflows/`](examples/workflows/) — a scheduled morning briefing, an urgent-email
-sentry, an API watchdog (wait + retry before alerting), a fork/merge research fan-out, a
-multi-persona review board with approval, a watched-folder document indexer, a GitHub
-release digest (http → transform → loop), an **app-builder pair** (idea → requirements →
-architecture → kickoff panel → frontend design → branding → sign-off → build db/backend/
-frontend with tests → per-area review → a launch meeting that votes GO/NO-GO — plus an
-iteration workflow to keep developing afterwards), a weekday standup note, a content studio
-(draft → adversarial critique → revision → publish with audio narration), and a weekly
-competitor watch. Each deliberately shows off a different
-set of node types; import them via **⤒ Import** (multi-select works) and open one in the
-editor to see how it's wired.
+**Examples.** The **App builder pair** ships ready-to-import in
+[`examples/workflows/`](examples/workflows/): *idea-to-launch* takes an idea through a whole
+company's worth of stages — PM requirements → CTO architecture → a kickoff panel → design
+spec → branding → your sign-off → the engineer personas **build** the database, backend, and
+frontend (unit tests per layer, fix-until-green) → per-area review → a launch meeting that
+votes GO/NO-GO — and *iteration* keeps developing afterwards, routing each change request to
+the owning engineer (backend / frontend / fullstack) via a switch. Between them they exercise
+most of the canvas; import via **⤒ Import** and open them in the editor to see the wiring.
 
 ---
 
