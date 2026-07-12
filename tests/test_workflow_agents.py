@@ -749,3 +749,32 @@ def test_delegate_node_default_passes_no_wall_clock(monkeypatch):
     rec = workflows.run(wf, trigger="manual", nested=True)
     assert rec["status"] == "ok"
     assert seen == [None, 300]        # default → None (idle-based); explicit cap → honoured
+
+
+def test_model_decision_follows_the_primary_not_local_llama(monkeypatch):
+    """A decision node in 'model' mode must judge on the PRIMARY model/endpoint. A bare
+    llm.chat() silently falls back to the local llama-swap defaults — which booted the local
+    resident model mid-workflow even when the primary was a remote endpoint (real bug)."""
+    import types
+    seen = {}
+
+    def fake_chat(messages, tools=None, model=None, base_url=None, api_key=None, **kw):
+        seen.update(model=model, base_url=base_url, api_key=api_key)
+        return types.SimpleNamespace(content="YES")
+    monkeypatch.setattr("oceano.llm.chat", fake_chat)
+    monkeypatch.setattr("oceano.delegate.resolve_primary",
+                        lambda: {"model": "gpt-remote", "base_url": "https://ep.example/v1",
+                                 "api_key": "sk-abc"})
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "transform", "mode": "template", "text": "all tests passed"},
+         {"id": 3, "type": "decision", "mode": "model", "question": "did tests pass?"},
+         {"id": 4, "type": "transform", "mode": "template", "text": "SHIPPED"},
+         {"id": 5, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3},
+         {"from": 3, "to": 4, "branch": "yes"}, {"from": 4, "to": 5}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok" and rec["output"] == "SHIPPED"
+    assert seen["model"] == "gpt-remote"                  # judged on the primary…
+    assert seen["base_url"] == "https://ep.example/v1"    # …at its endpoint, not local llama
+    assert seen["api_key"] == "sk-abc"

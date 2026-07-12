@@ -10,8 +10,8 @@ work then follow their single outgoing edge; a `decision` node evaluates a condi
 follows its "yes" or "no" edge instead — that's the branching / decision-tree behaviour.
 A decision can be judged three ways (the user picks per node):
   rule     — a deterministic test over the previous step's output (contains/equals/matches/gt/lt)
-  model    — the local model answers YES/NO given the context (flexible, less predictable)
-  delegate — Claude / a cloud model answers YES/NO (for judgments the local model shouldn't make)
+  model    — the PRIMARY model answers YES/NO given the context (flexible, less predictable)
+  delegate — Claude / a cloud model answers YES/NO (for judgments the primary shouldn't make)
 
 The whole run shares ONE Agent, so context accumulates across nodes. A hard node-visit cap
 stops any accidental loop from running forever. Runs are recorded so scheduled, unattended
@@ -1051,12 +1051,17 @@ def _decide(node, last_output, ag):
                          cwd=config.WORKSPACE, tools="Read", timeout=300, role=node.get("role", "default"))
         txt = (r.get("output") or "") if r.get("ok") else ""
         return _yesno(txt), f"delegate: {txt.strip()[:60] or '(no answer)'}"
-    # mode == "model"
+    # mode == "model" — judged by the PRIMARY model (Settings → Delegation), like every other
+    # model turn in a run. A bare llm.chat() would silently fall back to the local llama-swap
+    # defaults and boot the resident model mid-workflow even when the primary is a remote
+    # endpoint (that exact bug shipped once). '' model / None base_url still mean local.
     from oceano import llm
+    from oceano.agent import _default_primary
+    dm, db, dk = _default_primary()
     msg = llm.chat([{"role": "system", "content": "You are a decision gate in a workflow. "
                      "Read the question and the latest output, then answer with exactly one word: YES or NO."},
                     {"role": "user", "content": f"{q}\n\nLatest step output:\n{last_output[:2000]}"}],
-                   tools=None)
+                   tools=None, model=dm or None, base_url=db, api_key=dk)
     txt = (getattr(msg, "content", "") or "")
     return _yesno(txt), f"model: {txt.strip()[:40] or '(blank)'}"
 

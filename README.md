@@ -259,7 +259,7 @@ walks it from a **start** node, following edges:
   a fixed wall-clock, only a stalled one — with the node's optional **timeout (s)** field as
   an explicit absolute cap
 - **decision** — routes **yes / no** down different edges, judged by a **rule** over the
-  previous step's output, the **local model**, or a **delegate**
+  previous step's output, the **primary model**, or a **delegate**
 - **switch** — multi-branch routing (more than a yes/no — pick an edge by matching a value)
 - **loop** — foreach over a list, running its body once per element (`{{item}}` / `{{index}}`);
   at the **done** edge every iteration's result is collected into a **JSON list** (it becomes
