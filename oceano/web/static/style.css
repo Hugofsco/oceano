@@ -1365,19 +1365,39 @@ button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:
 .wf-run-status.ok{color:var(--biolum)}
 .wf-run-status.fail{color:var(--coral)}
 .wf-run-status.running{color:var(--buoy)}
-.wf-run-steps{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:9px}
-.wf-run-step{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:10px 12px;border-left:3px solid var(--line)}
-.wf-run-step.running{border-left-color:var(--buoy)}
-.wf-run-step.ok{border-left-color:var(--biolum)}
-.wf-run-step.fail{border-left-color:var(--coral)}
-.wf-rs-h{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--foam)}
-.wf-rs-ic{font-family:var(--font-mono);flex:none;width:16px}
-.wf-run-step.running .wf-rs-ic{animation:spin 1s linear infinite;display:inline-block}
+/* run log — console style: timestamp · glyph · body per line, ↳ tool sub-lines,
+   foldable output blocks. Dark, monospace, dense. */
+.wf-run-steps{flex:1;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:2px;background:rgba(var(--abyss-0-rgb),.55);font-family:var(--font-mono)}
+.wf-cl{display:grid;grid-template-columns:auto 16px 1fr;gap:0 8px;padding:2px 4px;border-radius:6px;align-items:baseline}
+.wf-cl:hover{background:rgba(var(--biolum-rgb),.04)}
+.wf-cl-ts{font-size:10px;color:var(--faint);opacity:.7}
+.wf-cl-ic{font-size:11px;text-align:center}
+.wf-cl.running .wf-cl-ic{color:var(--buoy);animation:spin 1s linear infinite;display:inline-block}
 @keyframes spin{to{transform:rotate(360deg)}}
-.wf-rs-tools{margin:5px 0 0 25px;display:flex;flex-direction:column;gap:2px}
-.wf-rs-tool{font-family:var(--font-mono);font-size:11px;color:var(--faint)}
-.wf-rs-out{margin:6px 0 0 25px;font-size:12.5px;color:var(--mist);white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow:auto}
-.wf-rs-out:empty{display:none}
+.wf-cl.ok .wf-cl-ic{color:var(--biolum)}
+.wf-cl.fail .wf-cl-ic{color:var(--coral)}
+.wf-cl-body{min-width:0;display:flex;flex-direction:column}
+.wf-cl-head{display:flex;align-items:baseline;gap:8px;font-size:12px;color:var(--foam);line-height:1.55;flex-wrap:wrap}
+.wf-cl.running .wf-cl-head .wf-cl-label{color:var(--buoy)}
+.wf-cl.fail .wf-cl-label{color:var(--coral)}
+.wf-cl-label{overflow-wrap:anywhere}
+.wf-cl-branch{color:var(--buoy);font-size:10.5px}
+.wf-cl-branch:empty,.wf-cl-dur:empty{display:none}
+.wf-cl-dur{color:var(--faint);font-size:10px;margin-left:auto;padding-left:8px}
+.wf-cl-tools{display:flex;flex-direction:column}
+.wf-cl-tool{font-size:10.5px;color:var(--faint);padding-left:14px;line-height:1.5;overflow-wrap:anywhere}
+.wf-cl-tool::before{content:"↳ ";opacity:.6}
+.wf-cl-out{margin:3px 0 5px;padding:6px 9px;border-left:2px solid rgba(var(--biolum-rgb),.28);background:rgba(var(--abyss-0-rgb),.8);border-radius:0 7px 7px 0;font-size:11px;line-height:1.55;color:var(--mist);white-space:pre-wrap;overflow-wrap:anywhere}
+.wf-cl.fail .wf-cl-out{border-left-color:rgba(var(--coral-rgb),.5)}
+.wf-cl-out.clip{max-height:120px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 55%,transparent);mask-image:linear-gradient(#000 55%,transparent)}
+.wf-cl-more{align-self:flex-start;background:none;border:none;color:var(--biolum);font-family:var(--font-mono);font-size:10px;cursor:pointer;padding:0 0 6px 2px;opacity:.85}
+.wf-cl-more:hover{opacity:1;text-decoration:underline}
+.wf-cl-note{font-size:10.5px;color:var(--faint);padding:6px 4px;letter-spacing:.05em;text-transform:uppercase}
+.wf-cl-note::before{content:"── "}
+.wf-cl-note::after{content:" ──"}
+.wf-cl-note.ok{color:var(--biolum)}
+.wf-cl-note.fail{color:var(--coral)}
+.wf-cl .wf-approve{grid-column:3;margin:4px 0 6px}
 /* history */
 .wf-runs-list{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
 .wf-run-rec{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:10px 12px;cursor:pointer;border-left:3px solid var(--line)}
@@ -1390,7 +1410,6 @@ button.kbd.recording{color:var(--abyss-0);background:var(--biolum);border-color:
 .wf-rr-sl{font-size:12px;color:var(--mist);font-family:var(--font-mono)}
 .wf-rr-out{font-size:12px;color:var(--faint);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px;padding-left:14px}
 .wf-rr-br{color:var(--buoy)}
-.wf-rs-branch{font-family:var(--font-mono);font-size:11px;color:var(--buoy);margin-left:auto}
 
 /* ---------------- Workflows: canvas editor (Drawflow) ---------------- */
 .wf-name-in{background:var(--abyss-0);border:1px solid var(--line);border-radius:8px;color:var(--foam);font-family:var(--font-body);font-size:13px;padding:6px 10px;width:170px}

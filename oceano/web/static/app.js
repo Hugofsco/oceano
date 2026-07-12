@@ -7112,7 +7112,7 @@ async function wfRenderRun(body, w) {
     inp = v;
   }
   body.innerHTML = `
-    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
+    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><button class="ed-btn" id="wfCopyLog" title="copy the run log as text">⧉ log</button><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
     ${inp ? `<div class="wf-run-input" title="this run's input">⌨ ${escapeHtml(inp.length > 160 ? inp.slice(0, 160) + "…" : inp)}</div>` : ""}
     <div class="wf-run-main">
       <div class="wf-canvas-wrap">
@@ -7157,12 +7157,64 @@ async function wfRenderRun(body, w) {
     },
     finish() { cv.querySelectorAll(".wf-run-active").forEach(el => el.classList.remove("wf-run-active")); },
   };
-  const addRow = (id, label) => {
-    const r = document.createElement("div"); r.className = "wf-run-step running";
-    r.innerHTML = `<div class="wf-rs-h"><span class="wf-rs-ic">◌</span><span class="wf-rs-label">${escapeHtml(label || "")}</span><span class="wf-rs-branch"></span></div><div class="wf-rs-tools"></div><div class="wf-rs-out"></div>`;
-    host.appendChild(r); host.scrollTop = host.scrollHeight; rows[id] = r; return r;
+  // ---- console-style run log: one timestamped line per node pass, ↳ tool sub-lines,
+  // collapsed output blocks, durations, and stick-to-bottom scrolling (only when the user
+  // is already at the bottom — never yank the view away from a line they're reading)
+  const logTime = () => new Date().toTimeString().slice(0, 8);
+  const stick = () => { if (host.scrollHeight - host.scrollTop - host.clientHeight < 60) host.scrollTop = host.scrollHeight; };
+  const note = (text, cls = "") => {
+    const d = document.createElement("div"); d.className = ("wf-cl-note " + cls).trim(); d.textContent = text;
+    host.appendChild(d); stick();
   };
-  if (liveState) return wfReconnectRun(body, w, host, status, rows, addRow, liveState, mark);
+  const addRow = (id, label) => {
+    const r = document.createElement("div"); r.className = "wf-cl running"; r.dataset.t0 = Date.now();
+    r.innerHTML = `<span class="wf-cl-ts">${logTime()}</span><span class="wf-cl-ic">◌</span><div class="wf-cl-body"><div class="wf-cl-head"><span class="wf-cl-label">${escapeHtml(label || "")}</span><span class="wf-cl-branch"></span><span class="wf-cl-dur"></span></div><div class="wf-cl-tools"></div></div>`;
+    host.appendChild(r); stick(); rows[id] = r; return r;
+  };
+  const toolLine = (r, text) => {
+    const t = document.createElement("div"); t.className = "wf-cl-tool"; t.textContent = text;
+    $(".wf-cl-tools", r).appendChild(t); stick();
+  };
+  const finishRow = (r, ok, branch, output) => {
+    r.className = "wf-cl " + (ok ? "ok" : "fail");
+    $(".wf-cl-ic", r).textContent = ok ? "✔" : "✘";
+    if (branch) $(".wf-cl-branch", r).textContent = "→ " + branch;
+    const secs = (Date.now() - (+r.dataset.t0 || Date.now())) / 1000;
+    if (secs >= 0.5) $(".wf-cl-dur", r).textContent =            // reconnect-painted rows have no
+      secs < 60 ? secs.toFixed(1) + "s"                          // real timing — they just skip this
+        : Math.floor(secs / 60) + "m" + String(Math.round(secs % 60)).padStart(2, "0") + "s";
+    const out = (output || "").trim();
+    if (out) {
+      const pre = document.createElement("pre"); pre.className = "wf-cl-out"; pre.textContent = out;
+      $(".wf-cl-body", r).appendChild(pre);
+      const lines = out.split("\n").length;
+      if (lines > 6 || out.length > 600) {                       // long outputs start folded
+        pre.classList.add("clip");
+        const btn = document.createElement("button"); btn.type = "button"; btn.className = "wf-cl-more";
+        const closed = `▾ show all · ${lines} line${lines === 1 ? "" : "s"}`;
+        btn.textContent = closed;
+        btn.onclick = () => { btn.textContent = pre.classList.toggle("clip") ? closed : "▴ collapse"; };
+        $(".wf-cl-body", r).appendChild(btn);
+      }
+    }
+    stick();
+  };
+  const log = { addRow, finishRow, note };
+  $("#wfCopyLog", body).onclick = () => {                        // the whole log as plain text
+    const txt = [...host.children].map(el => {
+      if (el.classList.contains("wf-cl-note")) return "── " + el.textContent + " ──";
+      const pick = c => { const n = el.querySelector(c); return n ? n.textContent : ""; };
+      const head = `[${pick(".wf-cl-ts")}] ${pick(".wf-cl-ic") || "◌"} ${pick(".wf-cl-label")}` +
+        (pick(".wf-cl-branch") ? " " + pick(".wf-cl-branch") : "") +
+        (pick(".wf-cl-dur") ? ` (${pick(".wf-cl-dur")})` : "");
+      const tools = [...el.querySelectorAll(".wf-cl-tool")].map(t => "    ↳ " + t.textContent);
+      const out = pick(".wf-cl-out");
+      return [head, ...tools, ...(out ? out.split("\n").map(l => "    │ " + l) : [])].join("\n");
+    }).join("\n");
+    navigator.clipboard.writeText(txt).then(() => toast("run log copied", "ok")).catch(() => toast("copy failed", "err"));
+  };
+  if (liveState) return wfReconnectRun(body, w, host, status, rows, log, liveState, mark);
+  note("▶ run started");
   try {
     const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input: inp }) });
@@ -7179,25 +7231,30 @@ async function wfRenderRun(body, w) {
         // an earlier orchestrator to reiterate); collapsing revisits onto one row silently ate the
         // later passes' log entries
         if (ev.event === "node_start") { mark.start(ev.id); const r = addRow(ev.id, ev.label); if (ev.type === "approval") wfShowApproval(r, w.id); }
-        else if (ev.event === "tool" && rows[ev.id] && ev.text) { const t = document.createElement("div"); t.className = "wf-rs-tool"; t.textContent = ev.text; $(".wf-rs-tools", rows[ev.id]).appendChild(t); }
+        else if (ev.event === "tool" && rows[ev.id] && ev.text) toolLine(rows[ev.id], ev.text);
         else if (ev.event === "node_end" && rows[ev.id]) {
           mark.end(ev.id, ev.ok);
-          const r = rows[ev.id]; r.className = "wf-run-step " + (ev.ok ? "ok" : "fail");
-          $(".wf-rs-ic", r).textContent = ev.ok ? "✓" : "✗";
-          if (ev.branch) $(".wf-rs-branch", r).textContent = "→ " + ev.branch;
-          $(".wf-rs-out", r).textContent = (ev.output || "").trim();
-        } else if (ev.event === "done") { mark.finish(); status.textContent = ev.run ? ev.run.summary : "done"; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail"); }
-        else if (ev.event === "error") { mark.finish(); status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail"; }
+          finishRow(rows[ev.id], ev.ok, ev.branch, ev.output);
+        } else if (ev.event === "done") {
+          mark.finish();
+          const sum = ev.run ? ev.run.summary : "done";
+          status.textContent = sum; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail");
+          note("run finished · " + sum, ev.status === "ok" ? "ok" : "fail");
+        } else if (ev.event === "error") {
+          mark.finish();
+          status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail";
+          note("run error · " + (ev.message || ""), "fail");
+        }
       }
-      host.scrollTop = host.scrollHeight;
     }
   } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; }
 }
-async function wfReconnectRun(body, w, host, status, rows, addRow, initial, mark) {
+async function wfReconnectRun(body, w, host, status, rows, log, initial, mark) {
   // Re-attach to a run already in progress on the server: render its accumulated steps and poll
   // the live registry until it finishes. Survives browser refreshes and works for scheduled runs.
   // `mark` (from wfRenderRun) paints the same states onto the live diagram.
   status.textContent = "reconnected · running…"; status.className = "wf-run-status running";
+  log.note("reconnected to a run already in progress — replaying its log");
   let stop = false;
   const back = $("#wfBack", body), orig = back.onclick;
   back.onclick = () => { stop = true; if (orig) orig(); };
@@ -7209,19 +7266,14 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial, mark
   const paint = (st) => {
     (st.steps || []).slice(painted).forEach(s => {
       if (mark) { mark.start(s.id); mark.end(s.id, s.ok); }   // start→end also traces the edge walked
-      const r = addRow(s.id, s.label);
-      r.className = "wf-run-step " + (s.ok ? "ok" : "fail");
-      $(".wf-rs-ic", r).textContent = s.ok ? "✓" : "✗";
-      if (s.branch) $(".wf-rs-branch", r).textContent = "→ " + s.branch;
-      $(".wf-rs-out", r).textContent = (s.output || "").trim();
+      log.finishRow(log.addRow(s.id, s.label), s.ok, s.branch, s.output);
     });
     painted = (st.steps || []).length;
     if (st.current) {
       if (mark) mark.start(st.current.id);
-      if (!rows[st.current.id]) addRow(st.current.id, st.current.label);              // node in flight
+      if (!rows[st.current.id]) log.addRow(st.current.id, st.current.label);          // node in flight
     }
     if (st.awaiting && st.current && rows[st.current.id]) wfShowApproval(rows[st.current.id], w.id, st.awaiting.token);
-    host.scrollTop = host.scrollHeight;
   };
   let st = initial;
   while (!stop) {
@@ -7230,6 +7282,7 @@ async function wfReconnectRun(body, w, host, status, rows, addRow, initial, mark
       if (mark) mark.finish();
       status.textContent = st.summary || st.status;
       status.className = "wf-run-status " + (st.status === "ok" ? "ok" : "fail");
+      log.note("run finished · " + (st.summary || st.status), st.status === "ok" ? "ok" : "fail");
       return;
     }
     await new Promise(r => setTimeout(r, 1500));
