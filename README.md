@@ -44,7 +44,7 @@ from a web UI or Telegram.
   a **persona skill** (`skills/persona-*/SKILL.md`) whose identity, principles, and rules get
   prefixed onto that step — so a growth-strategist, a finance-lead, a devil's-advocate, and a
   backend engineer can genuinely argue different angles in the same orchestrated run, instead
-  of one shared voice doing all the reasoning. Ships with a 9-persona starter library. See
+  of one shared voice doing all the reasoning. Ships with a 10-persona starter library. See
   [Workflows](#workflows).
 - **A built-in email client.** Connect IMAP/SMTP accounts (app passwords) and get a real client —
   a folder sidebar with **unread counts**, a message reader, **multi-select** bulk move/delete,
@@ -299,9 +299,10 @@ system prompt every step otherwise runs with. This is what makes an **orchestrat
 like a real panel instead of one voice repeating itself from different angles: plug in a
 growth-strategist, a finance-lead, and a backend-engineer persona as parallel agents in step
 one, a devil's-advocate persona as step two (it automatically sees the others' takes), then
-summarize into a verdict. Nine starter personas ship in `skills/` (devils-advocate,
-growth-strategist, finance-lead, backend-engineer, product-manager, solo-founder, startup-cto,
-content-strategist, devops-engineer) — write your own the same way any skill is authored.
+summarize into a verdict. Ten starter personas ship in `skills/` (devils-advocate,
+growth-strategist, finance-lead, backend-engineer, frontend-designer, product-manager,
+solo-founder, startup-cto, content-strategist, devops-engineer) — write your own the same
+way any skill is authored.
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
 runaway loops. A node can also declare **retries** and an **on-error** edge, so a flaky step
@@ -347,15 +348,16 @@ workflows with `run_workflow`, but you author them in the UI. Stored in
 `data/workflows.json`; the canvas is a vendored
 [Drawflow](https://github.com/jerosoler/Drawflow).
 
-**Examples.** Eleven ready-to-import workflows live in
+**Examples.** Twelve ready-to-import workflows live in
 [`examples/workflows/`](examples/workflows/) — a scheduled morning briefing, an urgent-email
 sentry, an API watchdog (wait + retry before alerting), a fork/merge research fan-out, a
 multi-persona review board with approval, a watched-folder document indexer, a GitHub
-release digest (http → transform → loop), a **full software-development cycle** (PM
-requirements → CTO architecture → a multi-persona design-review panel → sign-off →
-implement → test → fix-until-green → code review → release-readiness → dossier), a weekday
-standup note, a content studio (draft → adversarial critique → revision → publish with
-audio narration), and a weekly competitor watch. Each deliberately shows off a different
+release digest (http → transform → loop), an **app-builder pair** (idea → requirements →
+architecture → kickoff panel → frontend design → branding → sign-off → build db/backend/
+frontend with tests → per-area review → a launch meeting that votes GO/NO-GO — plus an
+iteration workflow to keep developing afterwards), a weekday standup note, a content studio
+(draft → adversarial critique → revision → publish with audio narration), and a weekly
+competitor watch. Each deliberately shows off a different
 set of node types; import them via **⤒ Import** (multi-select works) and open one in the
 editor to see how it's wired.
 
