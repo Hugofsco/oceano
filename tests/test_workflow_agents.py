@@ -762,6 +762,7 @@ def test_model_decision_follows_the_primary_not_local_llama(monkeypatch):
         seen.update(model=model, base_url=base_url, api_key=api_key)
         return types.SimpleNamespace(content="YES")
     monkeypatch.setattr("oceano.llm.chat", fake_chat)
+    monkeypatch.setattr("oceano.delegate.get_mind", lambda: "local")
     monkeypatch.setattr("oceano.delegate.resolve_primary",
                         lambda: {"model": "gpt-remote", "base_url": "https://ep.example/v1",
                                  "api_key": "sk-abc"})
@@ -778,3 +779,51 @@ def test_model_decision_follows_the_primary_not_local_llama(monkeypatch):
     assert seen["model"] == "gpt-remote"                  # judged on the primary…
     assert seen["base_url"] == "https://ep.example/v1"    # …at its endpoint, not local llama
     assert seen["api_key"] == "sk-abc"
+
+
+def test_model_decision_follows_a_claude_mind_not_the_model_loop(monkeypatch):
+    """Mind = Claude → a model-judged decision asks the Claude CLI, and never touches
+    llm.chat at all (which would boot the local resident model)."""
+    seen = {}
+    monkeypatch.setattr("oceano.delegate.get_mind", lambda: "claude")
+    monkeypatch.setattr("oceano.delegate.available", lambda: True)
+    monkeypatch.setattr("oceano.delegate.to_claude",
+                        lambda prompt, cwd=None, tools=None, timeout=0:
+                        seen.update(prompt=prompt) or {"ok": True, "output": "YES"})
+    monkeypatch.setattr("oceano.llm.chat",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("llm.chat must not be called")))
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "transform", "mode": "template", "text": "all tests passed"},
+         {"id": 3, "type": "decision", "mode": "model", "question": "did tests pass?"},
+         {"id": 4, "type": "transform", "mode": "template", "text": "SHIPPED"},
+         {"id": 5, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3},
+         {"from": 3, "to": 4, "branch": "yes"}, {"from": 4, "to": 5}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok" and rec["output"] == "SHIPPED"
+    assert "did tests pass?" in seen["prompt"]
+
+
+def test_orchestrate_summarize_follows_a_claude_mind(monkeypatch):
+    """Mind = Claude → the orchestrator's compile turn runs through the shared agent's
+    run_claude, not the raw model loop (which resolved to the local resident model)."""
+    made = []
+    monkeypatch.setattr("oceano.agent.Agent", lambda **kw: made.append(FakeMindAgent(**kw)) or made[-1])
+    monkeypatch.setattr("oceano.delegate.get_mind", lambda: "claude")
+    monkeypatch.setattr("oceano.delegate.available", lambda: True)
+    fake = FakeAgentJobs({1: {"state": "done", "output": "TAKE-A", "error": ""}})
+    monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
+    monkeypatch.setattr("oceano.agentjobs.status", fake.status)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "agent", "task": "scan", "label": "a"},
+         {"id": 3, "type": "orchestrate", "plan": {"2": 1}, "mode": "summarize",
+          "text": "compile the panel", "timeout": 5},
+         {"id": 4, "type": "end"}],
+        [{"from": 1, "to": 3}, {"from": 2, "to": 3}, {"from": 3, "to": 4}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    kinds = [k for k, _ in made[0].calls]
+    assert kinds == ["claude"]                       # the compile turn took the mind, not ag.run
+    assert "TAKE-A" in made[0].calls[0][1]           # …and saw the gathered agent results

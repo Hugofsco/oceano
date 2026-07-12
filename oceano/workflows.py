@@ -1051,10 +1051,24 @@ def _decide(node, last_output, ag):
                          cwd=config.WORKSPACE, tools="Read", timeout=300, role=node.get("role", "default"))
         txt = (r.get("output") or "") if r.get("ok") else ""
         return _yesno(txt), f"delegate: {txt.strip()[:60] or '(no answer)'}"
-    # mode == "model" — judged by the PRIMARY model (Settings → Delegation), like every other
-    # model turn in a run. A bare llm.chat() would silently fall back to the local llama-swap
-    # defaults and boot the resident model mid-workflow even when the primary is a remote
-    # endpoint (that exact bug shipped once). '' model / None base_url still mean local.
+    # mode == "model" — judged by the PRIMARY INTELLIGENCE, exactly like an un-pinned
+    # instruction node: the mind (Claude/Codex CLI) when one is set and available, else the
+    # primary model at its endpoint. A bare llm.chat() would fall back to the local llama-swap
+    # defaults and boot the resident model mid-workflow — that bug shipped twice (first when
+    # the primary was a remote endpoint, then when the primary was a CLI mind).
+    from oceano import delegate
+    prompt = (f"You are a decision gate in a workflow.\n\n{q}\n\n"
+              f"Latest step output:\n{last_output[:2000]}\n\n"
+              "Answer with exactly one word: YES or NO.")
+    mind = delegate.get_mind()
+    if mind == "claude" and delegate.available():
+        r = delegate.to_claude(prompt, cwd=config.WORKSPACE, tools="Read", timeout=180)
+        txt = (r.get("output") or "") if r.get("ok") else ""
+        return _yesno(txt), f"model: {txt.strip()[:40] or '(blank)'}"
+    if mind == "codex" and delegate.codex_available():
+        r = delegate.to_codex(prompt, cwd=config.WORKSPACE, tools="Read", timeout=180)
+        txt = (r.get("output") or "") if r.get("ok") else ""
+        return _yesno(txt), f"model: {txt.strip()[:40] or '(blank)'}"
     from oceano import llm
     from oceano.agent import _default_primary
     dm, db, dk = _default_primary()
@@ -1378,7 +1392,18 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
     if ok and node.get("mode") == "summarize" and gathered:
         brief = (node.get("text") or "").strip() \
             or "Synthesize the agents' results below into one coherent, complete answer."
-        compiled = ag.run(brief + "\n\n" + compiled) or compiled
+        # the compile turn follows the PRIMARY INTELLIGENCE like an un-pinned instruction node
+        # (mind → CLI; else the shared agent's model loop) — a bare ag.run() booted the local
+        # resident model mid-workflow whenever the mind was Claude/Codex
+        from oceano import delegate
+        mind = delegate.get_mind()
+        prompt = brief + "\n\n" + compiled
+        if mind == "claude" and delegate.available():
+            compiled = ag.run_claude(prompt) or compiled
+        elif mind == "codex" and delegate.codex_available():
+            compiled = ag.run_codex(prompt) or compiled
+        else:
+            compiled = ag.run(prompt) or compiled
     if gathered:
         ag.messages.append({"role": "user", "content": f"(orchestrated agents → {compiled[:1500]})"})
     return ok, compiled, step_records
