@@ -268,6 +268,12 @@ def _norm_graph(graph):
             # Explicit opt-in only: "write" (+run_tests/git) or "shell" (+arbitrary commands).
             node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""
             node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
+            try:                                     # absolute cap override; 0/unset = the delegation
+                tmo = int(n.get("timeout", 0))       # default (idle-based: a productive build is never
+            except (TypeError, ValueError):          # killed for taking long, only a stalled one)
+                tmo = 0
+            if tmo > 0:
+                node["timeout"] = max(60, min(tmo, 7200))
         elif t == "agent":                            # spawn a background sub-agent; the flow continues
             node["task"] = str(n.get("task", ""))
             node["provider"] = n.get("provider") if n.get("provider") in _AGENT_PROVIDERS else ""
@@ -277,13 +283,13 @@ def _norm_graph(graph):
             node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""   # "" default = read-only
             node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
             try:
-                node["timeout"] = max(1, min(int(n.get("timeout", 600)), 3600))    # seconds
+                node["timeout"] = max(1, min(int(n.get("timeout", 600)), 7200))    # seconds
             except (TypeError, ValueError):
                 node["timeout"] = 600
         elif t == "await":                            # join: wait for this run's spawned agents
             node["agents"] = str(n.get("agents", "")).strip()   # optional id list; empty = all spawned
             try:
-                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 3600))    # seconds
+                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 7200))    # seconds
             except (TypeError, ValueError):
                 node["timeout"] = 900
         elif t == "orchestrate":                      # run plugged-in agent nodes in ordered steps
@@ -298,7 +304,7 @@ def _norm_graph(graph):
             node["mode"] = n.get("mode") if n.get("mode") in ("concat", "summarize") else "concat"
             node["text"] = str(n.get("text", ""))     # compile brief (summarize mode)
             try:
-                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 3600))    # seconds PER STEP
+                node["timeout"] = max(1, min(int(n.get("timeout", 900)), 7200))    # seconds PER STEP
             except (TypeError, ValueError):
                 node["timeout"] = 900
         elif t == "decision":
@@ -1701,8 +1707,12 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                             from oceano import delegate
                             tool_scope = _tool_scope_for(cur.get("write"))
                             text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
+                            # None → delegation's own default: an IDLE timeout plus a generous
+                            # absolute cap (env-tunable) — a long ACTIVE build isn't killed at a
+                            # fixed wall-clock. The node's timeout field overrides the cap.
                             r = delegate.run(text, cwd=config.WORKSPACE,
-                                             tools=tool_scope, timeout=600, role=cur.get("role", "default"),
+                                             tools=tool_scope, timeout=cur.get("timeout") or None,
+                                             role=cur.get("role", "default"),
                                              skills=True)   # may reuse Oceano's published skills; never memory
                             ok = bool(r.get("ok"))
                             output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"

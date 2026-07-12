@@ -127,7 +127,7 @@ def test_norm_graph_normalizes_agent_and_await():
         {"id": 2, "type": "await", "timeout": -5},
     ], "edges": []})
     a, w = g["nodes"]
-    assert a["provider"] == "" and a["timeout"] == 3600       # bogus provider → default; clamped
+    assert a["provider"] == "" and a["timeout"] == 7200       # bogus provider → default; clamped
     assert w["timeout"] == 1
 
 
@@ -224,7 +224,7 @@ def test_norm_graph_normalizes_orchestrate():
     ], "edges": []})
     n = g["nodes"][0]
     assert n["plan"] == {"7": 2, "8": 1, "9": 20}             # ints, clamped 1..20, junk keys dropped
-    assert n["mode"] == "concat" and n["timeout"] == 3600
+    assert n["mode"] == "concat" and n["timeout"] == 7200
 
 
 def test_agent_model_pin_reaches_spawn(monkeypatch):
@@ -714,3 +714,38 @@ def test_orchestrated_agent_reaches_spawn_with_skills_true(monkeypatch):
     rec = workflows.run(wf, trigger="manual", nested=True)
     assert rec["status"] == "ok"
     assert fake.spawned[0]["skills"] is True
+
+
+# ---------------- delegate timeout: idle-based default, explicit per-node cap ----------------
+def test_norm_graph_delegate_timeout_optional_and_clamped():
+    g = workflows._norm_graph({"nodes": [
+        {"id": 1, "type": "delegate", "text": "t"},                       # unset → no cap stored
+        {"id": 2, "type": "delegate", "text": "t", "timeout": 99999},     # clamped down
+        {"id": 3, "type": "delegate", "text": "t", "timeout": 5},         # clamped up
+        {"id": 4, "type": "delegate", "text": "t", "timeout": "junk"},    # junk → no cap
+    ], "edges": []})
+    by_id = {n["id"]: n for n in g["nodes"]}
+    assert "timeout" not in by_id[1] and "timeout" not in by_id[4]
+    assert by_id[2]["timeout"] == 7200
+    assert by_id[3]["timeout"] == 60
+
+
+def test_delegate_node_default_passes_no_wall_clock(monkeypatch):
+    """No timeout on the node → delegate.run gets None, i.e. delegation's own idle-based
+    default — a long ACTIVE build must not be killed at a fixed 600s wall-clock (regression:
+    the old hard-coded timeout=600 did exactly that)."""
+    seen = []
+
+    def fake_delegate_run(text, cwd=None, tools=None, timeout=None, role="default", skills=False):
+        seen.append(timeout)
+        return {"ok": True, "output": "DONE", "error": ""}
+    monkeypatch.setattr("oceano.delegate.run", fake_delegate_run)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "delegate", "text": "build it", "write": "write"},
+         {"id": 3, "type": "delegate", "text": "quick check", "timeout": 300},
+         {"id": 4, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3}, {"from": 3, "to": 4}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    assert seen == [None, 300]        # default → None (idle-based); explicit cap → honoured

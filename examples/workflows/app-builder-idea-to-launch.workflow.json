@@ -1,74 +1,465 @@
 {
   "name": "App builder — idea to launch",
-  "description": "An idea becomes a running app, with the whole team involved. DISCOVERY: product-manager requirements → CTO architecture & delivery plan → a kickoff panel (growth + finance in parallel, devil's advocate attacking them) → frontend design spec (frontend-designer persona) → branding (content-strategist) → YOUR sign-off. BUILD: database → backend → frontend, each layer delivered with its own unit tests, then the full suite runs with a fix-and-retest loop until green. REVIEW: one agent per area (backend+db, frontend vs the design spec, ops) compiled into a quality report and saved. LAUNCH MEETING: PM and devops each cast a GO/NO-GO vote, a chair compiles the decision, the minutes are saved on one branch while the other routes the verdict — 🚀 GO or 🛑 NO-GO notification. Pair it with “App builder — iteration” to keep developing afterwards. Build steps use the ✎ write tier; the fix loop is bounded by the run's visit cap (cancel from the jobs popup if it thrashes).",
+  "description": "An idea becomes a running app, staffed like a company. DISCOVERY: the product-manager writes requirements → the CTO designs the architecture (reading your workspace) → a kickoff panel (growth + finance in parallel, devil's advocate attacking them) → the frontend-designer writes the design spec → the content-strategist brands it → YOUR sign-off. BUILD — engineers, not validators: the backend-engineer persona builds the database layer, then the backend API, the frontend-engineer persona builds the UI to the design spec — each layer with its own unit tests — then the full suite runs and the on-call engineer fixes-and-retests until green. Build steps run on the delegation IDLE timeout (a long ACTIVE build is never killed at a wall-clock; set a node timeout to cap one). REVIEW: one agent per area (backend+db, frontend vs the design spec, ops) compiled into a quality report and saved. LAUNCH MEETING: PM and devops each cast a GO/NO-GO vote, a chair compiles the decision, minutes are saved on one branch while the other routes the verdict — 🚀 GO or 🛑 NO-GO notification. Pair with “App builder — iteration” to keep developing afterwards. Build steps use the ✎ write tier; the fix loop is bounded by the run's visit cap (cancel from the jobs popup if it thrashes).",
   "overlap": "skip",
-  "input": {"enabled": true, "label": "The app idea", "placeholder": "e.g. a habit tracker with streaks, built as a small web app in workspace/habits", "required": true, "default": ""},
+  "input": {
+    "enabled": true,
+    "label": "The app idea",
+    "placeholder": "e.g. a habit tracker with streaks, built as a small web app in workspace/habits",
+    "required": true,
+    "default": ""
+  },
   "triggers": [],
   "graph": {
     "nodes": [
-      {"id": 1, "type": "trigger", "kind": "manual", "x": 40, "y": 260},
-      {"id": 2, "type": "instruction", "persona": "persona-product-manager", "text": "Turn this idea into product requirements: who it's for, the core user stories, a ruthless MVP scope (explicitly in and out), and 5-8 testable acceptance criteria.\n\nIdea: {{input}}", "x": 270, "y": 260},
-      {"id": 3, "type": "delegate", "persona": "persona-startup-cto", "role": "default", "write": "", "text": "Write the architecture and delivery plan for this app: stack choice (justify briefly), the three layers — database (schema), backend (API/business logic), frontend — with responsibilities and interfaces, the folder layout under the workspace, and the testing strategy per layer.\n\nRequirements:\n{{node.2}}", "x": 510, "y": 260},
-      {"id": 4, "type": "agent", "label": "growth take", "persona": "persona-growth-strategist", "task": "Kickoff review: who actually adopts this app, the wedge that gets the first 100 users, and what in the MVP scope helps or hurts that.\n\nRequirements:\n{{node.2}}", "timeout": 600, "x": 350, "y": 480},
-      {"id": 5, "type": "agent", "label": "finance take", "persona": "persona-finance-lead", "task": "Kickoff review: cost to build and run this, what it would take to sustain it (pricing or otherwise), and the financial risk in the plan.\n\nRequirements:\n{{node.2}}\n\nPlan:\n{{node.3}}", "timeout": 600, "x": 590, "y": 480},
-      {"id": 6, "type": "agent", "label": "devil's advocate", "persona": "persona-devils-advocate", "task": "The growth and finance takes are in your context. Attack the idea, the MVP scope, and their takes: the assumption that kills this, what everyone missed, and the simpler version nobody proposed.\n\nRequirements:\n{{node.2}}", "timeout": 600, "x": 830, "y": 480},
-      {"id": 7, "type": "orchestrate", "plan": {"4": 1, "5": 1, "6": 2}, "mode": "summarize", "text": "Chair the kickoff: compile the panel into scope changes that MUST happen before build, improvements worth making, and what's confirmed as-is.", "timeout": 900, "x": 800, "y": 260},
-      {"id": 8, "type": "instruction", "persona": "persona-frontend-designer", "text": "Write the frontend design spec for this app: the page/flow map, a component inventory (name · purpose · states · content rules), type scale and color tokens, and empty/loading/error behavior per view. Honor the kickoff verdict's scope changes.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}", "x": 1060, "y": 260},
-      {"id": 9, "type": "instruction", "persona": "persona-content-strategist", "text": "Brand this app: three name candidates with a one-line rationale each (pick a winner), a tagline, the voice (three adjectives + a sentence of guidance), and how the visual direction in the design spec should carry it.\n\nIdea: {{input}}\n\nDesign spec:\n{{node.8}}", "x": 1300, "y": 260},
-      {"id": 10, "type": "approval", "prompt": "Discovery is done for “{{input}}” — requirements, architecture, kickoff verdict, design spec, and branding are in the run log. Approve and start the build?", "timeout": 360, "x": 1540, "y": 260},
-      {"id": 11, "type": "delegate", "role": "default", "write": "write", "text": "BUILD 1/3 — scaffold the project per the architecture's folder layout, then implement the DATABASE layer: schema, migrations/seed data, and its unit tests. Honor the kickoff verdict's scope changes.\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}", "x": 1780, "y": 190},
-      {"id": 12, "type": "delegate", "role": "default", "write": "write", "text": "BUILD 2/3 — implement the BACKEND on top of the database layer just built: API endpoints and business logic per the architecture, each with unit tests.\n\nArchitecture:\n{{node.3}}\n\nRequirements:\n{{node.2}}", "x": 2020, "y": 190},
-      {"id": 13, "type": "delegate", "role": "default", "write": "write", "text": "BUILD 3/3 — implement the FRONTEND against the backend just built, following the design spec exactly (pages, components, states) and carrying the branding (name, tagline, voice). Add its tests.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}\n\nArchitecture:\n{{node.3}}", "x": 2260, "y": 190},
-      {"id": 14, "type": "tool", "tool": "run_tests", "args": {}, "x": 2500, "y": 190},
-      {"id": 15, "type": "decision", "mode": "model", "question": "Did the test run succeed — no failures or errors?\n\nTest output:\n{{node.14}}", "x": 2730, "y": 190},
-      {"id": 16, "type": "delegate", "role": "default", "write": "write", "text": "The test suite failed. Diagnose and fix the cause without changing intended behavior.\n\nTest output:\n{{node.14}}\n\nArchitecture for reference:\n{{node.3}}", "x": 2730, "y": 370},
-      {"id": 17, "type": "agent", "label": "backend & db review", "persona": "persona-backend-engineer", "task": "Review the backend and database code of the app just built (read the workspace — you have read-only access): correctness against the acceptance criteria, schema and query quality, error handling, and test quality. Findings by severity.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}", "timeout": 600, "x": 2850, "y": 480},
-      {"id": 18, "type": "agent", "label": "frontend & design review", "persona": "persona-frontend-designer", "task": "Review the built frontend against the design spec (read the workspace — you have read-only access): flows, missing states, accessibility, and whether the branding actually landed. Findings by severity.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}", "timeout": 600, "x": 3090, "y": 480},
-      {"id": 19, "type": "agent", "label": "ops review", "persona": "persona-devops-engineer", "task": "Review the app for operability (read the workspace — you have read-only access): can it be installed, run, and tested from a clean checkout; what's missing to deploy, monitor, and roll back. Findings by severity.\n\nArchitecture:\n{{node.3}}", "timeout": 600, "x": 3330, "y": 480},
-      {"id": 20, "type": "orchestrate", "plan": {"17": 1, "18": 1, "19": 1}, "mode": "summarize", "text": "Compile the three area reviews into one quality report: findings by severity per area, then an overall assessment of build quality.", "timeout": 900, "x": 3090, "y": 190},
-      {"id": 21, "type": "tool", "tool": "write_file", "args": {"path": "dev/app-report.md", "content": "{{node.20}}"}, "x": 3330, "y": 190},
-      {"id": 22, "type": "agent", "label": "PM vote", "persona": "persona-product-manager", "task": "Launch meeting — cast your vote: does the app meet the MVP acceptance criteria, judged on the quality report? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nAcceptance criteria:\n{{node.2}}\n\nQuality report:\n{{node.20}}", "timeout": 600, "x": 3450, "y": 480},
-      {"id": 23, "type": "agent", "label": "ops vote", "persona": "persona-devops-engineer", "task": "Launch meeting — cast your vote: is this app actually runnable right now (read the workspace and check), and safe to call live? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nQuality report:\n{{node.20}}", "timeout": 600, "x": 3690, "y": 480},
-      {"id": 24, "type": "orchestrate", "plan": {"22": 1, "23": 1}, "mode": "summarize", "text": "Chair the launch meeting: weigh the votes and conclude. Your FIRST line must be exactly 'DECISION: GO' or 'DECISION: NO-GO', followed by the reasons and the immediate next steps.", "timeout": 900, "x": 3570, "y": 190},
-      {"id": 25, "type": "tool", "tool": "write_file", "args": {"path": "dev/launch-meeting.md", "content": "{{node.24}}"}, "x": 3810, "y": 320},
-      {"id": 26, "type": "decision", "mode": "rule", "ruleOp": "contains", "ruleValue": "DECISION: GO", "question": "", "x": 3810, "y": 120},
-      {"id": 27, "type": "tool", "tool": "notify", "args": {"title": "🚀 Launch meeting: GO", "message": "The team declared GO for “{{input}}” — minutes at workspace/dev/launch-meeting.md, quality report at dev/app-report.md"}, "x": 4050, "y": 60},
-      {"id": 28, "type": "tool", "tool": "notify", "args": {"title": "🛑 Launch meeting: NO-GO", "message": "The team held the launch of “{{input}}” — see the minutes at workspace/dev/launch-meeting.md for the conditions"}, "x": 4050, "y": 200},
-      {"id": 29, "type": "end", "x": 4290, "y": 260}
+      {
+        "id": 1,
+        "type": "trigger",
+        "kind": "manual",
+        "x": 40,
+        "y": 260
+      },
+      {
+        "id": 2,
+        "type": "instruction",
+        "persona": "persona-product-manager",
+        "text": "Turn this idea into product requirements: who it's for, the core user stories, a ruthless MVP scope (explicitly in and out), and 5-8 testable acceptance criteria.\n\nIdea: {{input}}",
+        "x": 270,
+        "y": 260
+      },
+      {
+        "id": 3,
+        "type": "delegate",
+        "persona": "persona-startup-cto",
+        "role": "default",
+        "write": "",
+        "text": "Write the architecture and delivery plan for this app: stack choice (justify briefly), the three layers — database (schema), backend (API/business logic), frontend — with responsibilities and interfaces, the folder layout under the workspace, and the testing strategy per layer.\n\nRequirements:\n{{node.2}}",
+        "x": 510,
+        "y": 260
+      },
+      {
+        "id": 4,
+        "type": "agent",
+        "label": "growth take",
+        "persona": "persona-growth-strategist",
+        "task": "Kickoff review: who actually adopts this app, the wedge that gets the first 100 users, and what in the MVP scope helps or hurts that.\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 350,
+        "y": 480
+      },
+      {
+        "id": 5,
+        "type": "agent",
+        "label": "finance take",
+        "persona": "persona-finance-lead",
+        "task": "Kickoff review: cost to build and run this, what it would take to sustain it (pricing or otherwise), and the financial risk in the plan.\n\nRequirements:\n{{node.2}}\n\nPlan:\n{{node.3}}",
+        "timeout": 600,
+        "x": 590,
+        "y": 480
+      },
+      {
+        "id": 6,
+        "type": "agent",
+        "label": "devil's advocate",
+        "persona": "persona-devils-advocate",
+        "task": "The growth and finance takes are in your context. Attack the idea, the MVP scope, and their takes: the assumption that kills this, what everyone missed, and the simpler version nobody proposed.\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 830,
+        "y": 480
+      },
+      {
+        "id": 7,
+        "type": "orchestrate",
+        "plan": {
+          "4": 1,
+          "5": 1,
+          "6": 2
+        },
+        "mode": "summarize",
+        "text": "Chair the kickoff: compile the panel into scope changes that MUST happen before build, improvements worth making, and what's confirmed as-is.",
+        "timeout": 900,
+        "x": 800,
+        "y": 260
+      },
+      {
+        "id": 8,
+        "type": "instruction",
+        "persona": "persona-frontend-designer",
+        "text": "Write the frontend design spec for this app: the page/flow map, a component inventory (name · purpose · states · content rules), type scale and color tokens, and empty/loading/error behavior per view. Honor the kickoff verdict's scope changes.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}",
+        "x": 1060,
+        "y": 260
+      },
+      {
+        "id": 9,
+        "type": "instruction",
+        "persona": "persona-content-strategist",
+        "text": "Brand this app: three name candidates with a one-line rationale each (pick a winner), a tagline, the voice (three adjectives + a sentence of guidance), and how the visual direction in the design spec should carry it.\n\nIdea: {{input}}\n\nDesign spec:\n{{node.8}}",
+        "x": 1300,
+        "y": 260
+      },
+      {
+        "id": 10,
+        "type": "approval",
+        "prompt": "Discovery is done for “{{input}}” — requirements, architecture, kickoff verdict, design spec, and branding are in the run log. Approve and start the build?",
+        "timeout": 360,
+        "x": 1540,
+        "y": 260
+      },
+      {
+        "id": 11,
+        "type": "delegate",
+        "role": "default",
+        "write": "write",
+        "text": "BUILD 1/3 — scaffold the project per the architecture's folder layout, then implement the DATABASE layer: schema, migrations/seed data, and its unit tests. Honor the kickoff verdict's scope changes.\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}",
+        "x": 1780,
+        "y": 190,
+        "persona": "persona-backend-engineer"
+      },
+      {
+        "id": 12,
+        "type": "delegate",
+        "role": "default",
+        "write": "write",
+        "text": "BUILD 2/3 — implement the BACKEND on top of the database layer just built: API endpoints and business logic per the architecture, each with unit tests.\n\nArchitecture:\n{{node.3}}\n\nRequirements:\n{{node.2}}",
+        "x": 2020,
+        "y": 190,
+        "persona": "persona-backend-engineer"
+      },
+      {
+        "id": 13,
+        "type": "delegate",
+        "role": "default",
+        "write": "write",
+        "text": "BUILD 3/3 — implement the FRONTEND against the backend just built, following the design spec exactly (pages, components, states) and carrying the branding (name, tagline, voice). Add its tests.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}\n\nArchitecture:\n{{node.3}}",
+        "x": 2260,
+        "y": 190,
+        "persona": "persona-frontend-engineer"
+      },
+      {
+        "id": 14,
+        "type": "tool",
+        "tool": "run_tests",
+        "args": {},
+        "x": 2500,
+        "y": 190
+      },
+      {
+        "id": 15,
+        "type": "decision",
+        "mode": "model",
+        "question": "Did the test run succeed — no failures or errors?\n\nTest output:\n{{node.14}}",
+        "x": 2730,
+        "y": 190
+      },
+      {
+        "id": 16,
+        "type": "delegate",
+        "role": "default",
+        "write": "write",
+        "text": "The test suite failed and you're the engineer on call. Diagnose and fix the cause without changing intended behavior.\n\nTest output:\n{{node.14}}\n\nArchitecture for reference:\n{{node.3}}",
+        "x": 2730,
+        "y": 370,
+        "persona": "persona-backend-engineer"
+      },
+      {
+        "id": 17,
+        "type": "agent",
+        "label": "backend & db review",
+        "persona": "persona-backend-engineer",
+        "task": "Review the backend and database code of the app just built (read the workspace — you have read-only access): correctness against the acceptance criteria, schema and query quality, error handling, and test quality. Findings by severity.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}",
+        "timeout": 900,
+        "x": 2850,
+        "y": 480
+      },
+      {
+        "id": 18,
+        "type": "agent",
+        "label": "frontend & design review",
+        "persona": "persona-frontend-designer",
+        "task": "Review the built frontend against the design spec (read the workspace — you have read-only access): flows, missing states, accessibility, and whether the branding actually landed. Findings by severity.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}",
+        "timeout": 900,
+        "x": 3090,
+        "y": 480
+      },
+      {
+        "id": 19,
+        "type": "agent",
+        "label": "ops review",
+        "persona": "persona-devops-engineer",
+        "task": "Review the app for operability (read the workspace — you have read-only access): can it be installed, run, and tested from a clean checkout; what's missing to deploy, monitor, and roll back. Findings by severity.\n\nArchitecture:\n{{node.3}}",
+        "timeout": 900,
+        "x": 3330,
+        "y": 480
+      },
+      {
+        "id": 20,
+        "type": "orchestrate",
+        "plan": {
+          "17": 1,
+          "18": 1,
+          "19": 1
+        },
+        "mode": "summarize",
+        "text": "Compile the three area reviews into one quality report: findings by severity per area, then an overall assessment of build quality.",
+        "timeout": 900,
+        "x": 3090,
+        "y": 190
+      },
+      {
+        "id": 21,
+        "type": "tool",
+        "tool": "write_file",
+        "args": {
+          "path": "dev/app-report.md",
+          "content": "{{node.20}}"
+        },
+        "x": 3330,
+        "y": 190
+      },
+      {
+        "id": 22,
+        "type": "agent",
+        "label": "PM vote",
+        "persona": "persona-product-manager",
+        "task": "Launch meeting — cast your vote: does the app meet the MVP acceptance criteria, judged on the quality report? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nAcceptance criteria:\n{{node.2}}\n\nQuality report:\n{{node.20}}",
+        "timeout": 600,
+        "x": 3450,
+        "y": 480
+      },
+      {
+        "id": 23,
+        "type": "agent",
+        "label": "ops vote",
+        "persona": "persona-devops-engineer",
+        "task": "Launch meeting — cast your vote: is this app actually runnable right now (read the workspace and check), and safe to call live? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nQuality report:\n{{node.20}}",
+        "timeout": 600,
+        "x": 3690,
+        "y": 480
+      },
+      {
+        "id": 24,
+        "type": "orchestrate",
+        "plan": {
+          "22": 1,
+          "23": 1
+        },
+        "mode": "summarize",
+        "text": "Chair the launch meeting: weigh the votes and conclude. Your FIRST line must be exactly 'DECISION: GO' or 'DECISION: NO-GO', followed by the reasons and the immediate next steps.",
+        "timeout": 900,
+        "x": 3570,
+        "y": 190
+      },
+      {
+        "id": 25,
+        "type": "tool",
+        "tool": "write_file",
+        "args": {
+          "path": "dev/launch-meeting.md",
+          "content": "{{node.24}}"
+        },
+        "x": 3810,
+        "y": 320
+      },
+      {
+        "id": 26,
+        "type": "decision",
+        "mode": "rule",
+        "ruleOp": "contains",
+        "ruleValue": "DECISION: GO",
+        "question": "",
+        "x": 3810,
+        "y": 120
+      },
+      {
+        "id": 27,
+        "type": "tool",
+        "tool": "notify",
+        "args": {
+          "title": "🚀 Launch meeting: GO",
+          "message": "The team declared GO for “{{input}}” — minutes at workspace/dev/launch-meeting.md, quality report at dev/app-report.md"
+        },
+        "x": 4050,
+        "y": 60
+      },
+      {
+        "id": 28,
+        "type": "tool",
+        "tool": "notify",
+        "args": {
+          "title": "🛑 Launch meeting: NO-GO",
+          "message": "The team held the launch of “{{input}}” — see the minutes at workspace/dev/launch-meeting.md for the conditions"
+        },
+        "x": 4050,
+        "y": 200
+      },
+      {
+        "id": 29,
+        "type": "end",
+        "x": 4290,
+        "y": 260
+      }
     ],
     "edges": [
-      {"from": 1, "to": 2, "branch": null},
-      {"from": 2, "to": 3, "branch": null},
-      {"from": 3, "to": 7, "branch": null},
-      {"from": 4, "to": 7, "branch": null},
-      {"from": 5, "to": 7, "branch": null},
-      {"from": 6, "to": 7, "branch": null},
-      {"from": 7, "to": 8, "branch": null},
-      {"from": 8, "to": 9, "branch": null},
-      {"from": 9, "to": 10, "branch": null},
-      {"from": 10, "to": 11, "branch": "approved"},
-      {"from": 10, "to": 29, "branch": "rejected"},
-      {"from": 11, "to": 12, "branch": null},
-      {"from": 12, "to": 13, "branch": null},
-      {"from": 13, "to": 14, "branch": null},
-      {"from": 14, "to": 15, "branch": null},
-      {"from": 15, "to": 20, "branch": "yes"},
-      {"from": 15, "to": 16, "branch": "no"},
-      {"from": 16, "to": 14, "branch": null},
-      {"from": 17, "to": 20, "branch": null},
-      {"from": 18, "to": 20, "branch": null},
-      {"from": 19, "to": 20, "branch": null},
-      {"from": 20, "to": 21, "branch": null},
-      {"from": 21, "to": 24, "branch": null},
-      {"from": 22, "to": 24, "branch": null},
-      {"from": 23, "to": 24, "branch": null},
-      {"from": 24, "to": 25, "branch": null},
-      {"from": 24, "to": 26, "branch": null},
-      {"from": 25, "to": 29, "branch": null},
-      {"from": 26, "to": 27, "branch": "yes"},
-      {"from": 26, "to": 28, "branch": "no"},
-      {"from": 27, "to": 29, "branch": null},
-      {"from": 28, "to": 29, "branch": null}
+      {
+        "from": 1,
+        "to": 2,
+        "branch": null
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "branch": null
+      },
+      {
+        "from": 3,
+        "to": 7,
+        "branch": null
+      },
+      {
+        "from": 4,
+        "to": 7,
+        "branch": null
+      },
+      {
+        "from": 5,
+        "to": 7,
+        "branch": null
+      },
+      {
+        "from": 6,
+        "to": 7,
+        "branch": null
+      },
+      {
+        "from": 7,
+        "to": 8,
+        "branch": null
+      },
+      {
+        "from": 8,
+        "to": 9,
+        "branch": null
+      },
+      {
+        "from": 9,
+        "to": 10,
+        "branch": null
+      },
+      {
+        "from": 10,
+        "to": 11,
+        "branch": "approved"
+      },
+      {
+        "from": 10,
+        "to": 29,
+        "branch": "rejected"
+      },
+      {
+        "from": 11,
+        "to": 12,
+        "branch": null
+      },
+      {
+        "from": 12,
+        "to": 13,
+        "branch": null
+      },
+      {
+        "from": 13,
+        "to": 14,
+        "branch": null
+      },
+      {
+        "from": 14,
+        "to": 15,
+        "branch": null
+      },
+      {
+        "from": 15,
+        "to": 20,
+        "branch": "yes"
+      },
+      {
+        "from": 15,
+        "to": 16,
+        "branch": "no"
+      },
+      {
+        "from": 16,
+        "to": 14,
+        "branch": null
+      },
+      {
+        "from": 17,
+        "to": 20,
+        "branch": null
+      },
+      {
+        "from": 18,
+        "to": 20,
+        "branch": null
+      },
+      {
+        "from": 19,
+        "to": 20,
+        "branch": null
+      },
+      {
+        "from": 20,
+        "to": 21,
+        "branch": null
+      },
+      {
+        "from": 21,
+        "to": 24,
+        "branch": null
+      },
+      {
+        "from": 22,
+        "to": 24,
+        "branch": null
+      },
+      {
+        "from": 23,
+        "to": 24,
+        "branch": null
+      },
+      {
+        "from": 24,
+        "to": 25,
+        "branch": null
+      },
+      {
+        "from": 24,
+        "to": 26,
+        "branch": null
+      },
+      {
+        "from": 25,
+        "to": 29,
+        "branch": null
+      },
+      {
+        "from": 26,
+        "to": 27,
+        "branch": "yes"
+      },
+      {
+        "from": 26,
+        "to": 28,
+        "branch": "no"
+      },
+      {
+        "from": 27,
+        "to": 29,
+        "branch": null
+      },
+      {
+        "from": 28,
+        "to": 29,
+        "branch": null
+      }
     ]
   }
 }

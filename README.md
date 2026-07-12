@@ -44,7 +44,7 @@ from a web UI or Telegram.
   a **persona skill** (`skills/persona-*/SKILL.md`) whose identity, principles, and rules get
   prefixed onto that step — so a growth-strategist, a finance-lead, a devil's-advocate, and a
   backend engineer can genuinely argue different angles in the same orchestrated run, instead
-  of one shared voice doing all the reasoning. Ships with a 10-persona starter library. See
+  of one shared voice doing all the reasoning. Ships with an 11-persona starter library. See
   [Workflows](#workflows).
 - **A built-in email client.** Connect IMAP/SMTP accounts (app passwords) and get a real client —
   a folder sidebar with **unread counts**, a message reader, **multi-select** bulk move/delete,
@@ -254,7 +254,10 @@ walks it from a **start** node, following edges:
   on the capability pickers, e.g. load several skills or run several workflows at once — no
   JSON to hand-write)
 - **instruction** — a free-form step run through the agent loop (it may use any tool)
-- **delegate** — hand the step to the configured delegate (Claude Code / a cloud model)
+- **delegate** — hand the step to the configured delegate (Claude Code / a cloud model). By
+  default it runs on delegation's **idle timeout** — a long *active* build is never killed at
+  a fixed wall-clock, only a stalled one — with the node's optional **timeout (s)** field as
+  an explicit absolute cap
 - **decision** — routes **yes / no** down different edges, judged by a **rule** over the
   previous step's output, the **local model**, or a **delegate**
 - **switch** — multi-branch routing (more than a yes/no — pick an edge by matching a value)
@@ -299,10 +302,10 @@ system prompt every step otherwise runs with. This is what makes an **orchestrat
 like a real panel instead of one voice repeating itself from different angles: plug in a
 growth-strategist, a finance-lead, and a backend-engineer persona as parallel agents in step
 one, a devil's-advocate persona as step two (it automatically sees the others' takes), then
-summarize into a verdict. Ten starter personas ship in `skills/` (devils-advocate,
-growth-strategist, finance-lead, backend-engineer, frontend-designer, product-manager,
-solo-founder, startup-cto, content-strategist, devops-engineer) — write your own the same
-way any skill is authored.
+summarize into a verdict. Eleven starter personas ship in `skills/` (devils-advocate,
+growth-strategist, finance-lead, backend-engineer, frontend-designer, frontend-engineer,
+product-manager, solo-founder, startup-cto, content-strategist, devops-engineer) — write
+your own the same way any skill is authored.
 
 All steps share one agent, so context accumulates across nodes; a hard visit-cap stops
 runaway loops. A node can also declare **retries** and an **on-error** edge, so a flaky step

@@ -6002,7 +6002,7 @@ function wfToolOptions(sel) {
 function wfNodeData(n) {
   if (n.type === "tool") return { tool: n.tool || ((_wfTools && _wfTools[0] && _wfTools[0].name) || ""), args: JSON.stringify(n.args || {}) };
   if (n.type === "instruction") return { text: n.text || "", provider: n.provider || "", model: n.model || "", baseUrl: n.baseUrl || "", persona: n.persona || "", retries: String(n.retries || 0) };
-  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", write: wfWriteTier(n.write), persona: n.persona || "", retries: String(n.retries || 0) };
+  if (n.type === "delegate") return { text: n.text || "", role: n.role || "default", write: wfWriteTier(n.write), persona: n.persona || "", timeout: n.timeout ? String(n.timeout) : "", retries: String(n.retries || 0) };
   // Keys mirror what wfReadCanvas reads back — lowercase for historical df-* binding reasons;
   // trigger's mailFolder stays camelCase to match the backend. Settings are edited in the INSPECTOR
   // panel (wfInspect), so every type gets its full default data up front.
@@ -6433,6 +6433,8 @@ const WF_FIELDS = {
     { k: "persona", t: "combo", en: "skills", l: "persona", ph: "optional — e.g. persona-finance-lead" },
     { t: "note", text: WF_PERSONA_NOTE },
     { k: "role", t: "select", l: "role", opts: [["default", "default"], ["improve", "improve"]] },
+    { k: "timeout", t: "number", l: "timeout (s)", min: 60, max: 7200, ph: "default",
+      hint: "blank = delegation default: killed only when IDLE (no output for a while), generous absolute cap — a long active build survives. Set a number to cap this node's wall-clock." },
     { k: "write", t: "select", l: "file access", rr: true, opts: WF_ACCESS_OPTS },
     { t: "note", text: WF_SKILLS_NOTE },
     { t: "note", warn: true, showIf: d => d.write === "write", text: WF_ACCESS_NOTE_WRITE },
@@ -6440,7 +6442,7 @@ const WF_FIELDS = {
     { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
   await: [
     { t: "note", text: "waits for every agent spawned in this run, then continues with their results." },
-    { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 3600 }],
+    { k: "timeout", t: "number", l: "timeout (s)", min: 1, max: 7200 }],
   decision: [
     { k: "mode", t: "select", l: "how to decide", opts: [["model", "model judges"], ["rule", "rule on previous output"], ["delegate", "delegate judges"]], rr: true },
     { k: "question", t: "textarea", l: "yes/no question", ph: "e.g. does this look ready to publish?", showIf: d => d.mode !== "rule" },
@@ -6480,7 +6482,7 @@ function wfInspGeneric(editor, dfId, type, box, sync) {
       let inp;
       if (f.t === "textarea") inp = `<textarea class="wfn-fld" data-k="${f.k}" placeholder="${escapeHtml(f.ph || "")}">${escapeHtml(v)}</textarea>`;
       else if (f.t === "select") inp = `<select class="wfn-fld" data-k="${f.k}"${f.rr ? ' data-rr="1"' : ""}>${f.opts.map(([ov, ol]) => `<option value="${ov}"${v === ov ? " selected" : ""}>${ol}</option>`).join("")}</select>`;
-      else if (f.t === "number") inp = `<input class="wfn-fld" type="number" data-k="${f.k}"${f.min != null ? ` min="${f.min}"` : ""}${f.max != null ? ` max="${f.max}"` : ""} value="${escapeHtml(v)}">`;
+      else if (f.t === "number") inp = `<input class="wfn-fld" type="number" data-k="${f.k}"${f.min != null ? ` min="${f.min}"` : ""}${f.max != null ? ` max="${f.max}"` : ""}${f.ph ? ` placeholder="${escapeHtml(f.ph)}"` : ""} value="${escapeHtml(v)}">`;
       else if (f.t === "combo") inp = `<div class="wfn-combo-wrap"><input class="wfn-fld wfn-combo" data-k="${f.k}" data-enum="${f.en}" autocomplete="off" placeholder="${escapeHtml(f.ph || "type to search…")}" value="${escapeHtml(v)}"><div class="wfn-acx" style="display:none"></div></div>`;
       else inp = `<input class="wfn-fld" data-k="${f.k}" placeholder="${escapeHtml(f.ph || "")}" value="${escapeHtml(v)}">`;
       return `<div class="wf-insp-row"><label class="wfn-lab">${escapeHtml(f.l || f.k)}</label>${inp}${f.hint ? `<div class="wfn-hint">${f.hint}</div>` : ""}</div>`;
@@ -6554,7 +6556,7 @@ function wfInspAgent(editor, dfId, box, sync) {
     row("runs on", `<select class="wfn-fld wa-model"><option value="">delegation default</option></select>`) +
     row("file access", `<select class="wfn-fld" data-k="write">${WF_ACCESS_OPTS.map(([v, l]) => `<option value="${v}"${d.write === v ? " selected" : ""}>${l}</option>`).join("")}</select>`) +
     row("label", `<input class="wfn-fld" data-k="label" placeholder="short label" value="${escapeHtml(d.label || "")}">`) +
-    row("timeout (s)", `<input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "600")}">`) +
+    row("timeout (s)", `<input class="wfn-fld" type="number" min="1" max="7200" data-k="timeout" value="${escapeHtml(d.timeout || "600")}">`) +
     `<div class="wf-insp-note">join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}.</div>` +
     `<div class="wf-insp-note">${WF_SKILLS_NOTE}</div>` +
     (d.write === "write" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_WRITE}</div>`
@@ -6640,7 +6642,7 @@ function wfInspOrch(editor, dfId, box, sync) {
     }
     h += `<div class="wf-insp-row"><label class="wfn-lab">when all are done</label><select class="wfn-fld" data-k="mode"><option value="concat"${d.mode !== "summarize" ? " selected" : ""}>pass the combined results onward</option><option value="summarize"${d.mode === "summarize" ? " selected" : ""}>compile with the model first</option></select></div>`;
     if (d.mode === "summarize") h += `<div class="wf-insp-row"><label class="wfn-lab">compile brief</label><textarea class="wfn-fld" data-k="text" placeholder="how to compile the results — e.g. merge into one report, dedupe, note which agent found what">${escapeHtml(d.text || "")}</textarea></div>`;
-    h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="3600" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"><div class="wfn-hint">an agent that fails or stalls is retried once, alone, before the step fails</div></div>`;
+    h += `<div class="wf-insp-row"><label class="wfn-lab">timeout per step (s)</label><input class="wfn-fld" type="number" min="1" max="7200" data-k="timeout" value="${escapeHtml(d.timeout || "900")}"><div class="wfn-hint">an agent that fails or stalls is retried once, alone, before the step fails</div></div>`;
     box.innerHTML = h;
     box.querySelectorAll("[data-oa]").forEach(f => f.addEventListener("change", () => {
       plan[f.dataset.oa] = Math.max(1, parseInt(f.value, 10) || 1);
@@ -7063,7 +7065,7 @@ function wfReadCanvas(editor) {
       try { node.args = (d.args || "").trim() ? JSON.parse(d.args) : {}; }
       catch { error = `invalid JSON in tool node “${node.tool || id}”`; node.args = {}; }
     } else if (t === "instruction") { node.text = d.text || ""; node.provider = d.provider || ""; node.model = d.model || ""; node.baseUrl = d.baseUrl || ""; node.persona = d.persona || ""; node.retries = intOr0(d.retries); }
-    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; node.retries = intOr0(d.retries); }
+    else if (t === "delegate") { node.text = d.text || ""; node.role = d.role || "default"; node.write = wfWriteTier(d.write); node.persona = d.persona || ""; const dt = intOr0(d.timeout); if (dt) node.timeout = dt; node.retries = intOr0(d.retries); }
     else if (t === "decision") { node.mode = d.mode || "model"; node.question = d.question || ""; node.ruleOp = d.ruleop || "contains"; node.ruleValue = d.ruleval || ""; node.role = d.role || "default"; }
     else if (t === "trigger") { node.kind = d.kind || "manual"; node.cron = d.cron || ""; node.pattern = d.pattern || ""; node.channel = d.channel || "any"; node.folder = d.folder || ""; node.account = d.account || ""; node.mailFolder = d.mailFolder || "INBOX"; }
     else if (t === "switch") {
