@@ -1,6 +1,6 @@
 {
   "name": "App builder — idea to launch",
-  "description": "An idea becomes a running app, staffed like a company. DISCOVERY: the product-manager writes requirements → the CTO designs the architecture (reading your workspace) → a kickoff panel (growth + finance in parallel, devil's advocate attacking them) → the frontend-designer writes the design spec → the content-strategist brands it → YOUR sign-off. BUILD — engineers, not validators: the backend-engineer persona builds the database layer, then the backend API, the frontend-engineer persona builds the UI to the design spec — each layer with its own unit tests — then the full suite runs and the on-call engineer fixes-and-retests until green. Build steps run on the delegation IDLE timeout (a long ACTIVE build is never killed at a wall-clock; set a node timeout to cap one). REVIEW: one agent per area (backend+db, frontend vs the design spec, ops) compiled into a quality report and saved. LAUNCH MEETING: PM and devops each cast a GO/NO-GO vote, a chair compiles the decision, minutes are saved on one branch while the other routes the verdict — 🚀 GO or 🛑 NO-GO notification. Pair with “App builder — iteration” to keep developing afterwards. Build steps use the ✎ write tier; the fix loop is bounded by the run's visit cap (cancel from the jobs popup if it thrashes).",
+  "description": "An idea becomes a running app, staffed like a company — maximum collaboration, not just review. DISCOVERY: the product-manager writes requirements → a kickoff panel (growth + finance in parallel, devil's advocate attacking them) → an ARCHITECTURE MEETING where the engineers decide the design together: backend-engineer and frontend-engineer each propose their layer's architecture in parallel, devops reconciles the proposals and flags integration mismatches, and the CTO chairs the minutes into the final architecture (overruling with reasons) → the frontend-designer writes the design spec → the content-strategist brands it → YOUR sign-off. BUILD: the backend-engineer builds the database layer then the API, the frontend-engineer builds the UI to the spec — each layer with unit tests — then the full suite runs and the on-call engineer fixes-and-retests until green (delegates run on the delegation IDLE timeout: a long ACTIVE build is never killed at a wall-clock). REVIEW: one agent per area (backend+db, frontend vs the design spec, ops) compiled into a quality report and saved. LAUNCH MEETING: PM and devops each cast a GO/NO-GO vote, a chair compiles the decision, minutes are saved on one branch while the other routes the verdict — 🚀 GO or 🛑 NO-GO notification. Pair with “App builder — iteration”. Build steps use the ✎ write tier; the fix loop is bounded by the run's visit cap (cancel from the jobs popup if it thrashes).",
   "overlap": "skip",
   "input": {
     "enabled": true,
@@ -33,8 +33,8 @@
         "persona": "persona-startup-cto",
         "role": "default",
         "write": "",
-        "text": "Write the architecture and delivery plan for this app: stack choice (justify briefly), the three layers — database (schema), backend (API/business logic), frontend — with responsibilities and interfaces, the folder layout under the workspace, and the testing strategy per layer.\n\nRequirements:\n{{node.2}}",
-        "x": 510,
+        "text": "You chaired the engineering architecture meeting — its minutes are below. Resolve the points where the engineers disagree and write the FINAL architecture & delivery plan: stack choice (justify briefly), the three layers — database (schema), backend (API/business logic), frontend — with responsibilities and interfaces, the folder layout under the workspace, and the testing strategy per layer. Decisions, not options; where you overrule an engineer, say why.\n\nMeeting minutes:\n{{node.30}}\n\nRequirements:\n{{node.2}}\n\nKickoff verdict:\n{{node.7}}",
+        "x": 1020,
         "y": 260
       },
       {
@@ -44,18 +44,18 @@
         "persona": "persona-growth-strategist",
         "task": "Kickoff review: who actually adopts this app, the wedge that gets the first 100 users, and what in the MVP scope helps or hurts that.\n\nRequirements:\n{{node.2}}",
         "timeout": 600,
-        "x": 350,
-        "y": 480
+        "x": 160,
+        "y": 470
       },
       {
         "id": 5,
         "type": "agent",
         "label": "finance take",
         "persona": "persona-finance-lead",
-        "task": "Kickoff review: cost to build and run this, what it would take to sustain it (pricing or otherwise), and the financial risk in the plan.\n\nRequirements:\n{{node.2}}\n\nPlan:\n{{node.3}}",
+        "task": "Kickoff review: cost to build and run this, what it would take to sustain it (pricing or otherwise), and the financial risk you see in the MVP scope.\n\nRequirements:\n{{node.2}}",
         "timeout": 600,
-        "x": 590,
-        "y": 480
+        "x": 400,
+        "y": 470
       },
       {
         "id": 6,
@@ -64,8 +64,8 @@
         "persona": "persona-devils-advocate",
         "task": "The growth and finance takes are in your context. Attack the idea, the MVP scope, and their takes: the assumption that kills this, what everyone missed, and the simpler version nobody proposed.\n\nRequirements:\n{{node.2}}",
         "timeout": 600,
-        "x": 830,
-        "y": 480
+        "x": 640,
+        "y": 470
       },
       {
         "id": 7,
@@ -78,7 +78,7 @@
         "mode": "summarize",
         "text": "Chair the kickoff: compile the panel into scope changes that MUST happen before build, improvements worth making, and what's confirmed as-is.",
         "timeout": 900,
-        "x": 800,
+        "x": 520,
         "y": 260
       },
       {
@@ -86,7 +86,7 @@
         "type": "instruction",
         "persona": "persona-frontend-designer",
         "text": "Write the frontend design spec for this app: the page/flow map, a component inventory (name · purpose · states · content rules), type scale and color tokens, and empty/loading/error behavior per view. Honor the kickoff verdict's scope changes.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}",
-        "x": 1060,
+        "x": 1260,
         "y": 260
       },
       {
@@ -94,7 +94,7 @@
         "type": "instruction",
         "persona": "persona-content-strategist",
         "text": "Brand this app: three name candidates with a one-line rationale each (pick a winner), a tagline, the voice (three adjectives + a sentence of guidance), and how the visual direction in the design spec should carry it.\n\nIdea: {{input}}\n\nDesign spec:\n{{node.8}}",
-        "x": 1300,
+        "x": 1500,
         "y": 260
       },
       {
@@ -102,7 +102,7 @@
         "type": "approval",
         "prompt": "Discovery is done for “{{input}}” — requirements, architecture, kickoff verdict, design spec, and branding are in the run log. Approve and start the build?",
         "timeout": 360,
-        "x": 1540,
+        "x": 1740,
         "y": 260
       },
       {
@@ -111,7 +111,7 @@
         "role": "default",
         "write": "write",
         "text": "BUILD 1/3 — scaffold the project per the architecture's folder layout, then implement the DATABASE layer: schema, migrations/seed data, and its unit tests. Honor the kickoff verdict's scope changes.\n\nArchitecture:\n{{node.3}}\n\nKickoff verdict:\n{{node.7}}",
-        "x": 1780,
+        "x": 1980,
         "y": 190,
         "persona": "persona-backend-engineer"
       },
@@ -121,7 +121,7 @@
         "role": "default",
         "write": "write",
         "text": "BUILD 2/3 — implement the BACKEND on top of the database layer just built: API endpoints and business logic per the architecture, each with unit tests.\n\nArchitecture:\n{{node.3}}\n\nRequirements:\n{{node.2}}",
-        "x": 2020,
+        "x": 2220,
         "y": 190,
         "persona": "persona-backend-engineer"
       },
@@ -131,7 +131,7 @@
         "role": "default",
         "write": "write",
         "text": "BUILD 3/3 — implement the FRONTEND against the backend just built, following the design spec exactly (pages, components, states) and carrying the branding (name, tagline, voice). Add its tests.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}\n\nArchitecture:\n{{node.3}}",
-        "x": 2260,
+        "x": 2460,
         "y": 190,
         "persona": "persona-frontend-engineer"
       },
@@ -140,7 +140,7 @@
         "type": "tool",
         "tool": "run_tests",
         "args": {},
-        "x": 2500,
+        "x": 2700,
         "y": 190
       },
       {
@@ -148,7 +148,7 @@
         "type": "decision",
         "mode": "model",
         "question": "Did the test run succeed — no failures or errors?\n\nTest output:\n{{node.14}}",
-        "x": 2730,
+        "x": 2930,
         "y": 190
       },
       {
@@ -157,7 +157,7 @@
         "role": "default",
         "write": "write",
         "text": "The test suite failed and you're the engineer on call. Diagnose and fix the cause without changing intended behavior.\n\nTest output:\n{{node.14}}\n\nArchitecture for reference:\n{{node.3}}",
-        "x": 2730,
+        "x": 2930,
         "y": 370,
         "persona": "persona-backend-engineer"
       },
@@ -168,7 +168,7 @@
         "persona": "persona-backend-engineer",
         "task": "Review the backend and database code of the app just built (read the workspace — you have read-only access): correctness against the acceptance criteria, schema and query quality, error handling, and test quality. Findings by severity.\n\nRequirements:\n{{node.2}}\n\nArchitecture:\n{{node.3}}",
         "timeout": 900,
-        "x": 2850,
+        "x": 3050,
         "y": 480
       },
       {
@@ -178,7 +178,7 @@
         "persona": "persona-frontend-designer",
         "task": "Review the built frontend against the design spec (read the workspace — you have read-only access): flows, missing states, accessibility, and whether the branding actually landed. Findings by severity.\n\nDesign spec:\n{{node.8}}\n\nBranding:\n{{node.9}}",
         "timeout": 900,
-        "x": 3090,
+        "x": 3290,
         "y": 480
       },
       {
@@ -188,7 +188,7 @@
         "persona": "persona-devops-engineer",
         "task": "Review the app for operability (read the workspace — you have read-only access): can it be installed, run, and tested from a clean checkout; what's missing to deploy, monitor, and roll back. Findings by severity.\n\nArchitecture:\n{{node.3}}",
         "timeout": 900,
-        "x": 3330,
+        "x": 3530,
         "y": 480
       },
       {
@@ -202,7 +202,7 @@
         "mode": "summarize",
         "text": "Compile the three area reviews into one quality report: findings by severity per area, then an overall assessment of build quality.",
         "timeout": 900,
-        "x": 3090,
+        "x": 3290,
         "y": 190
       },
       {
@@ -213,7 +213,7 @@
           "path": "dev/app-report.md",
           "content": "{{node.20}}"
         },
-        "x": 3330,
+        "x": 3530,
         "y": 190
       },
       {
@@ -223,7 +223,7 @@
         "persona": "persona-product-manager",
         "task": "Launch meeting — cast your vote: does the app meet the MVP acceptance criteria, judged on the quality report? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nAcceptance criteria:\n{{node.2}}\n\nQuality report:\n{{node.20}}",
         "timeout": 600,
-        "x": 3450,
+        "x": 3650,
         "y": 480
       },
       {
@@ -233,7 +233,7 @@
         "persona": "persona-devops-engineer",
         "task": "Launch meeting — cast your vote: is this app actually runnable right now (read the workspace and check), and safe to call live? End with exactly 'VOTE: GO' or 'VOTE: NO-GO', then your conditions.\n\nQuality report:\n{{node.20}}",
         "timeout": 600,
-        "x": 3690,
+        "x": 3890,
         "y": 480
       },
       {
@@ -246,7 +246,7 @@
         "mode": "summarize",
         "text": "Chair the launch meeting: weigh the votes and conclude. Your FIRST line must be exactly 'DECISION: GO' or 'DECISION: NO-GO', followed by the reasons and the immediate next steps.",
         "timeout": 900,
-        "x": 3570,
+        "x": 3770,
         "y": 190
       },
       {
@@ -257,7 +257,7 @@
           "path": "dev/launch-meeting.md",
           "content": "{{node.24}}"
         },
-        "x": 3810,
+        "x": 4010,
         "y": 320
       },
       {
@@ -267,7 +267,7 @@
         "ruleOp": "contains",
         "ruleValue": "DECISION: GO",
         "question": "",
-        "x": 3810,
+        "x": 4010,
         "y": 120
       },
       {
@@ -278,7 +278,7 @@
           "title": "🚀 Launch meeting: GO",
           "message": "The team declared GO for “{{input}}” — minutes at workspace/dev/launch-meeting.md, quality report at dev/app-report.md"
         },
-        "x": 4050,
+        "x": 4250,
         "y": 60
       },
       {
@@ -289,30 +289,64 @@
           "title": "🛑 Launch meeting: NO-GO",
           "message": "The team held the launch of “{{input}}” — see the minutes at workspace/dev/launch-meeting.md for the conditions"
         },
-        "x": 4050,
+        "x": 4250,
         "y": 200
       },
       {
         "id": 29,
         "type": "end",
-        "x": 4290,
+        "x": 4490,
         "y": 260
+      },
+      {
+        "id": 30,
+        "type": "orchestrate",
+        "plan": {
+          "31": 1,
+          "32": 1,
+          "33": 2
+        },
+        "mode": "concat",
+        "text": "",
+        "timeout": 900,
+        "x": 770,
+        "y": 260
+      },
+      {
+        "id": 31,
+        "type": "agent",
+        "label": "backend proposal",
+        "persona": "persona-backend-engineer",
+        "task": "Architecture meeting — propose the BACKEND & DATA architecture for this app: data model/schema, API shape, business-logic layering, and how you'd test it. Be concrete and name your trade-offs.\n\nRequirements:\n{{node.2}}\n\nKickoff verdict:\n{{node.7}}",
+        "timeout": 600,
+        "x": 650,
+        "y": 640
+      },
+      {
+        "id": 32,
+        "type": "agent",
+        "label": "frontend proposal",
+        "persona": "persona-frontend-engineer",
+        "task": "Architecture meeting — propose the FRONTEND architecture: stack, component and state structure, how it consumes the API, and how you'd test it. Be concrete and name your trade-offs.\n\nRequirements:\n{{node.2}}\n\nKickoff verdict:\n{{node.7}}",
+        "timeout": 600,
+        "x": 890,
+        "y": 640
+      },
+      {
+        "id": 33,
+        "type": "agent",
+        "label": "ops reconciliation",
+        "persona": "persona-devops-engineer",
+        "task": "Architecture meeting — the backend and frontend proposals are in your context. Reconcile them: flag every integration mismatch, anything hard to build/test/deploy, and propose the CI/test/run story. Be specific about what should change in each proposal.\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 1130,
+        "y": 640
       }
     ],
     "edges": [
       {
         "from": 1,
         "to": 2,
-        "branch": null
-      },
-      {
-        "from": 2,
-        "to": 3,
-        "branch": null
-      },
-      {
-        "from": 3,
-        "to": 7,
         "branch": null
       },
       {
@@ -328,11 +362,6 @@
       {
         "from": 6,
         "to": 7,
-        "branch": null
-      },
-      {
-        "from": 7,
-        "to": 8,
         "branch": null
       },
       {
@@ -458,6 +487,41 @@
       {
         "from": 28,
         "to": 29,
+        "branch": null
+      },
+      {
+        "from": 2,
+        "to": 7,
+        "branch": null
+      },
+      {
+        "from": 7,
+        "to": 30,
+        "branch": null
+      },
+      {
+        "from": 31,
+        "to": 30,
+        "branch": null
+      },
+      {
+        "from": 32,
+        "to": 30,
+        "branch": null
+      },
+      {
+        "from": 33,
+        "to": 30,
+        "branch": null
+      },
+      {
+        "from": 30,
+        "to": 3,
+        "branch": null
+      },
+      {
+        "from": 3,
+        "to": 8,
         "branch": null
       }
     ]
