@@ -280,6 +280,27 @@ def test_to_codex_skills_true_uses_the_subagent_home_and_keeps_the_scoped_config
     assert env_home == str(subhome)
 
 
+def test_to_codex_error_surfaces_the_error_line_not_the_echoed_prompt(monkeypatch, tmp_path):
+    """codex's own stderr on failure opens with its startup banner and echoes the whole prompt
+    back before the real reason — a naive head-truncation buried the actual error (e.g. a usage
+    limit) under that noise for any non-trivial prompt. The real "ERROR:" line must survive."""
+    script = tmp_path / "fake_codex.py"
+    script.write_text(
+        "import sys\n"
+        "banner = 'Reading prompt from stdin...\\n' + ('x' * 500) + '\\n'\n"
+        "sys.stderr.write(banner + 'ERROR: You have hit your usage limit. Try again at 5:15 PM.\\n')\n"
+        "sys.exit(1)\n")
+    shim = tmp_path / "codex"
+    shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr("oceano.delegate.find_codex", lambda: str(shim))
+    monkeypatch.setattr("oceano.codex_mind.ensure_auth", lambda: (True, ""))
+    r = delegate.to_codex("do it", cwd=str(tmp_path))
+    assert r["ok"] is False
+    assert "usage limit" in r["error"]
+    assert "xxxx" not in r["error"]
+
+
 def test_to_claude_stream_max_turns_honors_the_user_override(monkeypatch, tmp_path):
     """A user-raised max_delegate_turns override (Settings → Tools) must reach the CLI's own
     --max-turns flag — this is the actual fix for a workflow agent hitting the turn cap."""

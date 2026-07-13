@@ -858,8 +858,15 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
         out = ""
     _unlink_quiet(out_path)
     if not out and r.returncode != 0:
+        # On failure codex's stderr opens with its startup banner and echoes the whole prompt
+        # back before the real reason (rate limits, auth, sandbox faults, ...) — often past 400
+        # chars for any non-trivial task. Pull actual "ERROR:" lines out first; fall back to the
+        # tail (not head) of stderr, since the real message is always at the end, never the start.
+        stderr = (r.stderr or "").strip()
+        err_lines = list(dict.fromkeys(ln for ln in stderr.splitlines() if ln.startswith("ERROR:")))
+        detail = "\n".join(err_lines) if err_lines else stderr[-400:]
         return {"ok": False, "output": "",
-                "error": (r.stderr or f"codex exited {r.returncode}").strip()[:400]}
+                "error": (detail or f"codex exited {r.returncode}").strip()[:400]}
     return {"ok": bool(out), "output": out, "error": "" if out else "codex returned no output"}
 
 
