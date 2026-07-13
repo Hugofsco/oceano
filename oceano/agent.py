@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 
 import config
-from oceano import llm, safety, tools
+from oceano import llm, safety, tools, traces
 
 
 class Cancelled(RuntimeError):
@@ -596,12 +596,15 @@ class Agent:
         yield ("result", box.get("result", ""))
 
     def _chat(self, with_tools, return_usage=False):
-        return llm.chat(
+        traces.record("model_call_start", model=self.model, with_tools=bool(with_tools), stream=False)
+        out = llm.chat(
             self.messages,
             tools=self._tool_schemas() if with_tools else None,
             model=self.model, base_url=self.base_url, api_key=self.api_key,
             return_usage=return_usage,
         )
+        traces.record("model_call_end", model=self.model, with_tools=bool(with_tools), stream=False)
+        return out
 
     def _stats(self, tokens, secs, tok_s=None, ctx=None):
         """`tokens` is shown to the user; `tok_s` is the DECODE rate (tokens/sec measured
@@ -632,7 +635,9 @@ class Agent:
             if cancel is not None and cancel.is_set():
                 raise Cancelled("cancelled")
             msg = self._chat(with_tools=True)
-            self.messages.append(msg.model_dump(exclude_none=True))
+            self.messages.append(msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else {
+                "role": "assistant", "content": getattr(msg, "content", ""),
+                "tool_calls": getattr(msg, "tool_calls", None)})
             if not msg.tool_calls:
                 self.on_event("answer", msg.content)
                 self._learn(user_message, msg.content)

@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from oceano import evals, researcher, skills, suggestions
+from oceano import evals, researcher, skills, suggestions, traces
 from oceano.web.state import _sse
 
 router = APIRouter()
@@ -452,6 +452,26 @@ async def workflows_schedule(wid: int, req: Request):
 def workflows_runs(wid: int):
     from oceano import workflows
     return workflows.runs(wid)
+
+
+@router.get("/api/workflows/{wid}/resume")
+def workflows_resume_state(wid: int):
+    from oceano import workflows
+    return {"checkpoint": workflows.resume_state(wid)}
+
+
+@router.post("/api/workflows/{wid}/resume")
+async def workflows_resume_run(wid: int):
+    from oceano import workflows
+    rec = await asyncio.to_thread(workflows.resume, wid)
+    if rec is None:
+        raise HTTPException(404, "no resumable checkpoint for that workflow")
+    return {"ok": rec.get("status") == "ok", "run": rec}
+
+
+@router.get("/api/workflows/{wid}/traces")
+def workflows_traces(wid: int, run_id: str = ""):
+    return {"events": traces.query(run_id=run_id or None, workflow_id=wid)}
 
 
 @router.get("/api/workflows/approvals")

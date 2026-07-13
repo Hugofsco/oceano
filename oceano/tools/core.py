@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import config
-from oceano import atomicio, turnctx
+from oceano import atomicio, traces, turnctx
 
 # --- channels --------------------------------------------------------------
 # Oceano is driven from several places, and they don't share a screen. The live
@@ -278,9 +278,14 @@ def run(name, arguments_json):
         args = json.loads(arguments_json or "{}")
     except json.JSONDecodeError as e:
         return f"ERROR: bad arguments JSON: {e}"
+    cap = None
+    traces.record("tool_call", tool=name, args=args)
     try:
-        return str(fn(**args))
+        out = str(fn(**args))
+        traces.record("tool_result", tool=name, ok=True, result=out[:500])
+        return out
     except Exception as e:                       # tools should never crash the loop
+        traces.record("tool_result", tool=name, ok=False, error=str(e))
         return f"ERROR running {name}: {e}"
 
 

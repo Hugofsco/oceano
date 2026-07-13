@@ -18,6 +18,7 @@ stops any accidental loop from running forever. Runs are recorded so scheduled, 
 runs stay observable. Storage is one JSON file (atomic); a workflow's cron schedule lives in
 the scheduler as a managed task tagged `workflow:<id>`.
 """
+import copy
 import hashlib
 import json
 import re
@@ -27,12 +28,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import config
-from oceano import atomicio, secretcrypto, tools
+from oceano import atomicio, secretcrypto, tools, traces
 
 STORE = config.WORKSPACE.parent / "data" / "workflows.json"
 RUNS_STORE = config.WORKSPACE.parent / "data" / "workflow_runs.json"      # history, split out so
 TRIG_STATE = config.WORKSPACE.parent / "data" / "trigger_state.json"      # the hot store stays small
 SECRETS_STORE = config.WORKSPACE.parent / "data" / "wf_secrets.json"      # named {{secret.X}} values
+CHECKPOINT_STORE = config.WORKSPACE.parent / "data" / "workflow_checkpoints.json"
 SOURCE_PREFIX = "workflow:"
 SCHED_PREFIX = "[ FLOW ] "
 # start/end + the action nodes; "trigger" is a start that also declares HOW the flow fires (issue 8 C);
@@ -127,6 +129,35 @@ def _load_runs():
 
 def _save_runs(rs):
     atomicio.write_text(RUNS_STORE, json.dumps({"runs": rs}, indent=2))
+
+
+def _load_checkpoints():
+    try:
+        d = json.loads(CHECKPOINT_STORE.read_text())
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_checkpoints(data):
+    atomicio.write_text(CHECKPOINT_STORE, json.dumps(data, indent=2))
+
+
+def _save_checkpoint(wf_id, state):
+    cps = _load_checkpoints()
+    cps[str(wf_id)] = state
+    _save_checkpoints(cps)
+
+
+def _clear_checkpoint(wf_id):
+    cps = _load_checkpoints()
+    if str(wf_id) in cps:
+        del cps[str(wf_id)]
+        _save_checkpoints(cps)
+
+
+def resume_state(wf_id):
+    return _load_checkpoints().get(str(wf_id))
 
 
 # ---------------- named secrets ({{secret.NAME}} — HTTP nodes only) ----------------
@@ -1475,18 +1506,62 @@ def _route(node, succ, branch):
             or next((to for (br, to) in outs if br not in ("error",)), None))
 
 
-def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _depth=0, nested=False):
+def _restore_runtime(wf, state):
+    graph = wf.get("graph") or {"nodes": [], "edges": []}
+    nodes = {n["id"]: n for n in graph.get("nodes", [])}
+    ctx = dict(state.get("ctx") or {})
+    ctx.setdefault("input", "")
+    ctx.setdefault("last", "")
+    raw_nodes = ctx.get("nodes") or {}
+    ctx["nodes"] = {int(k): v for k, v in raw_nodes.items()}
+    loop_state = {int(k): v for k, v in (state.get("loop_state") or {}).items()}
+    merge_got = {int(k): v for k, v in (state.get("merge_got") or {}).items()}
+    merge_done = {int(x) for x in (state.get("merge_done") or [])}
+    force_merge = {int(x) for x in (state.get("force_merge") or [])}
+    branch_q = [(int(nid), blast) for nid, blast in (state.get("branch_q") or [])]
+    spawned = {int(k): v for k, v in (state.get("spawned") or {}).items()}
+    return {
+        "ctx": ctx,
+        "loop_state": loop_state,
+        "branch_q": branch_q,
+        "merge_got": merge_got,
+        "merge_done": merge_done,
+        "force_merge": force_merge,
+        "spawned": spawned,
+        "results": list(state.get("results") or []),
+        "last_output": state.get("last_output", ""),
+        "visits": int(state.get("visits") or 0),
+        "cur": nodes.get(state.get("next_node_id")),
+        "messages": list(state.get("agent_messages") or []),
+        "run_id": state.get("run_id") or traces.new_run_id("wf"),
+    }
+
+
+def resume(wid, on_step=None):
+    st = resume_state(wid)
+    if not st:
+        return None
+    wf = get(wid) or copy.deepcopy(st.get("workflow"))
+    if not wf:
+        return None
+    return run(wf, trigger=st.get("trigger", "resume"), on_step=on_step, inp=st.get("input", ""),
+               _resume=st)
+
+
+def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _depth=0,
+        nested=False, _resume=None):
     """Walk the workflow graph from its start node, executing nodes and branching at decision/switch
     nodes, iterating loop nodes, retrying failures and taking 'error' edges, and pausing at approval
     nodes. Shares one Agent so context accumulates. Returns the run record (incl. 'output' = last value).
 
     `inp` is this run's input value: nodes reference it (and any earlier node's output) via {{...}}
     templating, and it's seeded into the agent's context. Empty/None falls back to the stored default.
-    `nested`/`_depth` are set when one workflow calls another via a sub-workflow node."""
+    `nested`/`_depth` are set when one workflow calls another via a sub-workflow node.
+    `_resume` is an internal checkpoint payload created by a prior failed/cancelled run."""
     from oceano.agent import Agent
     wf_id = wf["id"]
     inp = "" if inp is None else str(inp)
-    if not inp:                                        # no explicit value → the workflow's default
+    if not inp:
         inp = str((wf.get("input") or {}).get("default") or "")
 
     def beat():
@@ -1497,8 +1572,17 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
 
     def emit(ev):
         e = ev.get("event")
+        if e == "node_start":
+            traces.record("workflow_node_start", workflow_id=wf_id, node_id=ev.get("id"),
+                          node_type=ev.get("type"), label=ev.get("label"))
+        elif e == "node_end":
+            traces.record("workflow_node_end", workflow_id=wf_id, node_id=ev.get("id"),
+                          ok=ev.get("ok"), branch=ev.get("branch"), output=(ev.get("output") or "")[:500])
+        elif e == "done":
+            traces.record("workflow_done", workflow_id=wf_id, status=ev.get("status"),
+                          summary=((ev.get("run") or {}).get("summary") or ""))
         if not nested:
-            with _LIVE_LOCK:                            # mirror progress into the live registry
+            with _LIVE_LOCK:
                 st = _LIVE.get(wf_id)
                 if st is not None:
                     st["beat"] = time.time()
@@ -1517,10 +1601,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
             except Exception:
                 pass
 
-    # overlap guard: unless this workflow opts in ("overlap": "allow"), a run starting while one
-    # is already in flight is recorded as 'skipped' instead of racing it — stacked watch/email/cron
-    # fires would otherwise pile up threads and fight over the single live-view slot per workflow.
-    if not nested and (wf.get("overlap") or "skip") != "allow":
+    if not nested and _resume is None and (wf.get("overlap") or "skip") != "allow":
         with _LIVE_LOCK:
             _prune_live()
             st = _LIVE.get(wf_id)
@@ -1538,110 +1619,129 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
 
     graph = wf.get("graph") or {"nodes": [], "edges": []}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
-    succ = {}                                          # id -> [(branch, to_id)]
-    inbound = {}                                       # id -> flow-edge fan-in (a merge node's quorum)
-    attached = {}                                      # orchestrate node id -> [plugged-in agent nodes]
+    succ = {}
+    inbound = {}
+    attached = {}
     for e in graph.get("edges", []):
         src, dst = nodes.get(e["from"]), nodes.get(e["to"])
         if (src and dst and src["type"] == "agent" and dst["type"] == "orchestrate"
                 and e.get("branch") in (None, "next")):
-            # an agent wired into an orchestrator is an ATTACHMENT, not a flow edge: the
-            # orchestrator triggers it at its step — traversal must never walk this edge
             attached.setdefault(dst["id"], []).append(src)
             continue
         succ.setdefault(e["from"], []).append((e.get("branch"), e["to"]))
         inbound[e["to"]] = inbound.get(e["to"], 0) + 1
 
-    start = next((n for n in graph.get("nodes", []) if n["type"] in ("start", "trigger")), None)
-    if not start:                                      # tolerate a missing start: first node with no inbound edge
-        inbound = {e["to"] for e in graph.get("edges", [])}
-        start = next((n for n in graph.get("nodes", []) if n["id"] not in inbound),
-                     graph["nodes"][0] if graph.get("nodes") else None)
+    start_node = next((n for n in graph.get("nodes", []) if n["type"] in ("start", "trigger")), None)
+    if not start_node:
+        inbound_ids = {e["to"] for e in graph.get("edges", [])}
+        start_node = next((n for n in graph.get("nodes", []) if n["id"] not in inbound_ids),
+                          graph["nodes"][0] if graph.get("nodes") else None)
 
-    ag = Agent(learn=False, exclude_tools={"run_workflow"})
-    if inp:                                            # make the input visible to instruction nodes
-        ag.messages.append({"role": "user", "content": f"(workflow input)\n{inp}"})
-    # ctx powers {{...}} templating between nodes (issue 8 A)
-    ctx = {"input": inp, "last": "", "nodes": {}, "item": None, "index": None}
-    loop_state = {}                                    # loop node id -> {items, cursor, results}
-    # forking: a node with several plain out-edges runs EVERY branch — sequentially (the run
-    # shares one Agent by design), each with its own {{last}} — and a merge node joins them.
-    branch_q = []                                      # parked branches: (node id, that branch's last)
-    merge_got, merge_done, force_merge = {}, set(), set()
-    spawned = {}                                       # agent node id -> agentjobs id (this run's spawns)
-    results, last_output, visits = [], "", 0
-    cancelled = False
-    cur = start
-    if not nested:
-        with _LIVE_LOCK:
-            _prune_live()
-            _LIVE[wf_id] = {"workflow_id": wf_id, "name": wf.get("name", ""), "trigger": trigger,
-                            "started": _now(), "beat": time.time(), "status": "running", "current": None,
-                            "steps": [], "summary": "", "finished": None, "run_id": None, "awaiting": None}
-    import contextlib
-    from oceano import jobs
-    stack = contextlib.ExitStack()
-    try:
-        _jid = stack.enter_context(jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}")) if not nested else None
-        ce = jobs.cancel_event(_jid) if _jid is not None else None   # set by a ✕ click in the jobs popup
-        if not nested:
-            stack.enter_context(tools.background())
-        with stack:
-            while visits < _VISIT_CAP:
-                if cur is None:                        # this branch ended — resume a forked one,
-                    if branch_q:                       # restoring ITS branch-local {{last}}
-                        nid, blast = branch_q.pop(0)
-                        cur = nodes.get(nid)
-                        if cur is not None:
-                            ctx["last"] = blast
+    restored = _restore_runtime(wf, _resume) if _resume else None
+    run_id = (restored or {}).get("run_id") or traces.new_run_id("wf")
+    with traces.scope(run_id=run_id, workflow_id=wf_id, trigger=trigger, nested=nested):
+        traces.record("workflow_start", workflow_id=wf_id, name=wf.get("name", ""), resumed=bool(_resume))
+        ag = Agent(learn=False, exclude_tools={"run_workflow"})
+        if restored:
+            ag.messages = list(restored["messages"] or ag.messages)
+        elif inp:
+            ag.messages.append({"role": "user", "content": f"(workflow input)\n{inp}"})
+        ctx = (restored or {}).get("ctx") or {"input": inp, "last": "", "nodes": {}, "item": None, "index": None}
+        loop_state = (restored or {}).get("loop_state") or {}
+        branch_q = (restored or {}).get("branch_q") or []
+        merge_got = (restored or {}).get("merge_got") or {}
+        merge_done = (restored or {}).get("merge_done") or set()
+        force_merge = (restored or {}).get("force_merge") or set()
+        spawned = (restored or {}).get("spawned") or {}
+        results = (restored or {}).get("results") or []
+        last_output = (restored or {}).get("last_output") or ""
+        visits = int((restored or {}).get("visits") or 0)
+        cancelled = False
+        cur = start_node if restored is None else restored.get("cur")
+
+        def checkpoint(next_id):
+            _save_checkpoint(wf_id, {
+                "run_id": run_id,
+                "workflow_id": wf_id,
+                "workflow": copy.deepcopy(wf),
+                "trigger": trigger,
+                "input": inp,
+                "next_node_id": next_id,
+                "ctx": copy.deepcopy(ctx),
+                "loop_state": copy.deepcopy(loop_state),
+                "branch_q": list(branch_q),
+                "merge_got": copy.deepcopy(merge_got),
+                "merge_done": sorted(merge_done),
+                "force_merge": sorted(force_merge),
+                "spawned": dict(spawned),
+                "results": list(results),
+                "last_output": last_output,
+                "visits": visits,
+                "agent_messages": list(ag.messages),
+                "ts": _now(),
+            })
+
+        import contextlib
+        from oceano import jobs
+        stack = contextlib.ExitStack()
+        try:
+            _jid = stack.enter_context(jobs.job("workflow", wf.get("name", ""), ref=f"workflow:{wf['id']}")) if not nested else None
+            ce = jobs.cancel_event(_jid) if _jid is not None else None
+            if not nested:
+                stack.enter_context(tools.background())
+            with stack:
+                while visits < _VISIT_CAP:
+                    if cur is None:
+                        if branch_q:
+                            nid, blast = branch_q.pop(0)
+                            cur = nodes.get(nid)
+                            if cur is not None:
+                                ctx["last"] = blast
+                            continue
+                        mid = next((m for m, got in merge_got.items()
+                                    if got and m not in merge_done and m in nodes), None)
+                        if mid is None:
+                            break
+                        force_merge.add(mid)
+                        cur = nodes[mid]
                         continue
-                    # nothing left to run: force any merge still waiting whose other branches
-                    # died along the way (decision/error/end), so a fork can never hang the run
-                    mid = next((m for m, got in merge_got.items()
-                                if got and m not in merge_done and m in nodes), None)
-                    if mid is None:
+                    visits += 1
+                    if ce is not None and ce.is_set():
+                        cancelled = True
                         break
-                    force_merge.add(mid)
-                    cur = nodes[mid]
-                    continue
-                visits += 1
-                if ce is not None and ce.is_set():
-                    cancelled = True
-                    break
-                t = cur["type"]
-                if t == "end":                         # ends THIS branch; forked siblings continue
-                    cur = None
-                    continue
-                # ---- loop node: foreach over a list, with a "loop" body edge and a "done" exit edge ----
-                if t == "loop":
-                    ls = loop_state.get(cur["id"])
-                    if ls is None:                     # first entry: evaluate the list
-                        raw = _tmpl(cur.get("over", "") or "{{last}}", ctx).strip()
-                        items = None
-                        try:
-                            j = json.loads(raw)
-                            if isinstance(j, list):
-                                items = [x if isinstance(x, str) else json.dumps(x) for x in j]
-                        except Exception:              # noqa: BLE001
-                            items = None
-                        if items is None:
-                            items = [ln for ln in raw.splitlines() if ln.strip()]
-                        ls = loop_state[cur["id"]] = {"items": items[:_LOOP_CAP], "cursor": 0, "results": []}
-                    else:                              # back from an iteration: collect the body's output
-                        ls["results"].append(ctx["last"])
-                    if ls["cursor"] < len(ls["items"]):
-                        ctx["item"] = ls["items"][ls["cursor"]]
-                        ctx["index"] = ls["cursor"]
-                        ls["cursor"] += 1
-                        emit({"event": "node_start", "id": cur["id"], "type": t,
-                              "label": f"↻ loop {ls['cursor']}/{len(ls['items'])}"})
-                        emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": "loop",
-                              "output": f"item {ls['cursor']}/{len(ls['items'])}: {str(ctx['item'])[:120]}"})
-                        nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == "loop"), None))
-                        cur = nodes.get(nxt) if nxt is not None else None
+                    t = cur["type"]
+                    if t == "end":
+                        cur = None
                         continue
-                    else:                              # exhausted → aggregate every iteration's result
-                        ctx["item"] = ctx["index"] = None   # (a JSON list) and take the 'done' edge
+                    if t == "loop":
+                        ls = loop_state.get(cur["id"])
+                        if ls is None:
+                            raw = _tmpl(cur.get("over", "") or "{{last}}", ctx).strip()
+                            items = None
+                            try:
+                                j = json.loads(raw)
+                                if isinstance(j, list):
+                                    items = [x if isinstance(x, str) else json.dumps(x) for x in j]
+                            except Exception:
+                                items = None
+                            if items is None:
+                                items = [ln for ln in raw.splitlines() if ln.strip()]
+                            ls = loop_state[cur["id"]] = {"items": items[:_LOOP_CAP], "cursor": 0, "results": []}
+                        else:
+                            ls["results"].append(ctx["last"])
+                        if ls["cursor"] < len(ls["items"]):
+                            ctx["item"] = ls["items"][ls["cursor"]]
+                            ctx["index"] = ls["cursor"]
+                            ls["cursor"] += 1
+                            emit({"event": "node_start", "id": cur["id"], "type": t,
+                                  "label": f"↻ loop {ls['cursor']}/{len(ls['items'])}"})
+                            emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": "loop",
+                                  "output": f"item {ls['cursor']}/{len(ls['items'])}: {str(ctx['item'])[:120]}"})
+                            nxt = next((to for (br, to) in succ.get(cur["id"], []) if br == "loop"), None)
+                            checkpoint(nxt)
+                            cur = nodes.get(nxt) if nxt is not None else None
+                            continue
+                        ctx["item"] = ctx["index"] = None
                         agg = json.dumps(ls["results"])
                         ctx["nodes"][cur["id"]] = agg
                         ctx["last"] = agg
@@ -1651,249 +1751,241 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                         "branch": "done", "output": agg[:_OUT_CAP]})
                         emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": "done",
                               "label": label, "output": agg[:_OUT_CAP]})
-                        loop_state.pop(cur["id"], None)     # a revisit (cycle) starts a fresh pass
+                        loop_state.pop(cur["id"], None)
                         nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == "done"), None)
                                or next((to for (br, to) in succ.get(cur["id"], []) if br is None), None))
+                        checkpoint(nxt)
                         cur = nodes.get(nxt) if nxt is not None else None
                         continue
 
-                # ---- merge node: the join for forked branches — waits for its whole fan-in ----
-                if t == "merge":
-                    got = merge_got.setdefault(cur["id"], [])
-                    if cur["id"] not in force_merge:   # a forced entry brings no new arrival
-                        got.append(ctx["last"])
-                    need = inbound.get(cur["id"], 1)
-                    if len(got) < need and branch_q and cur["id"] not in force_merge:
-                        # visible like a loop iteration: one small completed row per arrival
-                        emit({"event": "node_start", "id": cur["id"], "type": t,
-                              "label": f"⧉ merge {len(got)}/{need}"})
+                    if t == "merge":
+                        got = merge_got.setdefault(cur["id"], [])
+                        if cur["id"] not in force_merge:
+                            got.append(ctx["last"])
+                        need = inbound.get(cur["id"], 1)
+                        if len(got) < need and branch_q and cur["id"] not in force_merge:
+                            emit({"event": "node_start", "id": cur["id"], "type": t,
+                                  "label": f"⧉ merge {len(got)}/{need}"})
+                            emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": None,
+                                  "output": f"{len(got)}/{need} branches arrived — waiting for the rest"})
+                            checkpoint(None)
+                            cur = None
+                            continue
+                        label = _node_label(cur)
+                        emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
+                        if len(got) < need:
+                            emit({"event": "tool", "id": cur["id"],
+                                  "text": f"⧉ merged {len(got)}/{need} branches (the rest never arrived)"})
+                        output = json.dumps(got) if cur.get("mode") == "json" else "\n\n".join(got)
+                        merge_done.add(cur["id"])
+                        merge_got.pop(cur["id"], None)
+                        force_merge.discard(cur["id"])
+                        ctx["nodes"][cur["id"]] = output
+                        ctx["last"] = output
+                        last_output = output
+                        results.append({"id": cur["id"], "type": t, "label": label, "ok": True,
+                                        "branch": None, "output": output[:_OUT_CAP]})
                         emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": None,
-                              "output": f"{len(got)}/{need} branches arrived — waiting for the rest"})
-                        cur = None                     # park: resume the next forked branch
+                              "label": label, "output": output[:_OUT_CAP]})
+                        nxt = _route(cur, succ, None)
+                        checkpoint(nxt)
+                        cur = nodes.get(nxt) if nxt is not None else None
                         continue
+
                     label = _node_label(cur)
                     emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
-                    if len(got) < need:                # forced or last-branch-standing: partial join
-                        emit({"event": "tool", "id": cur["id"],
-                              "text": f"⧉ merged {len(got)}/{need} branches (the rest never arrived)"})
-                    output = json.dumps(got) if cur.get("mode") == "json" else "\n\n".join(got)
-                    merge_done.add(cur["id"])
-                    merge_got.pop(cur["id"], None)     # a revisit (cycle) collects fresh arrivals
-                    force_merge.discard(cur["id"])
-                    ctx["nodes"][cur["id"]] = output
-                    ctx["last"] = output
-                    last_output = output
-                    results.append({"id": cur["id"], "type": t, "label": label, "ok": True,
-                                    "branch": None, "output": output[:_OUT_CAP]})
-                    emit({"event": "node_end", "id": cur["id"], "ok": True, "branch": None,
-                          "label": label, "output": output[:_OUT_CAP]})
-                    nxt = _route(cur, succ, None)
-                    cur = nodes.get(nxt) if nxt is not None else None
-                    continue
-
-                label = _node_label(cur)
-                emit({"event": "node_start", "id": cur["id"], "type": t, "label": label})
-                attempts = 1 + int(cur.get("retries", 0) or 0)
-                ok, output, branch = True, "", None
-                orch_step_records = []            # persisted per-agent rows, only set by "orchestrate"
-                for attempt in range(attempts):
+                    attempts = 1 + int(cur.get("retries", 0) or 0)
                     ok, output, branch = True, "", None
                     orch_step_records = []
-                    try:
-                        if t in ("start", "trigger"):
-                            output = ""
-                        elif t == "tool":
-                            name, args = cur.get("tool", ""), _tmpl(cur.get("args", {}), ctx)
-                            if not tools.is_enabled(name):
-                                ok, output = False, f"tool '{name}' is disabled or unknown"
-                            else:
-                                output = tools.run(name, json.dumps(args)) or ""
-                                ag.messages.append({"role": "user", "content": f"(ran tool `{name}` → {output[:1500]})"})
-                        elif t == "instruction":
-                            ag.on_event = lambda kind, d, _i=cur["id"]: (
-                                emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
-                                if kind in ("tool_call", "tool_result") else None)
-                            text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
-                            prov = cur.get("provider") or ""
-                            from oceano import delegate
-                            if cur.get("model"):        # pinned to an endpoint model — this node's turn only
-                                output = _pinned_agent(cur, ag).run(text) or ""
-                            elif prov == "claude" or (not prov and delegate.get_mind() == "claude"):
-                                if delegate.available():
-                                    output = ag.run_claude(text) or ""
+                    for attempt in range(attempts):
+                        ok, output, branch = True, "", None
+                        orch_step_records = []
+                        try:
+                            if t in ("start", "trigger"):
+                                output = ""
+                            elif ok and t == "tool":
+                                name, args = cur.get("tool", ""), _tmpl(cur.get("args", {}), ctx)
+                                if not tools.is_enabled(name):
+                                    ok, output = False, f"tool '{name}' is disabled or unknown"
                                 else:
-                                    ok, output = False, ("this step is pinned to Claude, but the `claude` "
-                                                         "CLI isn't available on this host")
-                            elif prov == "codex" or (not prov and delegate.get_mind() == "codex"):
-                                if delegate.codex_available():
-                                    output = ag.run_codex(text) or ""
+                                    output = tools.run(name, json.dumps(args)) or ""
+                                    if output.startswith("ERROR:"):
+                                        ok = False
+                                    ag.messages.append({"role": "user", "content": f"(ran tool `{name}` → {output[:1500]})"})
+                            elif ok and t == "instruction":
+                                ag.on_event = lambda kind, d, _i=cur["id"]: (
+                                    emit({"event": "tool", "id": _i, "text": _compact_event(kind, d)})
+                                    if kind in ("tool_call", "tool_result") else None)
+                                text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
+                                prov = cur.get("provider") or ""
+                                from oceano import delegate
+                                if cur.get("model"):
+                                    output = _pinned_agent(cur, ag).run(text) or ""
+                                elif prov == "claude" or (not prov and delegate.get_mind() == "claude"):
+                                    if delegate.available():
+                                        output = ag.run_claude(text) or ""
+                                    else:
+                                        ok, output = False, "this step is pinned to Claude, but the `claude` CLI isn't available on this host"
+                                elif prov == "codex" or (not prov and delegate.get_mind() == "codex"):
+                                    if delegate.codex_available():
+                                        output = ag.run_codex(text) or ""
+                                    else:
+                                        ok, output = False, "this step is pinned to Codex, but the `codex` CLI isn't available on this host"
                                 else:
-                                    ok, output = False, ("this step is pinned to Codex, but the `codex` "
-                                                         "CLI isn't available on this host")
-                            else:                        # "" following a local mind, or an explicit 'local' pin
-                                output = ag.run(text) or ""
-                            ag.on_event = lambda kind, d: None
-                        elif t == "delegate":
-                            from oceano import delegate
-                            tool_scope = _tool_scope_for(cur.get("write"))
-                            text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
-                            # None → delegation's own default: an IDLE timeout plus a generous
-                            # absolute cap (env-tunable) — a long ACTIVE build isn't killed at a
-                            # fixed wall-clock. The node's timeout field overrides the cap.
-                            r = delegate.run(text, cwd=config.WORKSPACE,
-                                             tools=tool_scope, timeout=cur.get("timeout") or None,
-                                             role=cur.get("role", "default"),
-                                             skills=True)   # may reuse Oceano's published skills; never memory
-                            ok = bool(r.get("ok"))
-                            output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
-                            ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
-                        elif t == "agent":             # spawn a background sub-agent — do NOT block
-                            from oceano import agentjobs
-                            tool_scope = _tool_scope_for(cur.get("write"))
-                            task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
-                            rec = agentjobs.spawn(task,
-                                                  provider=cur.get("provider", ""),
-                                                  model=cur.get("model", ""),
-                                                  base_url=cur.get("baseUrl", ""),
-                                                  label=cur.get("label", ""),
-                                                  timeout=cur.get("timeout", 600),
-                                                  tools=tool_scope, skills=True,   # may reuse skills; never memory
-                                                  cwd=config.WORKSPACE)   # raises on cap → error edge
-                            spawned[cur["id"]] = rec["id"]
-                            output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
-                                                 "provider": rec["provider"], "state": rec["state"]})
-                        elif t == "await":             # join: block until this run's agents finish
-                            from oceano import agentjobs
-                            want = [w.strip() for w in (cur.get("agents") or "").split(",") if w.strip()]
-                            targets = ({nid: aid for nid, aid in spawned.items() if nid in want or str(aid) in want}
-                                       if want else dict(spawned))
-                            if not targets:
-                                ok, output = False, "await: no agents were spawned in this run"
-                            else:
-                                deadline = time.time() + cur.get("timeout", 900)
-                                done, failed = {}, {}
+                                    output = ag.run(text) or ""
+                                ag.on_event = lambda kind, d: None
+                            elif ok and t == "delegate":
+                                from oceano import delegate
+                                tool_scope = _tool_scope_for(cur.get("write"))
+                                text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
+                                r = delegate.run(text, cwd=config.WORKSPACE,
+                                                 tools=tool_scope, timeout=cur.get("timeout") or None,
+                                                 role=cur.get("role", "default"),
+                                                 skills=True)
+                                ok = bool(r.get("ok"))
+                                output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
+                                ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
+                            elif ok and t == "agent":
+                                from oceano import agentjobs
+                                tool_scope = _tool_scope_for(cur.get("write"))
+                                task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
+                                rec = agentjobs.spawn(task,
+                                                      provider=cur.get("provider", ""),
+                                                      model=cur.get("model", ""),
+                                                      base_url=cur.get("baseUrl", ""),
+                                                      label=cur.get("label", ""),
+                                                      timeout=cur.get("timeout", 600),
+                                                      tools=tool_scope, skills=True,
+                                                      cwd=config.WORKSPACE)
+                                spawned[cur["id"]] = rec["id"]
+                                output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
+                                                     "provider": rec["provider"], "state": rec["state"]})
+                            elif ok and t == "await":
+                                from oceano import agentjobs
+                                want = [w.strip() for w in (cur.get("agents") or "").split(",") if w.strip()]
+                                targets = ({nid: aid for nid, aid in spawned.items() if nid in want or str(aid) in want}
+                                           if want else dict(spawned))
+                                if not targets:
+                                    ok, output = False, "await: no agents were spawned in this run"
+                                else:
+                                    deadline = time.time() + cur.get("timeout", 900)
+                                    done, failed = {}, {}
+                                    while time.time() < deadline:
+                                        beat()
+                                        left = False
+                                        for nid, aid in targets.items():
+                                            if nid in done or nid in failed:
+                                                continue
+                                            r = agentjobs.status(aid) or {"state": "lost"}
+                                            if r["state"] == "done":
+                                                done[nid] = r.get("output") or ""
+                                            elif r["state"] in ("failed", "lost"):
+                                                failed[nid] = r.get("error") or r["state"]
+                                            else:
+                                                left = True
+                                        if not left:
+                                            break
+                                        time.sleep(2)
+                                    for nid, out in done.items():
+                                        ctx["nodes"][nid] = out
+                                    timed_out = [nid for nid in targets if nid not in done and nid not in failed]
+                                    ok = not failed and not timed_out
+                                    parts = [f"[{nid}] {out}" for nid, out in done.items()]
+                                    parts += [f"[{nid}] FAILED: {err}" for nid, err in failed.items()]
+                                    parts += [f"[{nid}] TIMED OUT (still running)" for nid in timed_out]
+                                    output = "\n\n".join(parts)
+                                    if done:
+                                        ag.messages.append({"role": "user", "content": f"(agents finished → {output[:1500]})"})
+                            elif ok and t == "orchestrate":
+                                ok, output, orch_step_records = _run_orchestrate(
+                                    cur, attached.get(cur["id"], []), ctx, ag, spawned, emit, beat)
+                            elif ok and t == "decision":
+                                fnode = {**cur, "question": _tmpl(cur.get("question", ""), ctx),
+                                         "ruleValue": _tmpl(cur.get("ruleValue", ""), ctx)}
+                                verdict, output = _decide(fnode, ctx["last"], ag)
+                                branch = "yes" if verdict else "no"
+                            elif ok and t == "switch":
+                                branch, output = _run_switch(cur, ctx)
+                            elif ok and t == "http":
+                                ok, output = _run_http(cur, ctx)
+                            elif ok and t == "transform":
+                                ok, output = _run_transform(cur, ctx)
+                            elif ok and t == "subflow":
+                                ok, output = _run_subflow(cur, ctx, _depth)
+                                ag.messages.append({"role": "user", "content": f"(sub-workflow → {output[:1500]})"})
+                            elif ok and t == "approval":
+                                approved, detail = _await_approval(wf_id, _tmpl(cur.get("prompt", ""), ctx) or "Approve this step?",
+                                                                   cur.get("timeout", 60), beat)
+                                ok = approved
+                                branch = "approved" if approved else "rejected"
+                                output = detail
+                            elif ok and t == "wait":
+                                secs = int(_wait_seconds(cur))
+                                deadline = time.time() + secs
                                 while time.time() < deadline:
-                                    beat()             # keep the live entry fresh while we wait
-                                    left = False
-                                    for nid, aid in targets.items():
-                                        if nid in done or nid in failed:
-                                            continue
-                                        r = agentjobs.status(aid) or {"state": "lost"}
-                                        if r["state"] == "done":
-                                            done[nid] = r.get("output") or ""
-                                        elif r["state"] in ("failed", "lost"):
-                                            failed[nid] = r.get("error") or r["state"]
-                                        else:
-                                            left = True
-                                    if not left:
+                                    beat()
+                                    if ce is not None and ce.is_set():
                                         break
-                                    time.sleep(2)
-                                for nid, out in done.items():        # replace each spawn stub with the
-                                    ctx["nodes"][nid] = out          # real result, so {{nodes.X}} works
-                                timed_out = [nid for nid in targets if nid not in done and nid not in failed]
-                                ok = not failed and not timed_out
-                                parts = [f"[{nid}] {out}" for nid, out in done.items()]
-                                parts += [f"[{nid}] FAILED: {err}" for nid, err in failed.items()]
-                                parts += [f"[{nid}] TIMED OUT (still running)" for nid in timed_out]
-                                output = "\n\n".join(parts)
-                                if done:
-                                    ag.messages.append({"role": "user",
-                                                        "content": f"(agents finished → {output[:1500]})"})
-                        elif t == "orchestrate":       # trigger plugged-in agents step by step, join, compile
-                            ok, output, orch_step_records = _run_orchestrate(
-                                cur, attached.get(cur["id"], []), ctx, ag, spawned, emit, beat)
-                        elif t == "decision":
-                            fnode = {**cur, "question": _tmpl(cur.get("question", ""), ctx),
-                                     "ruleValue": _tmpl(cur.get("ruleValue", ""), ctx)}
-                            verdict, output = _decide(fnode, ctx["last"], ag)
-                            branch = "yes" if verdict else "no"
-                        elif t == "switch":
-                            branch, output = _run_switch(cur, ctx)
-                        elif t == "http":
-                            ok, output = _run_http(cur, ctx)
-                        elif t == "transform":
-                            ok, output = _run_transform(cur, ctx)
-                        elif t == "subflow":
-                            ok, output = _run_subflow(cur, ctx, _depth)
-                            ag.messages.append({"role": "user", "content": f"(sub-workflow → {output[:1500]})"})
-                        elif t == "approval":
-                            approved, detail = _await_approval(wf_id, _tmpl(cur.get("prompt", ""), ctx) or "Approve this step?",
-                                                               cur.get("timeout", 60), beat)
-                            ok = approved
-                            branch = "approved" if approved else "rejected"
-                            output = detail
-                        elif t == "wait":              # sleep in short slices: heartbeat + cancellable
-                            secs = int(_wait_seconds(cur))
-                            deadline = time.time() + secs
-                            while time.time() < deadline:
-                                beat()
-                                if ce is not None and ce.is_set():   # ✕ in the jobs popup
-                                    break
-                                time.sleep(min(30.0, max(0.0, deadline - time.time())))
-                            if ce is not None and ce.is_set():       # the loop head turns this into 'cancelled'
-                                output = f"wait interrupted by cancel after {max(0, secs - int(deadline - time.time()))}s"
-                            else:
-                                output = f"waited {secs}s" + (f" (until {cur['until']})" if cur.get("until") else "")
-                    except Exception as ex:            # noqa: BLE001
-                        ok, output = False, f"{type(ex).__name__}: {ex}"
-                    if ok or attempt + 1 >= attempts:
+                                    time.sleep(min(30.0, max(0.0, deadline - time.time())))
+                                if ce is not None and ce.is_set():
+                                    output = f"wait interrupted by cancel after {max(0, secs - int(deadline - time.time()))}s"
+                                else:
+                                    output = f"waited {secs}s" + (f" (until {cur['until']})" if cur.get("until") else "")
+                        except Exception as ex:
+                            ok, output = False, f"{type(ex).__name__}: {ex}"
+                        if ok or attempt + 1 >= attempts:
+                            break
+                        emit({"event": "tool", "id": cur["id"], "text": f"retry {attempt + 1}/{attempts - 1}…"})
+                        time.sleep(1)
+
+                    ctx["nodes"][cur["id"]] = output
+                    if t not in ("decision", "switch", "approval", "wait"):
+                        ctx["last"] = output
+                        last_output = output
+                    results.extend(orch_step_records)
+                    results.append({"id": cur["id"], "type": t, "label": label, "ok": ok,
+                                    "branch": branch, "output": output[:_OUT_CAP]})
+                    emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "label": label, "output": output[:_OUT_CAP]})
+
+                    err_to = next((to for (br, to) in succ.get(cur["id"], []) if br == "error"), None)
+                    if not ok and t != "approval" and err_to is None:
                         break
-                    emit({"event": "tool", "id": cur["id"], "text": f"retry {attempt + 1}/{attempts - 1}…"})
-                    time.sleep(1)
-
-                # record output as this node's value, and as 'last' for plain (non-branching)
-                # nodes — wait joins the exceptions so "waited 300s" never clobbers the value
-                # the node AFTER the pause actually wants to reference
-                ctx["nodes"][cur["id"]] = output
-                if t not in ("decision", "switch", "approval", "wait"):
-                    ctx["last"] = output
-                    last_output = output
-                # attached agents aren't walked by traversal, so fold their own rows in now — right
-                # before the orchestrator's compiled entry — or they'd be visible live but vanish
-                # from the persisted run history (and from a reconnect made after _LIVE_KEEP expires)
-                results.extend(orch_step_records)
-                results.append({"id": cur["id"], "type": t, "label": label, "ok": ok,
-                                "branch": branch, "output": output[:_OUT_CAP]})
-                emit({"event": "node_end", "id": cur["id"], "ok": ok, "branch": branch, "label": label, "output": output[:_OUT_CAP]})
-
-                # routing: a failed node with an 'error' edge takes it; decision/switch/approval branch
-                err_to = next((to for (br, to) in succ.get(cur["id"], []) if br == "error"), None)
-                if not ok and err_to is not None:
-                    nxt = err_to
-                elif t == "approval":
-                    nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == branch), None)
-                           or next((to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")), None))
-                else:
-                    plain = [to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")]
-                    if ok and len(plain) > 1 and t not in ("decision", "switch"):
-                        # fork: every plain out-edge runs — the first now, the rest parked with
-                        # THIS node's output as their own {{last}} — and a merge node joins them
-                        for to in plain[1:]:
-                            branch_q.append((to, ctx["last"]))
-                        nxt = plain[0]
+                    if not ok and err_to is not None:
+                        nxt = err_to
+                    elif t == "approval":
+                        nxt = (next((to for (br, to) in succ.get(cur["id"], []) if br == branch), None)
+                               or next((to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")), None))
                     else:
-                        nxt = _route(cur, succ, branch)
-                cur = nodes.get(nxt) if nxt is not None else None
+                        plain = [to for (br, to) in succ.get(cur["id"], []) if br in (None, "next")]
+                        if ok and len(plain) > 1 and t not in ("decision", "switch"):
+                            for to in plain[1:]:
+                                branch_q.append((to, ctx["last"]))
+                            nxt = plain[0]
+                        else:
+                            nxt = _route(cur, succ, branch)
+                    checkpoint(nxt)
+                    cur = nodes.get(nxt) if nxt is not None else None
 
-            status = "cancelled" if cancelled else (
-                "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error"))
-            done = sum(1 for r in results if r["ok"])
-            summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
-            rec = _record_run(wf["id"], trigger, status, results, summary)
-            rec["output"] = last_output                # so a sub-workflow / chain can use the final value
-            emit({"event": "done", "status": status, "run": rec})
-            if not nested:                             # chain-trigger any followers with this run's final output
-                fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id}, out=last_output)
-                if _jid is not None:
-                    jobs.set_result(_jid, summary)     # surface the workflow outcome in the activity log
-            return rec
-    finally:
-        if not nested:
-            with _LIVE_LOCK:                            # never leave a 'running' entry stranded
-                st = _LIVE.get(wf_id)
-                if st and st.get("status") == "running":
-                    st.update(status="error", current=None, finished=time.time(), summary="(ended unexpectedly)")
-
+                status = "cancelled" if cancelled else (
+                    "ok" if results and all(r["ok"] for r in results) else ("empty" if not results else "error"))
+                done = sum(1 for r in results if r["ok"])
+                summary = f"{done}/{len(results)} nodes ok" + ("" if status == "ok" else f" · {status}")
+                rec = _record_run(wf["id"], trigger, status, results, summary)
+                rec["output"] = last_output
+                emit({"event": "done", "status": status, "run": rec})
+                if status in ("ok", "empty", "skipped"):
+                    _clear_checkpoint(wf_id)
+                if not nested:
+                    fire_chain(wf_id, status, frozenset(_chain_seen) | {wf_id}, out=last_output)
+                    if _jid is not None:
+                        jobs.set_result(_jid, summary)
+                return rec
+        finally:
+            if not nested:
+                with _LIVE_LOCK:
+                    st = _LIVE.get(wf_id)
+                    if st and st.get("status") == "running":
+                        st.update(status="error", current=None, finished=time.time(), summary="(ended unexpectedly)")
 
 def run_by_id(wid, trigger="manual", on_step=None, inp=None):
     wf = get(wid)
