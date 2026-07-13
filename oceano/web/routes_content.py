@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from oceano import evals, researcher, skills, suggestions, traces
+from oceano import evals, policies, researcher, skills, suggestions, traces
 from oceano.web.state import _sse
 
 router = APIRouter()
@@ -472,6 +472,19 @@ async def workflows_resume_run(wid: int):
 @router.get("/api/workflows/{wid}/traces")
 def workflows_traces(wid: int, run_id: str = ""):
     return {"events": traces.query(run_id=run_id or None, workflow_id=wid)}
+
+
+@router.get("/api/policies")
+def runtime_policies_get():
+    return {"policies": policies.get(), "capabilities": list(policies.CAPABILITIES), "modes": list(policies.MODES)}
+
+
+@router.post("/api/policies")
+async def runtime_policies_set(req: Request):
+    b = await req.json()
+    if not policies.set_all((b or {}).get("policies") or {}):
+        raise HTTPException(500, "could not save policies")
+    return {"ok": True, "policies": policies.get()}
 
 
 @router.get("/api/workflows/approvals")

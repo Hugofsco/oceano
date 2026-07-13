@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import config
-from oceano import atomicio, secretcrypto, tools, traces
+from oceano import atomicio, policies, secretcrypto, tools, traces
 
 STORE = config.WORKSPACE.parent / "data" / "workflows.json"
 RUNS_STORE = config.WORKSPACE.parent / "data" / "workflow_runs.json"      # history, split out so
@@ -1506,6 +1506,30 @@ def _route(node, succ, branch):
             or next((to for (br, to) in outs if br not in ("error",)), None))
 
 
+def _policy_mode(node):
+    t = node.get("type")
+    if t == "tool":
+        cap = policies.capability_for_tool(node.get("tool", ""))
+    elif t == "http":
+        cap = "http_request"
+    elif t in ("delegate", "agent") and node.get("write") == "shell":
+        cap = "shell_exec"
+    elif t in ("delegate", "agent") and node.get("write") == "write":
+        cap = "workspace_write"
+    else:
+        cap = ""
+    mode = policies.get().get(cap, "allow") if cap else "allow"
+    return cap, mode
+
+
+def _policy_prompt(node, capability):
+    if node.get("type") == "tool":
+        return (f"Policy approval required for tool `{node.get('tool', '')}` "
+                f"(capability: {capability}). Allow this step to proceed?")
+    return (f"Policy approval required for workflow node `{_node_label(node)}` "
+            f"(capability: {capability}). Allow this step to proceed?")
+
+
 def _restore_runtime(wf, state):
     graph = wf.get("graph") or {"nodes": [], "edges": []}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
@@ -1801,14 +1825,23 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                         ok, output, branch = True, "", None
                         orch_step_records = []
                         try:
-                            if t in ("start", "trigger"):
+                            capability, mode = _policy_mode(cur)
+                            if mode == "block":
+                                ok, output = False, f"blocked by policy ({capability})"
+                            elif mode == "confirm":
+                                approved, detail = _await_approval(
+                                    wf_id, _policy_prompt(cur, capability), cur.get("timeout", 60), beat)
+                                if not approved:
+                                    ok, output = False, detail
+                            if ok and t in ("start", "trigger"):
                                 output = ""
                             elif ok and t == "tool":
                                 name, args = cur.get("tool", ""), _tmpl(cur.get("args", {}), ctx)
                                 if not tools.is_enabled(name):
                                     ok, output = False, f"tool '{name}' is disabled or unknown"
                                 else:
-                                    output = tools.run(name, json.dumps(args)) or ""
+                                    with policies.permit(capability):
+                                        output = tools.run(name, json.dumps(args)) or ""
                                     if output.startswith("ERROR:"):
                                         ok = False
                                     ag.messages.append({"role": "user", "content": f"(ran tool `{name}` → {output[:1500]})"})

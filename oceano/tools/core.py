@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import config
-from oceano import atomicio, traces, turnctx
+from oceano import atomicio, policies, traces, turnctx
 
 # --- channels --------------------------------------------------------------
 # Oceano is driven from several places, and they don't share a screen. The live
@@ -278,14 +278,20 @@ def run(name, arguments_json):
         args = json.loads(arguments_json or "{}")
     except json.JSONDecodeError as e:
         return f"ERROR: bad arguments JSON: {e}"
-    cap = None
-    traces.record("tool_call", tool=name, args=args)
+    cap = policies.capability_for_tool(name)
+    mode = policies.get().get(cap, "allow") if cap else "allow"
+    if mode == "block":
+        return f"ERROR: tool {name!r} is blocked by policy ({cap})"
+    if mode == "confirm" and not policies.is_permitted(cap):
+        return (f"ERROR: tool {name!r} requires approval by policy ({cap}). "
+                "Run it from a workflow approval step or set the capability to allow.")
+    traces.record("tool_call", tool=name, capability=cap or None, args=args)
     try:
         out = str(fn(**args))
-        traces.record("tool_result", tool=name, ok=True, result=out[:500])
+        traces.record("tool_result", tool=name, capability=cap or None, ok=True, result=out[:500])
         return out
     except Exception as e:                       # tools should never crash the loop
-        traces.record("tool_result", tool=name, ok=False, error=str(e))
+        traces.record("tool_result", tool=name, capability=cap or None, ok=False, error=str(e))
         return f"ERROR running {name}: {e}"
 
 
