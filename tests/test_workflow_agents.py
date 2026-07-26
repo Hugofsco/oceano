@@ -580,12 +580,14 @@ def test_norm_graph_accepts_the_execute_tier():
 def test_tool_scope_for_the_access_tiers():
     assert workflows._tool_scope_for("") == "Read,Glob,Grep"
     assert workflows._tool_scope_for(None) == "Read,Glob,Grep"
+    assert workflows._tool_scope_for("execute") == "Read,Glob,Grep,Bash"
     assert workflows._tool_scope_for("write") == "Read,Glob,Grep,Write,Edit"
     assert workflows._tool_scope_for("shell") == "Read,Glob,Grep,Write,Edit,Bash"
 
 
 def test_access_marker_matches_the_tier():
     assert workflows._access_marker("") == ""
+    assert workflows._access_marker("execute") == " ▶"
     assert workflows._access_marker("write") == " ✎"
     assert workflows._access_marker("shell") == " ⚠"
 
@@ -620,14 +622,12 @@ def test_delegate_node_shell_tier_reaches_delegate_run(monkeypatch):
          {"id": 3, "type": "end"}],
         [{"from": 1, "to": 2}, {"from": 2, "to": 3}])
     rec = workflows.run(wf, trigger="manual", nested=True)
-    assert workflows._tool_scope_for("execute") == "Read,Glob,Grep,Bash"
     assert rec["status"] == "ok"
     assert calls == ["Read,Glob,Grep,Write,Edit,Bash"]
 
 
 def test_orchestrated_agent_shell_tier_travels_with_its_own_node(monkeypatch):
     fake = FakeAgentJobs({1: {"state": "done", "output": "R1", "error": ""},
-    assert workflows._access_marker("execute") == " ▶"
                           2: {"state": "done", "output": "R2", "error": ""}})
     monkeypatch.setattr("oceano.agentjobs.spawn", fake.spawn)
     monkeypatch.setattr("oceano.agentjobs.status", fake.status)
