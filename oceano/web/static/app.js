@@ -6413,15 +6413,17 @@ const _WF_OPS = [["contains", "contains"], ["equals", "equals"], ["matches", "re
 // declarative field specs for the simple node types (tool / trigger / http / switch have custom builders)
 // shared across the agent/delegate node inspectors: three escalating, explicit opt-in tiers.
 // "" stays read-only by default — an unattended/scheduled flow must not be quietly MORE
-// privileged than the user intended; "write" and "shell" mirror workflows.py's _tool_scope_for.
-const wfWriteTier = v => (v === "write" || v === "shell") ? v : "";   // mirrors workflows.py's _WRITE_TIERS
-const wfAccessPrefix = v => v === "shell" ? "⚠ shell · " : v === "write" ? "✎ write · " : "";
+// privileged than the user intended; these mirror workflows.py's _tool_scope_for.
+const wfWriteTier = v => (["execute", "write", "shell"].includes(v)) ? v : "";
+const wfAccessPrefix = v => v === "shell" ? "⚠ shell · " : v === "execute" ? "▶ execute · " : v === "write" ? "✎ write · " : "";
 const WF_ACCESS_OPTS = [
   ["", "read-only (safe default)"],
-  ["write", "read + write — can create/edit files, run tests, use git"],
+  ["execute", "read + execute — can run checks, cannot edit files"],
+  ["write", "read + write — can create/edit files, cannot execute"],
   ["shell", "read + write + shell — can also run arbitrary commands"],
 ];
-const WF_ACCESS_NOTE_WRITE = "✎ this node can create/edit files, run the test suite, and use git under the workspace — make sure that's intended, especially if this flow runs unattended/scheduled.";
+const WF_ACCESS_NOTE_EXECUTE = "▶ this node can run tests, git, and arbitrary shell commands, but cannot use file-edit tools. Commands may still have side effects, so only enable it for trusted tasks.";
+const WF_ACCESS_NOTE_WRITE = "✎ this node can create/edit files under the workspace, but cannot run shell commands or tests. Make sure that's intended, especially if this flow runs unattended/scheduled.";
 const WF_ACCESS_NOTE_SHELL = "⚠ this node can run ARBITRARY shell commands — real code-execution risk, not just file writes. Only enable if you trust the task (and, for a background/scheduled flow, that it'll stay unattended without incident).";
 const WF_SKILLS_NOTE = "🧩 automatically reuses Oceano's published skills (list_skills / load_skill) if one fits the task — but has no access to memory, and can't learn new skills. Need memory, or full body access? Use an Instructions node instead.";
 const WF_PERSONA_NOTE = "🎭 optional: prefixes the task with a persona skill's identity, principles and rules (e.g. persona-devils-advocate, persona-finance-lead) — leave blank to run the plain task. Search by typing \"persona-\".";
@@ -6559,7 +6561,8 @@ function wfInspAgent(editor, dfId, box, sync) {
     row("timeout (s)", `<input class="wfn-fld" type="number" min="1" max="7200" data-k="timeout" value="${escapeHtml(d.timeout || "600")}">`) +
     `<div class="wf-insp-note">join spawned agents later with an <b>Await Agents</b> node — or plug this node into an <b>Orchestrator</b>, which triggers and joins it for you. Each result lands in its {{node.ID}}.</div>` +
     `<div class="wf-insp-note">${WF_SKILLS_NOTE}</div>` +
-    (d.write === "write" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_WRITE}</div>`
+    (d.write === "execute" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_EXECUTE}</div>`
+      : d.write === "write" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_WRITE}</div>`
       : d.write === "shell" ? `<div class="wf-insp-note wf-insp-warn">${WF_ACCESS_NOTE_SHELL}</div>` : "");
   box.querySelectorAll("[data-k]").forEach(f => {
     const h = () => { sync({ [f.dataset.k]: f.value }); if (f.dataset.k === "write") wfInspAgent(editor, dfId, box, sync); };
@@ -6755,6 +6758,7 @@ async function wfRenderList(body) {
       <button class="ed-btn" id="wfImport" title="import workflow JSON exports (choose several at once)">⤒ Import</button>
       <button class="primary sm" id="wfNew">+ New workflow</button></div>
     <div class="wf-list" id="wfList"><div class="empty-note">loading…</div></div>`;
+    { t: "note", warn: true, showIf: d => d.write === "execute", text: WF_ACCESS_NOTE_EXECUTE },
   $("#wfNew", body).onclick = () => wfRenderEditor(body, null);
   $("#wfSecrets", body).onclick = () => wfRenderSecrets(body);
   $("#wfImport", body).onclick = () => {

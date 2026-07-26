@@ -1,18 +1,19 @@
 {
   "name": "Daily standup",
-  "description": "Weekday mornings at 09:00: yesterday's commits (git log), current test-suite health (run_tests), and today's calendar, compiled into a standup note with suggested priorities. Shows: weekday cron, the dev tools (git · run_tests) as plain tool nodes, and the shared context an instruction step can draw on. Point your workspace at a git project first.",
+  "description": "Weekday mornings at 09:00: recent commits, current test-suite health, and calendar events for today and tomorrow, compiled into a standup note with suggested priorities. Each preparation step has an explicit failure notification. Point your workspace at a git project first.",
   "overlap": "skip",
   "input": {"enabled": false, "label": "", "placeholder": "", "required": false, "default": ""},
   "triggers": [],
   "graph": {
     "nodes": [
       {"id": 1, "type": "trigger", "kind": "schedule", "cron": "0 9 * * 1-5", "x": 40, "y": 160},
-      {"id": 2, "type": "tool", "tool": "git", "args": {"args": "log --oneline --since=yesterday"}, "x": 270, "y": 160},
+      {"id": 2, "type": "tool", "tool": "git", "args": {"args": "log --oneline --since='24 hours ago'"}, "x": 270, "y": 160},
       {"id": 3, "type": "tool", "tool": "run_tests", "args": {}, "x": 500, "y": 160},
       {"id": 4, "type": "tool", "tool": "calendar_events", "args": {"days": 1}, "x": 730, "y": 160},
-      {"id": 5, "type": "instruction", "text": "Write today's standup note as Markdown:\n- **Yesterday** — summarize these commits: {{node.2}}\n- **Suite health** — one line on this test output: {{node.3}}\n- **Today** — the calendar: {{node.4}}\n- **Suggested top 3** — infer the three highest-leverage tasks for today.\nKeep it under 200 words.", "x": 960, "y": 160},
+      {"id": 5, "type": "instruction", "text": "Write today's standup note as Markdown:\n- **Recent work** — summarize commits from the last 24 hours: {{node.2}}\n- **Suite health** — one line on this test output: {{node.3}}\n- **Calendar** — distinguish today's events from tomorrow's: {{node.4}}\n- **Suggested top 3** — infer the three highest-leverage tasks for today.\nKeep it under 200 words.", "x": 960, "y": 160},
       {"id": 6, "type": "tool", "tool": "write_file", "args": {"path": "dev/standup.md", "content": "{{last}}"}, "x": 1200, "y": 160},
       {"id": 7, "type": "tool", "tool": "notify", "args": {"title": "☀️ Standup", "message": "Standup note ready — workspace/dev/standup.md"}, "x": 1430, "y": 160},
+      {"id": 9, "type": "tool", "tool": "notify", "args": {"title": "⚠️ Standup preparation failed", "message": "The standup note could not be prepared. Open Workflows → History for the failed step; no partial note is announced as ready."}, "x": 1200, "y": 320},
       {"id": 8, "type": "end", "x": 1660, "y": 160}
     ],
     "edges": [
@@ -22,7 +23,13 @@
       {"from": 4, "to": 5, "branch": null},
       {"from": 5, "to": 6, "branch": null},
       {"from": 6, "to": 7, "branch": null},
-      {"from": 7, "to": 8, "branch": null}
+      {"from": 7, "to": 8, "branch": null},
+      {"from": 2, "to": 9, "branch": "error"},
+      {"from": 3, "to": 9, "branch": "error"},
+      {"from": 4, "to": 9, "branch": "error"},
+      {"from": 5, "to": 9, "branch": "error"},
+      {"from": 6, "to": 9, "branch": "error"},
+      {"from": 9, "to": 8, "branch": null}
     ]
   }
 }

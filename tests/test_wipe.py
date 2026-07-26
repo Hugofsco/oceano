@@ -14,14 +14,14 @@ from oceano import mail, mcp_client  # noqa: E402 - after the sys.path bootstrap
 def test_mail_wipe_removes_all_accounts_and_their_arm_state(tmp_path, monkeypatch):
     monkeypatch.setattr(mail, "STORE", tmp_path / "mail.json")
     monkeypatch.setattr(mail, "_ARM", {})
-    a = mail.create("personal", "a@x.com", "imap.x.com", "smtp.x.com", password="pw")
-    mail.create("work", "b@y.com", "imap.y.com", "smtp.y.com", password="pw2")
+    a = mail.create("personal", "personal@example.com", "imap.x.com", "smtp.x.com", password="pw")
+    mail.create("work", "work@example.com", "imap.y.com", "smtp.y.com", password="pw2")
     mail.arm(a["id"])
     assert len(mail.list_all()) == 2 and mail.is_armed(a["id"])
 
     assert mail.wipe() == 2
     assert mail.list_all() == [] and not mail.is_armed(a["id"])
-    assert "a@x.com" not in (tmp_path / "mail.json").read_text()   # credentials gone from disk
+    assert "personal@example.com" not in (tmp_path / "mail.json").read_text()   # credentials gone from disk
     assert mail.wipe() == 0                                        # idempotent
 
 

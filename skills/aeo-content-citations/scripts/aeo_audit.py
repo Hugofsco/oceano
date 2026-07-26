@@ -348,7 +348,7 @@ language models). It complements SEO but optimizes for citation, not click-throu
 | Author credentials | Low | High |
 | Schema markup | Medium | High |
 
-Contact us at info@acme.com for our corrections policy.
+Contact us at corrections@example.com for our corrections policy.
 """
 
 

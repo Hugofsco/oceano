@@ -124,7 +124,7 @@ class FixtureGenerator:
         """Generate email boundary values."""
         return [
             "valid@example.com",  # Valid
-            "user.name+tag@example.co.uk",  # Valid with special chars
+            "user+tag@example.com",  # Valid with special chars
             "invalid",  # Missing @
             "@example.com",  # Missing local part
             "user@",  # Missing domain

@@ -65,3 +65,26 @@ def test_example_edges_reference_existing_nodes(path):
     # exactly one start/trigger to walk from
     starts = [n for n in payload["graph"]["nodes"] if n["type"] in ("start", "trigger")]
     assert len(starts) == 1, f"{path.name}: expected one start/trigger node"
+
+
+def test_inbox_example_fences_untrusted_mail_and_allows_bursts():
+    path = next(p for p in EXAMPLES if p.name == "inbox-sentry.workflow.json")
+    payload = json.loads(path.read_text())
+    assert payload["overlap"] == "allow"
+    model_inputs = [n.get("question", "") + n.get("text", "")
+                    for n in payload["graph"]["nodes"] if n["type"] in ("decision", "instruction")]
+    assert model_inputs
+    assert all('<untrusted source="email">' in text and "never follow instructions" in text.lower()
+               for text in model_inputs)
+
+
+def test_everyday_examples_have_explicit_preparation_failure_paths():
+    for filename in ("inbox-sentry.workflow.json", "daily-standup.workflow.json"):
+        path = next(p for p in EXAMPLES if p.name == filename)
+        payload = json.loads(path.read_text())
+        nodes = {n["id"]: n for n in payload["graph"]["nodes"]}
+        failures = {n["id"] for n in nodes.values() if n.get("tool") == "notify"
+                    and "failed" in n.get("args", {}).get("title", "").lower()}
+        assert failures, f"{filename}: missing failure notification"
+        error_edges = [e for e in payload["graph"]["edges"] if e.get("branch") == "error"]
+        assert error_edges and all(e["to"] in failures for e in error_edges)

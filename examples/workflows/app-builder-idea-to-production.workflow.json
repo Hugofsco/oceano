@@ -1,0 +1,533 @@
+{
+  "name": "App builder — idea to production-ready app",
+  "description": "Turns an idea into a release candidate under a deterministic projects/<slug>-<id>/ path. Product discovery and technical planning run first, then a human approval gate confirms the exact plan and destination before any code is written. Backend, frontend, and devops/security build with shell access; a real zero-exit test gate must pass before three execute-only reviewers assess security, operability, and UX. Failed tests or readiness findings loop through an on-call fix step. Reports stay inside the generated project, and every fallible step has an explicit failure path.",
+  "graph": {
+    "nodes": [
+      {
+        "id": 1,
+        "type": "trigger",
+        "kind": "manual",
+        "x": 40,
+        "y": 340
+      },
+      {
+        "id": 27,
+        "type": "transform",
+        "mode": "python",
+        "source": "{{input}}",
+        "text": "slug = ''.join(c if c.isalnum() else '-' for c in value.lower())\nwhile '--' in slug: slug = slug.replace('--', '-')\nslug = slug.strip('-') or 'app'\nchecksum = sum((i + 1) * ord(c) for i, c in enumerate(value)) % 100000000\nprint(f\"projects/{slug[:48]}-{checksum:08d}\")",
+        "x": 150,
+        "y": 340
+      },
+      {
+        "id": 2,
+        "type": "instruction",
+        "persona": "persona-product-manager",
+        "text": "Turn this idea into product requirements: who it's for, the core use cases, a ruthlessly scoped MVP (explicitly in and out), and 5-8 testable acceptance criteria. This is a product, not a business — skip pricing, revenue, or funding considerations entirely.\n\nProject path: {{node.27}}\nIdea: {{input}}",
+        "retries": 1,
+        "x": 270,
+        "y": 340
+      },
+      {
+        "id": 4,
+        "type": "agent",
+        "label": "competitor landscape",
+        "task": "Competitive landscape: what similar apps/tools already exist for this idea, what they do well, where they fall short, and what would make this one worth using instead of (or alongside) them. Product and UX comparison only — not a business or market-sizing exercise.\n\nIdea: {{input}}\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 160,
+        "y": 520
+      },
+      {
+        "id": 5,
+        "type": "agent",
+        "label": "compliance read",
+        "task": "Compliance and regulatory read: what data this app would touch (personal, financial, health, etc.), which rules that could implicate (privacy regulations, accessibility requirements, sector-specific rules if relevant), and the handling practices the MVP needs from day one. Flag anything that needs a real lawyer's sign-off rather than guessing — this is a heads-up for engineering, not legal advice.\n\nIdea: {{input}}\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 400,
+        "y": 520
+      },
+      {
+        "id": 6,
+        "type": "agent",
+        "label": "design direction",
+        "persona": "persona-frontend-designer",
+        "task": "Initial design direction: the core user flow end-to-end, the 2-3 screens/views that matter most, and the tone/visual direction — not a full spec yet, that comes after the technical plan. Call out anything in the requirements that's hard to make usable as written.\n\nIdea: {{input}}\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 640,
+        "y": 520
+      },
+      {
+        "id": 3,
+        "type": "orchestrate",
+        "mode": "summarize",
+        "plan": {
+          "4": 1,
+          "5": 1,
+          "6": 2
+        },
+        "text": "Chair the kickoff — high-level meeting: compile the competitor read, compliance read, and design direction into one brief — what's confirmed, what must change in scope before the technical meeting, and open questions to carry forward. No financial or business analysis; this is a product decision, not a funding one.",
+        "timeout": 900,
+        "x": 520,
+        "y": 340
+      },
+      {
+        "id": 8,
+        "type": "agent",
+        "label": "backend plan",
+        "persona": "persona-backend-engineer",
+        "task": "Technical planning meeting — verify the kickoff brief is buildable and propose the BACKEND & DATA plan: data model, API shape, business logic layering, and how you'd test it. Flag anything in the requirements or design direction that's infeasible or needs to change.\n\nKickoff brief:\n{{node.3}}\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 900,
+        "y": 520
+      },
+      {
+        "id": 9,
+        "type": "agent",
+        "label": "frontend plan",
+        "persona": "persona-frontend-engineer",
+        "task": "Technical planning meeting — verify the kickoff brief is buildable and propose the FRONTEND plan: stack, component/state structure, and how it will consume the API. Flag anything in the design direction that's infeasible or needs to change.\n\nKickoff brief:\n{{node.3}}\n\nDesign direction:\n{{node.6}}",
+        "timeout": 600,
+        "x": 1140,
+        "y": 520
+      },
+      {
+        "id": 10,
+        "type": "agent",
+        "label": "ops plan & reconcile",
+        "persona": "persona-devops-engineer",
+        "task": "Technical planning meeting — the backend and frontend plans are in your context. Verify the whole thing is buildable, testable, and securable: propose the run/test/CI story, and flag every integration mismatch between the two plans plus anything that's a security or operability risk if built as proposed.\n\nRequirements:\n{{node.2}}",
+        "timeout": 600,
+        "x": 1380,
+        "y": 520
+      },
+      {
+        "id": 7,
+        "type": "orchestrate",
+        "mode": "summarize",
+        "plan": {
+          "8": 1,
+          "9": 1,
+          "10": 2
+        },
+        "text": "Compile the technical planning meeting's three plans into minutes: where they agree, and every place they conflict or need reconciliation.",
+        "x": 1140,
+        "y": 340
+      },
+      {
+        "id": 11,
+        "type": "delegate",
+        "persona": "persona-startup-cto",
+        "role": "default",
+        "write": "",
+        "text": "You chaired the technical planning meeting — its minutes are below. Resolve every place the plans disagree and write the FINAL technical plan: stack choice (briefly justified), the layers (data/backend/frontend) with responsibilities and interfaces, the folder layout rooted exactly at the project path below, the testing strategy per layer, and the security/operability baseline the build must hit. Decisions, not options — where you overrule an engineer, say why. Do not write outside this project path.\n\nProject path: {{node.27}}\n\nMeeting minutes:\n{{node.7}}\n\nKickoff brief:\n{{node.3}}\n\nRequirements:\n{{node.2}}",
+        "retries": 1,
+        "x": 1620,
+        "y": 340
+      },
+      {
+        "id": 12,
+        "type": "tool",
+        "tool": "write_file",
+        "args": {
+          "path": "{{node.27}}/docs/discovery.md",
+          "content": "# Discovery — {{input}}\n\n## Requirements\n{{node.2}}\n\n## Competitor landscape\n{{node.4}}\n\n## Compliance read\n{{node.5}}\n\n## Design direction\n{{node.6}}\n\n## Kickoff brief\n{{node.3}}\n\n## Technical plan\n{{node.11}}\n"
+        },
+        "retries": 1,
+        "x": 1860,
+        "y": 340
+      },
+      {
+        "id": 28,
+        "type": "approval",
+        "prompt": "Approve implementation of \"{{input}}\" at {{node.27}}? No project code has been written yet.\n\nFinal technical plan:\n{{node.11}}",
+        "timeout": 60,
+        "x": 1980,
+        "y": 340
+      },
+      {
+        "id": 13,
+        "type": "delegate",
+        "persona": "persona-backend-engineer",
+        "role": "default",
+        "write": "shell",
+        "text": "BUILD — backend & data layer. Scaffold the project exactly at {{node.27}} per the technical plan's folder layout, then implement the data model and API. Do not write outside that project path. Write real unit tests as you go and run them yourself before moving on — don't hand off code you haven't verified runs.\n\nProject path: {{node.27}}\n\nTechnical plan:\n{{node.11}}\n\nRequirements:\n{{node.2}}",
+        "retries": 1,
+        "x": 2100,
+        "y": 260
+      },
+      {
+        "id": 14,
+        "type": "delegate",
+        "persona": "persona-frontend-engineer",
+        "role": "default",
+        "write": "shell",
+        "text": "BUILD — frontend inside {{node.27}}. Implement the UI against the backend just built, following the design direction and the technical plan. Do not write outside that project path. Write and run your own tests before moving on.\n\nProject path: {{node.27}}\n\nTechnical plan:\n{{node.11}}\n\nDesign direction:\n{{node.6}}",
+        "retries": 1,
+        "x": 2340,
+        "y": 260
+      },
+      {
+        "id": 15,
+        "type": "delegate",
+        "persona": "persona-devops-engineer",
+        "role": "default",
+        "write": "shell",
+        "text": "BUILD — operability & security inside {{node.27}}. Set up the run/test story from the technical plan (so test tooling actually finds and runs the suite), and apply the security baseline: input validation, secrets never hardcoded, dependency hygiene. Do not write outside that project path. Run everything yourself before moving on.\n\nProject path: {{node.27}}\n\nTechnical plan:\n{{node.11}}",
+        "retries": 1,
+        "x": 2580,
+        "y": 260
+      },
+      {
+        "id": 16,
+        "type": "tool",
+        "tool": "run_tests",
+        "args": {
+          "path": "{{node.27}}"
+        },
+        "retries": 1,
+        "x": 2820,
+        "y": 260
+      },
+      {
+        "id": 30,
+        "type": "decision",
+        "mode": "rule",
+        "question": "Did the project test command complete successfully?",
+        "ruleOp": "contains",
+        "ruleValue": "(exit 0)",
+        "x": 2940,
+        "y": 260
+      },
+      {
+        "id": 18,
+        "type": "agent",
+        "label": "security review",
+        "persona": "security-self-check",
+        "write": "execute",
+        "task": "Security review of the app at {{node.27}}. Read that project and run non-mutating checks as useful; do not edit files. Scan against known vulnerability patterns, check secrets handling and dependency hygiene, and call out anything that must be fixed before release. Findings by severity.\n\nProject path: {{node.27}}\n\nTechnical plan:\n{{node.11}}",
+        "timeout": 900,
+        "x": 2700,
+        "y": 440
+      },
+      {
+        "id": 19,
+        "type": "agent",
+        "label": "functional & ops review",
+        "persona": "persona-devops-engineer",
+        "write": "execute",
+        "task": "Operability review of the app at {{node.27}}. Read and run it as useful, but do not edit files: can it be installed, run, and tested from a clean checkout; does it satisfy the acceptance criteria; what's missing to call it functional. Findings by severity.\n\nProject path: {{node.27}}\n\nRequirements:\n{{node.2}}\n\nTest output:\n{{node.16}}",
+        "timeout": 900,
+        "x": 2940,
+        "y": 440
+      },
+      {
+        "id": 20,
+        "type": "agent",
+        "label": "maturity & UX review",
+        "persona": "persona-frontend-designer",
+        "write": "execute",
+        "task": "Maturity review of the app at {{node.27}}. Read and run it if useful, but do not edit files: is it usable and polished enough for someone to use today, not just technically working — missing states, rough edges, and anything that would make a first-time user bounce. Findings by severity.\n\nProject path: {{node.27}}\n\nDesign direction:\n{{node.6}}",
+        "timeout": 900,
+        "x": 3180,
+        "y": 440
+      },
+      {
+        "id": 17,
+        "type": "orchestrate",
+        "mode": "summarize",
+        "plan": {
+          "18": 1,
+          "19": 1,
+          "20": 2
+        },
+        "text": "Compile the security, functional/operability, and maturity reviews into one production-readiness report: findings by severity per area, then an overall verdict on whether this is ready to use.",
+        "timeout": 900,
+        "x": 2940,
+        "y": 260
+      },
+      {
+        "id": 21,
+        "type": "decision",
+        "mode": "model",
+        "question": "Is this app production ready — secure, functional, and mature enough for someone to actually use? Weigh the test results and every review finding below; a single unresolved HIGH/CRITICAL finding in any area means NO.\n\nTest results:\n{{node.16}}\n\nProduction-readiness report:\n{{node.17}}",
+        "ruleOp": "contains",
+        "ruleValue": "",
+        "role": "default",
+        "retries": 1,
+        "x": 3180,
+        "y": 260
+      },
+      {
+        "id": 25,
+        "type": "delegate",
+        "persona": "persona-startup-cto",
+        "role": "default",
+        "write": "shell",
+        "text": "The automated test gate or readiness review found gaps — you're the engineer on call. Work only inside {{node.27}}. Read the outputs below, fix what's blocking release, and don't change intended behavior beyond what's needed. Run the tests yourself before finishing.\n\nProject path: {{node.27}}\n\nProduction-readiness report (may be empty when tests failed first):\n{{node.17}}\n\nTest results:\n{{node.16}}\n\nTechnical plan for reference:\n{{node.11}}",
+        "retries": 1,
+        "x": 3180,
+        "y": 460
+      },
+      {
+        "id": 22,
+        "type": "tool",
+        "tool": "write_file",
+        "args": {
+          "path": "{{node.27}}/docs/production-readiness.md",
+          "content": "# Production readiness — {{input}}\n\n{{node.17}}\n\n## Test results\n{{node.16}}\n"
+        },
+        "retries": 1,
+        "x": 3420,
+        "y": 180
+      },
+      {
+        "id": 23,
+        "type": "tool",
+        "tool": "notify",
+        "args": {
+          "title": "🚀 Release candidate checks passed",
+          "message": "\"{{input}}\" passed automated tests and the readiness review. Review {{node.27}}/docs/production-readiness.md before deploying."
+        },
+        "retries": 1,
+        "x": 3660,
+        "y": 180
+      },
+      {
+        "id": 26,
+        "type": "tool",
+        "tool": "notify",
+        "args": {
+          "title": "⚠️ App build run failed",
+          "message": "The run for \"{{input}}\" stopped at an unrecoverable step — open Workflows → History (or the live log) to see where and why. Files already written under {{node.27}} remain; fix the cause, then start a new run."
+        },
+        "retries": 1,
+        "x": 2340,
+        "y": 620
+      },
+      {
+        "id": 24,
+        "type": "end",
+        "x": 3900,
+        "y": 260
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 27
+      },
+      {
+        "from": 27,
+        "to": 2
+      },
+      {
+        "from": 2,
+        "to": 3
+      },
+      {
+        "from": 3,
+        "to": 7
+      },
+      {
+        "from": 7,
+        "to": 11
+      },
+      {
+        "from": 11,
+        "to": 12
+      },
+      {
+        "from": 12,
+        "to": 28
+      },
+      {
+        "from": 28,
+        "to": 13,
+        "branch": "approved"
+      },
+      {
+        "from": 28,
+        "to": 24,
+        "branch": "rejected"
+      },
+      {
+        "from": 13,
+        "to": 14
+      },
+      {
+        "from": 14,
+        "to": 15
+      },
+      {
+        "from": 15,
+        "to": 16
+      },
+      {
+        "from": 16,
+        "to": 30
+      },
+      {
+        "from": 30,
+        "to": 17
+        ,"branch": "yes"
+      },
+      {
+        "from": 30,
+        "to": 25,
+        "branch": "no"
+      },
+      {
+        "from": 17,
+        "to": 21
+      },
+      {
+        "from": 21,
+        "to": 22,
+        "branch": "yes"
+      },
+      {
+        "from": 21,
+        "to": 25,
+        "branch": "no"
+      },
+      {
+        "from": 22,
+        "to": 23
+      },
+      {
+        "from": 23,
+        "to": 24
+      },
+      {
+        "from": 25,
+        "to": 16
+      },
+      {
+        "from": 26,
+        "to": 24
+      },
+      {
+        "from": 4,
+        "to": 3
+      },
+      {
+        "from": 5,
+        "to": 3
+      },
+      {
+        "from": 6,
+        "to": 3
+      },
+      {
+        "from": 8,
+        "to": 7
+      },
+      {
+        "from": 9,
+        "to": 7
+      },
+      {
+        "from": 10,
+        "to": 7
+      },
+      {
+        "from": 18,
+        "to": 17
+      },
+      {
+        "from": 19,
+        "to": 17
+      },
+      {
+        "from": 20,
+        "to": 17
+      },
+      {
+        "from": 2,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 27,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 3,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 7,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 11,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 12,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 13,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 14,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 15,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 16,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 30,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 17,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 21,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 22,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 23,
+        "to": 26,
+        "branch": "error"
+      },
+      {
+        "from": 25,
+        "to": 26,
+        "branch": "error"
+      }
+    ]
+  },
+  "input": {
+    "enabled": true,
+    "label": "App idea",
+    "placeholder": "Describe the app idea…",
+    "required": true
+  }
+}

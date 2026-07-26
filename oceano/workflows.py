@@ -56,21 +56,25 @@ _LOOP_CAP = 200                      # max iterations a single loop node will ru
 _SALVAGE_BACKOFF = 15                # seconds before an orchestrator's serial salvage retry
 _SUBFLOW_DEPTH = 5                   # how deep nested sub-workflows may go
 _HTTP_CAP = 200000                   # cap an HTTP node's captured response body
-_WRITE_TIERS = ("", "write", "shell")   # an agent/delegate node's "file access" opt-in level
+_WRITE_TIERS = ("", "execute", "write", "shell")   # an agent/delegate node's access opt-in level
 
 
 def _tool_scope_for(write):
     """CLI-style tool spec for an agent/delegate node's chosen access tier. "" (default) stays
     read-only — an unattended/scheduled flow must not be quietly MORE privileged than the user
-    intended; "write" and "shell" are explicit, escalating opt-ins (each also unlocks matching
-    built-in tools for the api/local providers via delegate._API_TOOL_MAP — e.g. "write" reaches
-    run_tests/git, so a node that can edit files can also verify them).
+    intended; "execute", "write", and "shell" are explicit opt-ins. "execute" permits shell
+    verification without file edits; "write" is file-edit only (Read,Glob,Grep,Write,Edit) —
+    no execution, on ANY provider. "shell" combines both, which is
+    also what unlocks run_tests/git for the api/local providers via delegate._API_TOOL_MAP — a
+    node that needs to verify what it wrote (run its tests, touch git) needs "shell", not "write".
     Callers: keep the result in a variable named tool_scope, NOT tools — oceano.tools is a
     MODULE imported at file scope, and a local named `tools` anywhere in a function shadows
     that import for the function's ENTIRE body (Python scopes per-function, not per-branch),
     breaking every "tool" node call in run() with UnboundLocalError. This happened once already."""
     if write == "shell":
         return "Read,Glob,Grep,Write,Edit,Bash"
+    if write == "execute":
+        return "Read,Glob,Grep,Bash"
     if write == "write":
         return "Read,Glob,Grep,Write,Edit"
     return "Read,Glob,Grep"
@@ -81,6 +85,8 @@ def _access_marker(write):
     after the fact — the same distinction _tool_scope_for reads."""
     if write == "shell":
         return " ⚠"
+    if write == "execute":
+        return " ▶"
     if write == "write":
         return " ✎"
     return ""
@@ -1512,7 +1518,7 @@ def _policy_mode(node):
         cap = policies.capability_for_tool(node.get("tool", ""))
     elif t == "http":
         cap = "http_request"
-    elif t in ("delegate", "agent") and node.get("write") == "shell":
+    elif t in ("delegate", "agent") and node.get("write") in ("execute", "shell"):
         cap = "shell_exec"
     elif t in ("delegate", "agent") and node.get("write") == "write":
         cap = "workspace_write"
