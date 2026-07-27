@@ -821,6 +821,24 @@ copy `tool-loading.toml.example` to the gitignored `tool-loading.toml`. Preceden
 allowlist → surface → first matching model rule → global environment/default policy. Legacy
 `OCEANO_DYNAMIC_TOOL_*` settings remain supported for existing installations.
 
+The supplied examples are a ready-to-use Qwen-only setup: non-Qwen models receive the full
+allowed catalog, while model IDs matching `qwen*` use hybrid loading with a 4,200-token initial
+schema budget and a 7,600-token cumulative discovery ceiling. Unscoped workflow agents use a
+6,000-token initial budget; workflows and delegates with explicit allowlists continue to expose
+exactly that allowed set.
+
+```bash
+cp oceano.env.example oceano.env
+cp tool-loading.toml.example tool-loading.toml
+chmod 600 oceano.env
+# Add your private endpoint credentials/settings to oceano.env, then restart Oceano.
+```
+
+The two active tool-loading lines in `oceano.env.example` select the TOML file and keep the global
+mode at `full`; the more-specific `qwen*` model rule switches only Qwen models to `hybrid`.
+Do not also enable the legacy `OCEANO_DYNAMIC_TOOL_*` variables in a new setup, because the TOML
+policy and `OCEANO_TOOL_*` settings replace them.
+
 ---
 
 ## Security posture

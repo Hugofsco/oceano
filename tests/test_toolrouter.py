@@ -42,7 +42,9 @@ def test_routing_is_disabled_by_default(monkeypatch):
     assert route.schemas == tools.schemas()
 
 
-def test_model_allow_and_exclude_patterns(monkeypatch):
+def test_model_allow_and_exclude_patterns(monkeypatch, tmp_path):
+    # Keep a developer's ignored tool-loading.toml from overriding this legacy-env-only test.
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(tmp_path / "absent.toml"))
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOLS", "1")
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOL_MODELS", "qwen*,local-*")
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOL_EXCLUDE_MODELS", "*-large")
