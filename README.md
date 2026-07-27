@@ -839,6 +839,21 @@ mode at `full`; the more-specific `qwen*` model rule switches only Qwen models t
 Do not also enable the legacy `OCEANO_DYNAMIC_TOOL_*` variables in a new setup, because the TOML
 policy and `OCEANO_TOOL_*` settings replace them.
 
+### Rate-controlled web browsing
+
+Oceano uses one browsing policy across local-model and Claude/Codex tool calls. Interactive
+`fetch_url` renders in the shared browser with normal HTML, CSS, JavaScript, images, fonts, and API
+behavior. Oceano controls request volume between top-level page loads instead of filtering
+subresources, since filtering can break modern sites. Background jobs use the guarded HTTP reader.
+
+All web entry points share per-origin serialization, a global concurrency cap, safe-GET caching
+and in-flight deduplication, and host cooldowns after HTTP 403/429 responses. `Retry-After` is
+honored. The defaults are a 1.5-second per-origin interval, four simultaneous origins, a five-minute
+cache, and a two-minute minimum block cooldown. Configure these with `OCEANO_WEB_MIN_INTERVAL`,
+`OCEANO_WEB_MAX_CONCURRENCY`, `OCEANO_WEB_CACHE_TTL`, `OCEANO_WEB_CACHE_ENTRIES`, and
+`OCEANO_WEB_BLOCK_COOLDOWN`; see `oceano.env.example` for browser controls. The initial browser
+load wait is tunable with `OCEANO_BROWSER_RENDER_WAIT`; the page remains live after that wait.
+
 ---
 
 ## Security posture

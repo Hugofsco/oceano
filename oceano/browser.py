@@ -6,7 +6,7 @@ loopback/private/link-local/metadata targets) holds no matter which caller
 navigates — callers don't have to remember to check.
 """
 import config
-from oceano import livebrowser, safety
+from oceano import livebrowser, safety, webcontrol
 
 LATEST = livebrowser.LATEST          # shared frame buffer (mutated in place by the worker)
 
@@ -18,7 +18,11 @@ def open_url(url):
     refusal = safety.check_url(url)
     if refusal:
         return refusal
-    return livebrowser.open(url, read=True)
+    try:
+        with webcontrol.permit(url):
+            return livebrowser.open(url, read=True)
+    except webcontrol.CoolingDown as e:
+        return f"browser navigation paused: {e}"
 
 
 def screenshot(url, name="screenshot.png", shared=True):
@@ -35,7 +39,11 @@ def screenshot(url, name="screenshot.png", shared=True):
         name += ".png"
     path = config.WORKSPACE / name
     if shared:
-        livebrowser.navigate(url)
+        try:
+            with webcontrol.permit(url):
+                livebrowser.navigate(url)
+        except webcontrol.CoolingDown as e:
+            return f"browser navigation paused: {e}"
         livebrowser.save_screenshot(path)
     else:
         try:

@@ -8,9 +8,10 @@ reliable across tab switches (CDP screencast only fires on visual change, so swi
 to an already-loaded tab would leave the view stale).
 
 Research lifecycle:
-  • a web_search arms "research mode" — from then on each fetch_url / browser_open opens
-    the source in a NEW tab and the view follows the newest one. Tabs PERSIST across
-    searches (capped at MAX_TABS; the oldest is evicted) — a new search does NOT wipe them
+  • fetch_url opens a normal live browser tab and extracts its rendered text; request pacing and
+    deduplication happen between page loads rather than by blocking the page's own resources
+  • a web_search arms research mode for explicit browser_open calls, which open persistent tabs
+    (capped at MAX_TABS; the oldest is evicted)
   • manual navigation (address bar) reuses the active tab; a one-off open with no
     preceding search just navigates — tabs are left alone
 """
@@ -40,6 +41,14 @@ ACCEPT_LANGUAGE = os.environ.get("OCEANO_BROWSER_LANG", "en-US,en;q=0.9")
 # startup — if frames don't actually flow we fall back to the screenshot poll, so the live view
 # never breaks. Disable with OCEANO_BROWSER_SCREENCAST=0.
 SCREENCAST = os.environ.get("OCEANO_BROWSER_SCREENCAST", "1") == "1"
+try:
+    RESEARCH_TTL = max(0, int(os.environ.get("OCEANO_BROWSER_RESEARCH_TTL", "300")))
+except ValueError:
+    RESEARCH_TTL = 300
+try:
+    RENDER_WAIT = max(250, min(int(os.environ.get("OCEANO_BROWSER_RENDER_WAIT", "3000")), 10000))
+except ValueError:
+    RENDER_WAIT = 3000
 
 # Runs before any page script — removes the leftover automation tells that the
 # launch flags don't cover.
@@ -314,7 +323,8 @@ def _worker():
             br = _launch(p)
             ctx = _new_context(br)
         tabs = []                  # [{page, id, title, fresh}]
-        st = {"active": 0, "seq": 0, "armed": False, "dialog": "dismiss", "dialog_text": ""}
+        st = {"active": 0, "seq": 0, "armed_until": 0.0,
+              "dialog": "dismiss", "dialog_text": ""}
 
         def cur():
             return tabs[st["active"]]["page"] if tabs else None
@@ -363,8 +373,9 @@ def _worker():
                     pass
 
         def nav(tab, url):
+            response = None
             try:
-                tab["page"].goto(url, wait_until="domcontentloaded", timeout=30000)
+                response = tab["page"].goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
                 pass
             tab["page"].wait_for_timeout(250)
@@ -373,6 +384,13 @@ def _worker():
                 tab["title"] = (tab["page"].title() or url)[:48]
             except Exception:
                 tab["title"] = url[:48]
+            return response
+
+        def close_record(tab):
+            try:
+                tab["page"].close()
+            except Exception:
+                pass
 
         def clamp_active():
             st["active"] = max(0, min(st["active"], len(tabs) - 1))
@@ -446,7 +464,7 @@ def _worker():
                     except Exception:
                         pass
                 continue
-            nav_in_batch = any(c in ("open", "navigate", "switch_tab", "close_tab",
+            nav_in_batch = any(c in ("fetch", "open", "navigate", "switch_tab", "close_tab",
                                      "back", "forward", "reload", "new_tab", "resize")
                                for c, _, _ in batch)   # → re-cast (resize: new frame size) the active page after
             for cmd, arg, resp in coalesce(batch):
@@ -455,16 +473,35 @@ def _worker():
                     if cmd == "__quit__":              # clean shutdown — close Chrome, then exit
                         closing = True
                     elif cmd == "research_arm":         # a web_search → open results as tabs from here on
-                        st["armed"] = True             # tabs PERSIST across searches (MAX_TABS evicts the oldest)
+                        st["armed_until"] = time.monotonic() + RESEARCH_TTL
+                    elif cmd == "fetch":               # full-fidelity visible page for fetch_url
+                        if len(tabs) >= MAX_TABS:
+                            close_record(tabs.pop(0))
+                            clamp_active()
+                        t = make_tab(); tabs.append(t); st["active"] = len(tabs) - 1
+                        pg = t["page"]
+                        response = nav(t, arg)
+                        status = response.status if response is not None else 0
+                        headers = response.headers if response is not None else {}
+                        try:
+                            pg.wait_for_load_state("load", timeout=RENDER_WAIT)
+                        except Exception:
+                            pass
+                        try:
+                            text = pg.evaluate(_READ_MD_JS) or ""
+                        except Exception:
+                            text = ""
+                        out = {"ok": bool(text), "text": text[:8000], "status": status,
+                               "headers": {"Retry-After": headers.get("retry-after", "")},
+                               "error": "" if text else "page had no readable text"}
                     elif cmd == "open":                # agent fetch/open a source
-                        if st["armed"]:
+                        if RESEARCH_TTL and time.monotonic() < st["armed_until"]:
                             c = tabs[st["active"]]
                             if c.get("fresh"):
                                 nav(c, arg)            # fill the blank tab first
                             else:
                                 if len(tabs) >= MAX_TABS:
-                                    try: tabs.pop(0)["page"].close()
-                                    except Exception: pass
+                                    close_record(tabs.pop(0))
                                     clamp_active()
                                 t = make_tab(); tabs.append(t); st["active"] = len(tabs) - 1; nav(t, arg)
                         else:
@@ -479,13 +516,11 @@ def _worker():
                         if len(tabs) > 1:
                             for idx, t in enumerate(tabs):
                                 if t["id"] == arg:
-                                    try: t["page"].close()
-                                    except Exception: pass
+                                    close_record(t)
                                     tabs.pop(idx); clamp_active(); break
                     elif cmd == "new_tab":                 # open a fresh blank tab and focus it
                         if len(tabs) >= MAX_TABS:
-                            try: tabs.pop(0)["page"].close()
-                            except Exception: pass
+                            close_record(tabs.pop(0))
                             clamp_active()
                         t = make_tab(); tabs.append(t); st["active"] = len(tabs) - 1
                     elif cmd in ("back", "forward", "reload"):   # history navigation of the active tab
@@ -655,8 +690,7 @@ def _worker():
 
         _stop_screencast(cast)
         for t in tabs:                             # tear Chrome down ON this thread (it's
-            try: t["page"].close()                 # thread-bound) so the subprocess exits
-            except Exception: pass                 # cleanly instead of segfaulting at exit
+            close_record(t)                        # thread-bound) so the subprocess exits cleanly
         try: ctx.close()
         except Exception: pass
         if br is not None:                         # persistent context has no separate browser handle
@@ -720,9 +754,13 @@ def capture(url, path, full_page=True, timeout=30000):
 
 # --- convenience wrappers ---
 def start_research():
-    """A web_search arms research mode so results open as tabs. Tabs persist across searches
-    (capped at MAX_TABS — the oldest is evicted); they are NOT wiped on each search."""
+    """A web_search arms research mode so explicit browser_open calls open persistent tabs."""
     submit("research_arm")
+
+
+def fetch(url):
+    """Open a full-fidelity rendered tab and return text/status metadata."""
+    return submit("fetch", url, wait=True)
 
 
 def open(url, read=False):
