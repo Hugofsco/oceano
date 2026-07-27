@@ -65,6 +65,19 @@ def _notify_seed():
             "telegram": True}
 
 
+def _prefs_seed():
+    return {"agent_mode": False, "chat_agent_access": "read"}
+
+
+def _normalize_prefs(value):
+    """Fill preference defaults and keep permission-like values on known-safe tiers."""
+    prefs = dict(value) if isinstance(value, dict) else {}
+    prefs.setdefault("agent_mode", False)
+    if prefs.get("chat_agent_access") not in ("read", "write", "shell"):
+        prefs["chat_agent_access"] = "read"
+    return prefs
+
+
 def _hash_pw(password, salt):
     """PBKDF2-SHA256 — stdlib only, no bcrypt/passlib dependency."""
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
@@ -139,12 +152,15 @@ def load():
             data["auth"] = _auth_seed(); changed = True
         if "notify" not in data:
             data["notify"] = _notify_seed(); changed = True
+        prefs = _normalize_prefs(data.get("prefs"))
+        if prefs != data.get("prefs"):
+            data["prefs"] = prefs; changed = True
         if changed:
             save(data)
         return data
     seed = {"endpoints": [{"name": "Local (llama.cpp)",
                            "base_url": "http://127.0.0.1:8081/v1", "api_key": ""}],
-            "prefs": {"agent_mode": False},
+            "prefs": _prefs_seed(),
             "telegram": _telegram_seed(),
             "notify": _notify_seed(),
             "auth": _auth_seed()}
@@ -153,6 +169,7 @@ def load():
 
 
 def save(data):
+    data["prefs"] = _normalize_prefs(data.get("prefs"))
     STORE.parent.mkdir(parents=True, exist_ok=True)
     # Atomic write: this file holds the password hash+salt, the cookie-signing secret, and
     # every endpoint API key — a crash / full disk mid-write must never leave it half-written.
@@ -363,6 +380,10 @@ _TOOL_CATEGORY = {
     "mail_move": "mail", "mail_delete": "mail", "mail_flag": "mail", "mail_send": "mail",
     "mail_reply": "mail", "mail_folder": "mail", "mail_save_attachment": "mail",
     "list_hosts": "servers", "ssh_run": "servers", "sftp": "servers",
+    "kanban_board": "kanban", "add_kanban_card": "kanban",
+    "update_kanban_card": "kanban", "delete_kanban_card": "kanban",
+    "search_notebook": "notebook", "get_note": "notebook",
+    "add_note": "notebook", "update_note": "notebook", "delete_note": "notebook",
 }
 
 

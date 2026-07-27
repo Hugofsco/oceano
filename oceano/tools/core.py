@@ -2,6 +2,7 @@
 registry, per-tool enable/disable state, and dispatch. The tools themselves live in
 the sibling domain modules; the package __init__ re-exports everything."""
 import contextlib
+import contextvars
 import json
 import threading
 from pathlib import Path
@@ -108,6 +109,22 @@ def background_workspace(path):
 # --- registry --------------------------------------------------------------
 _TOOLS = {}        # name -> python function
 _SCHEMAS = []      # list of OpenAI tool schemas
+_TOOL_OVERRIDES = contextvars.ContextVar("oceano_tool_overrides", default=None)
+
+
+@contextlib.contextmanager
+def tool_overrides(mapping):
+    """Temporarily replace selected tool implementations for this execution context.
+
+    The eval harness uses this to give models deterministic fixtures for personal or
+    external services (calendar, mail, web) without touching the user's real state.
+    Values may be callables accepting the decoded arguments, or fixed result strings.
+    """
+    token = _TOOL_OVERRIDES.set(dict(mapping or {}))
+    try:
+        yield
+    finally:
+        _TOOL_OVERRIDES.reset(token)
 
 
 def tool(schema):
@@ -278,6 +295,16 @@ def run(name, arguments_json):
         args = json.loads(arguments_json or "{}")
     except json.JSONDecodeError as e:
         return f"ERROR: bad arguments JSON: {e}"
+    override = (_TOOL_OVERRIDES.get() or {}).get(name)
+    if override is not None:
+        traces.record("tool_call", tool=name, capability="eval-fixture", args=args)
+        try:
+            out = str(override(**args) if callable(override) else override)
+            traces.record("tool_result", tool=name, capability="eval-fixture", ok=True, result=out[:500])
+            return out
+        except Exception as e:
+            traces.record("tool_result", tool=name, capability="eval-fixture", ok=False, error=str(e))
+            return f"ERROR running eval fixture {name}: {e}"
     cap = policies.capability_for_tool(name)
     mode = policies.get().get(cap, "allow") if cap else "allow"
     if mode == "block":

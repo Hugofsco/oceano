@@ -200,19 +200,29 @@ def test_resolve_primary_routes_to_the_eval_winner_when_enabled(monkeypatch, tmp
     assert delegate.resolve_primary()["source"] == "primary"
 
 
-def test_api_tool_map_grants_code_search_and_run_tests_git():
+def test_api_tool_map_grants_code_search_but_keeps_run_tests_git_behind_bash():
     """The api/local providers had no path to code_search/run_tests/git at all — folding them
-    into the existing Read/Grep/Write CLI-style buckets closes that gap without adding a new
-    tier (native Bash already covers this for the claude/codex CLI providers)."""
+    into the existing Read/Grep/Bash CLI-style buckets closes that gap without adding a new
+    tier. run_tests/git ride on Bash, not Write: the CLI providers (claude/codex) never grant
+    execution at the plain "write" tier either (no Bash in that spec), so Write staying
+    file-edit-only keeps every provider's "write" tier meaning the same thing."""
     assert "code_search" in delegate._API_TOOL_MAP["Read"]
     assert "code_search" in delegate._API_TOOL_MAP["Grep"]
-    assert "run_tests" in delegate._API_TOOL_MAP["Write"]
-    assert "git" in delegate._API_TOOL_MAP["Write"]
+    assert "run_tests" not in delegate._API_TOOL_MAP["Write"]
+    assert "git" not in delegate._API_TOOL_MAP["Write"]
+    assert "run_tests" in delegate._API_TOOL_MAP["Bash"]
+    assert "git" in delegate._API_TOOL_MAP["Bash"]
 
 
-def test_api_only_tools_translates_write_to_the_new_tool_names():
+def test_api_only_tools_translates_write_to_file_edit_only():
     names = delegate._api_only_tools("Write")
-    assert names == {"write_file", "make_folder", "run_tests", "git"}
+    assert names == {"write_file", "make_folder"}
+    assert "run_tests" not in names and "git" not in names
+
+
+def test_api_only_tools_translates_bash_to_execution_including_tests_and_git():
+    names = delegate._api_only_tools("Bash")
+    assert names == {"run_shell", "python_exec", "run_tests", "git"}
 
 
 def test_api_only_tools_skills_true_grants_list_and_load_skill_at_any_tier():
@@ -252,10 +262,12 @@ def test_to_claude_stream_skills_true_wires_the_scoped_bridge_not_memory(monkeyp
     assert "mcp__oceano__remember" not in argv and "mcp__oceano__recall" not in argv
 
 
-def test_to_codex_skills_true_uses_the_subagent_home_and_keeps_the_scoped_config(monkeypatch, tmp_path):
-    """skills=True must load a SEPARATE CODEX_HOME (codex_mind.SUBAGENT_HOME) with the scoped
-    bridge's own config.toml — and must NOT pass --ignore-user-config (which would block loading
-    it), unlike the plain contained delegate path."""
+def test_to_codex_skills_true_uses_a_private_subagent_home_and_keeps_the_scoped_config(monkeypatch, tmp_path):
+    """skills=True must load a PRIVATE, one-off CODEX_HOME (never the old single shared one — two
+    concurrent codex processes sharing a home corrupt each other's session state, which is what
+    made parallel orchestrate-node agent spawns fail) with the scoped bridge's own config.toml —
+    and must NOT pass --ignore-user-config (which would block loading it), unlike the plain
+    contained delegate path. The private home must be discarded once codex exits."""
     from oceano import codex_mind
     argv_file = tmp_path / "argv.txt"
     script = tmp_path / "fake_codex.py"
@@ -269,15 +281,31 @@ def test_to_codex_skills_true_uses_the_subagent_home_and_keeps_the_scoped_config
     shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
     shim.chmod(0o755)
     monkeypatch.setattr("oceano.delegate.find_codex", lambda: str(shim))
-    subhome = tmp_path / "subagent-home"
-    monkeypatch.setattr(codex_mind, "SUBAGENT_HOME", subhome)
-    monkeypatch.setattr(codex_mind, "ensure_subagent_home", lambda: {"ok": True, "home": str(subhome)})
+    onehome = tmp_path / "codex-home-subagent-deadbeef"
+    monkeypatch.setattr(codex_mind, "new_subagent_home", lambda: onehome)
+    monkeypatch.setattr(codex_mind, "ensure_subagent_home", lambda home: {"ok": True, "home": str(home)})
+    discarded = []
+    monkeypatch.setattr(codex_mind, "discard_subagent_home", lambda home: discarded.append(home))
     r = delegate.to_codex("do it", cwd=str(tmp_path), skills=True)
     assert r["ok"] is True
     out = argv_file.read_text()
     argv_line, env_home = out.split("\n", 1)
     assert "--ignore-user-config" not in argv_line
-    assert env_home == str(subhome)
+    assert env_home == str(onehome)
+    assert discarded == [onehome]              # cleaned up after the process exited
+
+
+def test_to_codex_skills_true_discards_the_private_home_even_on_failure(monkeypatch, tmp_path):
+    from oceano import codex_mind
+    monkeypatch.setattr("oceano.delegate.find_codex", lambda: str(tmp_path / "nonexistent-codex"))
+    onehome = tmp_path / "codex-home-subagent-cafef00d"
+    monkeypatch.setattr(codex_mind, "new_subagent_home", lambda: onehome)
+    monkeypatch.setattr(codex_mind, "ensure_subagent_home", lambda home: {"ok": False, "error": "no auth"})
+    discarded = []
+    monkeypatch.setattr(codex_mind, "discard_subagent_home", lambda home: discarded.append(home))
+    r = delegate.to_codex("do it", cwd=str(tmp_path), skills=True)
+    assert r["ok"] is False and "no auth" in r["error"]
+    assert discarded == [onehome]
 
 
 def test_to_codex_error_surfaces_the_error_line_not_the_echoed_prompt(monkeypatch, tmp_path):

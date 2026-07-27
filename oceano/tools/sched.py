@@ -37,6 +37,18 @@ def list_tasks():
     return scheduler.list_tasks()
 
 
+def _managed_guard(tid):
+    """The task's record if it is MANAGED (a `source`-tagged entry: the self-maintenance
+    built-ins — reflection, skills review/distill, evals, memory hygiene, reindex — plus
+    researcher- and workflow-owned schedules), else None. The agent's tools refuse to touch
+    those: pausing the nightly reflection persists across restarts (the bootstrap only
+    recreates MISSING tasks), so a single bad turn — or text injected into something the
+    agent read — could silently switch off the whole self-improvement loop. The user manages
+    them in the Scheduler window; these tools only manage plain agent tasks."""
+    t = next((t for t in scheduler.all_tasks() if t["id"] == tid), None)
+    return t if (t and t.get("managed")) else None
+
+
 @tool({
     "type": "function",
     "function": {
@@ -52,18 +64,6 @@ def list_tasks():
         }, "required": ["id"]},
     },
 })
-def _managed_guard(tid):
-    """The task's record if it is MANAGED (a `source`-tagged entry: the self-maintenance
-    built-ins — reflection, skills review/distill, evals, memory hygiene, reindex — plus
-    researcher- and workflow-owned schedules), else None. The agent's tools refuse to touch
-    those: pausing the nightly reflection persists across restarts (the bootstrap only
-    recreates MISSING tasks), so a single bad turn — or text injected into something the
-    agent read — could silently switch off the whole self-improvement loop. The user manages
-    them in the Scheduler window; these tools only manage plain agent tasks."""
-    t = next((t for t in scheduler.all_tasks() if t["id"] == tid), None)
-    return t if (t and t.get("managed")) else None
-
-
 def update_task(id, cron=None, instruction=None, enabled=None):
     tid = int(id)
     m = _managed_guard(tid)

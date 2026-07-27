@@ -48,6 +48,32 @@ def _kw_embed(text, kind="document"):
     return [1.0 if "apple" in t else 0.0, 1.0 if "ocean" in t else 0.0, 0.1]
 
 
+def test_recall_and_search_embed_queries_with_the_query_prefix(tmp_path, monkeypatch):
+    """nomic-embed is asymmetric: stored text is embedded as a 'document', queries as a 'query'.
+    recall()/search() must pass kind='query' — embedding the query as a document (the _embed
+    default) silently degrades ranking. Regression guard for that prefix bug."""
+    monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
+    seen = []
+
+    def spy_embed(text, kind="document"):
+        seen.append(kind)
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(embeddings, "embed", spy_embed)      # _embed() delegates to embeddings.embed(text, kind)
+    monkeypatch.setattr(embeddings, "loads_vec", lambda s: [1.0, 0.0])
+
+    memory.remember("the ocean is deep")                     # stored → 'document'
+    assert seen and seen[-1] == "document"
+
+    seen.clear()
+    memory.recall("how deep is the sea")
+    assert seen == ["query"], "recall() must embed the query with the 'query' prefix"
+
+    seen.clear()
+    memory.search("how deep is the sea")
+    assert seen == ["query"], "search() must embed the query with the 'query' prefix"
+
+
 def test_vector_cache_results_and_invalidation(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
     monkeypatch.setattr(memory, "_embed", _kw_embed)         # real loads_vec/cosine; only the embed is faked
@@ -135,3 +161,21 @@ def test_maintain_skips_cleanly_when_the_delegate_is_down(monkeypatch, tmp_path)
     assert memory.count() == 3
     _plan(monkeypatch, "I think these all look fine!")          # no parsable JSON plan
     assert "no parsable plan" in memory._maintain()
+
+
+def test_memory_candidate_review_lifecycle(monkeypatch, tmp_path):
+    monkeypatch.setattr(memory, "DB_PATH", tmp_path / "mem.db")
+    monkeypatch.setattr(memory, "_embed", lambda *a, **k: None)
+    cid = memory.queue_candidate("My user prefers tea", "preference", "I prefer tea", 0.7,
+                                 "auto:user:abc")
+    assert cid
+    assert memory.queue_candidate("My user prefers tea", "preference", "I prefer tea", 0.7) == cid
+    assert memory.pending_count() == 1
+    assert memory.pending_candidates()[0]["evidence"] == "I prefer tea"
+    assert memory.approve_candidate(cid) is True
+    assert memory.pending_count() == 0
+    assert memory.count() == 1
+
+    cid2 = memory.queue_candidate("My user likes coffee", "preference", "I like coffee", 0.6)
+    assert memory.dismiss_candidate(cid2) is True
+    assert memory.pending_count() == 0

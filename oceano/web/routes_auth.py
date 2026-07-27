@@ -85,6 +85,13 @@ async def login(request: Request, response: Response):
 
 @router.post("/api/logout")
 def logout(response: Response):
+    # Rotate the cookie-signing secret so logging out actually REVOKES the session server-side,
+    # not just on this browser — a cookie copied off the wire/disk dies here too. Single-user, so
+    # this is "log out everywhere": any other open tab/device is signed out on its next request.
+    data = load()
+    if data.get("auth", {}).get("secret"):
+        data["auth"]["secret"] = secrets.token_hex(32)
+        save(data)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"ok": True}
 
@@ -105,10 +112,14 @@ async def change_account(request: Request, response: Response):
     if new_pw:
         auth["salt"] = secrets.token_hex(16)
         auth["pwhash"] = _hash_pw(new_pw, auth["salt"])
+        # Rotate the cookie-signing secret on a password change so EVERY other outstanding session
+        # cookie is invalidated — the instinctive "I've been compromised, change my password" must
+        # actually evict a thief's stolen cookie, which HMAC'ing with the old secret no longer will.
+        auth["secret"] = secrets.token_hex(32)
     auth["user"] = new_user
     data["auth"] = auth
     save(data)
-    _set_session_cookie(response, new_user, auth["secret"])   # re-issue (username may have changed)
+    _set_session_cookie(response, new_user, auth["secret"])   # re-issue with the (possibly new) secret
     return {"ok": True, "user": new_user}
 
 

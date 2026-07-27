@@ -25,11 +25,12 @@ from a web UI or Telegram.
   (OpenAI/OpenRouter/Groq/…) too — keys stay on the box.
 - **GPU-aware install.** `scripts/install.sh` detects your GPU/driver and builds
   `llama.cpp` with the matching backend (Vulkan / CUDA / ROCm / CPU).
-- **93 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
+- **102 built-in tools** + **MCP** — filesystem, shell, Python, dev (git · ripgrep · run
   tests), media (transcribe · speak · fetch · convert), web search, a real headless browser the
   agent operates (snapshot the page · fill forms · click · extract), HTTP/REST + RSS, local data analysis (DuckDB), long-term memory, document RAG, skills,
   scheduling, workflows, an agent-managed calendar (schedule a whole conflict-aware plan in
-  one shot), **a gated SSH keychain** (run command batches on registered servers),
+  one shot), a Kanban board and Notebook (add/search/pin cards and notes),
+  **a gated SSH keychain** (run command batches on registered servers),
   **multi-account email** (IMAP + SMTP — read, organize, delete spam, send & reply), agent-driven
   UI control (it opens & arranges your windows), **daemon-owned background jobs & parallel
   sub-agents** (results delivered back into the chat), **native desktop actions** (via the
@@ -147,7 +148,7 @@ from a web UI or Telegram.
 
 ---
 
-## The agent's tools (93)
+## The agent's tools (102)
 
 | Group | Tools |
 |-------|-------|
@@ -170,6 +171,8 @@ from a web UI or Telegram.
 | **Background jobs & sub-agents** | `spawn_job` (run a long command as a **daemon-owned** background job — it survives the turn, and the result is delivered back into the chat; same gates as `run_shell`), `job_status`, `spawn_agent` (fire a **parallel background sub-agent** on Claude / Codex / a cloud model / the local model), `agent_status` |
 | **Desktop** (OceanoDesktop only) | `desktop_notify` (native OS notification), `desktop_pick_file` / `desktop_save_file` (real native file dialogs), `desktop_reveal_path` / `desktop_open_path`, `desktop_clipboard_read` / `desktop_clipboard_write`, `desktop_screenshot` (capture the screen) — only when you're connected through the OceanoDesktop app, never a browser tab; actions are injection-gated like SSH/mail |
 | **Calendar** | `calendar_events` (read schedule), `find_free_slots` (open slots), `add_calendar_event`, `add_calendar_events` (a whole plan in one call — exact or auto-placed), `manage_calendar` (create · move · delete in one atomic, conflict-aware call), `update_calendar_event`, `delete_calendar_event` (synced feeds stay read-only) |
+| **Kanban board** | `kanban_board` (read columns + cards), `add_kanban_card`, `update_kanban_card` (edit/move), `delete_kanban_card` — columns are user-defined, resolved by name |
+| **Notebook** | `search_notebook` (free-text + tag), `get_note`, `add_note`, `update_note` (incl. pin/unpin), `delete_note` |
 | **MCP** | any tools exposed by connected MCP servers (`mcp__<server>__<tool>`) |
 
 File/shell operations are fenced to `workspace/` by default (`OCEANO_CONFINE=1`).
@@ -847,8 +850,9 @@ oceano/
   engine.py          the single daemon (web + telegram + scheduler + embed supervisor)
   agent.py           the agent loop, context building, self-learning
   llm.py             OpenAI-compatible client (streaming, tools)
-  tools/             the tool registry (core.py) + 15 domain modules (files, shell, web, mail_tools,
-                     browsing, desktop, calendar_tools, …) behind a full compatibility facade
+  tools/             the tool registry (core.py) + 16 domain modules (files, shell, web, mail_tools,
+                     browsing, desktop, calendar_tools, notes_tools, notebook_tools, …) behind a
+                     full compatibility facade
   turnctx.py         the one per-turn context (channel · client · taint · session) every entry point shares
   safety.py          shell/SSRF guards + untrusted-content fencing
   memory.py          long-term memory (SQLite + embeddings, policy, pinning, graph, maintenance)
@@ -866,7 +870,8 @@ oceano/
   mindbridge.py      Claude-as-mind: Oceano's tools exposed to the mind, executed in the daemon
   mcp_bridge_server.py  stdio MCP proxy Claude Code launches to reach those tools (token-gated)
   desktopbridge.py   request/response RPC to the OceanoDesktop app (native file dialogs, clipboard, …)
-  notes.py           Kanban scratchpad (JSON-persisted)
+  notes.py           Kanban board (JSON-persisted)
+  notebook.py        longer-form Markdown notes (JSON-persisted)
   evals.py           model eval suite (cases, leaderboard, scheduled runs)
   researcher.py      scheduled deep-dives → living docs → RAG
   calsync.py         calendar — agent-managed local events + read-only ICS feed sync

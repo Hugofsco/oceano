@@ -125,15 +125,19 @@ def update_topic(rid, topic=None, focus=None, cron=None, enabled=None, model=Non
     return True
 
 
-def note_schedule(rid, cron=None, enabled=None):
-    """Mirror a schedule/on-off change the user made from the Scheduler back into the
-    topic record, so the Researcher view stays in sync. Does NOT touch the scheduler
-    (the change originated there) — avoids a sync loop."""
+def note_schedule(rid, cron=None, enabled=None, model=None, base_url=None):
+    """Mirror a schedule/on-off/model change the user made from the Scheduler back into the
+    topic record, so the Researcher view stays in sync — and so the pinned model actually
+    takes effect (research runs read the TOPIC's model, not the task row's). Does NOT touch
+    the scheduler (the change originated there) — avoids a sync loop."""
     sets, vals = [], []
     if cron is not None:
         sets.append("cron=?"); vals.append(cron)
     if enabled is not None:
         sets.append("enabled=?"); vals.append(1 if enabled else 0)
+    if model is not None:                 # "" clears the override → back to the system default
+        sets.append("model=?"); vals.append((model or "").strip() or None)
+        sets.append("base_url=?"); vals.append((base_url or "").strip() or None)
     if not sets:
         return
     vals.append(rid)
@@ -228,6 +232,14 @@ def _run_with_model(prompt, model, base_url, cancel=None):
     threading.Event) is passed straight through to whichever Agent entry point runs."""
     from oceano.agent import Agent
     model = (model or "").strip()
+    if not model:                          # no per-topic override → follow the PRIMARY INTELLIGENCE,
+        from oceano import delegate        # same as an un-pinned scheduled task: mind → CLI, else local
+        mind = delegate.get_mind()
+        if mind == "claude" and delegate.available():
+            return Agent().run_claude(prompt, cancel=cancel)
+        if mind == "codex" and delegate.codex_available():
+            return Agent().run_codex(prompt, cancel=cancel)
+        return Agent().run(prompt, cancel=cancel)
     if model == "claude":
         from oceano import delegate
         if not delegate.available():
@@ -239,15 +251,14 @@ def _run_with_model(prompt, model, base_url, cancel=None):
             return "⚠️ This topic is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
         return Agent().run_codex(prompt, cancel=cancel)
     ag = Agent()
-    if model:                              # an endpoint model id (else Agent's configured default)
-        ag.model = model
-        if base_url:
-            ag.base_url = base_url
-            try:
-                from oceano.web import server
-                ag.api_key = server.endpoint_key(base_url)
-            except Exception:
-                pass
+    ag.model = model                       # an endpoint model id
+    if base_url:
+        ag.base_url = base_url
+        try:
+            from oceano.web import server
+            ag.api_key = server.endpoint_key(base_url)
+        except Exception:
+            pass
     return ag.run(prompt, cancel=cancel)
 
 

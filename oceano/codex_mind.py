@@ -11,6 +11,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import config
@@ -23,6 +24,11 @@ _CONFIG = _HOME / "config.toml"
 # config.toml (written by ensure_home) can never end up loaded for a contained sub-agent.
 _SUBAGENT_HOME = config.WORKSPACE.parent / "data" / "codex-home-subagent"
 _SUBAGENT_CONFIG = _SUBAGENT_HOME / "config.toml"
+# One-off homes for CONCURRENT skill-enabled runs (see new_subagent_home) live beside it, e.g.
+# data/codex-home-subagent-<uuid>. Swept for staleness on every new_subagent_home() call so a
+# crash mid-run (the only way discard_subagent_home's cleanup gets skipped) doesn't leak forever.
+_SUBAGENT_HOME_GLOB = "codex-home-subagent-*"
+_SUBAGENT_HOME_STALE_S = 3600
 
 
 def _j(s):
@@ -108,10 +114,10 @@ def ensure_auth():
     return ok, err
 
 
-def _write_subagent_config():
+def _write_subagent_config(dst):
     """Like _write_config, but the bridge is scoped to "skills" (list_skills/load_skill only —
     see mindbridge._SCOPES) and the turn is always marked background (a contained sub-agent is
-    never attended). Written to _SUBAGENT_CONFIG, never _CONFIG."""
+    never attended). Written to `dst` (never _CONFIG, the resident mind's)."""
     import sys
     lines = [
         'approval_policy = "never"',
@@ -135,24 +141,61 @@ def _write_subagent_config():
         'OCEANO_MCP_BACKGROUND = "1"',
         '',
     ]
-    atomicio.write_text(_SUBAGENT_CONFIG, "\n".join(lines))
+    atomicio.write_text(dst, "\n".join(lines))
 
 
-def ensure_subagent_home():
+def ensure_subagent_home(home=None):
     """Auth + a "skills"-scoped MCP bridge config for a CONTAINED delegate/agent-node Codex run
     that opts into skill-reuse (list_skills/load_skill only — never memory/mail/ssh/the rest of
-    the body). Kept in its own CODEX_HOME (_SUBAGENT_HOME), separate from both the resident
-    mind's (ensure_home) and the plain contained delegate's (ensure_auth), so this scoped bridge
-    can never be confused with either."""
-    ok, err = _sync_auth(_SUBAGENT_HOME)
+    the body). `home` defaults to the shared _SUBAGENT_HOME; pass a private path from
+    new_subagent_home() to isolate ONE concurrent run instead (see there for why that matters).
+    Kept separate from both the resident mind's (ensure_home) and the plain contained delegate's
+    (ensure_auth), so this scoped bridge can never be confused with either."""
+    home = Path(home) if home else _SUBAGENT_HOME
+    ok, err = _sync_auth(home)
     if not ok:
         return {"ok": False, "error": err}
     try:
-        _SUBAGENT_HOME.mkdir(parents=True, exist_ok=True)
-        _write_subagent_config()
+        home.mkdir(parents=True, exist_ok=True)
+        _write_subagent_config(home / "config.toml")
     except OSError as e:
         return {"ok": False, "error": f"could not prepare Codex home: {e}"}
-    return {"ok": True, "home": str(_SUBAGENT_HOME)}
+    return {"ok": True, "home": str(home)}
+
+
+def _sweep_stale_subagent_homes():
+    """Best-effort cleanup of one-off homes a crashed process never got to discard_subagent_home()
+    — cheap (a glob + mtime check), bounded (there are never many at once: MAX_AGENTS caps live
+    concurrency), and safe to skip on any error since it's purely disk hygiene."""
+    try:
+        cutoff = time.time() - _SUBAGENT_HOME_STALE_S
+        for p in _SUBAGENT_HOME.parent.glob(_SUBAGENT_HOME_GLOB):
+            try:
+                if p.is_dir() and p.stat().st_mtime < cutoff:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def new_subagent_home():
+    """A fresh, private CODEX_HOME for ONE skill-enabled contained Codex run — never shared with
+    a concurrently-running one. `codex exec` writes session/rollout state under CODEX_HOME, and
+    two processes pointed at the same directory at the same time corrupt each other's state (this
+    is why parallel orchestrate-node agent spawns used to fail almost immediately, right after
+    printing their startup banner, with no usable error). Caller must discard_subagent_home() it
+    once that process has exited, success or not."""
+    _sweep_stale_subagent_homes()
+    return _SUBAGENT_HOME.parent / f"codex-home-subagent-{uuid.uuid4().hex[:12]}"
+
+
+def discard_subagent_home(home):
+    """Remove a one-off home from new_subagent_home() now that its codex process has exited."""
+    try:
+        shutil.rmtree(home, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def _agent_text(item):
@@ -203,6 +246,15 @@ def _tool_result(item):
             return msg.strip()[:2000]
     if isinstance(err, str) and err.strip():
         return err.strip()[:2000]
+    # Shell command (item.type == "command_execution"): codex puts the combined stdout/stderr in
+    # `aggregated_output` and the status in `exit_code` — NOT in output/text/result — so the old
+    # lookups below missed it entirely and shell chips showed a BLANK result. Keep the tail (a
+    # command's errors/results print last), and prefix a non-zero exit so failures read clearly.
+    agg = item.get("aggregated_output")
+    if isinstance(agg, str) and agg.strip():
+        code = item.get("exit_code")
+        body = agg.strip()[-2000:]
+        return f"(exit {code})\n{body}" if code not in (None, 0) else body
     nested = item.get("result")
     if isinstance(nested, dict):
         content = nested.get("content")
@@ -222,6 +274,10 @@ def _tool_result(item):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()[:2000]
+    # A command that ran but printed nothing: surface its exit status instead of a blank chip.
+    if "exit_code" in item:
+        code = item.get("exit_code")
+        return "(no output)" if code in (None, 0) else f"(exit {code}, no output)"
     return ""
 
 

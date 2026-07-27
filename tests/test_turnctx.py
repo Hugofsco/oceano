@@ -109,6 +109,47 @@ def test_client_field_defaults_and_carries():
     assert turnctx.get().client == "web"                   # restored outside the push
 
 
+def test_run_confines_taint_to_the_turn(monkeypatch):
+    """Agent.run must not leave the caller's TurnContext tainted: a turn that read untrusted
+    content (web/email/doc) sets taint, but it has to be cleared on the way out so it can't leak
+    into whatever runs next in the same context (the bug that made a full-suite run order-dependent)."""
+    from oceano.agent import Agent
+    ag = Agent(model="m", learn=False, inject_context=False)
+
+    def fake_run(*a, **k):
+        safety.wrap_untrusted("web", "injected page text")   # a tool ingested untrusted content mid-turn
+        assert turnctx.get().tainted
+        return "ok"
+
+    monkeypatch.setattr(ag, "_run", fake_run)
+    assert not turnctx.get().tainted
+    assert ag.run("hi") == "ok"
+    assert not turnctx.get().tainted                         # taint did NOT survive the turn
+
+
+def test_run_stream_confines_taint_even_on_early_close(monkeypatch):
+    """The streaming wrapper's finally clears taint on normal completion AND on GeneratorExit
+    (Stop button / client disconnect mid-stream)."""
+    from oceano.agent import Agent
+    ag = Agent(model="m", learn=False, inject_context=False)
+
+    def fake_stream(*a, **k):
+        safety.wrap_untrusted("mail", "injected message body")
+        yield {"type": "token", "text": "hi"}
+        yield {"type": "token", "text": " there"}
+
+    monkeypatch.setattr(ag, "_run_stream", fake_stream)
+
+    assert list(ag.run_stream("x"))                          # fully consumed
+    assert not turnctx.get().tainted
+
+    gen = ag.run_stream("x")
+    next(gen)                                                # enter — taint now set
+    assert turnctx.get().tainted
+    gen.close()                                              # GeneratorExit → wrapper's finally runs
+    assert not turnctx.get().tainted
+
+
 def test_concurrent_turns_stay_isolated():
     """Two overlapping turns on different threads each keep their own full context."""
     seen, barrier = {}, threading.Barrier(2)

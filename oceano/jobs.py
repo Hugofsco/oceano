@@ -156,3 +156,12 @@ def cancel(jid):
         return False
     ev.set()
     return True
+
+
+def cancel_by_ref(ref):
+    """Same as cancel(), but looked up by `ref` (e.g. "workflow:5") instead of a numeric job id —
+    for callers that know WHAT they want to stop but not which job slot it landed in. Returns
+    False if nothing live currently carries that ref."""
+    with _mx:
+        jid = next((j["id"] for j in _jobs.values() if j["ref"] == ref), None)
+    return cancel(jid) if jid is not None else False

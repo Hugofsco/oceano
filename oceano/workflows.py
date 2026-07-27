@@ -166,6 +166,23 @@ def resume_state(wf_id):
     return _load_checkpoints().get(str(wf_id))
 
 
+def resumable_info():
+    """Workflow id -> {ts, status} for every saved checkpoint — one read for the whole list view,
+    instead of a /resume GET per card. `status` is the run that LEFT the checkpoint: 'cancelled'
+    (the user hit ⏸ Pause, or the jobs-popup ✕) vs 'error' (it crashed) — a checkpoint alone
+    can't tell those apart (both leave one; only ok/empty/skipped clear it), so the UI needs this
+    to show '⏸ paused' vs '⚠ failed' rather than a bare, ambiguous ▶ Resume button."""
+    out = {}
+    for k, cp in _load_checkpoints().items():
+        try:
+            wid = int(k)
+        except ValueError:
+            continue
+        rs = runs(wid, limit=1)
+        out[wid] = {"ts": cp.get("ts"), "status": (rs[0]["status"] if rs else "unknown")}
+    return out
+
+
 # ---------------- named secrets ({{secret.NAME}} — HTTP nodes only) ----------------
 # A small write-only store for API keys and tokens a flow's HTTP node needs: values are
 # encrypted at rest (secretcrypto) and NEVER surface through the API or the templating engine —
@@ -302,7 +319,7 @@ def _norm_graph(graph):
             node["role"] = n.get("role") if n.get("role") in ("default", "improve") else "default"
             # "" (default) = read-only, matching the sibling agent node below — a background/
             # unattended delegate must not be quietly MORE privileged than the rest of a flow.
-            # Explicit opt-in only: "write" (+run_tests/git) or "shell" (+arbitrary commands).
+            # Explicit opt-in only: "write" (file edit only) or "shell" (+run_tests/git/Bash).
             node["write"] = n.get("write") if n.get("write") in _WRITE_TIERS else ""
             node["persona"] = str(n.get("persona", "")).strip()[:80]   # optional persona skill name
             try:                                     # absolute cap override; 0/unset = the delegation
@@ -1060,6 +1077,16 @@ def _yesno(text):
     return head.startswith("yes") or head.startswith("true") or head.startswith("y ")
 
 
+def _run_mind(ag):
+    """The mind that UN-PINNED model work (instruction nodes, decision gates, orchestrate
+    compiles) follows for THIS run: the scheduled task's model pin when one was threaded
+    through run(default_model=...), else the global PRIMARY INTELLIGENCE. 'local' (set for
+    endpoint pins) deliberately bypasses the CLI minds so the shared agent's model loop —
+    already carrying the pinned endpoint — takes the turn."""
+    from oceano import delegate
+    return getattr(ag, "wf_mind_pin", "") or delegate.get_mind()
+
+
 def _decide(node, last_output, ag):
     """Return (branch_bool, detail_str) for a decision node."""
     mode = node.get("mode", "model")
@@ -1088,16 +1115,17 @@ def _decide(node, last_output, ag):
                          cwd=config.WORKSPACE, tools="Read", timeout=300, role=node.get("role", "default"))
         txt = (r.get("output") or "") if r.get("ok") else ""
         return _yesno(txt), f"delegate: {txt.strip()[:60] or '(no answer)'}"
-    # mode == "model" — judged by the PRIMARY INTELLIGENCE, exactly like an un-pinned
-    # instruction node: the mind (Claude/Codex CLI) when one is set and available, else the
-    # primary model at its endpoint. A bare llm.chat() would fall back to the local llama-swap
-    # defaults and boot the resident model mid-workflow — that bug shipped twice (first when
-    # the primary was a remote endpoint, then when the primary was a CLI mind).
+    # mode == "model" — judged by the run's mind (the task-level pin, else the PRIMARY
+    # INTELLIGENCE), exactly like an un-pinned instruction node: the mind (Claude/Codex CLI)
+    # when one is set and available, else the primary model at its endpoint. A bare llm.chat()
+    # would fall back to the local llama-swap defaults and boot the resident model mid-workflow
+    # — that bug shipped twice (first when the primary was a remote endpoint, then when the
+    # primary was a CLI mind).
     from oceano import delegate
     prompt = (f"You are a decision gate in a workflow.\n\n{q}\n\n"
               f"Latest step output:\n{last_output[:2000]}\n\n"
               "Answer with exactly one word: YES or NO.")
-    mind = delegate.get_mind()
+    mind = _run_mind(ag)
     if mind == "claude" and delegate.available():
         r = delegate.to_claude(prompt, cwd=config.WORKSPACE, tools="Read", timeout=180)
         txt = (r.get("output") or "") if r.get("ok") else ""
@@ -1109,6 +1137,8 @@ def _decide(node, last_output, ag):
     from oceano import llm
     from oceano.agent import _default_primary
     dm, db, dk = _default_primary()
+    if getattr(ag, "wf_endpoint_pin", False):  # task-level endpoint pin → judge on that endpoint too
+        dm, db, dk = ag.model, ag.base_url, ag.api_key
     msg = llm.chat([{"role": "system", "content": "You are a decision gate in a workflow. "
                      "Read the question and the latest output, then answer with exactly one word: YES or NO."},
                     {"role": "user", "content": f"{q}\n\nLatest step output:\n{last_output[:2000]}"}],
@@ -1299,7 +1329,7 @@ def _pinned_agent(node, ag):
             api_key = ""
     pinned = Agent(model=node["model"], base_url=base_url or None,
                    api_key=api_key or "sk-no-key-needed", learn=False,
-                   exclude_tools={"run_workflow"})
+                   exclude_tools={"run_workflow"}, inject_context=False)
     pinned.messages = ag.messages
     pinned.on_event = ag.on_event
     return pinned
@@ -1337,7 +1367,11 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
         # attached agent's OWN "write" setting (from its inspector) travels with it into the
         # orchestrator, so plugging an agent in doesn't change its privilege level either way.
         tool_scope = _tool_scope_for(a.get("write"))
-        rec = agentjobs.spawn(task, provider=a.get("provider", ""), label=a.get("label", ""),
+        # no per-node provider/model → the agent follows the run's mind (task pin, else the
+        # delegation default via spawn's own resolution); a node-level endpoint pin still wins
+        rec = agentjobs.spawn(task,
+                              provider=a.get("provider") or ("" if a.get("model") else getattr(ag, "wf_mind_pin", "")),
+                              label=a.get("label", ""),
                               model=a.get("model", ""), base_url=a.get("baseUrl", ""),
                               timeout=a.get("timeout", 600), skills=True,   # may reuse skills; never memory
                               tools=tool_scope, cwd=config.WORKSPACE)
@@ -1429,11 +1463,12 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
     if ok and node.get("mode") == "summarize" and gathered:
         brief = (node.get("text") or "").strip() \
             or "Synthesize the agents' results below into one coherent, complete answer."
-        # the compile turn follows the PRIMARY INTELLIGENCE like an un-pinned instruction node
-        # (mind → CLI; else the shared agent's model loop) — a bare ag.run() booted the local
-        # resident model mid-workflow whenever the mind was Claude/Codex
+        # the compile turn follows the run's mind (task pin, else the PRIMARY INTELLIGENCE)
+        # like an un-pinned instruction node (mind → CLI; else the shared agent's model loop)
+        # — a bare ag.run() booted the local resident model mid-workflow whenever the mind
+        # was Claude/Codex
         from oceano import delegate
-        mind = delegate.get_mind()
+        mind = _run_mind(ag)
         prompt = brief + "\n\n" + compiled
         if mind == "claude" and delegate.available():
             compiled = ag.run_claude(prompt) or compiled
@@ -1575,11 +1610,12 @@ def resume(wid, on_step=None):
     if not wf:
         return None
     return run(wf, trigger=st.get("trigger", "resume"), on_step=on_step, inp=st.get("input", ""),
-               _resume=st)
+               _resume=st, default_model=st.get("default_model", ""),
+               default_base_url=st.get("default_base_url", ""))
 
 
 def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _depth=0,
-        nested=False, _resume=None):
+        nested=False, _resume=None, default_model="", default_base_url=""):
     """Walk the workflow graph from its start node, executing nodes and branching at decision/switch
     nodes, iterating loop nodes, retrying failures and taking 'error' edges, and pausing at approval
     nodes. Shares one Agent so context accumulates. Returns the run record (incl. 'output' = last value).
@@ -1587,7 +1623,11 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     `inp` is this run's input value: nodes reference it (and any earlier node's output) via {{...}}
     templating, and it's seeded into the agent's context. Empty/None falls back to the stored default.
     `nested`/`_depth` are set when one workflow calls another via a sub-workflow node.
-    `_resume` is an internal checkpoint payload created by a prior failed/cancelled run."""
+    `_resume` is an internal checkpoint payload created by a prior failed/cancelled run.
+    `default_model` is the scheduled task's model pin ('claude'/'codex' = that mind, anything else
+    = an endpoint model id with `default_base_url`): un-pinned instruction nodes, decision gates,
+    orchestrate compiles and agent nodes follow it instead of the global mind. Per-node pins
+    still win. Sub-workflow nodes run with their own settings (the pin doesn't cascade)."""
     from oceano.agent import Agent
     wf_id = wf["id"]
     inp = "" if inp is None else str(inp)
@@ -1671,7 +1711,27 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     run_id = (restored or {}).get("run_id") or traces.new_run_id("wf")
     with traces.scope(run_id=run_id, workflow_id=wf_id, trigger=trigger, nested=nested):
         traces.record("workflow_start", workflow_id=wf_id, name=wf.get("name", ""), resumed=bool(_resume))
-        ag = Agent(learn=False, exclude_tools={"run_workflow"})
+        # inject_context=False: a workflow node is a self-contained task with its own explicit
+        # text/persona (like any other delegate call), not a live chat turn — it doesn't need the
+        # user's personal memories/research/skills catalog passively injected. Without this, EVERY
+        # node turn (even ones that end up routed to Claude/Codex as the mind) paid for a memory +
+        # research + skills relevance search over the local embedding server first, and shipped
+        # that personal content into the prompt regardless of which model actually answers.
+        ag = Agent(learn=False, exclude_tools={"run_workflow"}, inject_context=False)
+        dm = (default_model or "").strip()
+        if dm in ("claude", "codex"):
+            ag.wf_mind_pin = dm                # un-pinned nodes/gates follow the task's mind
+        elif dm:                               # an endpoint model id → the shared loop runs it
+            ag.wf_mind_pin = "local"           # keep the CLI minds out of un-pinned turns
+            ag.wf_endpoint_pin = True
+            ag.model = dm
+            if default_base_url:
+                ag.base_url = default_base_url
+                try:
+                    from oceano.web import server  # lazy: avoid an import cycle at module load
+                    ag.api_key = server.endpoint_key(default_base_url)
+                except Exception:
+                    pass
         if restored:
             ag.messages = list(restored["messages"] or ag.messages)
         elif inp:
@@ -1688,6 +1748,19 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
         visits = int((restored or {}).get("visits") or 0)
         cancelled = False
         cur = start_node if restored is None else restored.get("cur")
+
+        # mirror into the live registry so the UI can find/reconnect to this run: the
+        # "⊙ View run" badge (wfMarkLive), browser-refresh reconnect (wfReconnectRun), and the
+        # overlap guard's busy check all read this. Dropped by the resume/tracing refactor —
+        # `emit()` below only ever UPDATES an existing entry (`if st is not None`), so without
+        # this the registry stayed permanently empty and none of the above worked.
+        if not nested:
+            with _LIVE_LOCK:
+                _prune_live()
+                _LIVE[wf_id] = {"workflow_id": wf_id, "name": wf.get("name", ""), "trigger": trigger,
+                                "started": _now(), "beat": time.time(), "status": "running", "current": None,
+                                "steps": [dict(r) for r in results], "summary": "", "finished": None,
+                                "run_id": None, "awaiting": None}
 
         def checkpoint(next_id):
             _save_checkpoint(wf_id, {
@@ -1708,6 +1781,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                 "last_output": last_output,
                 "visits": visits,
                 "agent_messages": list(ag.messages),
+                "default_model": default_model,
+                "default_base_url": default_base_url,
                 "ts": _now(),
             })
 
@@ -1858,20 +1933,28 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                 text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
                                 prov = cur.get("provider") or ""
                                 from oceano import delegate
+                                mind = _run_mind(ag)   # task pin, else the global mind
+                                ag.last_mind_error = None   # only the mind streams set it; reset so a stale value can't carry over
                                 if cur.get("model"):
                                     output = _pinned_agent(cur, ag).run(text) or ""
-                                elif prov == "claude" or (not prov and delegate.get_mind() == "claude"):
+                                elif prov == "claude" or (not prov and mind == "claude"):
                                     if delegate.available():
                                         output = ag.run_claude(text) or ""
                                     else:
                                         ok, output = False, "this step is pinned to Claude, but the `claude` CLI isn't available on this host"
-                                elif prov == "codex" or (not prov and delegate.get_mind() == "codex"):
+                                elif prov == "codex" or (not prov and mind == "codex"):
                                     if delegate.codex_available():
                                         output = ag.run_codex(text) or ""
                                     else:
                                         ok, output = False, "this step is pinned to Codex, but the `codex` CLI isn't available on this host"
                                 else:
                                     output = ag.run(text) or ""
+                                # A mind turn that stalled/capped/rate-limited returned partial work — do NOT let
+                                # the flow record a truncated build as a clean step (that silent success is how a
+                                # cut-off session got logged as progress). Mark it failed so the run surfaces it.
+                                if ok and ag.last_mind_error:
+                                    ok = False
+                                    output = f"{output}\n\n[step did not complete — {ag.last_mind_error}]"
                                 ag.on_event = lambda kind, d: None
                             elif ok and t == "delegate":
                                 from oceano import delegate
@@ -1889,7 +1972,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                 tool_scope = _tool_scope_for(cur.get("write"))
                                 task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
                                 rec = agentjobs.spawn(task,
-                                                      provider=cur.get("provider", ""),
+                                                      provider=cur.get("provider")
+                                                      or ("" if cur.get("model") else getattr(ag, "wf_mind_pin", "")),
                                                       model=cur.get("model", ""),
                                                       base_url=cur.get("baseUrl", ""),
                                                       label=cur.get("label", ""),
@@ -2026,8 +2110,9 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                     if st and st.get("status") == "running":
                         st.update(status="error", current=None, finished=time.time(), summary="(ended unexpectedly)")
 
-def run_by_id(wid, trigger="manual", on_step=None, inp=None):
+def run_by_id(wid, trigger="manual", on_step=None, inp=None, default_model="", default_base_url=""):
     wf = get(wid)
     if not wf:
         return {"status": "error", "summary": f"no workflow #{wid}"}
-    return run(wf, trigger=trigger, on_step=on_step, inp=inp)
+    return run(wf, trigger=trigger, on_step=on_step, inp=inp,
+               default_model=default_model, default_base_url=default_base_url)

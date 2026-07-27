@@ -69,9 +69,12 @@ CLAUDE_MODELS = (
     {"id": "fable", "label": "Fable — newest addition to the Claude family"},
 )
 CODEX_MODELS = (
-    {"id": "", "label": "Recommended default (currently GPT-5.5)"},
-    {"id": "gpt-5.5", "label": "GPT-5.5 — strongest for complex coding and research"},
-    {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini — faster and lower cost"},
+    {"id": "", "label": "Recommended default (currently GPT-5.6 Sol)"},
+    {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol — strongest for complex coding and research"},
+    {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra — everyday workhorse, GPT-5.5-level at lower cost"},
+    {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna — fastest and most affordable of the family"},
+    {"id": "gpt-5.5", "label": "GPT-5.5 — previous-generation frontier model"},
+    {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini — fast, efficient mini model"},
     {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark — near-instant coding iteration (preview)"},
 )
 # 'default' = the agent's delegate tool · 'improve' = self-improving jobs · 'vision' = image
@@ -807,10 +810,14 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     — so a delegate gets Codex's own file/shell tools (confined by the sandbox mapped from `tools`),
     never Oceano's body (memory/mail/ssh). `images` attaches files to the prompt for vision (-i).
 
-    `skills=True` swaps in a SEPARATE CODEX_HOME (codex_mind.SUBAGENT_HOME) whose config.toml wires
-    a "skills"-scoped MCP bridge (list_skills/load_skill only — see mindbridge._SCOPES) — never the
-    resident mind's full-body one, which lives in a different CODEX_HOME entirely. --ignore-user-config
-    is dropped in that case since this dedicated config IS what we want Codex to load.
+    `skills=True` runs in a PRIVATE, one-off CODEX_HOME (codex_mind.new_subagent_home()) whose
+    config.toml wires a "skills"-scoped MCP bridge (list_skills/load_skill only — see
+    mindbridge._SCOPES) — never the resident mind's full-body one, which lives in a different
+    CODEX_HOME entirely. Private (not shared across calls) because `codex exec` writes
+    session/rollout state under CODEX_HOME: two concurrent calls sharing one home corrupt each
+    other's state, which is exactly what used to make parallel orchestrate-node agent spawns fail
+    (each crashed right after its startup banner, with no usable error). --ignore-user-config is
+    dropped when skills=True since this dedicated config IS what we want Codex to load.
     Returns {ok, output, error}."""
     import tempfile
     from oceano import codex_mind
@@ -818,56 +825,60 @@ def to_codex(instructions, cwd=None, tools=DEFAULT_TOOLS, timeout=600, images=No
     if not binary:
         return {"ok": False, "output": "",
                 "error": "codex CLI not found — install Codex, or set OCEANO_CODEX_BIN"}
-    if skills:
-        prep = codex_mind.ensure_subagent_home()
-        if not prep.get("ok"):
-            return {"ok": False, "output": "", "error": prep.get("error") or "could not prepare Codex"}
-        home = codex_mind.SUBAGENT_HOME
-    else:
-        ok, err = codex_mind.ensure_auth()
-        if not ok:
-            return {"ok": False, "output": "", "error": err}
-        home = codex_mind.HOME
-    sandbox = codex_sandbox_mode(_codex_sandbox(tools))
-    fd, out_path = tempfile.mkstemp(prefix="codex-deleg-", suffix=".txt")
-    os.close(fd)
-    cmd = [binary, "exec"] + ([] if skills else ["--ignore-user-config"]) + \
-          ["--skip-git-repo-check", "--ephemeral",
-           "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{sandbox}"',
-           "-o", out_path] + _codex_model_args() + _codex_effort_args()
-    for img in (images or []):
-        cmd += ["-i", str(img)]
-    if cwd:
-        cmd += ["--cd", str(cwd)]
-    # Pass the prompt on stdin, NOT as a positional: `-i <FILE>...` is greedy and would otherwise
-    # swallow a trailing prompt argument. Codex reads instructions from stdin when none is given.
-    env = dict(os.environ)
-    env["CODEX_HOME"] = str(home)
+    home = codex_mind.new_subagent_home() if skills else None
     try:
-        r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE), env=env, input=instructions,
-                           capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        if skills:
+            prep = codex_mind.ensure_subagent_home(home)
+            if not prep.get("ok"):
+                return {"ok": False, "output": "", "error": prep.get("error") or "could not prepare Codex"}
+        else:
+            ok, err = codex_mind.ensure_auth()
+            if not ok:
+                return {"ok": False, "output": "", "error": err}
+            home = codex_mind.HOME
+        sandbox = codex_sandbox_mode(_codex_sandbox(tools))
+        fd, out_path = tempfile.mkstemp(prefix="codex-deleg-", suffix=".txt")
+        os.close(fd)
+        cmd = [binary, "exec"] + ([] if skills else ["--ignore-user-config"]) + \
+              ["--skip-git-repo-check", "--ephemeral",
+               "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{sandbox}"',
+               "-o", out_path] + _codex_model_args() + _codex_effort_args()
+        for img in (images or []):
+            cmd += ["-i", str(img)]
+        if cwd:
+            cmd += ["--cd", str(cwd)]
+        # Pass the prompt on stdin, NOT as a positional: `-i <FILE>...` is greedy and would otherwise
+        # swallow a trailing prompt argument. Codex reads instructions from stdin when none is given.
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(home)
+        try:
+            r = subprocess.run(cmd, cwd=str(cwd or config.WORKSPACE), env=env, input=instructions,
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _unlink_quiet(out_path)
+            return {"ok": False, "output": "", "error": f"codex timed out after {timeout}s"}
+        except OSError as e:
+            _unlink_quiet(out_path)
+            return {"ok": False, "output": "", "error": f"could not launch codex: {e}"}
+        try:
+            out = Path(out_path).read_text().strip()        # the agent's final message (-o)
+        except OSError:
+            out = ""
         _unlink_quiet(out_path)
-        return {"ok": False, "output": "", "error": f"codex timed out after {timeout}s"}
-    except OSError as e:
-        _unlink_quiet(out_path)
-        return {"ok": False, "output": "", "error": f"could not launch codex: {e}"}
-    try:
-        out = Path(out_path).read_text().strip()        # the agent's final message (-o)
-    except OSError:
-        out = ""
-    _unlink_quiet(out_path)
-    if not out and r.returncode != 0:
-        # On failure codex's stderr opens with its startup banner and echoes the whole prompt
-        # back before the real reason (rate limits, auth, sandbox faults, ...) — often past 400
-        # chars for any non-trivial task. Pull actual "ERROR:" lines out first; fall back to the
-        # tail (not head) of stderr, since the real message is always at the end, never the start.
-        stderr = (r.stderr or "").strip()
-        err_lines = list(dict.fromkeys(ln for ln in stderr.splitlines() if ln.startswith("ERROR:")))
-        detail = "\n".join(err_lines) if err_lines else stderr[-400:]
-        return {"ok": False, "output": "",
-                "error": (detail or f"codex exited {r.returncode}").strip()[:400]}
-    return {"ok": bool(out), "output": out, "error": "" if out else "codex returned no output"}
+        if not out and r.returncode != 0:
+            # On failure codex's stderr opens with its startup banner and echoes the whole prompt
+            # back before the real reason (rate limits, auth, sandbox faults, ...) — often past 400
+            # chars for any non-trivial task. Pull actual "ERROR:" lines out first; fall back to the
+            # tail (not head) of stderr, since the real message is always at the end, never the start.
+            stderr = (r.stderr or "").strip()
+            err_lines = list(dict.fromkeys(ln for ln in stderr.splitlines() if ln.startswith("ERROR:")))
+            detail = "\n".join(err_lines) if err_lines else stderr[-400:]
+            return {"ok": False, "output": "",
+                    "error": (detail or f"codex exited {r.returncode}").strip()[:400]}
+        return {"ok": bool(out), "output": out, "error": "" if out else "codex returned no output"}
+    finally:
+        if skills:
+            codex_mind.discard_subagent_home(home)
 
 
 def _unlink_quiet(p):
@@ -882,18 +893,20 @@ def _unlink_quiet(p):
 # honours the same containment callers ask of the CLI. Grep has no local tool —
 # read_file/list_files cover that ground. Unknown CLI names grant nothing.
 # code_search rides on Read/Grep (it's pure ripgrep, no side effects — same trust level as
-# read_file); run_tests/git ride on Write (verifying/versioning what you just wrote is the
-# point of write access, not a bigger ask than the Write/Edit it already sits alongside — git
-# itself refuses push/remote ops, see oceano/tools/dev.py). Purely additive to what the CLI
-# providers (claude/codex) already do on their own with native Bash — this dict only affects
-# the api/local providers, which otherwise had no path to these tools at all.
+# read_file). run_tests/git ride on Bash, NOT Write: for the CLI providers (claude/codex),
+# "write" (Read,Glob,Grep,Write,Edit) never includes Bash — those CLIs have no distinct
+# run_tests/git tool of their own, only native Bash, so a "write"-tier node genuinely cannot
+# execute anything there. Write used to grant run_tests/git for the api/local providers only,
+# which meant the SAME "write" tier meant "can verify/version" on one provider and "cannot" on
+# another — surprising, and a bigger ask than plain file editing. Bash is the one execution
+# tier for every provider now: a node that needs to run tests or touch git needs "shell".
 _API_TOOL_MAP = {
     "Read": ("read_file", "list_files", "code_search"),
     "Glob": ("list_files",),
     "Grep": ("read_file", "list_files", "code_search"),
-    "Write": ("write_file", "make_folder", "run_tests", "git"),
+    "Write": ("write_file", "make_folder"),
     "Edit": ("edit_file",),
-    "Bash": ("run_shell", "python_exec"),
+    "Bash": ("run_shell", "python_exec", "run_tests", "git"),
 }
 
 # Granted on top of the CLI-style map when a caller opts into skill-reuse (skills=True below) —

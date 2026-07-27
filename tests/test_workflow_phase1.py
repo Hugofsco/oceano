@@ -131,6 +131,28 @@ def test_wait_node_waits_then_continues_without_clobbering_last(monkeypatch):
 
 
 # ---------------- overlap guard ----------------
+def test_run_populates_its_own_live_registry_entry():
+    """A real (unseeded) run must register itself in _LIVE while it's in flight — this is what
+    the "⊙ View run" badge, browser-refresh reconnect, and the overlap guard's busy check all
+    read. The resume/tracing refactor moved this init inside a new `with traces.scope(...)`
+    block and dropped it outright; every other overlap test here pre-seeds _LIVE by hand via
+    _seed_running() below, so none of them would have caught a run() that never writes to it."""
+    seen = {}
+    wf = _wf([{"id": 1, "type": "start"}, {"id": 2, "type": "end"}], [{"from": 1, "to": 2}])
+
+    def on_step(ev):
+        if ev["event"] == "node_start":
+            seen["mid_run"] = dict(workflows._LIVE.get(wf["id"]) or {})
+
+    rec = workflows.run(wf, trigger="manual", on_step=on_step)
+    assert seen.get("mid_run", {}).get("status") == "running", \
+        "_LIVE had no 'running' entry for this workflow while it was executing"
+    assert rec["status"] == "ok"
+    # finished runs linger for reconnection (_LIVE_KEEP), so the entry is still there right after
+    assert workflows._LIVE[wf["id"]]["status"] == "ok"
+    assert workflows.live() and workflows.live()[0]["workflow_id"] == wf["id"]
+
+
 def _seed_running(wid):
     workflows._LIVE[wid] = {"workflow_id": wid, "name": "t", "trigger": "manual",
                             "started": workflows._now(), "beat": time.time(), "status": "running",

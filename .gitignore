@@ -105,3 +105,9 @@ skills/*/
 !skills/tech-stack-evaluator/
 !skills/verify-by-running/
 !skills/x-growth-playbook/
+
+# editor/merge backups
+*.orig
+
+# local engineering backlog (not for the repo)
+BACKLOG.md

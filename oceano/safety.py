@@ -60,6 +60,29 @@ def check_shell(command):
     return None
 
 
+def _unwrap_ip(ip):
+    """Unwrap an IPv6-embedded IPv4 (IPv4-mapped ::ffff:a.b.c.d, 6to4, Teredo) to the real IPv4 so
+    an internal target can't hide behind ::ffff:169.254.169.254 — the IPv6 wrapper's own
+    is_private/is_link_local flags are False, so classifying the wrapper directly lets it through."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped or ip.sixtofour
+        if mapped is None and ip.teredo is not None:
+            mapped = ip.teredo[0]                    # (server, client) — the client's public IPv4
+        if mapped is not None:
+            return mapped
+    return ip
+
+
+def _internal_ip(addr):
+    """Given a resolved address string, return the classified ip if it's an internal/non-routable
+    target that SSRF must block, else None. One place so check_url and _safe_ip can't drift apart."""
+    ip = _unwrap_ip(ipaddress.ip_address(addr))
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return ip
+    return None
+
+
 def check_url(url):
     """Block URLs that resolve to loopback/private/link-local/reserved addresses
     (SSRF guard). Returns a refusal string, or None if the URL is safe."""
@@ -76,9 +99,8 @@ def check_url(url):
     except socket.gaierror:
         return _refuse(f"cannot resolve host {host!r}")
     for addr in addrs:
-        ip = ipaddress.ip_address(addr)
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast):
+        ip = _internal_ip(addr)
+        if ip is not None:
             return _refuse(f"{host} -> internal address {ip} (blocked: protects "
                            f"local DBs/LLM/metadata endpoints)")
     return None
@@ -118,9 +140,8 @@ def _safe_ip(host):
         raise Blocked(_refuse(f"cannot resolve host {host!r}"))
     chosen = None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast):
+        ip = _internal_ip(info[4][0])
+        if ip is not None:
             raise Blocked(_refuse(f"{host} -> internal address {ip} (blocked: protects "
                                   f"local DBs/LLM/metadata endpoints)"))
         chosen = chosen or info[4][0]

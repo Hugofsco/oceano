@@ -2,6 +2,7 @@
 Reuses the shared embedding server (:8082) + SQLite — same machinery as memory."""
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +16,7 @@ RERANK_POOL = 10            # dense candidates handed to the cross-encoder reran
                            # a wider pool of short near-neighbours hurt). No-op if the reranker is off.
 TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".rst"}
 RESEARCH_DIR = config.WORKSPACE / "research"     # where the Researcher writes its living docs
+HYBRID_POOL = 50
 
 
 def _db():
@@ -30,6 +32,25 @@ def _db():
     # the folders that were index_docs'd, so the nightly reindex can re-walk them and pick up
     # NEW files dropped in since (not just refresh/prune the files it already knows about)
     con.execute("CREATE TABLE IF NOT EXISTS docroots (path TEXT PRIMARY KEY)")
+    try:
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING "
+                    "fts5(chunk, path UNINDEXED, content='chunks', content_rowid='id')")
+        con.execute("CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN "
+                    "INSERT INTO chunks_fts(rowid,chunk,path) VALUES (new.id,new.chunk,new.path); END")
+        con.execute("CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN "
+                    "INSERT INTO chunks_fts(chunks_fts,rowid,chunk,path) "
+                    "VALUES ('delete',old.id,old.chunk,old.path); END")
+        con.execute("CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF chunk,path ON chunks BEGIN "
+                    "INSERT INTO chunks_fts(chunks_fts,rowid,chunk,path) "
+                    "VALUES ('delete',old.id,old.chunk,old.path); "
+                    "INSERT INTO chunks_fts(rowid,chunk,path) VALUES (new.id,new.chunk,new.path); END")
+        # One-time/backward-compatible backfill for databases created before FTS existed.
+        if con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0] != \
+                con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]:
+            con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+            con.commit()
+    except sqlite3.OperationalError:
+        pass                         # SQLite without FTS5: dense retrieval remains available
     return con
 
 
@@ -158,29 +179,70 @@ def _rerank_top(query, scored, k):
     return pool[:k]
 
 
+def _fts_expression(query):
+    toks = re.findall(r"\w+", (query or "").lower())
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in toks) if toks else ""
+
+
+def _lexical_ids(con, query, limit=HYBRID_POOL):
+    """Best chunk ids by BM25, or [] when FTS5 is unavailable/no term matches."""
+    expr = _fts_expression(query)
+    if not expr:
+        return []
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
+            "ORDER BY bm25(chunks_fts) LIMIT ?", (expr, limit)).fetchall()]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _hybrid_rank(con, query, rows):
+    """Dense + BM25 reciprocal-rank fusion over id/path/chunk/embedding rows.
+
+    The original cosine is retained for UI display; ordering comes from RRF. If either
+    side is unavailable, the other remains a complete fallback.
+    """
+    qvec = embeddings.embed(query, "query")
+    dense = []
+    if qvec:
+        for cid, path, chunk, emb in rows:
+            v = embeddings.loads_vec(emb)
+            if v:
+                dense.append((embeddings.cosine(qvec, v), cid, path, chunk))
+        dense.sort(key=lambda x: x[0], reverse=True)
+    lexical = _lexical_ids(con, query)
+    if not dense and not lexical:                 # last-resort substring search without FTS/embed
+        words = set(re.findall(r"\w+", query.lower()))
+        dense = [(float(sum(w in chunk.lower() for w in words)), cid, path, chunk)
+                 for cid, path, chunk, _ in rows]
+        dense = [r for r in dense if r[0] > 0]
+        dense.sort(key=lambda x: x[0], reverse=True)
+    by_id = {cid: (path, chunk) for cid, path, chunk, _ in rows}
+    cosine = {cid: score for score, cid, _, _ in dense}
+    if dense and lexical:
+        fused = {}
+        for ranked in ([r[1] for r in dense[:HYBRID_POOL]], lexical):
+            for rank, cid in enumerate(ranked, 1):
+                fused[cid] = fused.get(cid, 0.0) + 1.0 / (60 + rank)
+        order = sorted(fused, key=fused.get, reverse=True)
+    else:
+        order = [r[1] for r in dense] if dense else lexical
+    return [(cosine.get(cid, 0.0), *by_id[cid]) for cid in order if cid in by_id]
+
+
 def search_docs(query, k=4):
     """The k most relevant document chunks for a question — dense recall, then cross-encoder rerank
     of the top pool (when the reranker is up; dense order otherwise). Returns the chunk text."""
     con = _db()
-    rows = con.execute("SELECT path, chunk, embedding FROM chunks").fetchall()
-    con.close()
+    rows = con.execute("SELECT id, path, chunk, embedding FROM chunks").fetchall()
     if not rows:
+        con.close()
         return "(no documents indexed yet — run index_docs first)"
-    qvec = embeddings.embed(query, "query")
-    if qvec:
-        scored = []
-        for path, chunk, emb in rows:
-            v = embeddings.loads_vec(emb)            # skip a corrupt/missing embedding row
-            if v:
-                scored.append((embeddings.cosine(qvec, v), path, chunk))
-    else:                                            # embed server down → keyword fallback (like memory),
-        words = set(query.lower().split())           # so docs stay searchable instead of erroring out
-        scored = [(float(sum(w in chunk.lower() for w in words)), path, chunk)
-                  for path, chunk, _ in rows]
-        scored = [s for s in scored if s[0] > 0]
-        if not scored:
-            return "(embed server down; no keyword match in the indexed docs for this query)"
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored = _hybrid_rank(con, query, rows)
+    con.close()
+    if not scored:
+        return "(no matching indexed documents for this query)"
     return "\n\n".join(f"[{Path(p).name}]\n{c}" for _, p, c in _rerank_top(query, scored, k))
 
 
@@ -234,19 +296,12 @@ def stats():
 def search(query, k=6):
     """Structured semantic search for the UI: [{name, path, chunk, score}], best first."""
     con = _db()
-    rows = con.execute("SELECT path, chunk, embedding FROM chunks").fetchall()
-    con.close()
+    rows = con.execute("SELECT id, path, chunk, embedding FROM chunks").fetchall()
     if not rows:
+        con.close()
         return []
-    qvec = embeddings.embed(query, "query")
-    if not qvec:
-        return []
-    scored = []
-    for path, chunk, emb in rows:
-        v = embeddings.loads_vec(emb)                # skip a corrupt/missing embedding row
-        if v:
-            scored.append((embeddings.cosine(qvec, v), path, chunk))
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored = _hybrid_rank(con, query, rows)
+    con.close()
     return [{"name": Path(p).name, "path": p, "chunk": c, "score": round(s, 3)}
             for s, p, c in _rerank_top(query, scored, k)]
 

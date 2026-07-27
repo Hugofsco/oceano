@@ -173,7 +173,7 @@ def evals_results(run_id: int):
     return {"results": evals.results(run_id)}
 
 
-# ---------------- notes / kanban scratchpad ----------------
+# ---------------- notes / kanban board ----------------
 @router.get("/api/notes")
 def notes_get():
     from oceano import notes
@@ -184,20 +184,92 @@ def notes_get():
 async def notes_add(req: Request):
     from oceano import notes
     b = await req.json()
-    return {"ok": True, "card": notes.add(b.get("text", ""), b.get("col", "todo"))}
+    card = notes.add(b.get("title", b.get("text", "")), b.get("body", ""), b.get("tags"), b.get("col"))
+    if not card:
+        raise HTTPException(400, "no column to add to")
+    return {"ok": True, "card": card}
+
+
+@router.post("/api/notes/columns")
+async def notes_add_column(req: Request):
+    from oceano import notes
+    b = await req.json()
+    board = notes.add_column(b.get("name", ""), b.get("after"))
+    if not board:
+        raise HTTPException(400, "blank/duplicate column name, or the board is already full")
+    return {"ok": True, **board}
+
+
+@router.patch("/api/notes/columns/{name}")
+async def notes_rename_column(name: str, req: Request):
+    from oceano import notes
+    b = await req.json()
+    if not notes.rename_column(name, b.get("name", "")):
+        raise HTTPException(400, "no such column, or the new name is blank/taken")
+    return {"ok": True, **notes.board()}
+
+
+@router.post("/api/notes/columns/{name}/move")
+async def notes_move_column(name: str, req: Request):
+    from oceano import notes
+    b = await req.json()
+    if not notes.move_column(name, int(b.get("direction", 0) or 0)):
+        raise HTTPException(400, "no such column, or already at that edge")
+    return {"ok": True, **notes.board()}
+
+
+@router.delete("/api/notes/columns/{name}")
+def notes_delete_column(name: str, move_to: str = ""):
+    from oceano import notes
+    if not notes.remove_column(name, move_to or None):
+        raise HTTPException(400, "no such column, it's the last one, or its cards need a move_to")
+    return {"ok": True, **notes.board()}
 
 
 @router.patch("/api/notes/{cid}")
 async def notes_update(cid: int, req: Request):
     from oceano import notes
     b = await req.json()
-    return {"ok": notes.update(cid, b.get("text"), b.get("col"))}
+    ok = notes.update(cid, b.get("title", b.get("text")), b.get("body"), b.get("tags"), b.get("col"))
+    if not ok:
+        raise HTTPException(404, "no such card")
+    return {"ok": True}
 
 
 @router.delete("/api/notes/{cid}")
 def notes_delete(cid: int):
     from oceano import notes
     return {"ok": notes.remove(cid)}
+
+
+# ---------------- notebook — longer-form Markdown notes ----------------
+@router.get("/api/notebook")
+def notebook_list(q: str = "", tag: str = ""):
+    from oceano import notebook
+    return {"notes": notebook.list_all(q, tag), "tags": notebook.all_tags()}
+
+
+@router.post("/api/notebook")
+async def notebook_create(req: Request):
+    from oceano import notebook
+    b = await req.json()
+    return {"ok": True, "note": notebook.create(b.get("title", ""), b.get("body", ""), b.get("tags"))}
+
+
+@router.patch("/api/notebook/{nid}")
+async def notebook_update(nid: int, req: Request):
+    from oceano import notebook
+    b = await req.json()
+    ok = notebook.update(nid, b.get("title"), b.get("body"), b.get("tags"), b.get("pinned"))
+    if not ok:
+        raise HTTPException(404, "no such note")
+    return {"ok": True, "note": notebook.get(nid)}
+
+
+@router.delete("/api/notebook/{nid}")
+def notebook_delete(nid: int):
+    from oceano import notebook
+    return {"ok": notebook.remove(nid)}
 
 
 # ---------------- voice console (web) — reuses the Telegram speech stack ----------------
@@ -308,6 +380,16 @@ def workflows_live():
     live state after a browser refresh, and mark which workflows are running."""
     from oceano import workflows
     return {"running": workflows.live()}
+
+
+@router.get("/api/workflows/checkpoints")
+def workflows_checkpoints():
+    """Workflow id -> {ts, status} for every resumable checkpoint (from a paused ⏸ or failed run)
+    — the list view uses this to show a ▶ Resume button AND a status badge (paused vs failed) per
+    card, without a /resume GET for every workflow."""
+    from oceano import workflows
+    info = workflows.resumable_info()
+    return {"ids": list(info.keys()), "info": {str(k): v for k, v in info.items()}}
 
 
 # NB: registered BEFORE the /{wid}/… routes — "secrets" must never be parsed as a wid
@@ -452,6 +534,16 @@ async def workflows_schedule(wid: int, req: Request):
 def workflows_runs(wid: int):
     from oceano import workflows
     return workflows.runs(wid)
+
+
+@router.post("/api/workflows/{wid}/pause")
+def workflows_pause(wid: int):
+    """Ask a running workflow to stop after its current node finishes. Reuses the same signal
+    as a jobs-popup ✕ cancel — the run already keeps its checkpoint on a 'cancelled' status
+    (only ok/empty/skipped clear it), so this is a cancel that stays resumable via /resume.
+    False if the workflow isn't actually running right now."""
+    from oceano import jobs
+    return {"ok": jobs.cancel_by_ref(f"workflow:{wid}")}
 
 
 @router.get("/api/workflows/{wid}/resume")

@@ -109,6 +109,7 @@ function newVoyage() {
   setView("chat");
   state.session = uid(); _curT = []; _curTitle = "New voyage";
   localStorage.setItem("oceano.active", state.session);
+  _reconnectChatTermForSession();
   const thread = $("#thread"); thread.innerHTML = ""; thread.appendChild(welcomeNode());
   renderSessions(); $("#input").focus();
   refreshViewBusy();                                 // a fresh chat is idle (other chats may still stream)
@@ -117,6 +118,7 @@ function newVoyage() {
 async function openVoyage(id) {
   setView("chat");
   state.session = id; localStorage.setItem("oceano.active", id);
+  _reconnectChatTermForSession();
   let data; try { data = await api("/api/chats/" + encodeURIComponent(id)); } catch { data = { messages: [] }; }
   _curT = data.messages || []; _curTitle = data.title || "New voyage";
   renderThread();
@@ -870,6 +872,7 @@ function addSysNote(html) {
 }
 function setSysNote(body, html) { if (body) { body.innerHTML = html; toBottom(); } }
 const _postJ = (url, obj) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) }).then(r => r.json());
+const _patchJ = (url, obj) => fetch(url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) }).then(r => r.json());
 function _ctxLine(d) {
   const tok = d.ctx_tokens ? `${fmtNum(d.ctx_tokens)} tok` : `~${fmtNum(d.approx_tokens)} tok (est.)`;
   const cap = d.cap ? `auto-compact at ${d.cap} msgs` : "auto-compact off";
@@ -946,6 +949,7 @@ async function loadPrefs() {
     const cfg = await api("/api/config");
     state.agent = !!(cfg.prefs && cfg.prefs.agent_mode);   // Agent mode persists across reloads
     const t = $("#agentToggle"); if (t) t.checked = state.agent;
+    applyChatTermPrefs(!!(cfg.prefs && cfg.prefs.shell_panel));
   } catch {}
 }
 async function loadModels() {
@@ -1317,7 +1321,8 @@ const APP_SHORTCUTS = [
   { id: "researcher",label: "Researcher",   icon: "⌖", open: openResearcher,        win: "win-research",   defKey: { alt: true, shift: true, key: "r" } },
   { id: "workflows", label: "Workflows",    icon: "⚙", open: openWorkflows,         win: "win-workflows",  defKey: { alt: true, shift: true, key: "w" } },
   { id: "search",    label: "Search",       icon: "⌕", open: openSearch,            win: "win-search",     defKey: { alt: true, shift: true, key: "s" } },
-  { id: "notes",     label: "Notes",        icon: "❏", open: openNotes,             win: "win-notes",      defKey: { alt: true, shift: true, key: "n" } },
+  { id: "notes",     label: "Kanban Board", icon: "❏", open: openNotes,             win: "win-notes",      defKey: { alt: true, shift: true, key: "n" } },
+  { id: "notebook",  label: "Notebook",     icon: "❐", open: openNotebook,          win: "win-notebook",   defKey: { alt: true, shift: true, key: "d" } },
   { id: "logs",      label: "Logs",         icon: "▤", open: openLogs,              win: "win-logs",       defKey: { alt: true, shift: true, key: "g" } },
   { id: "hosts",     label: "Hosts",        icon: "⌗", open: openHosts,             win: "win-hosts",      defKey: { alt: true, shift: true, key: "o" } },
   { id: "mcp",       label: "MCP Servers",  icon: "⛓", open: openMcp,               win: "win-mcp",        defKey: { alt: true, shift: true, key: "j" } },
@@ -1461,6 +1466,11 @@ const SETTINGS_PAGES = {
       <label class="set-toggle"><input type="checkbox" id="serializeChatToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Queue chat messages too <span class="st-note">— a chat turn also waits behind running work (share the gate; enable the option above for full serialization)</span></span></label>
     </div>
     <div class="drawer-section">
+      <h3>Shell activity panel</h3>
+      <p class="sub">A read-only split terminal inside the chat view, showing every command the agent runs — local <code>run_shell</code>, and Claude's or Codex's own shell tool when either is the resident mind — as it happens. Separate from the chat's own tool cards, which stay as they are.</p>
+      <label class="set-toggle"><input type="checkbox" id="shellPanelToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Show the shell activity panel <span class="st-note">— adds a toggle button (▥) to the topbar, scoped to the open chat; resize/orientation are per-device, remembered locally</span></span></label>
+    </div>
+    <div class="drawer-section">
       <h3>Live browser</h3>
       <p class="sub">Drive a <b>real, persistent Google Chrome</b> instead of the throwaway headless one — a genuine fingerprint, and your logins &amp; extensions persist across runs (sign in to a site once in the Live browser and it's remembered). It's still viewed through the Live browser window. Needs Google Chrome installed on the host.</p>
       <label class="set-toggle"><input type="checkbox" id="realChromeToggle"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Drive a real, persistent Chrome <span class="st-note">— toggling restarts the browser; the current session drops</span></span></label>
@@ -1468,6 +1478,19 @@ const SETTINGS_PAGES = {
     <div class="drawer-section">
       <h3>Tools <span class="tool-count" id="toolCount"></span></h3>
       <p class="sub">Toggle what the agent can reach in Agent mode. Turning a tool off removes it from the model's prompt — handy to lower context (and cost) behind your tooling.</p>
+      <div class="tool-limits">
+        <div class="ct-head">Chat-spawned agent access</div>
+        <p class="sub">Default access for background agents started by the chat's <code>spawn_agent</code> tool. The selected tier is applied to every provider.</p>
+        <div class="tl-row">
+          <label class="tl-lab" for="chatAgentAccess">Workspace access</label>
+          <select id="chatAgentAccess" class="tl-in">
+            <option value="read">Read only</option>
+            <option value="write">Read / write</option>
+            <option value="shell">Shell access</option>
+          </select>
+        </div>
+        <span class="acct-msg" id="chatAgentAccessMsg"></span>
+      </div>
       <div class="tool-limits">
         <div class="ct-head">Tool-call budgets</div>
         <p class="sub">How many rounds of "reply + use tools" a single turn gets before Oceano forces a wrap-up. Raise this for large, multi-file builds (a workflow's Agent Spawn / Delegate nodes included) that need more room to work; leave blank for the built-in default.</p>
@@ -1673,7 +1696,7 @@ async function wipeTarget(key) {
     if (key === "workflows") { const w = document.getElementById("win-workflows"); if (w) wfRenderList($(".win-body", w)); }
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadBrowserSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadShellPanelSetting(); loadBrowserSetting(); loadVoiceSettings(); }
 async function _wireEffort(selId, endpoint, label) {   // reasoning-effort dropdown for a mind (Claude/Codex)
   const esel = $("#" + selId); if (!esel) return;
   let e; try { e = await api(endpoint); } catch { return; }
@@ -1877,6 +1900,19 @@ async function loadJobsSetting() {
   t.onchange = () => _postJ("/api/jobs/serialize", { enabled: t.checked }).then(r => toast(r.serialize ? "Background jobs will queue" : "Background jobs run in parallel", "info")).catch(() => {});
   if (tc) tc.onchange = () => _postJ("/api/jobs/serialize", { chat: tc.checked }).then(r => toast(r.serialize_chat ? "Chat messages will queue" : "Chat messages run immediately", "info")).catch(() => {});
 }
+async function loadShellPanelSetting() {
+  const t = $("#shellPanelToggle"); if (!t) return;
+  let d; try { d = await api("/api/config"); } catch { return; }
+  const on = !!(d.prefs && d.prefs.shell_panel);
+  t.checked = on;
+  applyChatTermPrefs(on);
+  t.onchange = () => {
+    applyChatTermPrefs(t.checked);
+    _postJ("/api/prefs", { shell_panel: t.checked })
+      .then(() => toast(t.checked ? "Shell activity panel enabled — ▥ in the topbar" : "Shell activity panel disabled", "info"))
+      .catch(() => {});
+  };
+}
 async function loadBrowserSetting() {
   const t = $("#realChromeToggle"); if (!t) return;
   let d; try { d = await api("/api/browser/settings"); } catch { return; }
@@ -1932,6 +1968,20 @@ async function loadTools() {
   });
   loadChatMemoryTools();
   loadToolLimits();
+  loadChatAgentAccess();
+}
+async function loadChatAgentAccess() {
+  const sel = $("#chatAgentAccess"), msg = $("#chatAgentAccessMsg");
+  if (!sel) return;
+  let d; try { d = await api("/api/config"); } catch { return; }
+  sel.value = (d.prefs && d.prefs.chat_agent_access) || "read";
+  sel.onchange = async () => {
+    if (msg) { msg.textContent = "saving…"; msg.className = "acct-msg"; }
+    try {
+      await _postJ("/api/prefs", { chat_agent_access: sel.value });
+      if (msg) { msg.textContent = "saved ✓"; msg.className = "acct-msg ok"; }
+    } catch { if (msg) { msg.textContent = "save failed"; msg.className = "acct-msg err"; } }
+  };
 }
 // tool-call budgets: blank input = built-in default (placeholder shows what that default is);
 // a number = an explicit override, saved on blur/Enter (not on every keystroke)
@@ -2750,11 +2800,10 @@ async function expLoad(path) {
   d.entries.forEach(e => {
     const row = document.createElement("div"); row.className = "exp-row" + (e.dir ? " dir" : "");
     row.innerHTML = `<span class="ei">${e.dir ? "▸" : "·"}</span><span class="en">${escapeHtml(e.name)}</span>` + (e.dir ? "" : `<span class="es">${fmtSize(e.size)}</span>`);
-    row.onclick = () => {                                      // single-click: select; files open in the pane
+    row.onclick = () => {                                      // single-click: select only
       $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
-      if (!e.dir) expOpenFile(e.path);
     };
-    row.ondblclick = () => { if (e.dir) expLoad(e.path); };     // double-click a folder to enter it
+    row.ondblclick = () => { if (e.dir) expLoad(e.path); else expOpenFile(e.path); };   // double-click to open
     row.oncontextmenu = ev => {
       ev.preventDefault();
       $$(".exp-row", list).forEach(r => r.classList.remove("sel")); row.classList.add("sel");
@@ -5752,6 +5801,103 @@ async function termAddMenu(body, btn) {
 }
 
 /* ====================================================================
+   Shell activity — a read-only split terminal INSIDE the chat view
+   (VS Code-style panel, not a floating window): every command the
+   agent runs (local run_shell, Claude's native Bash, Codex's native
+   shell — any channel), aggregated. The chat's own tool cards stay
+   plain, un-expanded — this is a separate, opt-in view onto the same
+   activity. Togglable in Settings; resizable and switchable between a
+   horizontal split (panel below) and vertical (panel beside) via the
+   divider. Fed by /api/shell/stream (SSE), which replays a short
+   backlog on connect so opening it isn't a blank pane.
+   ==================================================================== */
+const _CHAT_TERM_KEY = "oceano.chatTerm";
+function _loadChatTermState() {
+  try { return { open: false, vertical: false, size: 260, ...JSON.parse(localStorage.getItem(_CHAT_TERM_KEY) || "{}") }; }
+  catch { return { open: false, vertical: false, size: 260 }; }
+}
+function _saveChatTermState() { try { localStorage.setItem(_CHAT_TERM_KEY, JSON.stringify(_chatTermState)); } catch {} }
+let _chatTermState = _loadChatTermState();
+let _chatTermEnabled = false;                    // Settings toggle — gates the topbar button + panel entirely
+let _chatTerm = null, _chatTermFit = null, _chatTermES = null;
+
+function initChatTermPanel() {
+  const divider = $("#chatTermDivider"); if (!divider) return;   // chat view not in the DOM (shouldn't happen)
+  $("#chatTermOrient").onclick = () => { _chatTermState.vertical = !_chatTermState.vertical; _applyChatTermLayout(); _saveChatTermState(); };
+  $("#chatTermHide").onclick = () => setChatTermOpen(false);
+  $("#shellPanelBtn").onclick = () => setChatTermOpen(!_chatTermState.open);
+  _dragifyChatTermDivider(divider);
+  _applyChatTermLayout();
+}
+function applyChatTermPrefs(enabled) {
+  _chatTermEnabled = !!enabled;
+  const btn = $("#shellPanelBtn"); if (btn) btn.style.display = _chatTermEnabled ? "" : "none";
+  if (_chatTermEnabled && _chatTermState.open) setChatTermOpen(true);   // restore across reload
+  else if (!_chatTermEnabled && _chatTermState.open) setChatTermOpen(false);
+}
+function _applyChatTermLayout() {
+  const split = $("#chatSplit"), pane = $("#chatTermPane");
+  split.classList.toggle("vsplit", _chatTermState.vertical);
+  if (_chatTermState.vertical) { pane.style.width = _chatTermState.size + "px"; pane.style.height = ""; }
+  else { pane.style.height = _chatTermState.size + "px"; pane.style.width = ""; }
+  if (_chatTermFit) setTimeout(() => { try { _chatTermFit.fit(); } catch {} }, 30);
+}
+function setChatTermOpen(open) {
+  if (open && !_chatTermEnabled) return;          // turned off in Settings — nothing to open
+  _chatTermState.open = open;
+  $("#chatSplit").classList.toggle("term-open", open);
+  const btn = $("#shellPanelBtn"); if (btn) btn.classList.toggle("on", open);
+  _saveChatTermState();
+  if (open) { _applyChatTermLayout(); _ensureChatTerm(); } else _teardownChatTerm();
+}
+function _ensureChatTerm() {
+  if (_chatTerm) { setTimeout(() => { try { _chatTermFit.fit(); } catch {} }, 30); return; }
+  if (typeof Terminal === "undefined") return;
+  const host = $("#chatTermInner"); if (!host) return;
+  const cs = getComputedStyle(document.documentElement), c = (n, f) => (cs.getPropertyValue(n).trim() || f);
+  _chatTerm = new Terminal({ disableStdin: true, cursorBlink: false, convertEol: true, fontSize: 12, scrollback: 10000,
+    fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+    theme: { background: c("--abyss-0", "#04111a"), foreground: c("--foam", "#e8f2f3"), cursor: c("--biolum", "#37e3c6") } });
+  _chatTermFit = new FitAddon.FitAddon(); _chatTerm.loadAddon(_chatTermFit); _chatTerm.open(host);
+  setTimeout(() => { try { _chatTermFit.fit(); } catch {} }, 30);
+  _chatTermES = new EventSource("/api/shell/stream?session=" + encodeURIComponent(state.session || ""));
+  _chatTermES.onmessage = e => { let d; try { d = JSON.parse(e.data); } catch { return; } if (d.text) _chatTerm.write(d.text); };
+  _chatTermES.onerror = () => {};                 // EventSource auto-reconnects
+}
+function _teardownChatTerm() {
+  try { _chatTermES && _chatTermES.close(); } catch {} _chatTermES = null;
+  try { _chatTerm && _chatTerm.dispose(); } catch {} _chatTerm = null; _chatTermFit = null;
+}
+// The shell panel is a single global DOM singleton (#chatTermPane), not per-chat — so whenever
+// the OPEN chat changes, it must drop the old session's terminal + SSE connection and open a
+// fresh one for the new session. _ensureChatTerm() early-returns once a terminal instance
+// exists, so a plain re-call after switching chats would keep streaming the PREVIOUS chat's
+// commands (and its old scrollback) instead of the new one's — tear down first.
+function _reconnectChatTermForSession() {
+  if (_chatTermEnabled && _chatTermState.open) { _teardownChatTerm(); _ensureChatTerm(); }
+}
+function _dragifyChatTermDivider(divider) {
+  divider.addEventListener("mousedown", e => {
+    const vertical = _chatTermState.vertical;
+    const startPos = vertical ? e.clientX : e.clientY, startSize = _chatTermState.size;
+    divider.classList.add("dragging");
+    const mv = ev => {
+      const delta = startPos - (vertical ? ev.clientX : ev.clientY);   // dragging toward the pane grows it
+      const cap = (vertical ? innerWidth : innerHeight) - 200;
+      _chatTermState.size = Math.max(120, Math.min(startSize + delta, cap));
+      _applyChatTermLayout();
+    };
+    const up = () => {
+      divider.classList.remove("dragging");
+      document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+      _saveChatTermState();
+    };
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+    e.preventDefault();
+  });
+}
+
+/* ====================================================================
    Semantic search — ask the corpus (memories + indexed docs), with scores
    and jump-to-source.
    ==================================================================== */
@@ -5805,53 +5951,225 @@ function openDocSource(absPath) {
 }
 
 /* ====================================================================
-   Notes — a tiny Kanban scratchpad (todo / doing / done), drag to move.
+   Notes — a Kanban board, user-defined columns, drag to move. Cards carry a
+   title, an optional longer body, and free-form tags.
    ==================================================================== */
-const NOTE_COLS = [["todo", "To do"], ["doing", "Doing"], ["done", "Done"]];
 function openNotes() {
-  const { body, reused } = createWindow({ id: "win-notes", title: "Notes — board", icon: "❏", width: 720, height: 540 });
+  const { body, reused } = createWindow({ id: "win-notes", title: "Notes — board", icon: "❏", width: 760, height: 560 });
   if (reused) return;
   body.classList.add("kb-win");
-  body.innerHTML = `<div class="kb-board" id="kbBoard"></div>`;
+  body.innerHTML = `<div class="kb-toolbar"><button class="kb-add-col" id="kbAddCol">+ column</button></div>
+    <div class="kb-board" id="kbBoard"></div>`;
+  $("#kbAddCol", body).onclick = async () => {
+    const n = await promptDialog("New column", { placeholder: "column name", okLabel: "Add" });
+    if (!n) return;
+    const r = await _postJ("/api/notes/columns", { name: n });
+    if (!r.ok) { toast("that column name is taken (or blank)", "error"); return; }
+    loadNotes();
+  };
   loadNotes();
 }
 async function loadNotes() {
   const board = $("#kbBoard"); if (!board) return;
   let data; try { data = await api("/api/notes"); } catch { return; }
+  const cols = data.columns || [];
   board.innerHTML = "";
-  NOTE_COLS.forEach(([key, label]) => {
+  cols.forEach((key, i) => {
     const col = document.createElement("div"); col.className = "kb-col"; col.dataset.col = key;
-    const cards = data[key] || [];
-    col.innerHTML = `<div class="kb-col-h">${label}<span class="kb-count">${cards.length}</span></div><button class="kb-add">+ add</button><div class="kb-cards"></div>`;
+    const cards = data.cards[key] || [];
+    col.innerHTML = `<div class="kb-col-h">
+        <span class="kb-col-label" title="click to rename">${escapeHtml(key)}</span>
+        <span class="kb-count">${cards.length}</span>
+        <span class="kb-col-actions">
+          <button class="kb-col-btn kb-col-left" title="move left" ${i === 0 ? "disabled" : ""}>‹</button>
+          <button class="kb-col-btn kb-col-right" title="move right" ${i === cols.length - 1 ? "disabled" : ""}>›</button>
+          <button class="kb-col-btn kb-col-del" title="delete column">✕</button>
+        </span>
+      </div>
+      <button class="kb-add">+ add</button><div class="kb-cards"></div>`;
     const cardsEl = $(".kb-cards", col);
-    cards.forEach(c => cardsEl.appendChild(noteCard(c)));
+    cards.forEach(c => cardsEl.appendChild(noteCard(c, key)));
     $(".kb-add", col).onclick = async () => {
-      const t = await promptDialog("New card", { placeholder: "what needs doing?", okLabel: "Add" });
+      const t = await promptDialog("New card", { placeholder: "title", okLabel: "Add" });
       if (!t) return;
-      await _postJ("/api/notes", { text: t, col: key }); loadNotes();
+      await _postJ("/api/notes", { title: t, col: key }); loadNotes();
+    };
+    $(".kb-col-label", col).onclick = async () => {
+      const n = await promptDialog("Rename column", { value: key, okLabel: "Rename" });
+      if (!n || n === key) return;
+      const r = await _patchJ("/api/notes/columns/" + encodeURIComponent(key), { name: n });
+      if (!r.ok) { toast("that name is taken (or blank)", "error"); return; }
+      loadNotes();
+    };
+    const left = $(".kb-col-left", col), right = $(".kb-col-right", col);
+    if (left) left.onclick = async () => { await _postJ("/api/notes/columns/" + encodeURIComponent(key) + "/move", { direction: -1 }); loadNotes(); };
+    if (right) right.onclick = async () => { await _postJ("/api/notes/columns/" + encodeURIComponent(key) + "/move", { direction: 1 }); loadNotes(); };
+    $(".kb-col-del", col).onclick = async () => {
+      if (cols.length <= 1) { toast("can't delete the last column", "error"); return; }
+      if (cards.length && !await confirmAction("Delete column", `"${key}" has ${cards.length} card(s) — they'll move into the next column over.`, "Delete")) return;
+      const moveTo = cols[i - 1] ?? cols[i + 1];
+      const r = await fetch("/api/notes/columns/" + encodeURIComponent(key) + (moveTo ? "?move_to=" + encodeURIComponent(moveTo) : ""), { method: "DELETE" }).then(r => r.json());
+      if (!r.ok) { toast("couldn't delete that column", "error"); return; }
+      loadNotes();
     };
     col.addEventListener("dragover", e => { e.preventDefault(); col.classList.add("drop"); });
     col.addEventListener("dragleave", () => col.classList.remove("drop"));
     col.addEventListener("drop", async e => {
       e.preventDefault(); col.classList.remove("drop");
       const id = +e.dataTransfer.getData("text/plain");
-      if (id) { await fetch("/api/notes/" + id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ col: key }) }); loadNotes(); }
+      if (id) { await _patchJ("/api/notes/" + id, { col: key }); loadNotes(); }
     });
     board.appendChild(col);
   });
 }
-function noteCard(c) {
+function noteCard(c, col) {
   const el = document.createElement("div"); el.className = "kb-card"; el.draggable = true;
-  el.innerHTML = `<div class="kb-txt">${escapeHtml(c.text)}</div><button class="kb-del" title="delete">✕</button>`;
+  const paintView = () => {
+    el.innerHTML = `<div class="kb-title">${escapeHtml(c.title)}</div>
+      ${c.body ? `<div class="kb-body">${escapeHtml(c.body)}</div>` : ""}
+      ${c.tags && c.tags.length ? `<div class="kb-tags">${c.tags.map(t => `<span class="kb-tag">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+      <button class="kb-del" title="delete">✕</button>`;
+    $(".kb-title", el).onclick = paintEdit;
+    if (c.body) $(".kb-body", el).onclick = paintEdit;
+    $(".kb-del", el).onclick = async e => { e.stopPropagation(); await fetch("/api/notes/" + c.id, { method: "DELETE" }); loadNotes(); };
+  };
+  const paintEdit = () => {
+    el.innerHTML = `<div class="kb-edit">
+      <input class="kb-edit-title" placeholder="title" value="${escapeHtml(c.title)}">
+      <textarea class="kb-edit-body" placeholder="details (optional)" rows="3">${escapeHtml(c.body || "")}</textarea>
+      <input class="kb-edit-tags" placeholder="tags, comma, separated" value="${escapeHtml((c.tags || []).join(", "))}">
+      <div class="kb-edit-actions"><button class="kb-edit-cancel">Cancel</button><button class="kb-edit-save primary sm">Save</button></div>
+    </div>`;
+    const titleIn = $(".kb-edit-title", el);
+    const save = async () => {
+      const title = titleIn.value.trim();
+      if (!title) { titleIn.focus(); return; }
+      const tags = $(".kb-edit-tags", el).value.split(",").map(t => t.trim()).filter(Boolean);
+      await _patchJ("/api/notes/" + c.id, { title, body: $(".kb-edit-body", el).value, tags });
+      loadNotes();
+    };
+    $(".kb-edit-save", el).onclick = save;
+    $(".kb-edit-cancel", el).onclick = paintView;
+    el.querySelectorAll(".kb-edit input").forEach(inp => inp.onkeydown = e => { if (e.key === "Enter") save(); else if (e.key === "Escape") paintView(); });
+    setTimeout(() => { titleIn.focus(); titleIn.select(); }, 30);
+  };
   el.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", c.id); el.classList.add("dragging"); });
   el.addEventListener("dragend", () => el.classList.remove("dragging"));
-  $(".kb-txt", el).onclick = async () => {
-    const t = await promptDialog("Edit card", { value: c.text, okLabel: "Save" });
-    if (t === null) return;
-    await fetch("/api/notes/" + c.id, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t }) }); loadNotes();
-  };
-  $(".kb-del", el).onclick = async e => { e.stopPropagation(); await fetch("/api/notes/" + c.id, { method: "DELETE" }); loadNotes(); };
+  paintView();
   return el;
+}
+
+/* ====================================================================
+   Notebook — longer-form Markdown notes: search + tag filter sidebar,
+   an editor with a Markdown preview toggle, autosaved as you type.
+   ==================================================================== */
+let _nbState = { q: "", tag: "", activeId: null, preview: false, notes: [] };
+function openNotebook() {
+  const { body, reused } = createWindow({ id: "win-notebook", title: "Notebook", icon: "❐", width: 880, height: 600 });
+  if (reused) return;
+  body.classList.add("nb-win");
+  body.innerHTML = `<div class="nb-sidebar">
+      <div class="nb-side-top">
+        <button class="nb-new" id="nbNew">+ New note</button>
+        <input class="nb-search" id="nbSearch" placeholder="Search…" autocomplete="off">
+      </div>
+      <div class="nb-tags" id="nbTags"></div>
+      <div class="nb-list" id="nbList"></div>
+    </div>
+    <div class="nb-editor" id="nbEditor"><div class="nb-empty">Select a note, or create one.</div></div>`;
+  $("#nbNew", body).onclick = async () => {
+    const r = await _postJ("/api/notebook", { title: "" });
+    _nbState.activeId = r.note.id;
+    await nbLoadList(body);
+    nbOpenEditor(body, r.note.id);
+  };
+  let searchT = null;
+  $("#nbSearch", body).oninput = () => {
+    clearTimeout(searchT);
+    searchT = setTimeout(() => { _nbState.q = $("#nbSearch", body).value.trim(); nbLoadList(body); }, 200);
+  };
+  nbLoadList(body);
+}
+function nbFmtDate(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " +
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+async function nbLoadList(body) {
+  let data;
+  try { data = await api("/api/notebook?" + new URLSearchParams({ q: _nbState.q, tag: _nbState.tag })); }
+  catch { return; }
+  _nbState.notes = data.notes;
+  const tagsEl = $("#nbTags", body);
+  tagsEl.innerHTML = data.tags.map(t =>
+    `<span class="nb-tagchip${t === _nbState.tag ? " on" : ""}" data-tag="${escapeHtml(t)}">${escapeHtml(t)}</span>`).join("");
+  $$(".nb-tagchip", tagsEl).forEach(chip => chip.onclick = () => {
+    _nbState.tag = _nbState.tag === chip.dataset.tag ? "" : chip.dataset.tag;
+    nbLoadList(body);
+  });
+  const listEl = $("#nbList", body);
+  if (!data.notes.length) { listEl.innerHTML = `<div class="nb-empty-list">no notes${_nbState.q || _nbState.tag ? " match" : " yet"}</div>`; return; }
+  listEl.innerHTML = data.notes.map(n => `
+    <div class="nb-item${n.id === _nbState.activeId ? " active" : ""}" data-id="${n.id}">
+      <div class="nb-item-title">${n.pinned ? "📌 " : ""}${escapeHtml(n.title || "Untitled")}</div>
+      <div class="nb-item-meta">${nbFmtDate(n.updated)}${n.tags.length ? " · " + n.tags.map(escapeHtml).join(", ") : ""}</div>
+      ${n.body ? `<div class="nb-item-snip">${escapeHtml(n.body.slice(0, 90).replace(/\s+/g, " "))}</div>` : ""}
+    </div>`).join("");
+  $$(".nb-item", listEl).forEach(el => el.onclick = () => {
+    _nbState.activeId = +el.dataset.id;
+    $$(".nb-item", listEl).forEach(x => x.classList.toggle("active", x === el));
+    nbOpenEditor(body, +el.dataset.id);
+  });
+}
+function nbOpenEditor(body, id) {
+  const note = _nbState.notes.find(n => n.id === id);
+  const ed = $("#nbEditor", body);
+  if (!note) { ed.innerHTML = `<div class="nb-empty">note not found</div>`; return; }
+  _nbState.preview = false;
+  const paint = () => {
+    ed.innerHTML = `<div class="nb-ed-toolbar">
+        <input class="nb-ed-title" id="nbTitle" value="${escapeHtml(note.title)}" placeholder="Untitled">
+        <button class="nb-ed-btn nb-ed-pin${note.pinned ? " on" : ""}" id="nbPin" title="pin">📌</button>
+        <button class="nb-ed-btn" id="nbPreviewToggle">${_nbState.preview ? "Edit" : "Preview"}</button>
+        <button class="nb-ed-btn nb-ed-del" id="nbDel" title="delete">✕</button>
+      </div>
+      <input class="nb-ed-tags" id="nbTagsIn" value="${escapeHtml(note.tags.join(", "))}" placeholder="tags, comma, separated">
+      ${_nbState.preview ? `<div class="nb-ed-preview" id="nbPreview"></div>`
+                         : `<textarea class="nb-ed-body" id="nbBody" placeholder="Write in Markdown…">${escapeHtml(note.body)}</textarea>`}
+      <div class="nb-ed-status" id="nbStatus"></div>`;
+    if (_nbState.preview) renderMD($("#nbPreview", ed), note.body, true);
+    $("#nbPreviewToggle", ed).onclick = () => { _nbState.preview = !_nbState.preview; paint(); };
+    $("#nbPin", ed).onclick = async () => {
+      note.pinned = !note.pinned;
+      await _patchJ("/api/notebook/" + id, { pinned: note.pinned });
+      paint(); nbLoadList(body);
+    };
+    $("#nbDel", ed).onclick = async () => {
+      if (!await confirmAction("Delete note", `Delete "${note.title || "Untitled"}"? This can't be undone.`, "Delete")) return;
+      await fetch("/api/notebook/" + id, { method: "DELETE" });
+      _nbState.activeId = null;
+      ed.innerHTML = `<div class="nb-empty">Select a note, or create one.</div>`;
+      nbLoadList(body);
+    };
+    let saveT = null;
+    const scheduleSave = () => {
+      const status = $("#nbStatus", ed); if (status) status.textContent = "saving…";
+      clearTimeout(saveT);
+      saveT = setTimeout(async () => {
+        note.title = $("#nbTitle", ed).value;
+        note.tags = $("#nbTagsIn", ed).value.split(",").map(t => t.trim()).filter(Boolean);
+        if (!_nbState.preview) note.body = $("#nbBody", ed).value;
+        await _patchJ("/api/notebook/" + id, { title: note.title, body: note.body, tags: note.tags });
+        const s = $("#nbStatus", ed); if (s) s.textContent = "saved";
+        nbLoadList(body);
+      }, 600);
+    };
+    $("#nbTitle", ed).oninput = scheduleSave;
+    $("#nbTagsIn", ed).oninput = scheduleSave;
+    if (!_nbState.preview) $("#nbBody", ed).oninput = scheduleSave;
+  };
+  paint();
 }
 
 /* ====================================================================
@@ -6411,7 +6729,7 @@ function wfInspClear(body) {
 }
 const _WF_OPS = [["contains", "contains"], ["equals", "equals"], ["matches", "regex matches"], ["gt", "greater than"], ["lt", "less than"]];
 // declarative field specs for the simple node types (tool / trigger / http / switch have custom builders)
-// shared across the agent/delegate node inspectors: three escalating, explicit opt-in tiers.
+// shared across the agent/delegate node inspectors: explicit, least-privilege access tiers.
 // "" stays read-only by default — an unattended/scheduled flow must not be quietly MORE
 // privileged than the user intended; these mirror workflows.py's _tool_scope_for.
 const wfWriteTier = v => (["execute", "write", "shell"].includes(v)) ? v : "";
@@ -6439,6 +6757,7 @@ const WF_FIELDS = {
       hint: "blank = delegation default: killed only when IDLE (no output for a while), generous absolute cap — a long active build survives. Set a number to cap this node's wall-clock." },
     { k: "write", t: "select", l: "file access", rr: true, opts: WF_ACCESS_OPTS },
     { t: "note", text: WF_SKILLS_NOTE },
+    { t: "note", warn: true, showIf: d => d.write === "execute", text: WF_ACCESS_NOTE_EXECUTE },
     { t: "note", warn: true, showIf: d => d.write === "write", text: WF_ACCESS_NOTE_WRITE },
     { t: "note", warn: true, showIf: d => d.write === "shell", text: WF_ACCESS_NOTE_SHELL },
     { k: "retries", t: "number", l: "retries", min: 0, max: 5 }],
@@ -6758,7 +7077,6 @@ async function wfRenderList(body) {
       <button class="ed-btn" id="wfImport" title="import workflow JSON exports (choose several at once)">⤒ Import</button>
       <button class="primary sm" id="wfNew">+ New workflow</button></div>
     <div class="wf-list" id="wfList"><div class="empty-note">loading…</div></div>`;
-    { t: "note", warn: true, showIf: d => d.write === "execute", text: WF_ACCESS_NOTE_EXECUTE },
   $("#wfNew", body).onclick = () => wfRenderEditor(body, null);
   $("#wfSecrets", body).onclick = () => wfRenderSecrets(body);
   $("#wfImport", body).onclick = () => {
@@ -6817,6 +7135,7 @@ async function wfRenderList(body) {
       </div>
       <div class="wf-card-actions">
         <button class="primary sm wf-run">▶ Run</button>
+        <button class="ed-btn wf-resume" title="resume from the last checkpoint" style="display:none">▶ Resume</button>
         <button class="ed-btn wf-edit">Edit</button>
         <button class="ed-btn wf-sched-btn" title="schedule">⏱</button>
         <button class="ed-btn wf-trig-btn" title="triggers">⚡</button>
@@ -6826,6 +7145,7 @@ async function wfRenderList(body) {
         <button class="ed-btn wf-del" title="delete">✕</button>
       </div>`;
     $(".wf-run", el).onclick = () => wfRenderRun(body, w);
+    $(".wf-resume", el).onclick = () => wfRenderRun(body, w, { resume: true });
     $(".wf-edit", el).onclick = () => wfRenderEditor(body, w);
     $(".wf-sched-btn", el).onclick = () => wfSchedule(body, w);
     $(".wf-trig-btn", el).onclick = () => wfTriggers(body, w);
@@ -6843,19 +7163,52 @@ async function wfRenderList(body) {
     list.appendChild(el);
   });
   wfMarkLive(body);
+  wfMarkResumable(body);
+}
+// Paints/clears the "running now" state on a card: badge + "⊙ View run" button text. Shared by
+// wfMarkLive (the list's initial paint) and pollJobs (keeps it live afterward — a run that
+// started elsewhere, e.g. a schedule or trigger, must still become clickable without a reopen).
+function _wfPaintCardRunning(card) {
+  const name = $(".wf-card-name", card);
+  if (name && !$(".wf-running", name)) {
+    const b = document.createElement("span");
+    b.className = "wf-running"; b.title = "running now — open Run to reconnect to its live state";
+    b.textContent = " ● running"; name.appendChild(b);
+  }
+  const btn = $(".wf-run", card); if (btn) btn.textContent = "⊙ View run";
+}
+function _wfPaintCardIdle(card) {
+  const b = $(".wf-running", card); if (b) b.remove();
+  const btn = $(".wf-run", card); if (btn) btn.textContent = "▶ Run";
 }
 async function wfMarkLive(body) {
   let live; try { live = (await api("/api/workflows/live")).running || []; } catch { return; }
   live.filter(r => r.status === "running").forEach(r => {
     const card = body.querySelector(`.wf-card[data-wid="${r.workflow_id}"]`);
-    if (!card) return;
+    if (card) _wfPaintCardRunning(card);
+  });
+}
+// A workflow with a saved checkpoint (paused ⏸, or a run that failed mid-flow) gets a ▶ Resume
+// button alongside ▶ Run, AND a status badge — a bare Resume button doesn't say WHY it's there,
+// and a checkpoint alone can't tell a deliberate pause apart from a crash (both leave one; only
+// ok/empty/skipped clear it). "cancelled" = paused (⏸ button or the jobs-popup ✕); anything else
+// (error, or no run record at all) = it stopped on its own.
+async function wfMarkResumable(body) {
+  let info; try { info = (await api("/api/workflows/checkpoints")).info || {}; } catch { return; }
+  $$(".wf-card[data-wid]", body).forEach(card => {
+    const cp = info[card.dataset.wid];
+    const btn = $(".wf-resume", card);
+    if (btn) btn.style.display = cp ? "" : "none";
     const name = $(".wf-card-name", card);
-    if (name && !$(".wf-running", name)) {
-      const b = document.createElement("span");
-      b.className = "wf-running"; b.title = "running now — open Run to reconnect to its live state";
-      b.textContent = " ● running"; name.appendChild(b);
-    }
-    const btn = $(".wf-run", card); if (btn) btn.textContent = "⊙ View run";
+    let badge = $(".wf-paused, .wf-checkpoint-err", name);
+    if (!cp) { if (badge) badge.remove(); return; }
+    const paused = cp.status === "cancelled";
+    if (!badge) { badge = document.createElement("span"); name.appendChild(badge); }
+    badge.className = paused ? "wf-paused" : "wf-checkpoint-err";
+    badge.title = paused
+      ? "paused — resume to continue from where it left off"
+      : "stopped on its own (see History) — resume to continue from the last completed step";
+    badge.textContent = paused ? " ⏸ paused" : " ⚠ failed — resumable";
   });
 }
 async function wfSchedule(body, w) {
@@ -7100,7 +7453,7 @@ function wfReadCanvas(editor) {
   }
   return { graph: { nodes, edges }, error };
 }
-async function wfRenderRun(body, w) {
+async function wfRenderRun(body, w, opts = {}) {
   // Reconnect to an already-running run (after a refresh) rather than starting a new one — check
   // BEFORE prompting, so we don't ask for an input we won't use.
   let liveState = null;
@@ -7108,9 +7461,10 @@ async function wfRenderRun(body, w) {
   // registry for ~180s (workflows._LIVE_KEEP), and without the status filter a second ▶ Run within
   // that window would re-display the old finished run instead of starting a new one.
   try { liveState = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id && x.status === "running"); } catch {}
-  // A fresh run of an input-taking workflow: ask for the value first.
+  // A fresh run of an input-taking workflow: ask for the value first (not when resuming — the
+  // checkpoint already carries the original input).
   let inp = "";
-  if (!liveState && w.input && w.input.enabled) {
+  if (!liveState && !opts.resume && w.input && w.input.enabled) {
     const v = await promptDialog("Run · " + w.name, { value: w.input.default || "",
       placeholder: w.input.placeholder || "", message: w.input.label || "Input for this workflow", okLabel: "▶ Run" });
     if (v === null) return wfRenderList(body);                       // cancelled
@@ -7118,7 +7472,7 @@ async function wfRenderRun(body, w) {
     inp = v;
   }
   body.innerHTML = `
-    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><button class="ed-btn" id="wfCopyLog" title="copy the run log as text">⧉ log</button><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
+    <div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>Run · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><button class="ed-btn" id="wfCopyLog" title="copy the run log as text">⧉ log</button><button class="ed-btn" id="wfPause" title="pause after the current step — resumable from where it left off">⏸ Pause</button><button class="primary sm" id="wfResumeBtn" style="display:none" title="continue from the last checkpoint">▶ Resume</button><span class="wf-run-status running" id="wfRunStatus">running…</span></div>
     ${inp ? `<div class="wf-run-input" title="this run's input">⌨ ${escapeHtml(inp.length > 160 ? inp.slice(0, 160) + "…" : inp)}</div>` : ""}
     <div class="wf-run-main">
       <div class="wf-canvas-wrap">
@@ -7206,6 +7560,23 @@ async function wfRenderRun(body, w) {
     stick();
   };
   const log = { addRow, finishRow, note };
+  // pause/resume: pause is a cancel that the engine deliberately leaves resumable (any status
+  // other than ok/empty/skipped keeps its checkpoint) — resume just re-enters this same function
+  // in resume mode, which fires POST …/resume and reconnects the same way a refresh would.
+  const pauseBtn = $("#wfPause", body), resumeBtn = $("#wfResumeBtn", body);
+  const endRun = st => {
+    pauseBtn.style.display = "none";
+    resumeBtn.style.display = (st && !["ok", "empty", "skipped"].includes(st)) ? "" : "none";
+  };
+  pauseBtn.onclick = async () => {
+    pauseBtn.disabled = true; pauseBtn.textContent = "pausing…";
+    try {
+      const r = await _postJ("/api/workflows/" + w.id + "/pause", {});
+      if (!r.ok) { toast("nothing to pause — this run already finished", "info"); pauseBtn.disabled = false; pauseBtn.textContent = "⏸ Pause"; }
+      else note("⏸ pause requested — stopping after the current step");
+    } catch { toast("pause failed", "err"); pauseBtn.disabled = false; pauseBtn.textContent = "⏸ Pause"; }
+  };
+  resumeBtn.onclick = () => wfRenderRun(body, w, { resume: true });
   $("#wfCopyLog", body).onclick = () => {                        // the whole log as plain text
     const txt = [...host.children].map(el => {
       if (el.classList.contains("wf-cl-note")) return "── " + el.textContent + " ──";
@@ -7219,7 +7590,28 @@ async function wfRenderRun(body, w) {
     }).join("\n");
     navigator.clipboard.writeText(txt).then(() => toast("run log copied", "ok")).catch(() => toast("copy failed", "err"));
   };
-  if (liveState) return wfReconnectRun(body, w, host, status, rows, log, liveState, mark);
+  if (liveState) return wfReconnectRun(body, w, host, status, rows, log, liveState, mark, endRun);
+  if (opts.resume) {
+    note("▶ resuming from the last checkpoint");
+    fetch("/api/workflows/" + w.id + "/resume", { method: "POST" })
+      .then(r => r.json()).then(r => { if (r && (r.detail || r.error)) toast(r.detail || r.error, "err"); })
+      .catch(() => {});
+    // the resumed run registers in the live registry almost immediately (a fresh background
+    // thread), but not synchronously with the POST above — poll briefly for it, then reconnect
+    // exactly the way a browser-refresh reconnect would.
+    let found = null;
+    const deadline = Date.now() + 8000;
+    while (!found && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 300));
+      try { found = ((await api("/api/workflows/live")).running || []).find(x => x.workflow_id === w.id && x.status === "running"); } catch {}
+    }
+    if (!found) {
+      status.textContent = "resume failed to start"; status.className = "wf-run-status fail";
+      note("resume failed to start — no resumable checkpoint, or it never registered", "fail");
+      endRun("error"); return;
+    }
+    return wfReconnectRun(body, w, host, status, rows, log, found, mark, endRun);
+  }
   note("▶ run started");
   try {
     const resp = await fetch("/api/workflows/" + w.id + "/run", { method: "POST",
@@ -7246,16 +7638,18 @@ async function wfRenderRun(body, w) {
           const sum = ev.run ? ev.run.summary : "done";
           status.textContent = sum; status.className = "wf-run-status " + (ev.status === "ok" ? "ok" : "fail");
           note("run finished · " + sum, ev.status === "ok" ? "ok" : "fail");
+          endRun(ev.status);
         } else if (ev.event === "error") {
           mark.finish();
           status.textContent = "error: " + (ev.message || ""); status.className = "wf-run-status fail";
           note("run error · " + (ev.message || ""), "fail");
+          endRun("error");
         }
       }
     }
-  } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; }
+  } catch { status.textContent = "run failed"; status.className = "wf-run-status fail"; endRun("error"); }
 }
-async function wfReconnectRun(body, w, host, status, rows, log, initial, mark) {
+async function wfReconnectRun(body, w, host, status, rows, log, initial, mark, endRun) {
   // Re-attach to a run already in progress on the server: render its accumulated steps and poll
   // the live registry until it finishes. Survives browser refreshes and works for scheduled runs.
   // `mark` (from wfRenderRun) paints the same states onto the live diagram.
@@ -7289,12 +7683,17 @@ async function wfReconnectRun(body, w, host, status, rows, log, initial, mark) {
       status.textContent = st.summary || st.status;
       status.className = "wf-run-status " + (st.status === "ok" ? "ok" : "fail");
       log.note("run finished · " + (st.summary || st.status), st.status === "ok" ? "ok" : "fail");
+      if (endRun) endRun(st.status);
       return;
     }
     await new Promise(r => setTimeout(r, 1500));
     let arr; try { arr = (await api("/api/workflows/live")).running || []; } catch { return; }
     const next = arr.find(x => x.workflow_id === w.id);
-    if (!next) { if (mark) mark.finish(); status.textContent = "finished"; status.className = "wf-run-status ok"; return; }
+    if (!next) {
+      if (mark) mark.finish(); status.textContent = "finished"; status.className = "wf-run-status ok";
+      if (endRun) endRun("ok");   // it aged out of the live registry — treat as a clean finish
+      return;
+    }
     st = next;
   }
 }
@@ -7314,12 +7713,18 @@ async function wfShowApproval(row, wid, token) {
 }
 
 async function wfRenderRuns(body, w) {
-  body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>History · ${escapeHtml(w.name)}</h3></div><div class="wf-runs-list" id="wfRunsList"><div class="empty-note">loading…</div></div>`;
+  body.innerHTML = `<div class="wf-head"><button class="ed-btn" id="wfBack">←</button><h3>History · ${escapeHtml(w.name)}</h3><span class="fe-spacer"></span><button class="ed-btn" id="wfRunsReload" title="refresh">↻</button></div><div class="wf-runs-list" id="wfRunsList"><div class="empty-note">loading…</div></div>`;
   $("#wfBack", body).onclick = () => wfRenderList(body);
+  $("#wfRunsReload", body).onclick = () => wfRenderRuns(body, w);
+  let running = false;
+  try { running = ((await api("/api/workflows/live")).running || []).some(x => x.workflow_id === w.id && x.status === "running"); } catch {}
   let runs; try { runs = await api("/api/workflows/" + w.id + "/runs"); } catch { return; }
   const list = $("#wfRunsList", body);
-  if (!runs.length) { list.innerHTML = `<div class="empty-note">No runs yet — hit ▶ Run.</div>`; return; }
-  list.innerHTML = "";
+  const liveNote = running
+    ? `<div class="empty-note wf-runs-live">● a run is in progress — its entry lands here once it finishes; <a href="#" id="wfRunsWatch">watch it live</a></div>` : "";
+  if (!runs.length) { list.innerHTML = liveNote || `<div class="empty-note">No runs yet — hit ▶ Run.</div>`; }
+  else list.innerHTML = liveNote;
+  const watch = $("#wfRunsWatch", list); if (watch) watch.onclick = e => { e.preventDefault(); wfRenderRun(body, w); };
   runs.forEach(r => {
     const el = document.createElement("div"); el.className = "wf-run-rec " + (r.status === "ok" ? "ok" : "fail");
     el.innerHTML = `<div class="wf-rr-h"><span class="wf-rr-status">${r.status === "ok" ? "✓" : "✗"}</span><span class="wf-rr-sum">${escapeHtml(r.summary || "")}</span><span class="fe-spacer"></span><span class="wf-rr-meta">${escapeHtml((r.ts || "").slice(0, 16).replace("T", " "))} · ${escapeHtml(r.trigger || "")}</span></div><div class="wf-rr-steps"></div>`;
@@ -7366,8 +7771,22 @@ function renderJobsPop(pop) {
   // synthetic "bg"/"ag" id) can't yet, so no cancel button for those rather than a dead one.
   pop.innerHTML = `<div class="jb-head">Background jobs</div>` + _jobsLast.map(j => {
     const cancellable = typeof j.id === "number";
-    return `<div class="jb-item jb-${j.state}"><span class="jb-k">${escapeHtml(j.kind)}</span><span class="jb-l">${escapeHtml(j.label)}</span><span class="jb-m">${j.state === "queued" ? "queued" : Math.round(j.elapsed) + "s"}</span>${cancellable ? `<button class="jb-cancel" title="cancel" onclick="jobCancel(${j.id}, event)">✕</button>` : ""}</div>`;
+    // a workflow job's ref is always "workflow:<id>" — click the row to jump straight to its
+    // live run view (the only kind with a dedicated live view to jump to, so far)
+    const wid = j.kind === "workflow" && (j.ref || "").startsWith("workflow:") ? j.ref.slice(9) : "";
+    return `<div class="jb-item jb-${j.state}${wid ? " jb-clickable" : ""}"${wid ? ` title="open this run" onclick="wfOpenRun(${JSON.stringify(wid)}, event)"` : ""}><span class="jb-k">${escapeHtml(j.kind)}</span><span class="jb-l">${escapeHtml(j.label)}</span><span class="jb-m">${j.state === "queued" ? "queued" : Math.round(j.elapsed) + "s"}</span>${cancellable ? `<button class="jb-cancel" title="cancel" onclick="jobCancel(${j.id}, event)">✕</button>` : ""}</div>`;
   }).join("");
+}
+async function wfOpenRun(wid, e) {
+  if (e) e.stopPropagation();
+  const { body } = createWindow({ id: "win-workflows", title: "Workflows", icon: "⚙", width: 1100, height: 700, restoreKey: "workflows" });
+  body.classList.add("wf-win");
+  const id = +wid;
+  let wfs; try { wfs = await api("/api/workflows"); } catch { wfs = []; }
+  const w = wfs.find(x => x.id === id);
+  if (!w) { toast("that workflow no longer exists", "err"); wfRenderList(body); return; }
+  const pop = $("#jobsPop"); if (pop) pop.classList.remove("open");
+  wfRenderRun(body, w);
 }
 async function jobCancel(jid, e) {
   if (e) e.stopPropagation();
@@ -7386,9 +7805,18 @@ async function pollJobs() {
     badge.title = n ? `${d.running || 0} running${d.queued ? ", " + d.queued + " queued" : ""}` : "";
   }
   const pop = $("#jobsPop"); if (pop && pop.classList.contains("open")) renderJobsPop(pop);
-  // highlight the exact workflow cards / scheduler rows whose job is running (match by ref)
+  // highlight the exact workflow cards / scheduler rows whose job is running (match by ref) — a
+  // workflow started elsewhere (schedule, trigger, chat) must still light up + become clickable
+  // within this 2.5s tick, not only when the list happens to be freshly (re)opened
   const running = new Set(_jobsLast.filter(j => j.state === "running" && j.ref).map(j => j.ref));
-  $$(".wf-card[data-wid]").forEach(c => c.classList.toggle("job-running", running.has("workflow:" + c.dataset.wid)));
+  const wfCards = $$(".wf-card[data-wid]");
+  wfCards.forEach(c => {
+    c.classList.toggle("job-running", running.has("workflow:" + c.dataset.wid));
+    running.has("workflow:" + c.dataset.wid) ? _wfPaintCardRunning(c) : _wfPaintCardIdle(c);
+  });
+  // the ⏸ paused / ⚠ failed badge too — a run that pauses or crashes WHILE the list is already
+  // open must still show it within this tick, not only on the next reopen
+  if (wfCards.length) { const win = $("#win-workflows"); if (win) wfMarkResumable($(".win-body", win)); }
   $$(".sched-row[data-tid]").forEach(r => r.classList.toggle("job-running", running.has(r.dataset.src) || running.has("task:" + r.dataset.tid)));
   pollJobDeliveries();          // print any just-finished spawn_job results into the open conversation
 }
@@ -7500,6 +7928,7 @@ function wire() {
     else if (v === "workflows") openWorkflows();
     else if (v === "search") openSearch();
     else if (v === "notes") openNotes();
+    else if (v === "notebook") openNotebook();
     else if (v === "logs") openLogs();
     else if (v === "hosts") openHosts();
     else if (v === "mcp") openMcp();
@@ -7604,7 +8033,7 @@ const UI_OPENERS = {
   memory: () => openBrain("mem"), knowledge: () => openBrain("kn"), skills: () => openBrain("skills"),
   rivers: () => openBrain("rivers"), evals: () => openBrain("evals"),
   "memory-graph": () => openMemoryGraph(), scheduler: () => openScheduler(),
-  researcher: () => openResearcher(), notes: () => openNotes(), health: () => openHealth(),
+  researcher: () => openResearcher(), notes: () => openNotes(), notebook: () => openNotebook(), health: () => openHealth(),
   search: () => openSearch(), voice: () => openVoice(), workflows: () => openWorkflows(),
   live: () => openLiveView(), settings: () => openSettings(), hosts: () => openHosts(),
   logs: () => openLogs(), terminal: () => openTerminal(), mail: () => openMail(), mcp: () => openMcp(),
@@ -7613,7 +8042,7 @@ const UI_WINIDS = {
   files: "win-explorer", explorer: "win-explorer", preview: "win-preview", calendar: "win-cal",
   brain: "win-brain", memory: "win-brain", knowledge: "win-brain", skills: "win-brain",
   rivers: "win-brain", evals: "win-brain", "memory-graph": "win-memgraph", scheduler: "win-sched",
-  researcher: "win-research", notes: "win-notes", health: "win-health", search: "win-search",
+  researcher: "win-research", notes: "win-notes", notebook: "win-notebook", health: "win-health", search: "win-search",
   voice: "win-voice", workflows: "win-workflows", live: "win-live", settings: "win-settings",
   hosts: "win-hosts", logs: "win-logs", terminal: "win-terminal", mail: "win-mail", mcp: "win-mcp",
 };
@@ -7687,6 +8116,7 @@ async function initApp() {
   if (_appStarted) return;        // idempotent — survives a mid-session re-login
   _appStarted = true;
   wire();
+  initChatTermPanel();
   await loadModels();             // resolve the model + mind (Claude vs local) before any chat opens
   loadPrefs();
   setView("chat");

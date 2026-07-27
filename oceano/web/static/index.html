@@ -50,7 +50,8 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
             <button class="nav-item" data-view="researcher"><span class="ni">⌖</span> Researcher</button>
             <button class="nav-item" data-view="workflows"><span class="ni">⚙</span> Workflows</button>
             <button class="nav-item" data-view="search"><span class="ni">⌕</span> Search</button>
-            <button class="nav-item" data-view="notes"><span class="ni">❏</span> Notes</button>
+            <button class="nav-item" data-view="notes"><span class="ni">❏</span> Kanban Board</button>
+            <button class="nav-item" data-view="notebook"><span class="ni">❐</span> Notebook</button>
             <button class="nav-item" data-view="logs"><span class="ni">▤</span> Logs</button>
             <button class="nav-item" data-view="hosts"><span class="ni">⌗</span> Hosts</button>
             <button class="nav-item" data-view="mcp"><span class="ni">⛓</span> MCP Servers</button>
@@ -87,6 +88,7 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
           <div class="jobs-pop" id="jobsPop"></div>
         </div>
         <button class="icon-btn" id="liveBtn" title="Live browser — watch Oceano browse">◫</button>
+        <button class="icon-btn" id="shellPanelBtn" title="Shell activity — read only" style="display:none">▥</button>
         <label class="agent-switch" id="agentSwitch" title="Agent mode — give it tools and let it run">
           <input type="checkbox" id="agentToggle">
           <span class="track"><span class="thumb"></span></span>
@@ -98,30 +100,43 @@ if(de)d.classList.add("density-"+de);}catch(e){}})();
     <div class="views">
       <!-- CHAT -->
       <section class="view active" id="view-chat">
-        <div class="thread" id="thread"></div>
-        <!-- minimized windows dock — sits between the chat output and the input -->
-        <div id="winDock"></div>
-        <div class="composer">
-          <div class="composer-inner">
-            <div class="composer-row">
-              <button class="model-pill" id="modelPill"><span class="mp-dot"></span><span id="modelLabel">select model</span><span class="mp-caret">▾</span></button>
-              <div class="model-menu" id="modelMenu"></div>
+        <div class="chat-split" id="chatSplit">
+          <div class="chat-pane" id="chatPane">
+            <div class="thread" id="thread"></div>
+            <!-- minimized windows dock — sits between the chat output and the input -->
+            <div id="winDock"></div>
+            <div class="composer">
+              <div class="composer-inner">
+                <div class="composer-row">
+                  <button class="model-pill" id="modelPill"><span class="mp-dot"></span><span id="modelLabel">select model</span><span class="mp-caret">▾</span></button>
+                  <div class="model-menu" id="modelMenu"></div>
+                </div>
+                <div class="converse-bar" id="converseBar" style="display:none">
+                  <span class="cv-dot"></span><span id="converseStatus">listening…</span>
+                </div>
+                <div class="attach-tray" id="attachTray"></div>
+                <textarea id="input" rows="1" placeholder="Send a transmission…"></textarea>
+                <input type="file" id="attachInput" multiple style="display:none">
+                <div class="composer-actions">
+                  <button class="icon-btn converse-btn" id="converseBtn" title="hands-free voice conversation — talk and it talks back">🎙</button>
+                  <button class="icon-btn ghost attach-btn" id="attachBtn" title="attach files or images (or drag & drop / paste)">📎</button>
+                  <span class="hint">↵ send · ⇧↵ newline</span>
+                  <button class="send" id="send" aria-label="send">
+                    <span class="send-sonar"></span>
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3 11l18-8-8 18-2-7-8-3z"/></svg>
+                  </button>
+                </div>
+              </div>
             </div>
-            <div class="converse-bar" id="converseBar" style="display:none">
-              <span class="cv-dot"></span><span id="converseStatus">listening…</span>
+          </div>
+          <div class="chat-term-divider" id="chatTermDivider"></div>
+          <div class="chat-term-pane" id="chatTermPane">
+            <div class="chat-term-bar">
+              <span class="chat-term-title">▥ Shell activity <span class="chat-term-note">read only</span></span>
+              <button class="chat-term-btn" id="chatTermOrient" title="switch split direction">⇄</button>
+              <button class="chat-term-btn" id="chatTermHide" title="hide">✕</button>
             </div>
-            <div class="attach-tray" id="attachTray"></div>
-            <textarea id="input" rows="1" placeholder="Send a transmission…"></textarea>
-            <input type="file" id="attachInput" multiple style="display:none">
-            <div class="composer-actions">
-              <button class="icon-btn converse-btn" id="converseBtn" title="hands-free voice conversation — talk and it talks back">🎙</button>
-              <button class="icon-btn ghost attach-btn" id="attachBtn" title="attach files or images (or drag & drop / paste)">📎</button>
-              <span class="hint">↵ send · ⇧↵ newline</span>
-              <button class="send" id="send" aria-label="send">
-                <span class="send-sonar"></span>
-                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3 11l18-8-8 18-2-7-8-3z"/></svg>
-              </button>
-            </div>
+            <div class="chat-term-inner" id="chatTermInner"></div>
           </div>
         </div>
       </section>

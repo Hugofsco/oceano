@@ -213,7 +213,9 @@ def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=Fa
     tag, not by their instruction text, so editing the wording is cosmetic (and the bootstrap
     may re-canonicalize it on the next restart); the schedule, model, on/off and existence are
     what actually take effect. `model` (pass "" to clear → system default) applies to plain
-    agent tasks. `allow_managed` is the owner module's own write path (researcher/skills/etc.
+    agent tasks, research tasks (mirrored into the topic record below — research runs read
+    the topic's model, not this row's), and workflow tasks (threaded into the run as its
+    default mind; per-node pins still win). `allow_managed` is the owner module's own write path (researcher/skills/etc.
     syncing their generated label); it now only suppresses the research mirror-back below, so an
     owner-originated edit doesn't echo back to itself."""
     if cron is not None and not _cron_ok(cron):
@@ -240,7 +242,8 @@ def update_task(tid, cron=None, instruction=None, enabled=None, allow_managed=Fa
     if not allow_managed and src and src.startswith("research:"):
         try:
             from oceano import researcher
-            researcher.note_schedule(int(src.split(":", 1)[1]), cron=cron, enabled=enabled)
+            researcher.note_schedule(int(src.split(":", 1)[1]), cron=cron, enabled=enabled,
+                                     model=model, base_url=base_url)
         except Exception:
             pass
     return True
@@ -353,8 +356,43 @@ def _drain_loop():
             _set_run_status(tid, "error", f"{type(e).__name__}: {e}")
             notify(f"⚠️ Scheduled task failed:\n{instruction}\n\n{type(e).__name__}: {e}",
                    title="Oceano task failed")                          # silent failures → visible
+            # a failure should produce a proposed fix, not just a red row — diagnose on its own
+            # thread so a slow reviewer never blocks the next queued task
+            threading.Thread(target=_diagnose_failure,
+                             args=(tid, ref, instruction, f"{type(e).__name__}: {e}"),
+                             daemon=True).start()
         finally:
             _TASK_Q.task_done()
+
+
+def _diagnose_failure(tid, ref, instruction, err):
+    """One diagnosis turn on the 'improve' delegate after a task run fails, filed into the
+    Suggestions queue — the same independent reviewer the memory/skills jobs use. The queue's
+    pending de-dupe (kind+title) keeps a task that fails every tick from piling up duplicates,
+    and a reply starting with TRANSIENT (network blip, rate limit) files nothing. Never raises:
+    diagnosis is best-effort and must not take the drain worker down with it."""
+    try:
+        from oceano import delegate, suggestions
+        if not delegate.enabled():
+            return
+        prompt = (f"A scheduled task in Oceano just FAILED.\n\n"
+                  f"Task ({ref}) instruction:\n{(instruction or '')[:2000]}\n\n"
+                  f"Error:\n{err[:2000]}\n\n"
+                  "Diagnose the likely root cause (you have read access to the code under oceano/ "
+                  "and the workspace) and propose ONE concrete fix: a config change, an instruction "
+                  "rewrite, a model pin, or a code-change sketch. Reply with a short diagnosis (a "
+                  "few sentences) then the proposed fix. If the failure looks transient (network, "
+                  "rate limit, a service momentarily down), reply with exactly TRANSIENT and one "
+                  "line saying why.")
+        r = delegate.run(prompt, cwd=config.WORKSPACE, tools="Read", timeout=420, role="improve")
+        out = (r.get("output") or "").strip()
+        if r.get("ok") and out and not out.upper().startswith("TRANSIENT"):
+            suggestions.add("other", f"scheduled task {ref} failed — diagnosis & proposed fix",
+                            detail=f"instruction: {(instruction or '')[:300]}\n"
+                                   f"error: {err[:500]}\n\n{out[:4000]}",
+                            source=f"task:{tid}")
+    except Exception as e:                                              # noqa: BLE001
+        print(f"[scheduler] failure diagnosis for {ref} skipped: {e}")
 
 
 def _dispatch(source, instruction, ref=None, model=None, base_url=None):
@@ -392,9 +430,11 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
         if source == "reindex:all":                          # locked index re-sync (docs/memories/skills/chats)
             from oceano import reindex
             return reindex.reindex_all()
-        if source and source.startswith("workflow:"):        # a user-defined workflow
-            from oceano import workflows
-            return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule").get("summary", "workflow ran")
+        if source and source.startswith("workflow:"):        # a user-defined workflow — the task's
+            from oceano import workflows                     # model pin rides along as the run's mind
+            return workflows.run_by_id(int(source.split(":", 1)[1]), trigger="schedule",
+                                       default_model=model or "", default_base_url=base_url or "") \
+                            .get("summary", "workflow ran")
         with jobs.job("task", instruction, ref=ref) as jid:
             ce = jobs.cancel_event(jid)        # set by a ✕ click in the jobs popup while this runs
             try:
@@ -410,17 +450,25 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
                         answer = Agent().run_codex(instruction, cancel=ce)
                     else:
                         answer = "⚠️ This task is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
+                elif not model:                # no per-task override → follow the PRIMARY INTELLIGENCE,
+                    from oceano import delegate  # same as an un-pinned workflow step: mind → CLI, else local model
+                    mind = delegate.get_mind()
+                    if mind == "claude" and delegate.available():
+                        answer = Agent().run_claude(instruction, cancel=ce)
+                    elif mind == "codex" and delegate.codex_available():
+                        answer = Agent().run_codex(instruction, cancel=ce)
+                    else:
+                        answer = Agent().run(instruction, cancel=ce)
                 else:
                     ag = Agent()
-                    if model:                  # per-task model override (else Agent's configured default)
-                        ag.model = model
-                        if base_url:
-                            ag.base_url = base_url
-                            try:
-                                from oceano.web import server
-                                ag.api_key = server.endpoint_key(base_url)
-                            except Exception:
-                                pass
+                    ag.model = model           # per-task model override
+                    if base_url:
+                        ag.base_url = base_url
+                        try:
+                            from oceano.web import server
+                            ag.api_key = server.endpoint_key(base_url)
+                        except Exception:
+                            pass
                     answer = ag.run(instruction, cancel=ce)
             except AgentCancelled:
                 answer = "⏹️ cancelled by user"

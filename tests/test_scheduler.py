@@ -117,6 +117,41 @@ def test_self_reflection_is_delete_protected_for_everyone(tmp_path, monkeypatch)
                                                        # (recreated by ensure_*() on restart)
 
 
+def test_dispatch_follows_primary_intelligence_when_task_has_no_model_override(monkeypatch):
+    """A scheduled task left on "default" (no per-task model override) must follow whatever
+    mind is configured as the PRIMARY INTELLIGENCE — same as an un-pinned workflow step — not
+    silently boot the local resident model. Regression test: _dispatch's else-branch used to
+    call plain Agent().run() unconditionally, ignoring delegate.get_mind() entirely, so a task
+    left on "default" ran locally even with Claude/Codex set as primary."""
+    monkeypatch.setattr("oceano.logs.log_run", lambda *a, **k: None)
+
+    from oceano import delegate
+    monkeypatch.setattr(delegate, "get_mind", lambda: "claude")
+    monkeypatch.setattr(delegate, "available", lambda: True)
+
+    calls = []
+
+    class FakeAgent:
+        def run_claude(self, instruction, cancel=None):
+            calls.append("claude")
+            return "ran via claude mind"
+
+        def run_codex(self, instruction, cancel=None):
+            calls.append("codex")
+            return "ran via codex mind"
+
+        def run(self, instruction, cancel=None):
+            calls.append("local")
+            return "ran via local model"
+
+    monkeypatch.setattr("oceano.agent.Agent", FakeAgent)
+
+    answer = scheduler._dispatch(None, "check the news", model=None)
+
+    assert calls == ["claude"]
+    assert answer == "ran via claude mind"
+
+
 def test_wipe_removes_plain_tasks_and_keeps_managed(tmp_path, monkeypatch):
     """Settings → Wipe → Scheduled tasks clears what you/the agent scheduled, but never the
     source-tagged entries — maintenance built-ins and researcher/workflow schedules belong to

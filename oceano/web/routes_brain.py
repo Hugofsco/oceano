@@ -16,6 +16,7 @@ router = APIRouter()
 def brain_stats():
     docs = rag.stats()
     return {"memories": memory.count(),
+            "memory_candidates": memory.pending_count(),
             "docs": docs,
             "embed": {"ok": _embed_reachable(), "model": embeddings.EMBED_MODEL,
                       "url": embeddings.EMBED_URL, "dims": docs.get("dims")}}
@@ -179,6 +180,21 @@ async def patch_memory(mid: int, req: Request):
 @router.delete("/api/memories/{mid}")
 def remove_memory(mid: int):
     return {"ok": memory.forget(mid)}
+
+
+@router.get("/api/memory/candidates")
+def memory_candidates():
+    return {"candidates": memory.pending_candidates()}
+
+
+@router.post("/api/memory/candidates/{cid}/approve")
+def approve_memory_candidate(cid: int):
+    return {"ok": memory.approve_candidate(cid)}
+
+
+@router.post("/api/memory/candidates/{cid}/dismiss")
+def dismiss_memory_candidate(cid: int):
+    return {"ok": memory.dismiss_candidate(cid)}
 
 
 # ---------------- memory graph (Memory Graph window) ----------------

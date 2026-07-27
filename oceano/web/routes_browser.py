@@ -8,7 +8,7 @@ import json
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import StreamingResponse
 
-from oceano import desktopbridge, livebrowser, safety, uibridge
+from oceano import desktopbridge, livebrowser, safety, shellfeed, uibridge
 from oceano.web.state import SESSION_COOKIE, _sse, _token_user, load, save
 
 router = APIRouter()
@@ -268,6 +268,33 @@ async def ui_stream():
                 yield _sse(cmd)
         finally:
             uibridge.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@router.get("/api/shell/stream")
+async def shell_stream(session: str = ""):
+    """Per-chat read-only shell-activity feed (oceano.shellfeed): every run_shell/Bash/shell
+    command THIS chat's turn runs, scoped by `session` (the chat id) so two chats open in
+    parallel never bleed into each other's spectator panel. Empty/omitted `session` watches the
+    "no chat" bucket (scheduler/workflow/background work, and Telegram — none of which set a
+    session). New listeners get that session's recent backlog immediately, then live text.
+    Auth-gated by the middleware like /api/ui/stream."""
+    loop = asyncio.get_running_loop()
+    q = shellfeed.subscribe(loop, session or None)
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    text = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ka\n\n"          # keep-alive
+                    continue
+                yield _sse({"text": text})
+        finally:
+            shellfeed.unsubscribe(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})

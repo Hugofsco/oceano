@@ -80,6 +80,11 @@ def _db():
         "id INTEGER PRIMARY KEY, ts TEXT, text TEXT, tags TEXT, embedding TEXT, "
         "category TEXT DEFAULT 'fact', pinned INTEGER DEFAULT 0, source TEXT)"
     )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS memory_candidates ("
+        "id INTEGER PRIMARY KEY, ts TEXT, text TEXT, category TEXT, evidence TEXT, "
+        "confidence REAL, provenance TEXT, status TEXT DEFAULT 'pending')"
+    )
     cols = {r[1] for r in con.execute("PRAGMA table_info(memories)").fetchall()}
     if "category" not in cols:                       # migrate an older DB in place
         con.execute("ALTER TABLE memories ADD COLUMN category TEXT")
@@ -227,7 +232,7 @@ def recall(query, k=5):
     if not rows:
         return "(no memories yet)"
 
-    qvec = _embed(query)
+    qvec = _embed(query, "query")                # asymmetric: queries use the nomic 'query' prefix
     if qvec:  # semantic path
         scored = []
         for text, tags, emb, src in rows:
@@ -293,7 +298,7 @@ def search(query, k=8):
     con.close()
     if not rows:
         return []
-    qvec = _embed(query)
+    qvec = _embed(query, "query")                # asymmetric: queries use the nomic 'query' prefix
     if qvec:
         scored = []
         for r in rows:                               # corrupt/missing vector → -1.0 (sorts last)
@@ -389,6 +394,69 @@ def add_if_new(text, tags="", category="fact", threshold=0.86, source=""):
                  json.dumps(vec) if vec else None, _norm_cat(category), (source or "").strip()))
     con.commit(); con.close()
     return True
+
+
+def queue_candidate(text, category, evidence, confidence, provenance=""):
+    """Queue a lower-confidence automatic extraction for explicit review."""
+    text, evidence = (text or "").strip(), (evidence or "").strip()
+    if not text:
+        return None
+    con = _db()
+    existing = con.execute(
+        "SELECT id FROM memory_candidates WHERE status='pending' AND lower(text)=lower(?)", (text,)
+    ).fetchone()
+    if existing:
+        con.close()
+        return existing[0]
+    cur = con.execute(
+        "INSERT INTO memory_candidates "
+        "(ts,text,category,evidence,confidence,provenance,status) VALUES (?,?,?,?,?,?,'pending')",
+        (datetime.now(timezone.utc).isoformat(), text, _norm_cat(category), evidence,
+         max(0.0, min(1.0, float(confidence))), (provenance or "").strip()),
+    )
+    con.commit(); con.close()
+    return cur.lastrowid
+
+
+def pending_candidates(limit=100):
+    con = _db()
+    rows = con.execute(
+        "SELECT id,ts,text,category,evidence,confidence,provenance FROM memory_candidates "
+        "WHERE status='pending' ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    con.close()
+    return [{"id": r[0], "ts": r[1], "text": r[2], "category": r[3],
+             "evidence": r[4], "confidence": r[5], "provenance": r[6]} for r in rows]
+
+
+def approve_candidate(cid):
+    con = _db()
+    row = con.execute(
+        "SELECT text,category,provenance FROM memory_candidates WHERE id=? AND status='pending'", (cid,)
+    ).fetchone()
+    if not row:
+        con.close()
+        return False
+    con.execute("UPDATE memory_candidates SET status='approved' WHERE id=?", (cid,))
+    con.commit(); con.close()
+    add_if_new(row[0], tags="auto-reviewed", category=row[1], source=row[2])
+    return True
+
+
+def dismiss_candidate(cid):
+    con = _db()
+    cur = con.execute(
+        "UPDATE memory_candidates SET status='dismissed' WHERE id=? AND status='pending'", (cid,)
+    )
+    con.commit(); con.close()
+    return bool(cur.rowcount)
+
+
+def pending_count():
+    con = _db()
+    n = con.execute("SELECT COUNT(*) FROM memory_candidates WHERE status='pending'").fetchone()[0]
+    con.close()
+    return n
 
 
 def best_match(query):

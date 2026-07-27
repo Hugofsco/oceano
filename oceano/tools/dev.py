@@ -77,13 +77,77 @@ def code_search(query, path=".", glob=""):
     return ("\n".join(lines[:200]) + extra)[:8000]
 
 
+def _project_python(d):
+    """Prefer a project-local virtualenv's interpreter over Oceano's own — a scaffolded
+    sub-project ships its OWN dependencies (pandas, ccxt, whatever it needs), which Oceano's venv
+    never has, so running its tests with sys.executable fails on imports that have nothing to do
+    with the actual code under test."""
+    for venv_dir in (".venv", "venv"):
+        py = d / venv_dir / "bin" / "python"
+        if py.exists():
+            return str(py)
+    return sys.executable
+
+
+def _test_cmd(d):
+    """The test-runner command for `d`, or None if no marker is present."""
+    if (d / "pyproject.toml").exists() or (d / "pytest.ini").exists() or (d / "tests").is_dir() or list(d.glob("test_*.py")):
+        return [_project_python(d), "-m", "pytest", "-q"]
+    if (d / "package.json").exists():
+        return ["npm", "test", "--silent"]
+    if (d / "Cargo.toml").exists():
+        return ["cargo", "test", "-q"]
+    if (d / "Makefile").exists():
+        return ["make", "test"]
+    return None
+
+
+_TEST_SEARCH_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache", ".mypy_cache"}
+
+
+def _find_test_dir(base, max_depth=3):
+    """`base` itself first; if it has no test markers, search subdirectories (bounded depth,
+    common dependency/VCS dirs skipped) for exactly one that does. A scaffolded sub-project
+    (e.g. workspace/projects/<app>/ — the normal shape a build step leaves behind) shouldn't
+    report "no test suite" just because the WORKSPACE ROOT itself has none: that made an
+    app-builder-style test-then-fix loop spin forever, since a directory that's never actually
+    checked can never start reporting a pass.
+    Returns (dir, candidates): dir is the match (None if zero or more than one found);
+    candidates is the full list when there's more than one, so the caller can ask for an
+    explicit path instead of silently guessing which project was meant."""
+    if _test_cmd(base) is not None:
+        return base, []
+    found = []
+
+    def walk(d, depth):
+        if depth > max_depth:
+            return
+        try:
+            children = [c for c in d.iterdir()
+                       if c.is_dir() and c.name not in _TEST_SEARCH_SKIP and not c.name.startswith(".")]
+        except OSError:
+            return
+        for c in sorted(children):
+            if _test_cmd(c) is not None:
+                found.append(c)
+            else:
+                walk(c, depth + 1)
+
+    walk(base, 1)
+    if len(found) == 1:
+        return found[0], []
+    return None, found
+
+
 @tool({
     "type": "function",
     "function": {
         "name": "run_tests",
         "description": "Detect and run the project's test suite in the workspace (pytest / npm test / "
                        "cargo test / make test) and return the result. Use after writing or editing "
-                       "code to check it works.",
+                       "code to check it works. If the given path has no test suite of its own, looks "
+                       "one level of subdirectories deep for exactly one that does (e.g. a project "
+                       "scaffolded under projects/<name>/).",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "project subdir, default the workspace root"},
         }},
@@ -91,17 +155,15 @@ def code_search(query, path=".", glob=""):
 })
 def run_tests(path="."):
     base = _resolve(path)
-    d = base if base.is_dir() else base.parent
-    if (d / "pyproject.toml").exists() or (d / "pytest.ini").exists() or (d / "tests").is_dir() or list(d.glob("test_*.py")):
-        cmd = [sys.executable, "-m", "pytest", "-q"]
-    elif (d / "package.json").exists():
-        cmd = ["npm", "test", "--silent"]
-    elif (d / "Cargo.toml").exists():
-        cmd = ["cargo", "test", "-q"]
-    elif (d / "Makefile").exists():
-        cmd = ["make", "test"]
-    else:
+    base = base if base.is_dir() else base.parent
+    d, candidates = _find_test_dir(base)
+    if d is None:
+        if candidates:
+            names = ", ".join(str(c.relative_to(base)) for c in candidates)
+            return f"(multiple test suites found under {path or '.'}/ — {names} — pass path= to pick one)"
         return "(no test suite detected — looked for pytest, package.json, Cargo.toml, Makefile)"
+    cmd = _test_cmd(d)
+    note = f"(no test suite at {path or '.'}/ itself — using {d.relative_to(base)}/)\n" if d != base else ""
     try:
         r = subprocess.run(cmd, cwd=str(d), capture_output=True, text=True, timeout=max(config.SHELL_TIMEOUT, 300))
     except FileNotFoundError as e:
@@ -109,7 +171,7 @@ def run_tests(path="."):
     except subprocess.TimeoutExpired:
         return "ERROR: tests timed out"
     tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-60:])
-    return f"(exit {r.returncode}) {' '.join(cmd)}\n{tail}"[:8000]
+    return f"{note}(exit {r.returncode}) {' '.join(cmd)}\n{tail}"[:8000]
 
 
 @tool({

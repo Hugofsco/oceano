@@ -47,7 +47,10 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS results ("
                 "id INTEGER PRIMARY KEY, run_id INTEGER, case_id INTEGER, case_name TEXT, model TEXT, "
                 "score REAL, passed INTEGER, tokens INTEGER, ms INTEGER, steps INTEGER, "
-                "tools TEXT, error TEXT, verdict TEXT, answer TEXT)")
+                "tools TEXT, error TEXT, verdict TEXT, answer TEXT, weight REAL DEFAULT 1.0)")
+    result_cols = {r[1] for r in con.execute("PRAGMA table_info(results)").fetchall()}
+    if "weight" not in result_cols:
+        con.execute("ALTER TABLE results ADD COLUMN weight REAL DEFAULT 1.0")
     con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     return con
 
@@ -193,7 +196,45 @@ def _scheduled_note():
 
 
 # ============================ running a single case ============================
-def _run_case(case, model, cancel=None):
+_SEED_TOOL_RESULTS = "__tool_results__"
+_EVAL_WORKSPACE_TOOLS = {
+    "list_files", "read_file", "write_file", "edit_file", "make_folder",
+    "run_shell", "python_exec", "code_search", "run_tests", "git",
+}
+_DEFAULT_TOOL_FIXTURES = {
+    "research-fetch": {
+        "web_search": "1. BIPM SI Brochure — Electric current base unit "
+                      "(https://www.bipm.org/en/measurement-units)",
+        "fetch_url": "BIPM SI Brochure: The ampere, symbol A, is the SI unit of electric current. "
+                     "Source: https://www.bipm.org/en/measurement-units",
+    },
+    "tool-choice-calendar": {
+        "calendar_events": "2026-01-13 10:00–10:30 — Project sync (synthetic eval fixture)",
+    },
+}
+
+
+def _case_tool_setup(case):
+    """Return (advertised tool names, deterministic overrides) for an isolated case.
+
+    File/shell/dev tools are safe because background_workspace redirects them to the
+    throwaway root. Every external or personal-state tool must have a fixture; otherwise
+    it is withheld even if a grader names it.
+    """
+    seed = case.get("seed") or {}
+    fixtures = seed.get(_SEED_TOOL_RESULTS, {}) if isinstance(seed, dict) else {}
+    fixtures = fixtures if isinstance(fixtures, dict) else {}
+    fixtures = {**_DEFAULT_TOOL_FIXTURES.get(case.get("name"), {}), **fixtures}
+    wanted = {g.get("name") for g in case.get("graders", []) if g.get("type") == "tool_called"}
+    if case.get("category") in ("file", "code"):
+        wanted |= _EVAL_WORKSPACE_TOOLS
+    if case.get("category") == "research":
+        wanted |= {"web_search", "fetch_url"}
+    allowed = {n for n in wanted if n in _EVAL_WORKSPACE_TOOLS or n in fixtures}
+    return allowed, fixtures
+
+
+def _run_case(case, model, cancel=None, dynamic_tools=None):
     """Drive the agent through one case in an isolated workspace; capture answer,
     tools used, tokens, steps, wall-time, created files. Returns a result dict.
     Aborts mid-case if `cancel` (a threading.Event) is set."""
@@ -202,17 +243,31 @@ def _run_case(case, model, cancel=None):
     safe = re.sub(r"[^a-z0-9]+", "-", case["name"].lower()).strip("-")[:40] or "case"
     scratch = RUN_DIR / f"{safe}-{case['id']}"
     answer, tools_used, tokens, steps, err = "", [], 0, 0, None
+    preview = None
     t0 = time.time()
     try:
-        with tools.background_workspace(scratch) as root:
+        allowed, fixtures = _case_tool_setup(case)
+        from oceano import toolrouter
+        from oceano import tools as tool_catalog
+        all_schemas = tool_catalog.schemas()
+        safe_schemas = [s for s in all_schemas if s["function"]["name"] in allowed]
+        preview = (toolrouter.route(all_schemas, case["prompt"], model=model, force=dynamic_tools)
+                   if dynamic_tools is not None else
+                   toolrouter.Route(safe_schemas, False, False, "explicit-allowlist",
+                                    len(safe_schemas), len(safe_schemas), model))
+        with tools.background_workspace(scratch) as root, tools.tool_overrides(fixtures):
             for fn, content in (case.get("seed") or {}).items():
+                if fn == _SEED_TOOL_RESULTS:
+                    continue
                 try:
                     p = (root / fn)
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_text(str(content), encoding="utf-8")
                 except OSError:
                     pass
-            ag = Agent(model=model)
+            ag = Agent(model=model, learn=False, inject_context=False, only_tools=allowed,
+                       dynamic_tools=dynamic_tools,
+                       routing_catalog=all_schemas if dynamic_tools is not None else None)
             deadline = t0 + (case.get("timeout") or CASE_TIMEOUT)
             for ev in ag.run_stream(case["prompt"]):
                 kind = ev.get("type")
@@ -236,7 +291,51 @@ def _run_case(case, model, cancel=None):
         err = f"{type(e).__name__}: {e}"
     return {"case": case, "model": model, "answer": answer.strip(), "tools": tools_used,
             "tokens": tokens, "steps": steps, "ms": int((time.time() - t0) * 1000),
-            "error": err, "scratch": str(scratch), "files": files}
+            "error": err, "scratch": str(scratch), "files": files,
+            "routing": {"enabled": bool(preview and preview.enabled),
+                        "routed": bool(preview and preview.routed),
+                        "catalog_tools": preview.total if preview else 0,
+                        "advertised_tools": preview.selected if preview else 0,
+                        "domains": list(preview.domains) if preview else []}}
+
+
+def compare_tool_routing(model, case_ids=None):
+    """Run the existing enabled eval suite twice for one model: full safe catalog vs routing.
+
+    This is intentionally explicit rather than part of every scheduled eval—it doubles model and
+    judge calls. Both variants stay inside each case's deterministic safe allowlist. The returned
+    report exposes task-score/pass deltas alongside schema, token, latency, and tool-call changes.
+    """
+    wanted = set(case_ids or ())
+    cases = [c for c in all_cases() if c["enabled"] and (not wanted or c["id"] in wanted)]
+    rows = []
+    for case in cases:
+        variants = {}
+        for label, enabled in (("full", False), ("routed", True)):
+            run = _run_case(case, model, dynamic_tools=enabled)
+            grade = _grade(case, run)
+            variants[label] = {
+                "score": grade["score"], "passed": grade["passed"], "tokens": run["tokens"],
+                "ms": run["ms"], "steps": run["steps"], "tools": run["tools"],
+                "advertised_tools": run["routing"]["advertised_tools"],
+                "catalog_tools": run["routing"]["catalog_tools"], "error": run["error"],
+            }
+        rows.append({"case_id": case["id"], "case": case["name"], **variants,
+                     "score_delta": variants["routed"]["score"] - variants["full"]["score"],
+                     "token_delta": variants["routed"]["tokens"] - variants["full"]["tokens"],
+                     "ms_delta": variants["routed"]["ms"] - variants["full"]["ms"]})
+    def avg(label, key):
+        vals = [r[label][key] for r in rows]
+        return round(sum(vals) / len(vals), 1) if vals else 0
+    return {
+        "model": model, "cases": len(rows), "rows": rows,
+        "full": {"avg_score": avg("full", "score"), "pass_rate": avg("full", "passed") * 100,
+                 "avg_tokens": avg("full", "tokens"), "avg_ms": avg("full", "ms"),
+                 "avg_advertised_tools": avg("full", "advertised_tools")},
+        "routed": {"avg_score": avg("routed", "score"), "pass_rate": avg("routed", "passed") * 100,
+                   "avg_tokens": avg("routed", "tokens"), "avg_ms": avg("routed", "ms"),
+                   "avg_advertised_tools": avg("routed", "advertised_tools")},
+    }
 
 
 # ============================ grading ============================
@@ -387,11 +486,12 @@ def _run_all(models=None):
                 per_model[model].append(graded["score"])
                 con = _db()
                 con.execute("INSERT INTO results (run_id, case_id, case_name, model, score, passed, "
-                            "tokens, ms, steps, tools, error, verdict, answer) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "tokens, ms, steps, tools, error, verdict, answer, weight) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (run_id, case["id"], case["name"], model, graded["score"],
                              1 if graded["passed"] else 0, run["tokens"], run["ms"], run["steps"],
                              json.dumps(run["tools"]), run["error"], json.dumps(graded["verdict"]),
-                             (run["answer"] or "")[:4000]))
+                             (run["answer"] or "")[:4000], float(case.get("weight") or 1.0)))
                 con.commit()
                 con.close()
                 _STATE["done"] += 1
@@ -492,7 +592,11 @@ def leaderboard(run_id=None, category=None):
     if run_id is None:
         con.close()
         return {"run_id": None, "rows": []}
-    q = ("SELECT r.model, AVG(r.score), AVG(r.passed)*100, SUM(r.tokens), AVG(r.ms), AVG(r.steps), COUNT(*) "
+    q = ("SELECT r.model, SUM(r.score*COALESCE(r.weight,c.weight,1.0))/"
+         "SUM(COALESCE(r.weight,c.weight,1.0)), "
+         "SUM(r.passed*COALESCE(r.weight,c.weight,1.0))*100/"
+         "SUM(COALESCE(r.weight,c.weight,1.0)), "
+         "SUM(r.tokens), AVG(r.ms), AVG(r.steps), COUNT(*) "
          "FROM results r LEFT JOIN cases c ON c.id = r.case_id WHERE r.run_id=?")
     args = [run_id]
     if category:
@@ -504,6 +608,11 @@ def leaderboard(run_id=None, category=None):
               "tokens": int(r[3] or 0), "avg_ms": int(r[4] or 0), "avg_steps": round(r[5], 1),
               "cases": r[6]} for r in rows]
     board.sort(key=lambda x: x["score"], reverse=True)
+    for i, row in enumerate(board):
+        margin = row["score"] - board[i + 1]["score"] if i + 1 < len(board) else None
+        row["margin"] = round(margin, 1) if margin is not None else None
+        row["confidence"] = ("low" if row["cases"] < 5 or (margin is not None and margin < 5)
+                             else "medium" if row["cases"] < 20 else "high")
     return {"run_id": run_id, "rows": board}
 
 
@@ -525,10 +634,15 @@ def best_model(among=None, category=None, max_age_days=45):
     except (TypeError, ValueError):
         pass                                           # unparsable stamp → treat as fresh
     allowed = set(among) if among is not None else None
-    for r in leaderboard(row[0], category=category)["rows"]:
-        if allowed is None or r["model"] in allowed:
-            return r["model"]
-    return None
+    candidates = [r for r in leaderboard(row[0], category=category)["rows"]
+                  if allowed is None or r["model"] in allowed]
+    if not candidates:
+        return None
+    # Do not steer routing on an effective tie. A two-point gap is smaller than ordinary
+    # single-judge/run variance; keep the stable configured order until evidence separates them.
+    if len(candidates) > 1 and candidates[0]["score"] - candidates[1]["score"] < 2:
+        return None
+    return candidates[0]["model"]
 
 
 def results(run_id):
@@ -575,11 +689,19 @@ _SEED_CASES = [
     {"name": "research-fetch", "category": "research",
      "prompt": "Find out what the SI base unit of electric current is and cite where you read it.",
      "rubric": "States the ampere, and actually fetched a page (didn't answer from memory alone).",
-     "graders": [{"type": "tool_called", "name": "fetch_url"}, {"type": "contains", "value": "ampere"}, {"type": "judge"}]},
+     "graders": [{"type": "tool_called", "name": "fetch_url"}, {"type": "contains", "value": "ampere"}, {"type": "judge"}],
+     "seed": {_SEED_TOOL_RESULTS: {
+         "web_search": "1. BIPM SI Brochure — Electric current base unit (https://www.bipm.org/en/measurement-units)",
+         "fetch_url": "BIPM SI Brochure: The ampere, symbol A, is the SI unit of electric current. "
+                      "Source: https://www.bipm.org/en/measurement-units",
+     }}},
     {"name": "tool-choice-calendar", "category": "tool-use",
      "prompt": "What's on my calendar in the next 7 days?",
      "rubric": "Calls the calendar_events tool rather than guessing or refusing.",
-     "graders": [{"type": "tool_called", "name": "calendar_events"}, {"type": "judge"}]},
+     "graders": [{"type": "tool_called", "name": "calendar_events"}, {"type": "judge"}],
+     "seed": {_SEED_TOOL_RESULTS: {
+         "calendar_events": "2026-01-13 10:00–10:30 — Project sync (synthetic eval fixture)",
+     }}},
 ]
 
 
@@ -588,5 +710,6 @@ def seed_cases():
     if all_cases():
         return 0
     for c in _SEED_CASES:
-        save_case(None, c["name"], c["category"], c["prompt"], c["rubric"], c["graders"])
+        save_case(None, c["name"], c["category"], c["prompt"], c["rubric"], c["graders"],
+                  seed=c.get("seed"))
     return len(_SEED_CASES)

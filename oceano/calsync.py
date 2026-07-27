@@ -359,14 +359,14 @@ def delete_event(eid):
 
 # ============================ sync ============================
 def _fetch_ics(url, max_redirects=3):
-    """GET a feed with the SSRF guard applied to the URL AND to every redirect hop
-    (redirects are followed manually so each target is re-validated)."""
+    """GET a feed with the SSRF guard applied to the URL AND to every redirect hop (redirects are
+    followed manually so each target is re-validated). Uses guarded_get so the socket is PINNED to
+    the validated IP — closing the DNS-rebinding window that plain check_url()+requests.get left
+    open (resolve for the check, re-resolve for the connect). Raises safety.Blocked on an internal
+    target, which sync_feed records as the feed's last_error."""
     for _ in range(max_redirects + 1):
-        refusal = safety.check_url(url)
-        if refusal:
-            raise ValueError(refusal)
-        r = requests.get(url, timeout=30, allow_redirects=False,
-                         headers={"User-Agent": "Oceano-Calendar/1.0"})
+        r = safety.guarded_get(url, timeout=30, allow_redirects=False,
+                               headers={"User-Agent": "Oceano-Calendar/1.0"})
         loc = r.headers.get("Location")
         if r.status_code in (301, 302, 303, 307, 308) and loc:
             url = requests.compat.urljoin(url, loc)

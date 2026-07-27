@@ -43,6 +43,7 @@ from oceano.tools.core import (  # noqa: F401
     set_max_steps,
     set_progress_sink,
     tool,
+    tool_overrides,
     unregister_prefix,
 )
 
@@ -63,6 +64,8 @@ from oceano.tools import (  # noqa: E402, F401
     dev,
     ui,
     desktop,
+    notes_tools,
+    notebook_tools,
 )
 
 # Re-export the tool functions (and the private gates/helpers tests rely on) so
@@ -200,4 +203,20 @@ from oceano.tools.desktop import (  # noqa: E402, F401
     desktop_reveal_path,
     desktop_save_file,
     desktop_screenshot,
+)
+from oceano.tools.notes_tools import (  # noqa: E402, F401
+    _card_line,
+    _find_column,
+    add_kanban_card,
+    delete_kanban_card,
+    kanban_board,
+    update_kanban_card,
+)
+from oceano.tools.notebook_tools import (  # noqa: E402, F401
+    _note_line,
+    add_note,
+    delete_note,
+    get_note,
+    search_notebook,
+    update_note,
 )

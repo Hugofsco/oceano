@@ -82,3 +82,37 @@ def test_short_conversations_never_fold(monkeypatch):
     monkeypatch.setattr(agent_mod, "_FOLD_CHARS", 10)
     ag = _agent(monkeypatch, n_messages=agent_mod._FOLD_KEEP, msg_chars=5000)
     assert ag._autofold() == 0
+
+
+def test_chunking_preserves_the_entire_transcript():
+    text = "alpha\n" + ("x" * 73) + "\nomega"
+    chunks = Agent._chunk_text(text, limit=17)
+    assert "".join(chunks) == text
+    assert all(len(c) <= 17 for c in chunks)
+
+
+def test_hierarchical_summary_reads_the_tail(monkeypatch):
+    ag = Agent(model="test-model", learn=False)
+    seen = []
+
+    def summarize_once(self, text):
+        seen.append(text)
+        # Compact enough that the merge fits in one final call.
+        return f"[{text[:8]}…{text[-8:]}]"
+
+    monkeypatch.setattr(Agent, "_summarize_once", summarize_once)
+    monkeypatch.setattr(agent_mod, "_FOLD_CHUNK_CHARS", 2000)
+    transcript = "START\n" + ("middle\n" * 800) + "TAIL-SENTINEL"
+    summary = ag._summarize_convo(transcript)
+    assert any("TAIL-SENTINEL" in part for part in seen)
+    assert "ENTINEL" in summary
+
+
+def test_compaction_serialises_tool_calls_without_text():
+    msg = {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "c1", "type": "function",
+        "function": {"name": "write_file", "arguments": '{"path":"result.txt"}'},
+    }]}
+    rendered = Agent._message_for_summary(msg)
+    assert "write_file" in rendered
+    assert "result.txt" in rendered

@@ -1,11 +1,13 @@
 """Shell / Python execution and Oceano-owned background jobs — with the shared
 anti-exfiltration taint gate and the bubblewrap sandbox."""
 import os
+import select
 import subprocess
 import sys
+import time
 
 import config
-from oceano import bgjobs, safety
+from oceano import bgjobs, safety, shellfeed, turnctx
 from oceano.tools.core import _ws, tool
 
 # After this turn read untrusted content (a web page, email, or document), shell/Python execution
@@ -64,6 +66,22 @@ def _sandbox_wrap(inner):
     return _bwrap_base() + ["--", *inner]
 
 
+_OUT_HEAD, _OUT_TAIL = 2000, 6000   # keep the START (context) AND the END of long output
+
+
+def _clip_output(total, head_parts, tail):
+    """Reassemble captured stdout, bounded to _OUT_HEAD + _OUT_TAIL chars — keeping the start AND,
+    crucially, the end. Build/test failures print LAST, so the old head-only cap (keep the first
+    8000 chars, drop the rest) discarded exactly the part the model needs. The middle is elided
+    with a marker only when the output is longer than the head+tail budget."""
+    head = "".join(head_parts)
+    if total <= _OUT_TAIL:
+        return tail                                  # the whole output fits in the tail window
+    if total <= _OUT_HEAD + _OUT_TAIL:
+        return head[:total - _OUT_TAIL] + tail       # head+tail exactly cover it — no overlap, no loss
+    return f"{head}\n\n…[{total - _OUT_HEAD - _OUT_TAIL} chars elided]…\n\n{tail}"
+
+
 @tool({
     "type": "function",
     "function": {
@@ -82,12 +100,52 @@ def run_shell(command):
     refusal = safety.check_shell(command)
     if refusal:
         return refusal
-    r = subprocess.run(
+    sess = turnctx.get().session          # tag every push below so only THIS chat's spectator panel sees it
+    shellfeed.push(f"\x1b[2m$ {command}\x1b[0m\r\n", session=sess)
+    proc = subprocess.Popen(
         _sandbox_wrap(["bash", "-c", command]), cwd=str(_ws()),   # confined: data/ + home creds hidden
-        capture_output=True, text=True, timeout=config.SHELL_TIMEOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
     )
-    out = (r.stdout + r.stderr).strip()
-    return f"(exit {r.returncode})\n{out[:8000]}" or f"(exit {r.returncode}, no output)"
+    # Stream raw output chunks (not lines) to the shell-activity feed as they arrive — chunked
+    # (not readline()) so a \r-driven progress bar still moves live instead of appearing to hang
+    # until its next '\n'. shellfeed.push is cheap even with nobody watching (fire-and-forget).
+    fd = proc.stdout.fileno()
+    # Capture a bounded head + rolling tail (see _clip_output): the start for context and the end
+    # for the errors/results that print last. Memory is capped at _OUT_HEAD + _OUT_TAIL regardless
+    # of how much the command emits.
+    head_parts, head_len, tail, total, timed_out = [], 0, "", 0, False
+    deadline = time.monotonic() + config.SHELL_TIMEOUT
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+        if ready:
+            data = os.read(fd, 4096)
+            if not data:                          # EOF: the process closed stdout
+                break
+            text = data.decode("utf-8", "replace")
+            shellfeed.push(text, session=sess)
+            total += len(text)
+            if head_len < _OUT_HEAD:
+                take = text[:_OUT_HEAD - head_len]
+                head_parts.append(take); head_len += len(take)
+            tail = (tail + text)[-_OUT_TAIL:]
+        elif proc.poll() is not None:             # exited with nothing left buffered
+            break
+    if timed_out:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        shellfeed.push(f"\x1b[2m(timed out after {config.SHELL_TIMEOUT}s)\x1b[0m\r\n\r\n", session=sess)
+        return f"(timed out after {config.SHELL_TIMEOUT}s)\n{_clip_output(total, head_parts, tail)}"
+    proc.wait()
+    shellfeed.push(f"\x1b[2m(exit {proc.returncode})\x1b[0m\r\n\r\n", session=sess)
+    out = _clip_output(total, head_parts, tail).strip()
+    return f"(exit {proc.returncode})\n{out}" if out else f"(exit {proc.returncode}, no output)"
 
 
 # --- background OS jobs — owned by Oceano's daemon, unlike the mind's own native backgrounding ---

@@ -210,3 +210,59 @@ def test_judge_prompt_includes_rubric_and_truncates_the_answer(monkeypatch, tmp_
     evals._judge(case, _run(tmp_path, answer="x" * 10000))
     assert "must cite a source" in seen["prompt"]
     assert len(seen["prompt"]) < 6000                  # 4000-char answer cap held
+
+
+def test_eval_tool_setup_never_exposes_unfixtureed_personal_tools():
+    case = _case([{"type": "tool_called", "name": "mail_send"}])
+    allowed, fixtures = evals._case_tool_setup(case)
+    assert "mail_send" not in allowed
+    assert fixtures == {}
+
+    calendar = {**case, "name": "tool-choice-calendar",
+                "graders": [{"type": "tool_called", "name": "calendar_events"}]}
+    allowed, fixtures = evals._case_tool_setup(calendar)
+    assert allowed == {"calendar_events"}
+    assert "synthetic eval fixture" in fixtures["calendar_events"]
+
+
+def test_leaderboard_honours_case_weights(monkeypatch, tmp_path):
+    _use_tmp_db(monkeypatch, tmp_path)
+    important = evals.save_case(None, "important", "qa", "p", "r", [{"type": "judge"}], weight=3)
+    minor = evals.save_case(None, "minor", "qa", "p", "r", [{"type": "judge"}], weight=1)
+    con = evals._db()
+    rid = con.execute("INSERT INTO runs (ts, models, status, summary) "
+                      "VALUES ('2099-01-01T00:00:00+00:00','[]','done','')").lastrowid
+    for cid, score, weight in ((important, 100, 3), (minor, 0, 1)):
+        con.execute("INSERT INTO results (run_id,case_id,case_name,model,score,passed,tokens,ms,"
+                    "steps,tools,error,verdict,answer,weight) "
+                    "VALUES (?,?,?,'m',?,1,1,1,1,'[]',NULL,'{}','',?)",
+                    (rid, cid, str(cid), score, weight))
+    con.commit(); con.close()
+    assert evals.leaderboard(rid)["rows"][0]["score"] == 75.0
+
+
+def test_best_model_refuses_to_route_on_an_effective_tie(monkeypatch, tmp_path):
+    _use_tmp_db(monkeypatch, tmp_path)
+    _insert_run("done", [("a", 80, True), ("b", 79, True)])
+    assert evals.best_model() is None
+
+
+def test_compare_tool_routing_runs_the_same_cases_in_both_modes(monkeypatch):
+    case = {"id": 7, "name": "routing-case", "enabled": True}
+    seen = []
+    monkeypatch.setattr(evals, "all_cases", lambda: [case])
+
+    def fake_run(c, model, dynamic_tools=None):
+        seen.append(dynamic_tools)
+        return {"case": c, "model": model, "tokens": 12 if dynamic_tools else 20,
+                "steps": 1, "ms": 80 if dynamic_tools else 100, "tools": ["read_file"],
+                "error": None, "routing": {"advertised_tools": 8 if dynamic_tools else 20,
+                                             "catalog_tools": 20}}
+
+    monkeypatch.setattr(evals, "_run_case", fake_run)
+    monkeypatch.setattr(evals, "_grade", lambda c, run: {"score": 100, "passed": True})
+    report = evals.compare_tool_routing("model-a")
+    assert seen == [False, True]
+    assert report["full"]["avg_advertised_tools"] == 20
+    assert report["routed"]["avg_advertised_tools"] == 8
+    assert report["routed"]["avg_score"] == report["full"]["avg_score"] == 100

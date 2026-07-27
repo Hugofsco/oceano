@@ -7,6 +7,7 @@
 model/base_url/api_key can be set per instance or swapped between turns (so the
 web UI can change model mid-conversation).
 """
+import hashlib
 import json
 import os
 import re
@@ -163,6 +164,66 @@ def _context_block(user_message):
                                    _skills_note(user_message)) if p)
 
 
+def _task_plan(user_message):
+    """A cheap adaptive plan for genuinely multi-step action requests.
+
+    Small requests stay one-pass. Complex builds get explicit success criteria in the
+    system context, which is more reliable for local models than hoping they infer when
+    to inspect, implement, and verify.
+    """
+    text = (user_message or "").lower()
+    action = any(w in text for w in ("implement", "build", "create", "refactor", "debug", "fix ",
+                                     "develop", "migrate", "integrate", "add support"))
+    complex_signal = any(w in text for w in ("codebase", "project", "multiple", "across", "production",
+                                             "test suite", "end to end", "end-to-end", "in sequence",
+                                             "these changes", "all of"))
+    if not (action and (complex_signal or len(text) > 500)):
+        return None
+    code = any(w in text for w in ("code", "implement", "build", "refactor", "debug", "test", "project"))
+    return {
+        "goal": (user_message or "").strip()[:500],
+        "steps": [
+            "Inspect the relevant existing implementation and constraints.",
+            "Make the smallest coherent changes that satisfy the request.",
+            "Verify the changed behavior with focused checks.",
+            "Report completed work and any remaining limitation accurately.",
+        ],
+        "requires_action": True,
+        "verify_code": code,
+    }
+
+
+def _plan_note(plan):
+    if not plan:
+        return ""
+    checks = ["requested artifacts/actions actually exist", "no tool result ended in an error"]
+    if plan.get("verify_code"):
+        checks.append("changed code was exercised by tests or an equivalent executable check")
+    return ("TASK EXECUTION PLAN — use this as working state, updating your approach when observations disagree:\n"
+            + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan["steps"]))
+            + "\nSuccess criteria: " + "; ".join(checks) + ".")
+
+
+def _outcome_issues(plan, tool_events):
+    """Deterministic completion gate. Returns concrete reasons to continue, never a vibe score."""
+    if not plan:
+        return []
+    calls = [name for name, _ in tool_events]
+    results = [result for _, result in tool_events]
+    issues = []
+    delegated = "delegate" in calls
+    mutations = {"write_file", "edit_file", "make_folder", "run_shell", "python_exec", "delegate"}
+    if plan.get("requires_action") and not (set(calls) & mutations):
+        issues.append("no action tool was used")
+    if any((r or "").lstrip().lower().startswith("error") or "traceback (most recent call last)" in (r or "").lower()
+           for r in results):
+        issues.append("at least one tool returned an error")
+    verification = {"run_tests", "run_shell", "python_exec"}
+    if plan.get("verify_code") and not delegated and not (set(calls) & verification):
+        issues.append("the changed code was not exercised")
+    return issues
+
+
 # --- self-learning memory: after each turn, extract durable facts in the background ---
 _LEARN_SYSTEM = (
     "From the USER'S MESSAGE below, extract durable facts the user reveals ABOUT THEMSELVES "
@@ -180,37 +241,48 @@ _LEARN_SYSTEM = (
     "Output ONLY a JSON array of objects, each {\"text\": short fact in YOUR voice "
     "(\"My user…\"), \"category\": one of \"identity\" (the core of who my user is and our "
     "relationship), \"preference\" (what my user likes/wants/prefers), \"project\" (their "
-    "ongoing work or goals), \"task\" (something to do), \"fact\" (anything else durable)}. "
-    "Example: [{\"text\": \"My user is vegetarian\", \"category\": \"preference\"}, "
-    "{\"text\": \"My user is building a trading bot in Rust\", \"category\": \"project\"}]. Nothing else.")
+    "ongoing work or goals), \"task\" (something to do), \"fact\" (anything else durable), "
+    "\"confidence\": number from 0 to 1, \"evidence\": an EXACT short quote copied from the user's "
+    "message that proves the fact}. Never infer beyond that quote. "
+    "Example: [{\"text\": \"My user is vegetarian\", \"category\": \"preference\", "
+    "\"confidence\": 0.99, \"evidence\": \"I'm vegetarian\"}]. Nothing else.")
 
 
-def _parse_facts(text):
-    """Returns [(fact_text, category), ...]. Accepts the {"text","category"} objects the
-    prompt asks for, but tolerates plain strings and non-JSON output (category → 'fact')."""
+def _parse_facts(text, user_message=""):
+    """Strictly validate structured extraction output; free-form prose is never memory."""
     from oceano import memory
-
-    def norm(item):
-        if isinstance(item, dict):
-            t = str(item.get("text", "")).strip()
-            c = str(item.get("category", "")).strip().lower()
-        else:
-            t, c = str(item).strip(), ""
-        return (t, c if c in memory.CATEGORIES else "fact") if t else None
 
     text = (text or "").strip()
     m = re.search(r"\[.*\]", text, re.DOTALL)
-    if m:
+    if not m:
+        return []
+    try:
+        raw = json.loads(m.group(0))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    source_low = (user_message or "").lower()
+    out = []
+    for item in raw[:6]:
+        if not isinstance(item, dict):
+            continue
+        fact = str(item.get("text", "")).strip()
+        category = str(item.get("category", "")).strip().lower()
+        evidence = str(item.get("evidence", "")).strip()
         try:
-            return [f for f in (norm(x) for x in json.loads(m.group(0))) if f][:6]
-        except Exception:
-            pass
-    out = []                                  # lenient fallback if the model didn't emit clean JSON
-    for line in text.splitlines():
-        line = line.strip().lstrip("-*•0123456789. ").strip().strip('"')
-        if len(line) > 4 and not line.lower().startswith(("here", "none", "no ", "[", "]")):
-            out.append((line, "fact"))
-    return out[:6]
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            continue
+        if not (5 <= len(fact) <= 300 and "my user" in fact.lower()):
+            continue
+        if category not in memory.CATEGORIES or category == "knowledge":
+            continue
+        if not (0 <= confidence <= 1 and len(evidence) >= 3 and evidence.lower() in source_low):
+            continue
+        out.append({"text": fact, "category": category, "confidence": confidence,
+                    "evidence": evidence})
+    return out
 
 
 _WRAPUP_NUDGE = (
@@ -228,10 +300,21 @@ def _learn_from(user_message, model, base_url, api_key):
         resp = llm.chat([{"role": "system", "content": _LEARN_SYSTEM},
                          {"role": "user", "content": "USER'S MESSAGE:\n" + (user_message or "")[:4000]}],
                         tools=None, model=model, base_url=base_url, api_key=api_key)
-        for fact, category in _parse_facts(getattr(resp, "content", "") or ""):
-            memory.add_if_new(fact, tags="auto", category=category)
-    except Exception:
-        pass
+        parsed = _parse_facts(getattr(resp, "content", "") or "", user_message)
+        provenance = "auto:user:" + hashlib.sha256((user_message or "").encode()).hexdigest()[:12]
+        for fact in parsed:
+            if fact["confidence"] >= 0.8:
+                memory.add_if_new(fact["text"], tags="auto", category=fact["category"],
+                                  source=provenance)
+            elif fact["confidence"] >= 0.55:
+                memory.queue_candidate(fact["text"], fact["category"], fact["evidence"],
+                                       fact["confidence"], provenance)
+        traces.record("memory_extract", candidates=len(parsed),
+                      saved=sum(1 for f in parsed if f["confidence"] >= 0.8),
+                      queued=sum(1 for f in parsed if 0.55 <= f["confidence"] < 0.8))
+    except Exception as e:
+        traces.record("memory_extract", candidates=0, saved=0, queued=0,
+                      error=f"{type(e).__name__}: {e}")
 
 SYSTEM_PROMPT = """You are Oceano, a capable AI agent running locally on the user's machine.
 
@@ -383,8 +466,34 @@ _VOICE_NOTE = ("\n\nVOICE MODE — your reply is being read ALOUD. Keep it SHORT
                "a sentence and offer to go deeper.")
 
 # Tools that emit live progress (run in a worker thread so run_stream can drain it). The
-# streaming delegate is the one that matters — a long build shouldn't look frozen.
+# streaming delegate is the one that matters — a long build shouldn't look frozen. run_shell is
+# NOT in here: its output goes to the global shell-activity feed (oceano.shellfeed), not the
+# per-chat progress stream — the chat's own tool card stays a plain, non-streaming result.
 _STREAMING_TOOLS = {"delegate", "delegate_to_claude"}
+
+# Claude's native "Bash" and Codex's native "shell" tool: the resident mind runs these itself,
+# never through Oceano's own run_shell, so they'd otherwise be invisible to the shell-activity
+# feed entirely. Neither CLI's protocol exposes incremental output (verified against a real
+# `codex exec --json` run: command_execution goes item.started -> item.completed with nothing
+# in between), so this only ever gets a command echo at the call and the full text at the result
+# — never truly live like run_shell's own chunks.
+_SHELL_MIND_TOOLS = {"Bash", "shell"}
+
+
+def _feed_shell_event(ev):
+    """If `ev` is a tool_call/tool_result SSE event for the mind's own shell tool, echo it into
+    this turn's chat's shell-activity feed too. Returns `ev` unchanged either way, so callers can
+    wrap a yield site with this instead of restructuring the event-construction code around it."""
+    if ev.get("name") not in _SHELL_MIND_TOOLS:
+        return ev
+    from oceano import shellfeed, turnctx
+    sess = turnctx.get().session
+    if ev.get("type") == "tool_call":
+        shellfeed.push(f"\x1b[2m$ {ev.get('args', '')}\x1b[0m\r\n", session=sess)
+    elif ev.get("type") == "tool_result":
+        text = (ev.get("result") or "").replace("\n", "\r\n")
+        shellfeed.push((text if text else "\x1b[2m(no output)\x1b[0m\r\n") + "\r\n", session=sess)
+    return ev
 
 # Rolling context fold (the always-on safety net; /context <n> auto-compact stays the opt-in,
 # count-based, fold-EVERYTHING variant). Char-based because the resident Claude/Codex minds
@@ -397,11 +506,13 @@ _STREAMING_TOOLS = {"delegate", "delegate_to_claude"}
 # travels as an argv string again. 0 disables folding.
 _FOLD_CHARS = int(os.environ.get("OCEANO_CTX_FOLD_CHARS", "120000"))
 _FOLD_KEEP = 12
+_FOLD_CHUNK_CHARS = max(2000, int(os.environ.get("OCEANO_CTX_FOLD_CHUNK_CHARS", "10000")))
 
 
 class Agent:
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
-                 exclude_tools=None, only_tools=None, inject_context=True):
+                 exclude_tools=None, only_tools=None, inject_context=True, dynamic_tools=None,
+                 routing_catalog=None):
         if model:                                    # explicit model → caller owns base_url/api_key
             self.model, self.base_url, self.api_key = model, base_url, api_key
         else:                                        # default → primary model AND its endpoint
@@ -418,6 +529,12 @@ class Agent:
         # if given, the ONLY tool names this agent may ever use (a delegate's containment).
         # None = the full enabled set. Enforced at execution time, not just in the schemas.
         self.only_tools = set(only_tools) if only_tools is not None else None
+        # None = normal environment/per-model policy; True/False force a mode for controlled
+        # evaluation. A forced True still routes only WITHIN an explicit allowlist, never beyond it.
+        self.dynamic_tools = dynamic_tools
+        # Eval-only schema universe. It lets A/B runs advertise the realistic catalog while
+        # only_tools remains the independent execution boundary. Production callers leave None.
+        self.routing_catalog = list(routing_catalog) if routing_catalog is not None else None
         # inject_context=False for delegates: give operational context (date/workspace/channel)
         # but NOT the user's personal memories/research/skills — a delegate gets a self-contained
         # task, and we shouldn't ship personal data to it (esp. a cloud delegate).
@@ -426,6 +543,13 @@ class Agent:
         # the mind's per-turn MCP bridge so a spawn_job routes its result back to THIS chat; None for
         # utility/delegate agents and non-web callers (their jobs just notify, unattributed).
         self.session_id = None
+        # Set by the resident-mind streams to the delegate's failure reason when a mind turn did NOT
+        # finish cleanly (stalled past the idle cap, hit the wall-clock cap, rate-limited, cancelled);
+        # None on a clean finish. Lets a caller (the workflow instruction node) record a truncated
+        # build as a FAILED step instead of silently accepting partial work as done.
+        self.last_mind_error = None
+        self._turn_tool_schemas = None
+        self._turn_plan = None
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + _date_note()}]
 
     def _prepare_turn(self, user_message, voice=False):
@@ -438,6 +562,10 @@ class Agent:
         if self.messages and self.messages[0]["role"] == "system":
             ctx = _context_block(user_message) if self.inject_context else \
                 "\n\n".join(p for p in (_date_note(), _workspace_note(), _channel_note()) if p)
+            self._turn_plan = _task_plan(user_message)
+            plan = _plan_note(self._turn_plan)
+            if plan:
+                ctx += "\n\n" + plan
             if voice:
                 ctx += _VOICE_NOTE
             self.messages[0]["content"] = SYSTEM_PROMPT + "\n\n" + ctx
@@ -472,9 +600,9 @@ class Agent:
                 break
         if not take:
             return 0
-        convo = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in take if m.get("content"))
+        convo = "\n".join(self._message_for_summary(m) for m in take)
         try:
-            summary = self._summarize_convo(convo[:12000])
+            summary = self._summarize_convo(convo)
         except Exception as e:                       # never block the turn on a failed summarize
             print(f"[fold] summarize failed, keeping full history this turn: {e}", flush=True)
             return 0
@@ -489,27 +617,75 @@ class Agent:
         """Fold everything but the system message into a single summary note, shrinking
         the context. Returns the number of messages dropped. Shared by the web composer's
         /compact command and Telegram's /compact (and web auto-compact)."""
-        convo = [f"{m.get('role')}: {m.get('content')}"
-                 for m in self.messages[1:] if m.get("content")]
+        convo = [self._message_for_summary(m) for m in self.messages[1:]]
         if not convo:
             return 0
-        summary = self._summarize_convo("\n".join(convo)[:12000])
+        summary = self._summarize_convo("\n".join(convo))
         before = len(self.messages)
         self.messages = [self.messages[0],
                          {"role": "assistant", "content": "📋 Summary of our earlier conversation:\n" + summary}]
         return before - len(self.messages)
 
-    _COMPACT_INSTR = ("Summarize this conversation concisely for the assistant to continue later. "
-                      "Preserve facts about the user, decisions made, open tasks, and any important state. "
-                      "Compact bullet points, no preamble.")
+    _COMPACT_INSTR = (
+        "Summarize this conversation segment as durable state for the assistant to continue later. "
+        "Preserve user facts and constraints, decisions and their reasons, exact file paths and identifiers, "
+        "tool outcomes/errors, completed work, and unresolved tasks. Never claim an action completed unless "
+        "the segment shows its result. Use compact bullet points with no preamble.")
+
+    @staticmethod
+    def _message_for_summary(message):
+        """Lossless-enough text form for compaction, including otherwise-empty tool calls."""
+        role = message.get("role", "unknown")
+        parts = []
+        content = message.get("content")
+        if content:
+            parts.append(str(content))
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict):
+                fn = call.get("function") or {}
+                parts.append(f"TOOL CALL {fn.get('name', '?')}({fn.get('arguments', '')})")
+            else:
+                fn = getattr(call, "function", None)
+                parts.append(f"TOOL CALL {getattr(fn, 'name', '?')}({getattr(fn, 'arguments', '')})")
+        return f"{role}: " + ("\n".join(parts) if parts else "(empty message)")
+
+    @staticmethod
+    def _chunk_text(text, limit=None):
+        """Split text without dropping bytes, preferring line boundaries."""
+        limit = limit or _FOLD_CHUNK_CHARS
+        chunks, buf, size = [], [], 0
+        for line in (text or "").splitlines(keepends=True):
+            while len(line) > limit:
+                if buf:
+                    chunks.append("".join(buf)); buf, size = [], 0
+                chunks.append(line[:limit]); line = line[limit:]
+            if buf and size + len(line) > limit:
+                chunks.append("".join(buf)); buf, size = [], 0
+            buf.append(line); size += len(line)
+        if buf:
+            chunks.append("".join(buf))
+        return chunks or ([text] if text else [])
 
     def _summarize_convo(self, convo_text):
-        """Summarize the conversation through whatever mind is driving it — the resident Codex/Claude
+        """Hierarchically summarize the ENTIRE conversation without truncating its tail.
+
+        Summarize through whatever mind is driving it — the resident Codex/Claude
         mind if one is set, else the local OpenAI-compatible model. Compaction used to ALWAYS go to the
         local model (self.model via llama-swap); with Codex/Claude as the mind that model often isn't
         served, so /compact died with a 404 'no router for requested model' exactly when you needed it.
         The summary prompt is tiny, so a contained, tool-less delegate is the right, always-available
         path. Raises on failure so the caller leaves the history untouched rather than dropping it."""
+        chunks = self._chunk_text(convo_text)
+        if not chunks:
+            return "(nothing notable)"
+        summaries = [self._summarize_once(chunk) for chunk in chunks]
+        while len(summaries) > 1:
+            merged = "\n\n".join(f"SEGMENT {i + 1}:\n{s}" for i, s in enumerate(summaries))
+            summaries = [self._summarize_once(chunk) for chunk in self._chunk_text(merged)]
+        return summaries[0].strip() or "(nothing notable)"
+
+    def _summarize_once(self, convo_text):
+        """One bounded compaction call; _summarize_convo handles chunking and merging."""
         from oceano import delegate
         if delegate.mind_is_codex() and delegate.codex_available():
             r = delegate.to_codex(self._COMPACT_INSTR + "\n\n--- CONVERSATION ---\n" + convo_text,
@@ -538,9 +714,8 @@ class Agent:
         threading.Thread(target=_learn_from,
                          args=(user_message, self.model, self.base_url, self.api_key), daemon=True).start()
 
-    def _tool_schemas(self, only=None):
-        """Tools this agent may use this turn: the enabled set, optionally narrowed to an
-        `only` allowlist (e.g. chat mode → just the memory tools), minus any excluded ones."""
+    def _base_tool_schemas(self, only=None):
+        """The authoritative allowed catalog before optional schema routing."""
         sc = tools.schemas()
         for allow in (self.only_tools, only):
             if allow is not None:
@@ -549,6 +724,24 @@ class Agent:
         if self.exclude_tools:
             sc = [s for s in sc if s["function"]["name"] not in self.exclude_tools]
         return sc
+
+    def _tool_route(self, only=None, query=None):
+        """Route within the authoritative catalog. Explicit scopes bypass routing in production;
+        evals may force it on to compare the same safe catalog enabled vs disabled."""
+        from oceano import toolrouter
+        allowed = self._base_tool_schemas(only=only)
+        sc = self.routing_catalog if self.routing_catalog is not None else allowed
+        explicit = self.only_tools is not None or only is not None
+        if explicit and self.dynamic_tools is not True and self.routing_catalog is None:
+            return toolrouter.Route(sc, False, False, "explicit-allowlist", len(sc), len(sc), self.model or "")
+        return toolrouter.route(sc, query or "", model=self.model or "", force=self.dynamic_tools)
+
+    def _full_routing_catalog(self, only=None):
+        return list(self.routing_catalog) if self.routing_catalog is not None else self._base_tool_schemas(only=only)
+
+    def _tool_schemas(self, only=None, query=None):
+        """Compatibility helper returning only the schemas for a turn."""
+        return self._tool_route(only=only, query=query).schemas
 
     def _exec_tool(self, name, args, allowed):
         """Run one tool call, re-checking the turn's allowlist at EXECUTION time. The
@@ -595,11 +788,13 @@ class Agent:
             yield (kind, payload)
         yield ("result", box.get("result", ""))
 
-    def _chat(self, with_tools, return_usage=False):
+    def _chat(self, with_tools, return_usage=False, tool_schemas=None):
         traces.record("model_call_start", model=self.model, with_tools=bool(with_tools), stream=False)
         out = llm.chat(
             self.messages,
-            tools=self._tool_schemas() if with_tools else None,
+            tools=(tool_schemas if tool_schemas is not None else
+                   (self._turn_tool_schemas if self._turn_tool_schemas is not None else self._tool_schemas()))
+                  if with_tools else None,
             model=self.model, base_url=self.base_url, api_key=self.api_key,
             return_usage=return_usage,
         )
@@ -619,6 +814,15 @@ class Agent:
 
     # --- blocking (CLI / Telegram / scheduler) -----------------------------
     def run(self, user_message: str, deadline=None, cancel=None) -> str:
+        """Blocking turn. Wraps _run so this turn's injection taint is confined to the turn —
+        a turn that read a web page/email/doc must never leave the caller's TurnContext (or the
+        MCP-bridge flag) tainted for whatever runs next in the same context (see turnctx)."""
+        try:
+            return self._run(user_message, deadline=deadline, cancel=cancel)
+        finally:
+            safety.reset_untrusted(); safety.reset_bridge_untrusted()
+
+    def _run(self, user_message: str, deadline=None, cancel=None) -> str:
         """`deadline` (a time.monotonic() instant) bounds a delegated run: checked
         between steps, so it can't interrupt one in-flight LLM/tool call, but it stops
         the loop from running on. Raises TimeoutError when hit. `cancel` (a threading.Event,
@@ -628,7 +832,13 @@ class Agent:
             return _NO_MODEL_MSG
         self._prepare_turn(user_message)
         self.messages.append({"role": "user", "content": user_message})
-        allowed = {s["function"]["name"] for s in self._tool_schemas()}
+        from oceano import toolrouter
+        route_info = self._tool_route(query=user_message)
+        turn_tools = route_info.schemas
+        self._turn_tool_schemas = turn_tools
+        allowed = {s["function"]["name"] for s in self._base_tool_schemas()}
+        toolrouter.telemetry(route_info)
+        tool_events, corrected = [], False
         for _ in range(tools.get_max_steps()):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("delegate run hit its time limit")
@@ -639,14 +849,47 @@ class Agent:
                 "role": "assistant", "content": getattr(msg, "content", ""),
                 "tool_calls": getattr(msg, "tool_calls", None)})
             if not msg.tool_calls:
+                issues = _outcome_issues(self._turn_plan, tool_events)
+                if toolrouter.should_expand(route_info, msg.content or "", issues, tool_events):
+                    route_info = toolrouter.expanded(route_info, self._full_routing_catalog())
+                    turn_tools = route_info.schemas
+                    self._turn_tool_schemas = turn_tools
+                    toolrouter.telemetry(route_info, "fallback",
+                                         used_tools=[name for name, _ in tool_events],
+                                         errors=sum((result or "").lstrip().lower().startswith("error")
+                                                    for _, result in tool_events))
+                    self.messages.append({"role": "user", "content":
+                        "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
+                        "Continue the task and use any newly available tool needed to finish it."})
+                    continue
+                if issues and not corrected:
+                    corrected = True
+                    self.messages.append({"role": "user", "content":
+                        "OUTCOME CHECK: This task is not complete yet because " + "; ".join(issues) +
+                        ". Continue working now, fix the issue, and verify the result before answering."})
+                    continue
                 self.on_event("answer", msg.content)
                 self._learn(user_message, msg.content)
+                toolrouter.telemetry(route_info, "completed",
+                                     used_tools=[name for name, _ in tool_events],
+                                     errors=sum((result or "").lstrip().lower().startswith("error")
+                                                for _, result in tool_events))
                 return msg.content or ""
             for call in msg.tool_calls:
                 self.on_event("tool_call", {"name": call.function.name, "args": call.function.arguments})
                 result = self._exec_tool(call.function.name, call.function.arguments, allowed)
+                tool_events.append((call.function.name, result))
                 self.on_event("tool_result", {"name": call.function.name, "result": result})
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            if toolrouter.should_expand(route_info, tool_events=tool_events):
+                route_info = toolrouter.expanded(route_info, self._full_routing_catalog())
+                turn_tools = route_info.schemas
+                self._turn_tool_schemas = turn_tools
+                toolrouter.telemetry(route_info, "fallback",
+                                     used_tools=[name for name, _ in tool_events], errors=1)
+                self.messages.append({"role": "user", "content":
+                    "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
+                    "Retry the blocked action with an available tool."})
         # cap hit — one tool-less pass so the user gets a real summary + next steps
         final = llm.chat(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
                          tools=None, model=self.model, base_url=self.base_url, api_key=self.api_key)
@@ -654,6 +897,8 @@ class Agent:
         self.messages.append({"role": "assistant", "content": text})
         self.on_event("answer", text)
         self._learn(user_message, text)
+        toolrouter.telemetry(route_info, "step-limit",
+                             used_tools=[name for name, _ in tool_events])
         return text
 
     def run_claude(self, user_message: str, cancel=None) -> str:
@@ -789,6 +1034,11 @@ class Agent:
                 holder["res"] = delegate.to_claude_stream(
                     prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
                     on_progress=on_prog, append_system=sys_prompt, cancel=cancel,
+                    # Unattended (scheduler/workflow) build → roomier idle + wall-clock caps so a long
+                    # install/test tool call isn't mistaken for a stall. Interactive turns pass None
+                    # and keep the tight delegate defaults.
+                    idle_timeout=(config.MIND_BG_IDLE or None) if bg else None,
+                    max_total=(config.MIND_BG_MAXTOTAL or None) if bg else None,
                     disallow="WebSearch,WebFetch,CronCreate,CronList,CronDelete")  # web → Oceano's visible browser; cron → Oceano's persistent scheduler
             except Exception as e:                             # noqa: BLE001
                 holder["res"] = {"ok": False, "error": str(e), "output": ""}
@@ -807,25 +1057,29 @@ class Agent:
                 break
             if kind == "tool":
                 if pending and not pending[1]:          # prior visible tool ended without a result
-                    yield {"type": "tool_result", "name": pending[0], "result": ""}
+                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
                 name, detail = data
                 if name not in _HIDDEN:
-                    yield {"type": "tool_call", "name": name, "args": detail}   # → a real tool chip
+                    yield _feed_shell_event({"type": "tool_call", "name": name, "args": detail})   # → a real tool chip
                 pending = (name, name in _HIDDEN)
             elif kind == "toolres":
                 if pending and not pending[1]:
-                    yield {"type": "tool_result", "name": pending[0], "result": data[:2000]}
+                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": data[:2000]})
                 pending = None
             elif kind == "token":
                 if pending and not pending[1]:
-                    yield {"type": "tool_result", "name": pending[0], "result": ""}
+                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
                 pending = None
                 parts.append(data)
                 yield {"type": "token", "text": data}
         if pending and not pending[1]:
-            yield {"type": "tool_result", "name": pending[0], "result": ""}
+            yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
 
         res = holder.get("res") or {}
+        # A mind turn that didn't finish cleanly (stalled/capped/rate-limited) still returns partial
+        # text — keep it, but flag the incompletion so a workflow build node marks the step failed
+        # instead of logging a truncated build as done.
+        self.last_mind_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
         answer = "".join(parts).strip() or (res.get("output") or "").strip()
         if cancel is not None and cancel.is_set():             # Stopped → leave history clean, don't learn
             return
@@ -937,9 +1191,10 @@ class Agent:
                 parts.append(ev.get("text", ""))
                 yield ev
             elif ev.get("type") in ("tool_call", "tool_result"):
-                yield ev
+                yield _feed_shell_event(ev)
 
         res = holder.get("res") or {}
+        self.last_mind_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
         answer = "".join(parts).strip() or (res.get("output") or "").strip()
         if cancel is not None and cancel.is_set():
             return
@@ -954,6 +1209,16 @@ class Agent:
         yield {"type": "answer_done"}
 
     def run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
+        """Streaming turn. Wraps _run_stream so this turn's injection taint is confined to the
+        turn — a turn that read a web page/email/doc must never leave the caller's TurnContext
+        (or the MCP-bridge flag) tainted for whatever runs next in the same context. The finally
+        runs on normal completion AND on GeneratorExit (Stop button / client disconnect)."""
+        try:
+            yield from self._run_stream(user_message, only_tools=only_tools, cancel=cancel, voice=voice)
+        finally:
+            safety.reset_untrusted(); safety.reset_bridge_untrusted()
+
+    def _run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat
         mode passes MEMORY_TOOLS so the model can still recall/remember without full agent
         mode. None = the whole enabled toolset. `cancel` (an Event) lets a Stop kill the
@@ -977,8 +1242,12 @@ class Agent:
         self._prepare_turn(user_message, voice=voice)
         self.messages.append({"role": "user", "content": user_message})
         total_tok = 0                    # tokens generated across the whole turn (incl. tool steps)
-        turn_tools = self._tool_schemas(only=only_tools)
-        allowed = {s["function"]["name"] for s in turn_tools}
+        from oceano import toolrouter
+        route_info = self._tool_route(only=only_tools, query=user_message)
+        turn_tools = route_info.schemas
+        allowed = {s["function"]["name"] for s in self._base_tool_schemas(only=only_tools)}
+        toolrouter.telemetry(route_info)
+        tool_events, corrected = [], False
         for _ in range(tools.get_max_steps()):
             seg_first = None             # time the first token of THIS segment arrived (for decode rate)
             content, reason, calls, ntok, ptok = "", "", None, 0, 0
@@ -1015,7 +1284,33 @@ class Agent:
                     if content:
                         yield {"type": "token", "text": content}
                 self.messages.append({"role": "assistant", "content": content})
+                issues = _outcome_issues(self._turn_plan, tool_events)
+                if toolrouter.should_expand(route_info, content, issues, tool_events):
+                    route_info = toolrouter.expanded(route_info, self._full_routing_catalog(only=only_tools))
+                    turn_tools = route_info.schemas
+                    toolrouter.telemetry(route_info, "fallback",
+                                         used_tools=[name for name, _ in tool_events],
+                                         errors=sum((result or "").lstrip().lower().startswith("error")
+                                                    for _, result in tool_events))
+                    self.messages.append({"role": "user", "content":
+                        "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
+                        "Continue the task and use any newly available tool needed to finish it."})
+                    yield {"type": "reasoning", "text":
+                           "\nExpanded the allowed tool catalog for one recovery attempt.\n"}
+                    continue
+                if issues and not corrected:
+                    corrected = True
+                    self.messages.append({"role": "user", "content":
+                        "OUTCOME CHECK: This task is not complete yet because " + "; ".join(issues) +
+                        ". Continue working now, fix the issue, and verify the result before answering."})
+                    yield {"type": "reasoning", "text": "\nOutcome check requested another pass: "
+                           + "; ".join(issues) + ".\n"}
+                    continue
                 self._learn(user_message, content)
+                toolrouter.telemetry(route_info, "completed",
+                                     used_tools=[name for name, _ in tool_events],
+                                     errors=sum((result or "").lstrip().lower().startswith("error")
+                                                for _, result in tool_events))
                 # tok/s = decode rate of the ANSWER segment (from its first token), matching
                 # plain chat — so agent mode / Telegram report a comparable number, not one
                 # dragged down by the tool-schema prompt-processing time.
@@ -1043,6 +1338,17 @@ class Agent:
                         result = payload
                 yield {"type": "tool_result", "name": c["name"], "result": (result or "")[:2000]}
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result or ""})
+                tool_events.append((c["name"], result or ""))
+            if toolrouter.should_expand(route_info, tool_events=tool_events):
+                route_info = toolrouter.expanded(route_info, self._full_routing_catalog(only=only_tools))
+                turn_tools = route_info.schemas
+                toolrouter.telemetry(route_info, "fallback",
+                                     used_tools=[name for name, _ in tool_events], errors=1)
+                self.messages.append({"role": "user", "content":
+                    "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
+                    "Retry the blocked action with an available tool."})
+                yield {"type": "reasoning", "text":
+                       "\nExpanded the allowed tool catalog after a blocked tool call.\n"}
         # cap hit — stream one tool-less wrap-up (summary + next steps) instead of a dead-end
         seg_first = None; tail = ""; tail_tok = 0; tail_ptok = 0
         for item in llm.stream(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
@@ -1055,6 +1361,8 @@ class Agent:
                 tail_tok = item["usage"]; tail_ptok = item.get("prompt_tokens", 0); total_tok += item["usage"]
         self.messages.append({"role": "assistant", "content": tail or "(stopped at the tool-step limit)"})
         self._learn(user_message, tail)
+        toolrouter.telemetry(route_info, "step-limit",
+                             used_tools=[name for name, _ in tool_events])
         dsecs = (time.perf_counter() - seg_first) if seg_first else 0
         yield {"type": "answer_done"}
         yield self._stats(total_tok, dsecs,

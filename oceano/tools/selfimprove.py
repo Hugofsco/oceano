@@ -101,6 +101,15 @@ def delegate_tool(instructions):
 _TOOLS["delegate_to_claude"] = delegate_tool
 
 
+def _chat_agent_tool_scope(access):
+    """Translate the user-owned chat spawn permission into every provider's tool vocabulary."""
+    if access == "shell":
+        return "Read,Glob,Grep,Write,Edit,Bash"
+    if access == "write":
+        return "Read,Glob,Grep,Write,Edit"
+    return "Read,Glob,Grep"
+
+
 @tool({
     "type": "function",
     "function": {
@@ -127,9 +136,12 @@ _TOOLS["delegate_to_claude"] = delegate_tool
 })
 def spawn_agent(task, provider="", label="", timeout=0):
     from oceano import agentjobs, mindbridge   # lazy: mindbridge imports tools (avoid an import cycle)
+    from oceano.web import state as web_state
+    access = web_state.load().get("prefs", {}).get("chat_agent_access", "read")
     try:
         rec = agentjobs.spawn(task, provider=provider, label=label, timeout=timeout,
-                              cwd=config.WORKSPACE, sid=mindbridge.active_session())
+                              tools=_chat_agent_tool_scope(access), cwd=config.WORKSPACE,
+                              sid=mindbridge.active_session())
     except RuntimeError as e:                  # cap / unknown provider → relay the reason verbatim
         return f"could not spawn the agent: {e}"
     out = (f"started agent #{rec['id']} ({rec['provider']}) \"{rec['label']}\" — running in the "

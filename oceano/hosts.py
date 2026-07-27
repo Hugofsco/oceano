@@ -161,8 +161,17 @@ def update(hid, **fields):
     if fields.get("policy") in POLICIES:
         h["policy"] = fields["policy"]
     if fields.get("auth") is not None:
-        # merge: keep a previously-custodied key_file unless a new auth supplies one
-        merged = {**(h.get("auth") or {}), **_norm_auth(fields["auth"])}
+        # merge: keep a previously-custodied key_file/passphrase/etc. unless the incoming auth
+        # actually supplies a replacement. Normalizing the incoming auth FIRST (as this used to)
+        # fills every omitted field with None/False, so spreading it over the existing auth wiped
+        # them out on every save — e.g. editing just the name/policy blanked the stored key_file.
+        # Merge the raw, unnormalized fields first so "omitted" and "explicitly cleared" stay
+        # distinct, then normalize once at the end.
+        incoming = fields["auth"] or {}
+        merged = dict(h.get("auth") or {})
+        for k in ("type", "key_file", "key_path", "has_passphrase", "passphrase", "password"):
+            if incoming.get(k) is not None:
+                merged[k] = incoming[k]
         h["auth"] = _norm_auth(merged)
     _save(d)
     return _public(h)

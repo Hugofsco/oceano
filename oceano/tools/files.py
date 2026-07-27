@@ -61,15 +61,18 @@ def write_file(path, content):
         "description": "Edit part of an existing workspace text file by replacing an EXACT "
                        "substring — safer/cheaper than rewriting the whole file with write_file. "
                        "Read the file first and copy the exact text (including indentation) into "
-                       "`find`. Fails if `find` isn't found verbatim.",
+                       "`find`. `find` must be UNIQUE in the file (include surrounding context to "
+                       "disambiguate); if it appears more than once the edit is refused unless you "
+                       "pass replace_all=true. Fails if `find` isn't found verbatim.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
-            "find": {"type": "string", "description": "exact text to replace (copy it verbatim from the file)"},
+            "find": {"type": "string", "description": "exact text to replace (copy it verbatim from the file); must be unique unless replace_all"},
             "replace": {"type": "string", "description": "the new text"},
+            "replace_all": {"type": "boolean", "description": "replace every occurrence of `find` (default false — a non-unique `find` is otherwise refused)"},
         }, "required": ["path", "find", "replace"]},
     },
 })
-def edit_file(path, find, replace):
+def edit_file(path, find, replace, replace_all=False):
     p = _resolve(path)
     if not p.is_file():
         return f"(no such file: {path} — use write_file to create it)"
@@ -78,6 +81,10 @@ def edit_file(path, find, replace):
     if n == 0:
         return ("ERROR: the `find` text was not found verbatim. Read the file and copy the exact "
                 "text (including whitespace) you want to replace.")
+    if n > 1 and not replace_all:
+        return (f"ERROR: `find` matches {n} places in {p.relative_to(_ws())} — the edit is ambiguous. "
+                "Add surrounding context to make `find` unique, or pass replace_all=true to change "
+                "every occurrence on purpose.")
     p.write_text(text.replace(find, replace), encoding="utf-8")
     return f"edited {p.relative_to(_ws())}: replaced {n} occurrence(s)"
 

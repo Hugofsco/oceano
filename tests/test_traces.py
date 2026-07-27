@@ -60,7 +60,10 @@ def test_agent_model_calls_are_traced(monkeypatch):
         return Msg()
 
     monkeypatch.setattr("oceano.llm.chat", fake_chat)
-    ag = Agent(model="fake-model", learn=False)
+    # inject_context=False: this test is about tracing, not context assembly — without it the
+    # Agent reads the developer's real memory/research store, which both slows the test and (via
+    # the passive research-note injection) taints the shared TurnContext, leaking into later tests.
+    ag = Agent(model="fake-model", learn=False, inject_context=False)
     with traces.scope(run_id="r2", session_id="s1"):
         out = ag.run("hi")
     evs = traces.query(run_id="r2")

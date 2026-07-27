@@ -60,6 +60,14 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "") or os.environ.get("OCEANO_HF_TOKEN", "
 # --- Agent safety knobs ---
 MAX_STEPS   = int(os.environ.get("OCEANO_MAX_STEPS", "25"))   # tool-call loop cap per turn (multi-file builds need headroom)
 SHELL_TIMEOUT = int(os.environ.get("OCEANO_SHELL_TIMEOUT", "60"))
+# Resident-mind (Claude/Codex) turns on an UNATTENDED channel (scheduler/workflow builds) get roomier
+# caps than an interactive turn: a real build fires single tool calls (an install, a full test run)
+# that emit no stream events for minutes, and the default 300s idle-stall guard was killing them
+# mid-build and silently recording the truncated result as success. Interactive turns keep the tight
+# delegate defaults (delegate._DELEGATE_IDLE / _MAX). Set 0 to fall back to those defaults.
+MIND_BG_IDLE     = int(os.environ.get("OCEANO_MIND_BG_IDLE", "900"))       # unattended mind: no-output stall cap (s)
+MIND_BG_MAXTOTAL = int(os.environ.get("OCEANO_MIND_BG_MAXTOTAL", "7200"))  # unattended mind: absolute wall-clock cap (s)
+CONFINE_TO_WORKSPACE = os.environ.get("OCEANO_CONFINE", "1") == "1"  # file ops stay inside workspace
 CONFINE_TO_WORKSPACE = os.environ.get("OCEANO_CONFINE", "1") == "1"  # file ops stay inside workspace
 
 # After each turn, a background LLM pass extracts durable facts and saves new ones

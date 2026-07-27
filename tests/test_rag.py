@@ -1,6 +1,7 @@
 """RAG: overlapping chunks, and the keyword fallback that keeps documents searchable
 when the embedding server is down (instead of erroring out)."""
 import os
+import json
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +37,22 @@ def test_search_docs_keyword_fallback_when_embed_down(tmp_path, monkeypatch):
     out = rag.search_docs("what is the capital of france", k=1)
     assert "paris" in out.lower()                                 # found by keyword, not an ERROR string
     assert "error" not in out.lower()
+
+
+def test_hybrid_retrieval_recovers_exact_identifier_when_dense_prefers_distractor(tmp_path, monkeypatch):
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "rag.db")
+    from oceano import embeddings
+    monkeypatch.setattr(embeddings, "embed", lambda *a, **k: [1.0, 0.0])
+    monkeypatch.setattr(rag.rerank, "order", lambda *a, **k: None)
+    con = rag._db()
+    con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)",
+                ("wrong.md", "generic network troubleshooting guide", json.dumps([1.0, 0.0])))
+    con.execute("INSERT INTO chunks (path, chunk, embedding) VALUES (?,?,?)",
+                ("right.md", "EADDRINUSE means another process already owns the port",
+                 json.dumps([0.0, 1.0])))
+    con.commit(); con.close()
+    out = rag.search_docs("EADDRINUSE", k=1)
+    assert "another process" in out
 
 
 def test_reindex_discovers_new_files_in_indexed_roots(tmp_path, monkeypatch):

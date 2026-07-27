@@ -283,6 +283,46 @@ def test_instruction_model_pin_runs_on_pinned_agent_with_shared_context(monkeypa
     assert pinned.messages is shared.messages     # same conversation object → context accumulates
 
 
+def test_shared_and_pinned_agents_never_inject_personal_context(monkeypatch):
+    """A workflow node is a self-contained task with its own explicit text/persona — like any other
+    delegate call, not a live chat turn. Without inject_context=False, EVERY node turn (even ones
+    routed to Claude/Codex as the mind) paid for a memory/research/skills relevance search over the
+    local embedding server first, and shipped that personal content into the prompt regardless of
+    which model actually answers — the literal 'local model gets loaded for no reason' bug."""
+    import types
+    made = []
+
+    class FakeAgent:
+        def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
+                     exclude_tools=None, only_tools=None, inject_context=True):
+            self.model, self.base_url, self.api_key = model, base_url, api_key
+            self.inject_context = inject_context
+            self.messages = [{"role": "system", "content": "sys"}]
+            self.on_event = on_event or (lambda k, d: None)
+            made.append(self)
+
+        def run(self, text, **kw):
+            return "ok"
+
+    monkeypatch.setattr("oceano.agent.Agent", FakeAgent)
+    monkeypatch.setattr("oceano.delegate.get_mind", lambda: "local")   # deterministic: routes via ag.run()
+    stub = types.SimpleNamespace(endpoint_key=lambda burl: "sk-test")
+    import sys
+    monkeypatch.setitem(sys.modules, "oceano.web.server", stub)
+    if "oceano.web" in sys.modules:
+        monkeypatch.setattr(sys.modules["oceano.web"], "server", stub, raising=False)
+    wf = _wf(
+        [{"id": 1, "type": "start"},
+         {"id": 2, "type": "instruction", "text": "plain"},
+         {"id": 3, "type": "instruction", "text": "pinned", "model": "m", "baseUrl": "http://x/v1"},
+         {"id": 4, "type": "end"}],
+        [{"from": 1, "to": 2}, {"from": 2, "to": 3}, {"from": 3, "to": 4}])
+    rec = workflows.run(wf, trigger="manual", nested=True)
+    assert rec["status"] == "ok"
+    assert len(made) == 2                      # the shared agent + the one pinned agent
+    assert all(a.inject_context is False for a in made)
+
+
 def test_orchestrate_salvage_retry_rescues_a_stalled_agent(monkeypatch):
     """A step-1 agent that stalls on its first attempt (e.g. an endpoint holding the request past
     the client timeout) is retried once, ALONE — a successful retry keeps the step (and run) ok."""

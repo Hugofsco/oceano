@@ -64,6 +64,24 @@ def record(event, **fields):
     return payload
 
 
+def record_global(event, **fields):
+    """Append a content-free operational metric even outside a run scope.
+
+    Used for routing telemetry, which deliberately stores model/tool names and counts only—never
+    prompts, tool arguments, results, or answers. Keeping this separate preserves record()'s
+    opt-in scope behavior for normal traces.
+    """
+    payload = {"ts": _now(), "event": event, **fields}
+    try:
+        TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRACE_PATH, "a", encoding="utf-8") as f:
+            atomicio.secure(TRACE_PATH)
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except OSError:
+        return None
+    return payload
+
+
 def query(run_id=None, workflow_id=None, limit=500):
     """Recent trace events, optionally filtered by run or workflow."""
     try:
