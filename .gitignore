@@ -2,6 +2,7 @@
 oceano.env
 oceano.env.key
 .env
+tool-loading.toml
 
 # --- runtime data: dbs, heartbeat, persisted web config (holds the bot token) ---
 data/*

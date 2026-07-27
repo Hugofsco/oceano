@@ -243,6 +243,7 @@ def _run_local(task, tools_spec, timeout, cwd, on_progress, skills=False):
                    api_key=prim["api_key"] or None, learn=False, inject_context=False,
                    exclude_tools=EXCLUDE, only_tools=delegate._api_only_tools(tools_spec, skills=skills),
                    on_event=_on_ev)
+        ag.tool_surface = "delegate"
         deadline = (time.monotonic() + timeout) if timeout else None
         with jobs.job("agent", label=str(task)[:140], gate=True) as jid:
             ce = jobs.cancel_event(jid)        # set by a ✕ click in the jobs popup while this runs

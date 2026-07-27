@@ -251,7 +251,8 @@ def _run_case(case, model, cancel=None, dynamic_tools=None):
         from oceano import tools as tool_catalog
         all_schemas = tool_catalog.schemas()
         safe_schemas = [s for s in all_schemas if s["function"]["name"] in allowed]
-        preview = (toolrouter.route(all_schemas, case["prompt"], model=model, force=dynamic_tools)
+        preview = (toolrouter.route(all_schemas, case["prompt"], model=model, force=dynamic_tools,
+                                    surface="eval")
                    if dynamic_tools is not None else
                    toolrouter.Route(safe_schemas, False, False, "explicit-allowlist",
                                     len(safe_schemas), len(safe_schemas), model))
@@ -268,6 +269,7 @@ def _run_case(case, model, cancel=None, dynamic_tools=None):
             ag = Agent(model=model, learn=False, inject_context=False, only_tools=allowed,
                        dynamic_tools=dynamic_tools,
                        routing_catalog=all_schemas if dynamic_tools is not None else None)
+            ag.tool_surface = "eval"
             deadline = t0 + (case.get("timeout") or CASE_TIMEOUT)
             for ev in ag.run_stream(case["prompt"]):
                 kind = ev.get("type")

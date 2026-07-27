@@ -231,26 +231,32 @@ def _run_with_model(prompt, model, base_url, cancel=None):
     the scheduler's per-task model dispatch so research honours the same choice. `cancel` (a
     threading.Event) is passed straight through to whichever Agent entry point runs."""
     from oceano.agent import Agent
+
+    def research_agent():
+        ag = Agent()
+        ag.tool_surface = "research"
+        return ag
+
     model = (model or "").strip()
     if not model:                          # no per-topic override → follow the PRIMARY INTELLIGENCE,
         from oceano import delegate        # same as an un-pinned scheduled task: mind → CLI, else local
         mind = delegate.get_mind()
         if mind == "claude" and delegate.available():
-            return Agent().run_claude(prompt, cancel=cancel)
+            return research_agent().run_claude(prompt, cancel=cancel)
         if mind == "codex" and delegate.codex_available():
-            return Agent().run_codex(prompt, cancel=cancel)
-        return Agent().run(prompt, cancel=cancel)
+            return research_agent().run_codex(prompt, cancel=cancel)
+        return research_agent().run(prompt, cancel=cancel)
     if model == "claude":
         from oceano import delegate
         if not delegate.available():
             return "⚠️ This topic is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
-        return Agent().run_claude(prompt, cancel=cancel)
+        return research_agent().run_claude(prompt, cancel=cancel)
     if model == "codex":
         from oceano import delegate
         if not delegate.codex_available():
             return "⚠️ This topic is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
-        return Agent().run_codex(prompt, cancel=cancel)
-    ag = Agent()
+        return research_agent().run_codex(prompt, cancel=cancel)
+    ag = research_agent()
     ag.model = model                       # an endpoint model id
     if base_url:
         ag.base_url = base_url

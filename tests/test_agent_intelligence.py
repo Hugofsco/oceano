@@ -65,3 +65,63 @@ def test_dynamic_tool_failure_retries_once_with_full_catalog(monkeypatch):
     assert ag.run("Research the latest sources online") == "Recovered."
     assert len(seen) == 2
     assert seen[0] < seen[1] == len(tools.schemas())
+
+
+def test_discover_tools_cumulatively_updates_next_model_call(monkeypatch):
+    seen = []
+
+    class Function:
+        name = "discover_tools"
+        arguments = '{"query":"inspect calendar","operation":"load"}'
+
+    class Call:
+        id = "discover-1"
+        function = Function()
+
+    class Msg:
+        def __init__(self, content="", tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    replies = iter([Msg(tool_calls=[Call()]), Msg("Calendar tools loaded.")])
+
+    def fake_chat(*args, **kwargs):
+        seen.append({s["function"]["name"] for s in (kwargs.get("tools") or [])})
+        return next(replies)
+
+    def forbidden_registry_call(name, args):
+        raise AssertionError(f"virtual discovery reached executable registry: {name}")
+
+    monkeypatch.setattr("oceano.llm.chat", fake_chat)
+    monkeypatch.setattr("oceano.tools.run", forbidden_registry_call)
+    monkeypatch.setattr("oceano.toolrouter.telemetry", lambda *a, **k: None)
+    ag = Agent(model="small-local", learn=False, inject_context=False, dynamic_tools=True)
+    assert ag.run("do it") == "Calendar tools loaded."
+    assert "discover_tools" in seen[0]
+    assert "calendar_events" not in seen[0]
+    assert "calendar_events" in seen[1]
+
+
+def test_streaming_discovery_updates_schemas_without_registry_execution(monkeypatch):
+    seen = []
+
+    def fake_stream(*args, **kwargs):
+        seen.append({s["function"]["name"] for s in (kwargs.get("tools") or [])})
+        if len(seen) == 1:
+            yield {"tool_calls": [{"id": "discover-1", "name": "discover_tools",
+                                    "args": '{"query":"inspect calendar","operation":"load"}'}]}
+        else:
+            yield {"content": "Ready."}
+            yield {"usage": 2, "prompt_tokens": 20}
+
+    def forbidden_registry_call(name, args):
+        raise AssertionError(f"virtual discovery reached executable registry: {name}")
+
+    monkeypatch.setattr("oceano.llm.stream", fake_stream)
+    monkeypatch.setattr("oceano.tools.run", forbidden_registry_call)
+    monkeypatch.setattr("oceano.toolrouter.telemetry", lambda *a, **k: None)
+    ag = Agent(model="small-local", learn=False, inject_context=False, dynamic_tools=True)
+    events = list(ag.run_stream("do it"))
+    assert any(ev.get("text") == "Ready." for ev in events)
+    assert "calendar_events" not in seen[0]
+    assert "calendar_events" in seen[1]

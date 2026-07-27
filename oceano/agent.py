@@ -512,7 +512,7 @@ _FOLD_CHUNK_CHARS = max(2000, int(os.environ.get("OCEANO_CTX_FOLD_CHUNK_CHARS", 
 class Agent:
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
                  exclude_tools=None, only_tools=None, inject_context=True, dynamic_tools=None,
-                 routing_catalog=None):
+                 routing_catalog=None, tool_surface="chat"):
         if model:                                    # explicit model → caller owns base_url/api_key
             self.model, self.base_url, self.api_key = model, base_url, api_key
         else:                                        # default → primary model AND its endpoint
@@ -535,6 +535,9 @@ class Agent:
         # Eval-only schema universe. It lets A/B runs advertise the realistic catalog while
         # only_tools remains the independent execution boundary. Production callers leave None.
         self.routing_catalog = list(routing_catalog) if routing_catalog is not None else None
+        # Named policy surface (chat/workflow/delegate/eval). It affects schema advertisement
+        # only; only_tools/exclude_tools remain the execution-time security boundary.
+        self.tool_surface = tool_surface
         # inject_context=False for delegates: give operational context (date/workspace/channel)
         # but NOT the user's personal memories/research/skills — a delegate gets a self-contained
         # task, and we shouldn't ship personal data to it (esp. a cloud delegate).
@@ -733,11 +736,27 @@ class Agent:
         sc = self.routing_catalog if self.routing_catalog is not None else allowed
         explicit = self.only_tools is not None or only is not None
         if explicit and self.dynamic_tools is not True and self.routing_catalog is None:
-            return toolrouter.Route(sc, False, False, "explicit-allowlist", len(sc), len(sc), self.model or "")
-        return toolrouter.route(sc, query or "", model=self.model or "", force=self.dynamic_tools)
+            policy = toolrouter.Policy(mode="full", source="explicit-allowlist")
+            return toolrouter.Route(sc, False, False, "explicit-allowlist", len(sc), len(sc),
+                                    self.model or "", surface=self.tool_surface, policy=policy)
+        return toolrouter.route(sc, query or "", model=self.model or "", force=self.dynamic_tools,
+                                surface=self.tool_surface)
 
     def _full_routing_catalog(self, only=None):
         return list(self.routing_catalog) if self.routing_catalog is not None else self._base_tool_schemas(only=only)
+
+    def _discover_tools(self, route_info, args, allowed, only=None):
+        """Handle the virtual discovery tool without adding it to the executable registry."""
+        from oceano import toolrouter
+        if not (route_info.enabled and route_info.policy.discovery):
+            return route_info, "ERROR: tool 'discover_tools' is not available in this conversation"
+        return toolrouter.discover(route_info, self._full_routing_catalog(only=only), allowed, args)
+
+    def _recover_tool_route(self, route_info, allowed, query, only=None):
+        """Apply configured tiered recovery inside the same execution allowlist."""
+        from oceano import toolrouter
+        return toolrouter.recover(
+            route_info, self._full_routing_catalog(only=only), allowed, query)
 
     def _tool_schemas(self, only=None, query=None):
         """Compatibility helper returning only the schemas for a turn."""
@@ -851,17 +870,21 @@ class Agent:
             if not msg.tool_calls:
                 issues = _outcome_issues(self._turn_plan, tool_events)
                 if toolrouter.should_expand(route_info, msg.content or "", issues, tool_events):
-                    route_info = toolrouter.expanded(route_info, self._full_routing_catalog())
-                    turn_tools = route_info.schemas
-                    self._turn_tool_schemas = turn_tools
-                    toolrouter.telemetry(route_info, "fallback",
-                                         used_tools=[name for name, _ in tool_events],
-                                         errors=sum((result or "").lstrip().lower().startswith("error")
-                                                    for _, result in tool_events))
-                    self.messages.append({"role": "user", "content":
-                        "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
-                        "Continue the task and use any newly available tool needed to finish it."})
-                    continue
+                    route_info, phase, _ = self._recover_tool_route(
+                        route_info, allowed, user_message)
+                    if phase:
+                        turn_tools = route_info.schemas
+                        self._turn_tool_schemas = turn_tools
+                        toolrouter.telemetry(route_info, f"{phase}-fallback",
+                                             used_tools=[name for name, _ in tool_events],
+                                             errors=sum((result or "").lstrip().lower().startswith("error")
+                                                        for _, result in tool_events))
+                        scope = ("additional relevant tool schemas" if phase == "discovery"
+                                 else "all allowed tool schemas")
+                        self.messages.append({"role": "user", "content":
+                            f"TOOL ROUTING RECOVERY: {scope} are now available. "
+                            "Continue the task and use any newly available tool needed to finish it."})
+                        continue
                 if issues and not corrected:
                     corrected = True
                     self.messages.append({"role": "user", "content":
@@ -877,19 +900,31 @@ class Agent:
                 return msg.content or ""
             for call in msg.tool_calls:
                 self.on_event("tool_call", {"name": call.function.name, "args": call.function.arguments})
-                result = self._exec_tool(call.function.name, call.function.arguments, allowed)
+                if call.function.name == "discover_tools":
+                    route_info, result = self._discover_tools(
+                        route_info, call.function.arguments, allowed)
+                    turn_tools = route_info.schemas
+                    self._turn_tool_schemas = turn_tools
+                    toolrouter.telemetry(route_info, "discovered",
+                                         used_tools=[name for name, _ in tool_events])
+                else:
+                    result = self._exec_tool(call.function.name, call.function.arguments, allowed)
                 tool_events.append((call.function.name, result))
                 self.on_event("tool_result", {"name": call.function.name, "result": result})
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
             if toolrouter.should_expand(route_info, tool_events=tool_events):
-                route_info = toolrouter.expanded(route_info, self._full_routing_catalog())
-                turn_tools = route_info.schemas
-                self._turn_tool_schemas = turn_tools
-                toolrouter.telemetry(route_info, "fallback",
-                                     used_tools=[name for name, _ in tool_events], errors=1)
-                self.messages.append({"role": "user", "content":
-                    "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
-                    "Retry the blocked action with an available tool."})
+                route_info, phase, _ = self._recover_tool_route(
+                    route_info, allowed, user_message)
+                if phase:
+                    turn_tools = route_info.schemas
+                    self._turn_tool_schemas = turn_tools
+                    toolrouter.telemetry(route_info, f"{phase}-fallback",
+                                         used_tools=[name for name, _ in tool_events], errors=1)
+                    scope = ("additional relevant tool schemas" if phase == "discovery"
+                             else "all allowed tool schemas")
+                    self.messages.append({"role": "user", "content":
+                        f"TOOL ROUTING RECOVERY: {scope} are now available. "
+                        "Retry the blocked action with an available tool."})
         # cap hit — one tool-less pass so the user gets a real summary + next steps
         final = llm.chat(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],
                          tools=None, model=self.model, base_url=self.base_url, api_key=self.api_key)
@@ -1286,18 +1321,22 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": content})
                 issues = _outcome_issues(self._turn_plan, tool_events)
                 if toolrouter.should_expand(route_info, content, issues, tool_events):
-                    route_info = toolrouter.expanded(route_info, self._full_routing_catalog(only=only_tools))
-                    turn_tools = route_info.schemas
-                    toolrouter.telemetry(route_info, "fallback",
-                                         used_tools=[name for name, _ in tool_events],
-                                         errors=sum((result or "").lstrip().lower().startswith("error")
-                                                    for _, result in tool_events))
-                    self.messages.append({"role": "user", "content":
-                        "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
-                        "Continue the task and use any newly available tool needed to finish it."})
-                    yield {"type": "reasoning", "text":
-                           "\nExpanded the allowed tool catalog for one recovery attempt.\n"}
-                    continue
+                    route_info, phase, _ = self._recover_tool_route(
+                        route_info, allowed, user_message, only=only_tools)
+                    if phase:
+                        turn_tools = route_info.schemas
+                        toolrouter.telemetry(route_info, f"{phase}-fallback",
+                                             used_tools=[name for name, _ in tool_events],
+                                             errors=sum((result or "").lstrip().lower().startswith("error")
+                                                        for _, result in tool_events))
+                        scope = ("additional relevant tool schemas" if phase == "discovery"
+                                 else "all allowed tool schemas")
+                        self.messages.append({"role": "user", "content":
+                            f"TOOL ROUTING RECOVERY: {scope} are now available. "
+                            "Continue the task and use any newly available tool needed to finish it."})
+                        yield {"type": "reasoning", "text":
+                               f"\nTool routing recovery loaded {scope}.\n"}
+                        continue
                 if issues and not corrected:
                     corrected = True
                     self.messages.append({"role": "user", "content":
@@ -1330,25 +1369,36 @@ class Agent:
                                for c in norm]})
             for c in norm:
                 yield {"type": "tool_call", "name": c["name"], "args": c["args"]}
-                result = None
-                for kind, payload in self._run_tool_streamed(c["name"], c["args"], allowed):
-                    if kind == "progress":
-                        yield {"type": "tool_progress", "name": c["name"], **payload}
-                    else:
-                        result = payload
+                if c["name"] == "discover_tools":
+                    route_info, result = self._discover_tools(
+                        route_info, c["args"], allowed, only=only_tools)
+                    turn_tools = route_info.schemas
+                    toolrouter.telemetry(route_info, "discovered",
+                                         used_tools=[name for name, _ in tool_events])
+                else:
+                    result = None
+                    for kind, payload in self._run_tool_streamed(c["name"], c["args"], allowed):
+                        if kind == "progress":
+                            yield {"type": "tool_progress", "name": c["name"], **payload}
+                        else:
+                            result = payload
                 yield {"type": "tool_result", "name": c["name"], "result": (result or "")[:2000]}
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result or ""})
                 tool_events.append((c["name"], result or ""))
             if toolrouter.should_expand(route_info, tool_events=tool_events):
-                route_info = toolrouter.expanded(route_info, self._full_routing_catalog(only=only_tools))
-                turn_tools = route_info.schemas
-                toolrouter.telemetry(route_info, "fallback",
-                                     used_tools=[name for name, _ in tool_events], errors=1)
-                self.messages.append({"role": "user", "content":
-                    "TOOL ROUTING RECOVERY: The complete allowed tool catalog is now available. "
-                    "Retry the blocked action with an available tool."})
-                yield {"type": "reasoning", "text":
-                       "\nExpanded the allowed tool catalog after a blocked tool call.\n"}
+                route_info, phase, _ = self._recover_tool_route(
+                    route_info, allowed, user_message, only=only_tools)
+                if phase:
+                    turn_tools = route_info.schemas
+                    toolrouter.telemetry(route_info, f"{phase}-fallback",
+                                         used_tools=[name for name, _ in tool_events], errors=1)
+                    scope = ("additional relevant tool schemas" if phase == "discovery"
+                             else "all allowed tool schemas")
+                    self.messages.append({"role": "user", "content":
+                        f"TOOL ROUTING RECOVERY: {scope} are now available. "
+                        "Retry the blocked action with an available tool."})
+                    yield {"type": "reasoning", "text":
+                           f"\nTool routing recovery loaded {scope} after a blocked call.\n"}
         # cap hit — stream one tool-less wrap-up (summary + next steps) instead of a dead-end
         seg_first = None; tail = ""; tail_tok = 0; tail_ptok = 0
         for item in llm.stream(self.messages + [{"role": "user", "content": _WRAPUP_NUDGE}],

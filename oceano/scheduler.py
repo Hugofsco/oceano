@@ -407,6 +407,12 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
     from oceano.agent import Agent
     from oceano.agent import Cancelled as AgentCancelled
     from oceano import tools, jobs
+
+    def task_agent():
+        ag = Agent()
+        ag.tool_surface = "scheduled"
+        return ag
+
     with tools.background():
         if source and source.startswith("research:"):        # Researcher-owned entry
             from oceano import researcher
@@ -441,26 +447,26 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
                 if model == "claude":          # run this task via the Claude mind (its own subscription)
                     from oceano import delegate
                     if delegate.available():
-                        answer = Agent().run_claude(instruction, cancel=ce)
+                        answer = task_agent().run_claude(instruction, cancel=ce)
                     else:
                         answer = "⚠️ This task is set to run on 🧠 Claude, but the `claude` CLI isn't available on this host."
                 elif model == "codex":         # run this task via the Codex mind (its own auth/session)
                     from oceano import delegate
                     if delegate.codex_available():
-                        answer = Agent().run_codex(instruction, cancel=ce)
+                        answer = task_agent().run_codex(instruction, cancel=ce)
                     else:
                         answer = "⚠️ This task is set to run on 🧠 Codex, but the `codex` CLI isn't available on this host."
                 elif not model:                # no per-task override → follow the PRIMARY INTELLIGENCE,
                     from oceano import delegate  # same as an un-pinned workflow step: mind → CLI, else local model
                     mind = delegate.get_mind()
                     if mind == "claude" and delegate.available():
-                        answer = Agent().run_claude(instruction, cancel=ce)
+                        answer = task_agent().run_claude(instruction, cancel=ce)
                     elif mind == "codex" and delegate.codex_available():
-                        answer = Agent().run_codex(instruction, cancel=ce)
+                        answer = task_agent().run_codex(instruction, cancel=ce)
                     else:
-                        answer = Agent().run(instruction, cancel=ce)
+                        answer = task_agent().run(instruction, cancel=ce)
                 else:
-                    ag = Agent()
+                    ag = task_agent()
                     ag.model = model           # per-task model override
                     if base_url:
                         ag.base_url = base_url

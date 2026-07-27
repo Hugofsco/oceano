@@ -1330,6 +1330,7 @@ def _pinned_agent(node, ag):
     pinned = Agent(model=node["model"], base_url=base_url or None,
                    api_key=api_key or "sk-no-key-needed", learn=False,
                    exclude_tools={"run_workflow"}, inject_context=False)
+    pinned.tool_surface = "workflow"
     pinned.messages = ag.messages
     pinned.on_event = ag.on_event
     return pinned
@@ -1718,6 +1719,7 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
         # research + skills relevance search over the local embedding server first, and shipped
         # that personal content into the prompt regardless of which model actually answers.
         ag = Agent(learn=False, exclude_tools={"run_workflow"}, inject_context=False)
+        ag.tool_surface = "workflow"
         dm = (default_model or "").strip()
         if dm in ("claude", "codex"):
             ag.wf_mind_pin = dm                # un-pinned nodes/gates follow the task's mind

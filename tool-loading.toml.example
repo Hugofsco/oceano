@@ -1,0 +1,57 @@
+# Oceano tool-schema advertisement policy.
+#
+# Copy to tool-loading.toml and restart Oceano. The active file is gitignored. This controls
+# schemas shown to a model, never which tools may execute. Explicit workflow/delegate allowlists
+# remain the hard boundary and take precedence over every rule here.
+#
+# Precedence: explicit allowlist > surface > first matching model rule > default/environment.
+
+[default]
+mode = "hybrid"                 # "full" or "hybrid"
+schema_budget = 5000            # approximate schema tokens on the first call
+max_schema_budget = 9000        # cumulative ceiling after discover_tools
+discovery = true
+fallback = "full-once"          # "none", "discover-once", or "full-once"
+ambiguous = "discover"          # "discover" keeps the bootstrap small; "full" is conservative
+telemetry = true
+core_bundles = ["core"]
+
+# Model rules use case-insensitive shell patterns; the first match wins.
+[[models]]
+pattern = "qwen*"
+schema_budget = 4200
+max_schema_budget = 7600
+
+[[models]]
+pattern = "*-large"
+mode = "full"
+
+# Surface rules override model and default settings.
+[surfaces.chat]
+mode = "hybrid"
+
+[surfaces.workflow]
+# Workflows commonly provide explicit tool scopes, which bypass routing. This setting applies
+# only to workflow agents without an explicit scope.
+mode = "hybrid"
+schema_budget = 6000
+
+[surfaces.delegate]
+# Delegates normally have explicit allowlists and therefore keep exactly that advertised set.
+mode = "hybrid"
+
+[surfaces.eval]
+mode = "hybrid"
+
+[surfaces.research]
+mode = "hybrid"
+
+[surfaces.scheduled]
+mode = "hybrid"
+
+# Override a built-in bundle or define a new one. Unknown/unavailable tool names are ignored.
+# [bundles.project-management]
+# description = "Read and update project-management issues"
+# aliases = ["issue", "ticket", "project", "sprint"]
+# tools = ["issues_list", "issue_read", "issue_update"]
+# core = ["issues_list", "issue_read"]

@@ -15,10 +15,11 @@ def _names(query):
 
 
 def test_calendar_query_gets_a_small_calendar_focused_catalog():
-    names = _names("What meetings are on my calendar next week?")
+    route = _route("What meetings are on my calendar next week?")
+    names = set(route.names)
     assert "calendar_events" in names
     assert "mail_send" not in names
-    assert len(names) <= toolrouter.MAX_TOOLS
+    assert route.schema_tokens <= route.policy.schema_budget
 
 
 def test_code_task_keeps_execution_and_verification_tools():
@@ -26,9 +27,12 @@ def test_code_task_keeps_execution_and_verification_tools():
     assert {"read_file", "write_file", "run_shell", "run_tests", "delegate"} <= names
 
 
-def test_ambiguous_request_falls_back_to_all_tools():
+def test_ambiguous_request_keeps_core_and_discovery_instead_of_all_tools():
     schemas = tools.schemas()
-    assert toolrouter.select(schemas, "do it", force=True) == schemas
+    route = toolrouter.route(schemas, "do it", force=True)
+    assert "discover_tools" in route.names
+    assert route.selected < len(schemas)
+    assert route.reason == "ambiguous-discovery"
 
 
 def test_routing_is_disabled_by_default(monkeypatch):
@@ -73,6 +77,74 @@ def test_full_catalog_recovery_signals_are_conservative():
     assert toolrouter.should_expand(route, "Done", [], [("run_tests", "12 passed")]) is False
     expanded = toolrouter.expanded(route, tools.schemas())
     assert expanded.fallback is True and expanded.schemas == tools.schemas()
+
+
+def test_discovery_loads_cumulatively_but_never_crosses_allowed_boundary():
+    schemas = tools.schemas()
+    forbidden = "add_calendar_event"
+    allowed = {s["function"]["name"] for s in schemas} - {forbidden}
+    route = toolrouter.route([s for s in schemas if s["function"]["name"] in allowed],
+                             "do it", force=True)
+    before = set(route.names)
+    updated, result = toolrouter.discover(
+        route, schemas, allowed, {"query": "inspect calendar", "operation": "load"})
+    assert before <= set(updated.names)
+    assert "calendar_events" in updated.names
+    assert forbidden not in updated.names
+    assert '"loaded"' in result
+    assert updated.schema_tokens <= updated.policy.max_schema_budget
+
+
+def test_recovery_expands_relevant_tools_before_full_catalog():
+    schemas = tools.schemas()
+    allowed = {s["function"]["name"] for s in schemas}
+    route = toolrouter.route(schemas, "do it", force=True)
+    discovered, phase, _ = toolrouter.recover(route, schemas, allowed, "inspect calendar")
+    assert phase == "discovery"
+    assert discovered.recovery_level == 1
+    assert "calendar_events" in discovered.names
+    full, phase, _ = toolrouter.recover(discovered, schemas, allowed, "inspect calendar")
+    assert phase == "full"
+    assert full.fallback is True
+    assert full.names == tuple(s["function"]["name"] for s in schemas)
+
+
+def test_config_precedence_is_surface_then_model_then_global(tmp_path, monkeypatch):
+    config_path = tmp_path / "tool-loading.toml"
+    config_path.write_text(
+        '[default]\nmode = "full"\nschema_budget = 7000\n'
+        '[[models]]\npattern = "qwen*"\nmode = "hybrid"\nschema_budget = 4000\n'
+        '[surfaces.workflow]\nmode = "full"\nschema_budget = 3000\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(config_path))
+    monkeypatch.setenv("OCEANO_TOOL_LOADING_MODE", "hybrid")
+    toolrouter._CACHE.update({"path": None, "mtime": None, "data": {}})
+    chat = toolrouter.resolve_policy("qwen-small", "chat")
+    workflow = toolrouter.resolve_policy("qwen-small", "workflow")
+    assert chat.mode == "hybrid" and chat.schema_budget == 4000
+    assert workflow.mode == "full" and workflow.schema_budget == 3000
+
+
+def test_config_can_define_a_custom_capability_bundle(tmp_path, monkeypatch):
+    config_path = tmp_path / "tool-loading.toml"
+    config_path.write_text(
+        '[default]\nschema_budget = 500\n'
+        '[bundles.issues]\ndescription = "Project issue tracking"\n'
+        'aliases = ["ticket"]\ntools = ["issue_list", "issue_read"]\n'
+        'core = ["issue_list"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(config_path))
+    toolrouter._CACHE.update({"path": None, "mtime": None, "data": {}})
+    schemas = [
+        {"type": "function", "function": {"name": name, "description": name,
+                                           "parameters": {"type": "object", "properties": {}}}}
+        for name in ("issue_list", "issue_read", *(f"unrelated_{i}" for i in range(30)))
+    ]
+    route = toolrouter.route(schemas, "read the ticket", force=True)
+    assert {"issue_list", "issue_read"} <= set(route.names)
+    assert "issues" in route.loaded_bundles
 
 
 def test_routing_telemetry_never_accepts_prompt_or_result_fields(tmp_path, monkeypatch):

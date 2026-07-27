@@ -799,11 +799,27 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 | `OCEANO_DELEGATE_IDLE` / `_MAXTOTAL` / `_MAXTURNS` | `300` / `3600` / `60` | delegation idle timeout (s), absolute cap (s), max turns |
 | `OCEANO_AGENTS_MAX` | `3` | max concurrent background sub-agents (`spawn_agent`) |
 | `OCEANO_CTX_FOLD_CHARS` | `120000` | resident-mind rolling context fold threshold (chars); `0` disables |
+| `OCEANO_TOOL_LOADING_MODE` | `full` | `full` catalog or context-saving `hybrid` schema loading |
+| `OCEANO_TOOL_SCHEMA_BUDGET` / `_MAX_SCHEMA_BUDGET` | `5000` / `9000` | initial and cumulative approximate tool-schema token budgets |
+| `OCEANO_TOOL_DISCOVERY` / `_FALLBACK` | `1` / `full-once` | virtual bundle discovery and tiered recovery policy |
+| `OCEANO_TOOL_CONFIG` | `tool-loading.toml` | structured bundle/model/surface policy; see `tool-loading.toml.example` |
 | `OCEANO_CONFINE` | `1` | fence file ops to the workspace |
 | `OCEANO_AUTO_LEARN` | `1` | background self-learning memory |
 | `OCEANO_SHELL_GUARD` / `OCEANO_URL_GUARD` | `1` | safety guards |
 | `OCEANO_TELEGRAM_TOKEN` / `_ALLOWED` | — | Telegram (or set in Settings) |
 | `HF_TOKEN` | — | optional, for gated Hugging Face repos |
+
+Hybrid tool loading separates three concerns: tools registered by the process, tools allowed
+to execute in a particular conversation, and schemas advertised to the model. It starts with
+budgeted capability bundles selected from the request. The virtual `discover_tools` schema can
+then add only already-allowed tools for later calls in the same turn. If selection still fails,
+the configured recovery expands relevant bundles once and may expose the complete allowed catalog
+once. Explicit workflow/delegate allowlists always win; routing never grants permission.
+
+For scalar settings, use `oceano.env`. For per-model rules, per-surface rules, or custom bundles,
+copy `tool-loading.toml.example` to the gitignored `tool-loading.toml`. Precedence is explicit
+allowlist → surface → first matching model rule → global environment/default policy. Legacy
+`OCEANO_DYNAMIC_TOOL_*` settings remain supported for existing installations.
 
 ---
 
