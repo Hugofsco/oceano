@@ -20,18 +20,81 @@ CAPABILITIES = (
     "python_exec",
     "background_job",
     "http_request",
+    "browser_control",
     "remote_access",
+    "mail_manage",
     "mail_send",
+    "calendar_write",
+    "memory_write",
+    "schedule_write",
+    "notes_write",
+    "desktop_control",
 )
 DEFAULTS = {
+    # New capability groups default to the app's historical behavior. Users may
+    # tighten them independently without a compatibility-breaking policy migration.
     "workspace_write": "allow",
     "shell_exec": "allow",
     "python_exec": "allow",
     "background_job": "allow",
     "http_request": "allow",
+    "browser_control": "allow",
     "remote_access": "confirm",
+    "mail_manage": "allow",
     "mail_send": "confirm",
+    "calendar_write": "allow",
+    "memory_write": "allow",
+    "schedule_write": "allow",
+    "notes_write": "allow",
+    "desktop_control": "allow",
 }
+
+# One auditable source of truth for built-in tool capabilities. ToolSpec captures
+# this at registration time; schemas may override it through private x-oceano metadata.
+TOOL_CAPABILITIES = {
+    **{name: "workspace_write" for name in (
+        "write_file", "edit_file", "make_folder", "convert", "fetch_media", "speak_to_file",
+    )},
+    "run_shell": "shell_exec",
+    "git": "shell_exec",
+    "python_exec": "python_exec",
+    "spawn_job": "background_job",
+    "spawn_agent": "background_job",
+    "schedule_task": "schedule_write",
+    "update_task": "schedule_write",
+    "cancel_task": "schedule_write",
+    "run_workflow": "background_job",
+    "http_request": "http_request",
+    **{name: "browser_control" for name in (
+        "browser_open", "browser_click", "browser_scroll", "browser_fill", "browser_select",
+        "browser_press", "browser_wait", "browser_eval", "browser_hover", "browser_upload",
+        "browser_dialog", "browser_tab",
+    )},
+    "ssh_run": "remote_access",
+    "sftp": "remote_access",
+    **{name: "mail_manage" for name in (
+        "mail_move", "mail_delete", "mail_flag", "mail_save_attachment", "mail_folder",
+    )},
+    "mail_send": "mail_send",
+    "mail_reply": "mail_send",
+    **{name: "calendar_write" for name in (
+        "add_calendar_event", "add_calendar_events", "update_calendar_event",
+        "delete_calendar_event", "manage_calendar",
+    )},
+    **{name: "memory_write" for name in (
+        "remember", "update_memory", "forget_memory", "index_docs", "learn_skill",
+    )},
+    **{name: "notes_write" for name in (
+        "add_note", "update_note", "delete_note", "add_kanban_card", "update_kanban_card",
+        "delete_kanban_card",
+    )},
+    **{name: "desktop_control" for name in (
+        "ui_open", "ui_close", "ui_arrange", "desktop_notify", "desktop_pick_file",
+        "desktop_save_file", "desktop_reveal_path", "desktop_open_path",
+        "desktop_clipboard_read", "desktop_clipboard_write", "desktop_screenshot",
+    )},
+}
+
 
 
 _perm = contextvars.ContextVar("oceano_policy_permit", default=frozenset())
@@ -89,18 +152,4 @@ def set_all(policies):
 
 
 def capability_for_tool(name):
-    if name in ("write_file", "edit_file", "make_folder"):
-        return "workspace_write"
-    if name == "run_shell":
-        return "shell_exec"
-    if name == "python_exec":
-        return "python_exec"
-    if name == "spawn_job":
-        return "background_job"
-    if name == "http_request":
-        return "http_request"
-    if name in ("ssh_run", "sftp"):
-        return "remote_access"
-    if name in ("mail_send", "mail_reply"):
-        return "mail_send"
-    return ""
+    return TOOL_CAPABILITIES.get(name, "")

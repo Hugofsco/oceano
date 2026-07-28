@@ -4,8 +4,11 @@ the sibling domain modules; the package __init__ re-exports everything."""
 import contextlib
 import contextvars
 import json
+import re
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import config
 from oceano import atomicio, policies, traces, turnctx
@@ -109,7 +112,136 @@ def background_workspace(path):
 # --- registry --------------------------------------------------------------
 _TOOLS = {}        # name -> python function
 _SCHEMAS = []      # list of OpenAI tool schemas
+_TOOL_SPECS = {}   # name -> ToolSpec (execution/security metadata; schemas stay provider-neutral)
 _TOOL_OVERRIDES = contextvars.ContextVar("oceano_tool_overrides", default=None)
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Runtime contract for a registered tool.
+
+    The JSON schema answers "how may the model call this?". This metadata answers
+    "what may the runtime permit and expect?". Defaults preserve the historical
+    behavior; built-ins inherit the existing capability map unless a decorator or
+    an MCP schema explicitly declares richer ``x-oceano`` metadata.
+    """
+
+    name: str
+    capability: str = ""
+    risk: str = "low"
+    side_effecting: bool = False
+    idempotent: bool = True
+    requires_confirmation: bool = False
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Structured internal result with a backward-compatible model-facing string."""
+
+    ok: bool
+    summary: str = ""
+    data: Any = None
+    error: str | None = None
+    retryable: bool = False
+    side_effects: tuple[str, ...] = field(default_factory=tuple)
+    code: str = ""
+
+    def text(self) -> str:
+        if self.ok:
+            if self.summary:
+                return self.summary
+            if self.data is None:
+                return ""
+            if isinstance(self.data, str):
+                return self.data
+            return json.dumps(self.data, ensure_ascii=False, default=str)
+        message = self.error or self.summary or "tool execution failed"
+        return message if message.lstrip().upper().startswith("ERROR") else f"ERROR: {message}"
+
+    @classmethod
+    def from_value(cls, value, *, spec=None):
+        if isinstance(value, cls):
+            return value
+        text = str(value)
+        low = text.lstrip().lower()
+        failed = low.startswith("error") or "traceback (most recent call last)" in low
+        effects = (f"capability:{spec.capability}",) if spec and spec.side_effecting and not failed else ()
+        return cls(ok=not failed, summary=text if not failed else "",
+                   data=value if not failed and not isinstance(value, str) else None,
+                   error=text if failed else None, side_effects=effects)
+
+
+def _schema_metadata(schema):
+    raw = schema.get("x-oceano") if isinstance(schema, dict) else None
+    return raw if isinstance(raw, dict) else {}
+
+
+_EXIT = re.compile(r"\(exit\s+(\d+)(?:,|\))", re.IGNORECASE)
+
+
+def _normalize_result(name, args, value, spec):
+    """Enrich legacy string-returning tools without changing their public API."""
+    result = ToolResult.from_value(value, spec=spec)
+    text = result.text()
+    low = text.lower()
+    if result.ok and name in {"run_tests", "run_shell", "python_exec"}:
+        match = _EXIT.search(text)
+        if match and int(match.group(1)) != 0:
+            code = "tests_failed" if name == "run_tests" else "command_failed"
+            return ToolResult(False, error=text, retryable=True, code=code)
+        if "timed out" in low:
+            return ToolResult(False, error=text, retryable=True, code="timeout")
+    if result.ok and name in {"list_files", "edit_file"} and low.startswith("(no such"):
+        return ToolResult(False, error=text, retryable=True, code="not_found")
+    if not result.ok and not result.code:
+        retryable = any(term in low for term in ("not found", "timed out", "temporar", "try again"))
+        code = "not_found" if "not found" in low else "tool_error"
+        return ToolResult(False, error=result.error or text, retryable=retryable, code=code)
+    if result.ok:
+        path = str(args.get("path") or ".")
+        effects = {
+            "write_file": (f"file:{path}",),
+            "edit_file": (f"file:{path}",),
+            "make_folder": (f"directory:{path}",),
+        }.get(name)
+        if effects:
+            return ToolResult(True, summary=result.summary, data=result.data,
+                              side_effects=effects, code=result.code)
+    return result
+
+
+def _exception_result(name, exc):
+    if isinstance(exc, FileNotFoundError):
+        return ToolResult(False, error=f"running {name}: {exc}", retryable=True,
+                          code="not_found")
+    if isinstance(exc, PermissionError):
+        return ToolResult(False, error=f"running {name}: {exc}", code="permission_denied")
+    if isinstance(exc, IsADirectoryError):
+        return ToolResult(False, error=f"running {name}: {exc}", code="invalid_target")
+    if isinstance(exc, ValueError):
+        return ToolResult(False, error=f"running {name}: {exc}", code="invalid_input")
+    return ToolResult(False, error=f"running {name}: {exc}", code="execution_error")
+
+
+_SIDE_EFFECT_CAPABILITIES = {
+    "workspace_write", "shell_exec", "python_exec", "background_job", "http_request",
+    "browser_control", "remote_access", "mail_manage", "mail_send", "calendar_write",
+    "memory_write", "schedule_write", "notes_write", "desktop_control",
+}
+
+
+def _make_spec(name, schema, metadata=None):
+    values = {**_schema_metadata(schema), **(metadata or {})}
+    capability = str(values.get("capability") or policies.capability_for_tool(name) or "")
+    side_effecting = bool(values.get("side_effecting", capability in _SIDE_EFFECT_CAPABILITIES))
+    return ToolSpec(
+        name=name, capability=capability,
+        risk=str(values.get("risk") or ("high" if capability in {"remote_access", "mail_send"}
+                                        else "medium" if side_effecting else "low")),
+        side_effecting=side_effecting,
+        idempotent=bool(values.get("idempotent", not side_effecting)),
+        requires_confirmation=bool(values.get("requires_confirmation", False)),
+    )
 
 
 @contextlib.contextmanager
@@ -127,19 +259,22 @@ def tool_overrides(mapping):
         _TOOL_OVERRIDES.reset(token)
 
 
-def tool(schema):
+def tool(schema, **metadata):
     """Decorator: register a function as a tool with the given JSON schema."""
     def wrap(fn):
-        _TOOLS[schema["function"]["name"]] = fn
+        name = schema["function"]["name"]
+        _TOOLS[name] = fn
+        _TOOL_SPECS[name] = _make_spec(name, schema, metadata)
         _SCHEMAS.append(schema)
         return fn
     return wrap
 
 
-def register(name, schema, fn):
+def register(name, schema, fn, **metadata):
     """Register (or replace) a tool at runtime — used by the MCP client to expose
     external servers' tools alongside the built-in ones."""
     _TOOLS[name] = fn
+    _TOOL_SPECS[name] = _make_spec(name, schema, metadata)
     _SCHEMAS[:] = [s for s in _SCHEMAS if s["function"]["name"] != name] + [schema]
 
 
@@ -147,6 +282,7 @@ def unregister_prefix(prefix):
     """Drop all tools whose name starts with `prefix` (e.g. reconnecting MCP)."""
     for n in [n for n in _TOOLS if n.startswith(prefix)]:
         _TOOLS.pop(n, None)
+        _TOOL_SPECS.pop(n, None)
     _SCHEMAS[:] = [s for s in _SCHEMAS if not s["function"]["name"].startswith(prefix)]
 
 
@@ -212,6 +348,11 @@ def schemas():
 
 def is_enabled(name):
     return name not in _DISABLED
+
+
+def tool_spec(name):
+    """Return immutable execution metadata for a registered tool, if known."""
+    return _TOOL_SPECS.get(name)
 
 
 def set_enabled(name, on):
@@ -283,43 +424,62 @@ def set_max_delegate_turns(n):
     _save_state()
 
 
-def run(name, arguments_json):
-    """Execute a tool call and return its result as a string (always a string —
-    that's what we feed back to the model)."""
-    if name in _DISABLED:                         # the model can't see it, but never run it anyway
-        return f"ERROR: tool {name!r} is disabled in Settings → Tools"
+def run_result(name, arguments_json):
+    """Execute a tool and return a structured result.
+
+    ``run()`` below remains the compatibility API used by integrations and tests.
+    New orchestration code should consume this result instead of parsing error text.
+    """
+    if name in _DISABLED:
+        return ToolResult(False, error=f"tool {name!r} is disabled in Settings → Tools",
+                          code="disabled")
     fn = _TOOLS.get(name)
     if fn is None:
-        return f"ERROR: unknown tool {name!r}"
+        return ToolResult(False, error=f"unknown tool {name!r}", code="unknown_tool")
     try:
         args = json.loads(arguments_json or "{}")
     except json.JSONDecodeError as e:
-        return f"ERROR: bad arguments JSON: {e}"
+        return ToolResult(False, error=f"bad arguments JSON: {e}", code="bad_arguments")
+    if not isinstance(args, dict):
+        return ToolResult(False, error="tool arguments must be a JSON object", code="bad_arguments")
+    spec = _TOOL_SPECS.get(name) or _make_spec(name, {}, {})
     override = (_TOOL_OVERRIDES.get() or {}).get(name)
     if override is not None:
         traces.record("tool_call", tool=name, capability="eval-fixture", args=args)
         try:
-            out = str(override(**args) if callable(override) else override)
-            traces.record("tool_result", tool=name, capability="eval-fixture", ok=True, result=out[:500])
-            return out
+            value = override(**args) if callable(override) else override
+            result = _normalize_result(name, args, value, spec)
+            traces.record("tool_result", tool=name, capability="eval-fixture", ok=result.ok,
+                          result=result.text()[:500])
+            return result
         except Exception as e:
             traces.record("tool_result", tool=name, capability="eval-fixture", ok=False, error=str(e))
-            return f"ERROR running eval fixture {name}: {e}"
-    cap = policies.capability_for_tool(name)
+            return ToolResult(False, error=f"running eval fixture {name}: {e}", code="fixture_error")
+    cap = spec.capability
     mode = policies.get().get(cap, "allow") if cap else "allow"
     if mode == "block":
-        return f"ERROR: tool {name!r} is blocked by policy ({cap})"
-    if mode == "confirm" and not policies.is_permitted(cap):
-        return (f"ERROR: tool {name!r} requires approval by policy ({cap}). "
-                "Run it from a workflow approval step or set the capability to allow.")
+        return ToolResult(False, error=f"tool {name!r} is blocked by policy ({cap})",
+                          code="policy_blocked")
+    if (mode == "confirm" or spec.requires_confirmation) and not policies.is_permitted(cap):
+        return ToolResult(False,
+                          error=(f"tool {name!r} requires approval by policy ({cap}). Run it from a "
+                                 "workflow approval step or set the capability to allow."),
+                          code="approval_required")
     traces.record("tool_call", tool=name, capability=cap or None, args=args)
     try:
-        out = str(fn(**args))
-        traces.record("tool_result", tool=name, capability=cap or None, ok=True, result=out[:500])
-        return out
-    except Exception as e:                       # tools should never crash the loop
+        result = _normalize_result(name, args, fn(**args), spec)
+        traces.record("tool_result", tool=name, capability=cap or None, ok=result.ok,
+                      result=result.text()[:500], code=result.code or None,
+                      side_effects=list(result.side_effects))
+        return result
+    except Exception as e:
         traces.record("tool_result", tool=name, capability=cap or None, ok=False, error=str(e))
-        return f"ERROR running {name}: {e}"
+        return _exception_result(name, e)
+
+
+def run(name, arguments_json):
+    """Execute a tool call and return the historical model-facing string."""
+    return run_result(name, arguments_json).text()
 
 
 def _resolve(path: str) -> Path:

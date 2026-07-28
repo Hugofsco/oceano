@@ -17,6 +17,9 @@ from datetime import datetime
 
 import config
 from oceano import llm, safety, tools, traces
+from oceano.agent_runtime import (
+    ContextCheckpoint, ResidentEventAdapter, TaskSpec, TurnBudget, TurnState,
+)
 
 
 class Cancelled(RuntimeError):
@@ -80,7 +83,9 @@ def _relevant_memories(user_message, k=5):
 
 
 def _workspace_note():
-    return (f"Your writable workspace is at {config.WORKSPACE} — create files and project "
+    from oceano import turnctx
+    root = turnctx.get().workspace or config.WORKSPACE
+    return (f"Your writable workspace is at {root} — create files and project "
             "folders here. File and shell tools use paths relative to it.")
 
 
@@ -609,9 +614,12 @@ class Agent:
         except Exception as e:                       # never block the turn on a failed summarize
             print(f"[fold] summarize failed, keeping full history this turn: {e}", flush=True)
             return 0
+        checkpoint = ContextCheckpoint.parse(summary)
         note = {"role": "assistant", "content":
                 "📋 Earlier conversation, folded to keep the context small (the full transcript "
-                "is still in the chat window, and search_chats can recall specifics):\n" + summary}
+                "is still in the chat window, and search_chats can recall specifics):\n" +
+                checkpoint.render()}
+        traces.record("context_checkpoint", folded_messages=len(take), **checkpoint.metrics())
         self.messages = [self.messages[0], note] + self.messages[1 + len(take):]
         print(f"[fold] folded {len(take)} messages (~{acc} chars) into a summary note", flush=True)
         return len(take)
@@ -625,15 +633,20 @@ class Agent:
             return 0
         summary = self._summarize_convo("\n".join(convo))
         before = len(self.messages)
+        checkpoint = ContextCheckpoint.parse(summary)
         self.messages = [self.messages[0],
-                         {"role": "assistant", "content": "📋 Summary of our earlier conversation:\n" + summary}]
+                         {"role": "assistant", "content":
+                          "📋 Summary of our earlier conversation:\n" + checkpoint.render()}]
+        traces.record("context_checkpoint", folded_messages=before - 1, manual=True,
+                      **checkpoint.metrics())
         return before - len(self.messages)
 
     _COMPACT_INSTR = (
         "Summarize this conversation segment as durable state for the assistant to continue later. "
         "Preserve user facts and constraints, decisions and their reasons, exact file paths and identifiers, "
         "tool outcomes/errors, completed work, and unresolved tasks. Never claim an action completed unless "
-        "the segment shows its result. Use compact bullet points with no preamble.")
+        "the segment shows its result. Output ONLY one JSON object with array fields: decisions, constraints, "
+        "artifacts, evidence, unresolved, and notes. Use [] for an empty field; do not use markdown fences.")
 
     @staticmethod
     def _message_for_summary(message):
@@ -737,8 +750,10 @@ class Agent:
         explicit = self.only_tools is not None or only is not None
         if explicit and self.dynamic_tools is not True and self.routing_catalog is None:
             policy = toolrouter.Policy(mode="full", source="explicit-allowlist")
-            return toolrouter.Route(sc, False, False, "explicit-allowlist", len(sc), len(sc),
-                                    self.model or "", surface=self.tool_surface, policy=policy)
+            return toolrouter.Route(
+                sc, False, False, "explicit-allowlist", len(sc), len(sc), self.model or "",
+                surface=self.tool_surface, policy=policy,
+                catalog_schema_tokens=sum(toolrouter.schema_cost(schema) for schema in sc))
         return toolrouter.route(sc, query or "", model=self.model or "", force=self.dynamic_tools,
                                 surface=self.tool_surface)
 
@@ -762,14 +777,17 @@ class Agent:
         """Compatibility helper returning only the schemas for a turn."""
         return self._tool_route(only=only, query=query).schemas
 
-    def _exec_tool(self, name, args, allowed):
-        """Run one tool call, re-checking the turn's allowlist at EXECUTION time. The
-        narrowing in _tool_schemas only controls what is advertised — the model can
-        still emit (or leak as <tool_call> text) a call to any name, so the real gate
-        is here, or only_tools/exclude_tools would be decorative."""
+    def _exec_tool_result(self, name, args, allowed):
+        """Execute inside the authoritative allowlist and retain structured evidence."""
         if name not in allowed:
-            return f"ERROR: tool {name!r} is not available in this conversation"
-        return tools.run(name, args)
+            return tools.ToolResult(False,
+                                    error=f"tool {name!r} is not available in this conversation",
+                                    code="not_allowed")
+        return tools.run_result(name, args)
+
+    def _exec_tool(self, name, args, allowed):
+        """Compatibility helper returning the historical model-facing string."""
+        return self._exec_tool_result(name, args, allowed).text()
 
     def _run_tool_streamed(self, name, args, allowed):
         """Run a tool, surfacing any progress it emits as it goes. Yields ('progress', dict)
@@ -777,10 +795,12 @@ class Agent:
         thread with a drained progress sink — everything else runs inline as before, so the
         common path is unchanged."""
         if name not in allowed:
-            yield ("result", f"ERROR: tool {name!r} is not available in this conversation")
+            yield ("result", tools.ToolResult(False,
+                                               error=f"tool {name!r} is not available in this conversation",
+                                               code="not_allowed"))
             return
         if name not in _STREAMING_TOOLS:
-            yield ("result", tools.run(name, args))
+            yield ("result", tools.run_result(name, args))
             return
         import queue as _queue
         q = _queue.Queue()
@@ -789,9 +809,11 @@ class Agent:
         def worker():
             tools.set_progress_sink(lambda ev: q.put(("progress", ev)))
             try:
-                box["result"] = tools.run(name, args)
+                box["result"] = tools.run_result(name, args)
             except Exception as e:
-                box["result"] = f"ERROR: {type(e).__name__}: {e}"
+                box["result"] = tools.ToolResult(False,
+                                                  error=f"{type(e).__name__}: {e}",
+                                                  code="execution_error")
             finally:
                 tools.clear_progress_sink()
                 q.put(("__done__", None))
@@ -856,10 +878,12 @@ class Agent:
         turn_tools = route_info.schemas
         self._turn_tool_schemas = turn_tools
         allowed = {s["function"]["name"] for s in self._base_tool_schemas()}
+        state = TurnState(user_message, route_info, allowed, TaskSpec.from_plan(self._turn_plan),
+                          TurnBudget.create(tools.get_max_steps(), deadline=deadline))
         toolrouter.telemetry(route_info)
-        tool_events, corrected = [], False
-        for _ in range(tools.get_max_steps()):
-            if deadline is not None and time.monotonic() >= deadline:
+        for _ in range(state.budget.max_steps):
+            state.budget.begin_step()
+            if state.budget.timed_out:
                 raise TimeoutError("delegate run hit its time limit")
             if cancel is not None and cancel.is_set():
                 raise Cancelled("cancelled")
@@ -868,58 +892,65 @@ class Agent:
                 "role": "assistant", "content": getattr(msg, "content", ""),
                 "tool_calls": getattr(msg, "tool_calls", None)})
             if not msg.tool_calls:
-                issues = _outcome_issues(self._turn_plan, tool_events)
-                if toolrouter.should_expand(route_info, msg.content or "", issues, tool_events):
+                issues = state.completion_issues()
+                if toolrouter.should_expand(route_info, msg.content or "", issues, state.legacy_events):
                     route_info, phase, _ = self._recover_tool_route(
                         route_info, allowed, user_message)
+                    state.route = route_info
                     if phase:
                         turn_tools = route_info.schemas
                         self._turn_tool_schemas = turn_tools
                         toolrouter.telemetry(route_info, f"{phase}-fallback",
-                                             used_tools=[name for name, _ in tool_events],
+                                             used_tools=[name for name, _ in state.legacy_events],
                                              errors=sum((result or "").lstrip().lower().startswith("error")
-                                                        for _, result in tool_events))
+                                                        for _, result in state.legacy_events))
                         scope = ("additional relevant tool schemas" if phase == "discovery"
                                  else "all allowed tool schemas")
                         self.messages.append({"role": "user", "content":
                             f"TOOL ROUTING RECOVERY: {scope} are now available. "
                             "Continue the task and use any newly available tool needed to finish it."})
                         continue
-                if issues and not corrected:
-                    corrected = True
+                if issues and not state.corrected:
+                    state.corrected = True
                     self.messages.append({"role": "user", "content":
                         "OUTCOME CHECK: This task is not complete yet because " + "; ".join(issues) +
                         ". Continue working now, fix the issue, and verify the result before answering."})
                     continue
                 self.on_event("answer", msg.content)
                 self._learn(user_message, msg.content)
-                toolrouter.telemetry(route_info, "completed",
-                                     used_tools=[name for name, _ in tool_events],
-                                     errors=sum((result or "").lstrip().lower().startswith("error")
-                                                for _, result in tool_events))
+                toolrouter.telemetry(route_info, "completed", **state.metrics())
                 return msg.content or ""
             for call in msg.tool_calls:
                 self.on_event("tool_call", {"name": call.function.name, "args": call.function.arguments})
-                if call.function.name == "discover_tools":
+                if not state.budget.consume_tool():
+                    structured = tools.ToolResult(False, error="turn tool-call budget exhausted",
+                                                  code="budget_exhausted")
+                    result = structured.text()
+                elif call.function.name == "discover_tools":
                     route_info, result = self._discover_tools(
                         route_info, call.function.arguments, allowed)
+                    state.route = route_info
                     turn_tools = route_info.schemas
                     self._turn_tool_schemas = turn_tools
+                    structured = tools.ToolResult.from_value(result)
                     toolrouter.telemetry(route_info, "discovered",
-                                         used_tools=[name for name, _ in tool_events])
+                                         used_tools=state.used_tools)
                 else:
-                    result = self._exec_tool(call.function.name, call.function.arguments, allowed)
-                tool_events.append((call.function.name, result))
+                    structured = self._exec_tool_result(
+                        call.function.name, call.function.arguments, allowed)
+                    result = structured.text()
+                state.record(call.function.name, structured)
                 self.on_event("tool_result", {"name": call.function.name, "result": result})
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-            if toolrouter.should_expand(route_info, tool_events=tool_events):
+            if toolrouter.should_expand(route_info, tool_events=state.legacy_events):
                 route_info, phase, _ = self._recover_tool_route(
                     route_info, allowed, user_message)
+                state.route = route_info
                 if phase:
                     turn_tools = route_info.schemas
                     self._turn_tool_schemas = turn_tools
                     toolrouter.telemetry(route_info, f"{phase}-fallback",
-                                         used_tools=[name for name, _ in tool_events], errors=1)
+                                         used_tools=[name for name, _ in state.legacy_events], errors=1)
                     scope = ("additional relevant tool schemas" if phase == "discovery"
                              else "all allowed tool schemas")
                     self.messages.append({"role": "user", "content":
@@ -933,7 +964,7 @@ class Agent:
         self.on_event("answer", text)
         self._learn(user_message, text)
         toolrouter.telemetry(route_info, "step-limit",
-                             used_tools=[name for name, _ in tool_events])
+                             used_tools=[name for name, _ in state.legacy_events])
         return text
 
     def run_claude(self, user_message: str, cancel=None) -> str:
@@ -974,6 +1005,25 @@ class Agent:
         bg = tools.is_background()
         self._prepare_turn(user_message, voice=voice)          # system msg now carries persona + memory + context
         self.messages.append({"role": "user", "content": user_message})
+        allowed = {schema["function"]["name"] for schema in self._base_tool_schemas()}
+        state = TurnState(user_message, None, allowed, TaskSpec.from_plan(self._turn_plan),
+                          TurnBudget.create(tools.get_max_steps()))
+        state.budget.begin_step()
+        adapter = ResidentEventAdapter(state)
+        budget_cancel = threading.Event()
+
+        class _CombinedCancel:
+            def is_set(self):
+                return budget_cancel.is_set() or (cancel is not None and cancel.is_set())
+
+        effective_cancel = _CombinedCancel()
+        from oceano import turnctx
+        mind_workspace = turnctx.get().workspace or config.WORKSPACE
+        mcp_path = mindbridge.mcp_config_path(
+            self.session_id, background=bg, client=tools.current_client())
+        allow = "Read,Glob,Grep,Write,Edit,Bash"
+        if mcp_path:
+            allow += "," + ",".join("mcp__oceano__" + name for name in mindbridge.tool_names())
         sys_prompt = self.messages[0]["content"] + (
             "\n\nOCEANO'S BODY — you have Oceano's own tools (named mcp__oceano__*) on top of your built-in ones:\n"
             "• MEMORY — use these, NOT your own: mcp__oceano__remember / recall / forget_memory / update_memory. "
@@ -1039,36 +1089,30 @@ class Agent:
         holder = {}
 
         def on_prog(ev):
-            k = ev.get("kind")
-            if k == "text" and ev.get("text"):
+            kind = ev.get("kind")
+            if kind == "text" and ev.get("text"):
                 q.put(("token", ev["text"]))
-            elif k == "tool":
-                name = ev.get("tool", "tool")
-                if name.startswith("mcp__oceano__"):       # show the bare Oceano tool name, not the MCP prefix
-                    name = name[len("mcp__oceano__"):]
-                q.put(("tool", (name, str(ev.get("detail", "")))))
-            elif k == "tool_result":
-                q.put(("toolres", str(ev.get("text", ""))))
+            elif kind == "tool":
+                q.put(("tool", {
+                    "name": ev.get("tool", "tool"),
+                    "detail": str(ev.get("detail", "")),
+                    "args": ev.get("args") or {},
+                    "tool_use_id": ev.get("tool_use_id"),
+                }))
+            elif kind == "tool_result":
+                q.put(("toolres", {
+                    "text": str(ev.get("text", "")),
+                    "tool_use_id": ev.get("tool_use_id"),
+                    "is_error": bool(ev.get("is_error")),
+                }))
 
         def work():
             try:
-                # The body: Oceano's own tools, executed in the daemon. The per-turn config carries
-                # this chat's id, whether the turn is unattended (bridged tools then run on the
-                # background channel — no live browser/UI), and which client started it (so
-                # oceano/tools/desktop.py's tools unlock only when OceanoDesktop, not a browser tab,
-                # is on the other end) — all per turn, so concurrent turns for other chats never
-                # inherit this one's channel or client.
-                mcp_path = mindbridge.mcp_config_path(self.session_id, background=bg, client=tools.current_client())
-                # Claude keeps its native tools for files/shell; Oceano's BODY (memory, calendar, windows,
-                # notify, AND the web) rides alongside as mcp__oceano — it reaches for those because nothing
-                # native competes. The web is the exception: its native WebSearch/WebFetch ARE disallowed, so
-                # it browses through Oceano's shared live browser (visible to the user) instead of invisibly.
-                allow = "Read,Glob,Grep,Write,Edit,Bash"
-                if mcp_path:                                   # EXACT tool names load directly; the bare server name gets deferred behind ToolSearch (flaky headless)
-                    allow += "," + ",".join("mcp__oceano__" + n for n in mindbridge.tool_names())
+                # Claude keeps native file/shell tools; Oceano's body rides alongside over
+                # the per-turn MCP bridge prepared above with this chat/client/background context.
                 holder["res"] = delegate.to_claude_stream(
-                    prompt, cwd=config.WORKSPACE, tools=allow, mcp_config=(mcp_path or None),
-                    on_progress=on_prog, append_system=sys_prompt, cancel=cancel,
+                    prompt, cwd=mind_workspace, tools=allow, mcp_config=(mcp_path or None),
+                    on_progress=on_prog, append_system=sys_prompt, cancel=effective_cancel,
                     # Unattended (scheduler/workflow) build → roomier idle + wall-clock caps so a long
                     # install/test tool call isn't mistaken for a stall. Interactive turns pass None
                     # and keep the tight delegate defaults.
@@ -1081,40 +1125,70 @@ class Agent:
                 q.put(("done", None))
 
         threading.Thread(target=work, daemon=True).start()
-        # Surface Claude's tool use as real chips. pending = (name, hidden) of a call awaiting its
-        # result. Hide ToolSearch — that's Claude Code's internal deferred-tool loader, not an action.
-        _HIDDEN = {"ToolSearch"}
+        # Claude may emit several tool_use blocks before their results. Correlate by the
+        # protocol's tool_use_id; retain FIFO fallback for older CLI versions without IDs.
+        hidden = {"ToolSearch"}
         parts = []
-        pending = None
+        pending = {}
+        pending_order = []
+        sequence = 0
         while True:
             kind, data = q.get()
             if kind == "done":
                 break
             if kind == "tool":
-                if pending and not pending[1]:          # prior visible tool ended without a result
-                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
-                name, detail = data
-                if name not in _HIDDEN:
-                    yield _feed_shell_event({"type": "tool_call", "name": name, "args": detail})   # → a real tool chip
-                pending = (name, name in _HIDDEN)
+                raw_name = data["name"]
+                display_name = (raw_name[len("mcp__oceano__"):]
+                                if raw_name.startswith("mcp__oceano__") else raw_name)
+                key = data.get("tool_use_id") or f"legacy-{sequence}"
+                sequence += 1
+                is_hidden = raw_name in hidden
+                accepted = True
+                if not is_hidden:
+                    accepted = adapter.tool_call(raw_name, data.get("args"))
+                    if not accepted:
+                        budget_cancel.set()
+                    yield _feed_shell_event({"type": "tool_call", "name": display_name,
+                                             "args": data.get("detail", "")})
+                pending[key] = {"name": raw_name, "display": display_name,
+                                "hidden": is_hidden, "accepted": accepted}
+                pending_order.append(key)
             elif kind == "toolres":
-                if pending and not pending[1]:
-                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": data[:2000]})
-                pending = None
+                key = data.get("tool_use_id")
+                if key not in pending:
+                    key = next((candidate for candidate in pending_order
+                                if candidate in pending), None)
+                item = pending.pop(key, None) if key is not None else None
+                if key in pending_order:
+                    pending_order.remove(key)
+                if item and not item["hidden"]:
+                    if item["accepted"]:
+                        adapter.tool_result(item["name"], data.get("text"),
+                                            is_error=data.get("is_error", False))
+                    yield _feed_shell_event({"type": "tool_result", "name": item["display"],
+                                             "result": data.get("text", "")[:2000]})
             elif kind == "token":
-                if pending and not pending[1]:
-                    yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
-                pending = None
                 parts.append(data)
                 yield {"type": "token", "text": data}
-        if pending and not pending[1]:
-            yield _feed_shell_event({"type": "tool_result", "name": pending[0], "result": ""})
+        for key in pending_order:
+            item = pending.get(key)
+            if not item or item["hidden"]:
+                continue
+            if item["accepted"]:
+                adapter.missing_result(item["name"])
+            yield _feed_shell_event({"type": "tool_result", "name": item["display"], "result": ""})
 
         res = holder.get("res") or {}
-        # A mind turn that didn't finish cleanly (stalled/capped/rate-limited) still returns partial
-        # text — keep it, but flag the incompletion so a workflow build node marks the step failed
-        # instead of logging a truncated build as done.
-        self.last_mind_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
+        provider_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
+        issues = state.completion_issues()
+        if issues:
+            self.last_mind_error = "outcome check failed: " + "; ".join(issues)
+        elif budget_cancel.is_set():
+            self.last_mind_error = "turn tool-call budget exhausted"
+        else:
+            self.last_mind_error = provider_error
+        traces.record("resident_turn", mind="claude", incomplete=bool(self.last_mind_error),
+                      **state.metrics())
         answer = "".join(parts).strip() or (res.get("output") or "").strip()
         if cancel is not None and cancel.is_set():             # Stopped → leave history clean, don't learn
             return
@@ -1139,6 +1213,20 @@ class Agent:
         bg = tools.is_background()
         self._prepare_turn(user_message, voice=voice)
         self.messages.append({"role": "user", "content": user_message})
+        allowed = {schema["function"]["name"] for schema in self._base_tool_schemas()}
+        state = TurnState(user_message, None, allowed, TaskSpec.from_plan(self._turn_plan),
+                          TurnBudget.create(tools.get_max_steps()))
+        state.budget.begin_step()
+        adapter = ResidentEventAdapter(state)
+        budget_cancel = threading.Event()
+
+        class _CombinedCancel:
+            def is_set(self):
+                return budget_cancel.is_set() or (cancel is not None and cancel.is_set())
+
+        effective_cancel = _CombinedCancel()
+        from oceano import turnctx
+        mind_workspace = turnctx.get().workspace or config.WORKSPACE
         body = (
             "OCEANO'S BODY — you have Oceano's MCP server tools for memory, the web, browser control, "
             "calendar, windows, notifications, hosts, and mail. Prefer those tools over any private "
@@ -1206,8 +1294,8 @@ class Agent:
             try:
                 from oceano import delegate
                 holder["res"] = codex_mind.run_stream(
-                    prompt, cwd=config.WORKSPACE,
-                    cancel=cancel, on_event=on_ev, model=delegate.get_codex_model(),
+                    prompt, cwd=mind_workspace,
+                    cancel=effective_cancel, on_event=on_ev, model=delegate.get_codex_model(),
                     # per-turn -c overrides carry this chat's id + unattended flag to the bridge —
                     # never a process-global, so concurrent chats keep their own channel
                     session=self.session_id, background=bg)
@@ -1225,11 +1313,25 @@ class Agent:
             if ev.get("type") == "token":
                 parts.append(ev.get("text", ""))
                 yield ev
-            elif ev.get("type") in ("tool_call", "tool_result"):
+            elif ev.get("type") == "tool_call":
+                if not adapter.tool_call(ev.get("name"), ev.get("args")):
+                    budget_cancel.set()
+                yield _feed_shell_event(ev)
+            elif ev.get("type") == "tool_result":
+                adapter.tool_result(ev.get("name"), ev.get("result"))
                 yield _feed_shell_event(ev)
 
         res = holder.get("res") or {}
-        self.last_mind_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
+        provider_error = None if res.get("ok", True) else (res.get("error") or "the mind turn did not complete")
+        issues = state.completion_issues()
+        if issues:
+            self.last_mind_error = "outcome check failed: " + "; ".join(issues)
+        elif budget_cancel.is_set():
+            self.last_mind_error = "turn tool-call budget exhausted"
+        else:
+            self.last_mind_error = provider_error
+        traces.record("resident_turn", mind="codex", incomplete=bool(self.last_mind_error),
+                      **state.metrics())
         answer = "".join(parts).strip() or (res.get("output") or "").strip()
         if cancel is not None and cancel.is_set():
             return
@@ -1281,9 +1383,14 @@ class Agent:
         route_info = self._tool_route(only=only_tools, query=user_message)
         turn_tools = route_info.schemas
         allowed = {s["function"]["name"] for s in self._base_tool_schemas(only=only_tools)}
+        state = TurnState(user_message, route_info, allowed, TaskSpec.from_plan(self._turn_plan),
+                          TurnBudget.create(tools.get_max_steps()), only_tools=only_tools)
         toolrouter.telemetry(route_info)
-        tool_events, corrected = [], False
-        for _ in range(tools.get_max_steps()):
+        for _ in range(state.budget.max_steps):
+            state.budget.begin_step()
+            if cancel is not None and cancel.is_set():
+                yield {"type": "answer_done"}
+                return
             seg_first = None             # time the first token of THIS segment arrived (for decode rate)
             content, reason, calls, ntok, ptok = "", "", None, 0, 0
             try:
@@ -1319,16 +1426,17 @@ class Agent:
                     if content:
                         yield {"type": "token", "text": content}
                 self.messages.append({"role": "assistant", "content": content})
-                issues = _outcome_issues(self._turn_plan, tool_events)
-                if toolrouter.should_expand(route_info, content, issues, tool_events):
+                issues = state.completion_issues()
+                if toolrouter.should_expand(route_info, content, issues, state.legacy_events):
                     route_info, phase, _ = self._recover_tool_route(
                         route_info, allowed, user_message, only=only_tools)
+                    state.route = route_info
                     if phase:
                         turn_tools = route_info.schemas
                         toolrouter.telemetry(route_info, f"{phase}-fallback",
-                                             used_tools=[name for name, _ in tool_events],
+                                             used_tools=[name for name, _ in state.legacy_events],
                                              errors=sum((result or "").lstrip().lower().startswith("error")
-                                                        for _, result in tool_events))
+                                                        for _, result in state.legacy_events))
                         scope = ("additional relevant tool schemas" if phase == "discovery"
                                  else "all allowed tool schemas")
                         self.messages.append({"role": "user", "content":
@@ -1337,8 +1445,8 @@ class Agent:
                         yield {"type": "reasoning", "text":
                                f"\nTool routing recovery loaded {scope}.\n"}
                         continue
-                if issues and not corrected:
-                    corrected = True
+                if issues and not state.corrected:
+                    state.corrected = True
                     self.messages.append({"role": "user", "content":
                         "OUTCOME CHECK: This task is not complete yet because " + "; ".join(issues) +
                         ". Continue working now, fix the issue, and verify the result before answering."})
@@ -1346,10 +1454,7 @@ class Agent:
                            + "; ".join(issues) + ".\n"}
                     continue
                 self._learn(user_message, content)
-                toolrouter.telemetry(route_info, "completed",
-                                     used_tools=[name for name, _ in tool_events],
-                                     errors=sum((result or "").lstrip().lower().startswith("error")
-                                                for _, result in tool_events))
+                toolrouter.telemetry(route_info, "completed", **state.metrics())
                 # tok/s = decode rate of the ANSWER segment (from its first token), matching
                 # plain chat — so agent mode / Telegram report a comparable number, not one
                 # dragged down by the tool-schema prompt-processing time.
@@ -1369,29 +1474,36 @@ class Agent:
                                for c in norm]})
             for c in norm:
                 yield {"type": "tool_call", "name": c["name"], "args": c["args"]}
-                if c["name"] == "discover_tools":
+                if not state.budget.consume_tool():
+                    structured = tools.ToolResult(False, error="turn tool-call budget exhausted",
+                                                  code="budget_exhausted")
+                    result = structured.text()
+                elif c["name"] == "discover_tools":
                     route_info, result = self._discover_tools(
                         route_info, c["args"], allowed, only=only_tools)
+                    state.route = route_info
                     turn_tools = route_info.schemas
-                    toolrouter.telemetry(route_info, "discovered",
-                                         used_tools=[name for name, _ in tool_events])
+                    structured = tools.ToolResult.from_value(result)
+                    toolrouter.telemetry(route_info, "discovered", used_tools=state.used_tools)
                 else:
-                    result = None
+                    structured = None
                     for kind, payload in self._run_tool_streamed(c["name"], c["args"], allowed):
                         if kind == "progress":
                             yield {"type": "tool_progress", "name": c["name"], **payload}
                         else:
-                            result = payload
-                yield {"type": "tool_result", "name": c["name"], "result": (result or "")[:2000]}
-                self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result or ""})
-                tool_events.append((c["name"], result or ""))
-            if toolrouter.should_expand(route_info, tool_events=tool_events):
+                            structured = payload
+                    result = structured.text()
+                state.record(c["name"], structured)
+                yield {"type": "tool_result", "name": c["name"], "result": result[:2000]}
+                self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+            if toolrouter.should_expand(route_info, tool_events=state.legacy_events):
                 route_info, phase, _ = self._recover_tool_route(
                     route_info, allowed, user_message, only=only_tools)
+                state.route = route_info
                 if phase:
                     turn_tools = route_info.schemas
                     toolrouter.telemetry(route_info, f"{phase}-fallback",
-                                         used_tools=[name for name, _ in tool_events], errors=1)
+                                         used_tools=[name for name, _ in state.legacy_events], errors=1)
                     scope = ("additional relevant tool schemas" if phase == "discovery"
                              else "all allowed tool schemas")
                     self.messages.append({"role": "user", "content":
@@ -1412,7 +1524,7 @@ class Agent:
         self.messages.append({"role": "assistant", "content": tail or "(stopped at the tool-step limit)"})
         self._learn(user_message, tail)
         toolrouter.telemetry(route_info, "step-limit",
-                             used_tools=[name for name, _ in tool_events])
+                             used_tools=[name for name, _ in state.legacy_events])
         dsecs = (time.perf_counter() - seg_first) if seg_first else 0
         yield {"type": "answer_done"}
         yield self._stats(total_tok, dsecs,

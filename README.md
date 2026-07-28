@@ -129,10 +129,15 @@ from a web UI or Telegram.
   Telegram bot via the app lifespan, runs the scheduler as a background task, and
   spawns/supervises the `llama.cpp` embedding server — and the optional reranker — as
   child processes (auto-restart, unified logs).
-- **`oceano/agent.py`** — the agent loop. Each turn it rebuilds a context block
-  (current date, the workspace path, relevant memories, the skills catalog), calls
-  the model with tools, executes tool calls, and streams the result. After the turn
-  it extracts durable facts in the background (self-learning memory).
+- **`oceano/agent.py`** — the model-facing agent drivers. Each turn rebuilds a context block
+  (current date, workspace, relevant memories, skills), calls the model, and emits blocking or
+  streaming results.
+- **`oceano/agent_runtime.py`** — the shared turn spine: structured task/checkpoint contracts,
+  typed tool evidence, completion verification, execution budgets, and privacy-safe metrics used
+  identically by blocking and streaming drivers.
+- **`oceano/tools/core.py`** — the capability broker and tool registry. Every tool has immutable
+  risk/side-effect metadata and returns an internal `ToolResult`; the historical string API remains
+  available to models, frontends, MCP integrations, and third-party callers.
 - **Frontends are thin** — web, Telegram, CLI, and the scheduler all just call
   `Agent.run()` / `run_stream()`.
 
@@ -795,7 +800,8 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 | `OCEANO_MODEL` | _(unset)_ | pin a model; unset → Oceano uses your primary (Settings → Delegation) or a model served in Brain → Rivers |
 | `OCEANO_WORKSPACE` | `./workspace` | the agent's working folder |
 | `OCEANO_SEARXNG` | `http://127.0.0.1:8080` | web search |
-| `OCEANO_MAX_STEPS` | `25` | tool-call loop cap per turn |
+| `OCEANO_MAX_STEPS` | `25` | model/tool-loop step cap per turn |
+| `OCEANO_MAX_TOOL_CALLS` | `4 × MAX_STEPS` | individual tool-call cap per turn; explicit positive value overrides |
 | `OCEANO_DELEGATE_IDLE` / `_MAXTOTAL` / `_MAXTURNS` | `300` / `3600` / `60` | delegation idle timeout (s), absolute cap (s), max turns |
 | `OCEANO_AGENTS_MAX` | `3` | max concurrent background sub-agents (`spawn_agent`) |
 | `OCEANO_CTX_FOLD_CHARS` | `120000` | resident-mind rolling context fold threshold (chars); `0` disables |
@@ -808,6 +814,17 @@ Secrets live in `oceano.env` (loaded by systemd; `chmod 600`, never committed).
 | `OCEANO_SHELL_GUARD` / `OCEANO_URL_GUARD` | `1` | safety guards |
 | `OCEANO_TELEGRAM_TOKEN` / `_ALLOWED` | — | Telegram (or set in Settings) |
 | `HF_TOKEN` | — | optional, for gated Hugging Face repos |
+
+The agent runtime separates four concerns: the structured task contract, tools permitted to
+execute, schemas advertised to the model, and typed evidence returned by execution. API/local
+blocking and streaming modes share the same turn state, budgets, recovery evidence, and completion
+checks; Claude and Codex resident-mind tool events are adapted into that same state as well. Their
+native and MCP calls therefore use the same budgets, typed outcomes, artifact evidence, recovered-error
+lifecycle, and completion checks. Tool outputs remain plain text at the model/UI boundary for
+compatibility, while the runtime uses
+`ToolResult.ok`, error codes, retryability, and side-effect records instead of parsing prose.
+Conversation folds now request structured checkpoints (decisions, constraints, artifacts,
+verification evidence, and unresolved work) and retain a lossless plain-summary fallback.
 
 Hybrid tool loading separates three concerns: tools registered by the process, tools allowed
 to execute in a particular conversation, and schemas advertised to the model. It starts with

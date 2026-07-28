@@ -165,3 +165,10 @@ def test_concurrent_turns_stay_isolated():
     t2 = threading.Thread(target=turn, args=("two", "web"))
     t1.start(); t2.start(); t1.join(); t2.join()
     assert seen == {"one": ("background", "one", True), "two": ("web", "two", False)}
+
+
+def test_agent_workspace_note_uses_the_active_turn_override(tmp_path):
+    from oceano.agent import _workspace_note
+    from oceano import tools
+    with tools.background_workspace(tmp_path):
+        assert str(tmp_path.resolve()) in _workspace_note()

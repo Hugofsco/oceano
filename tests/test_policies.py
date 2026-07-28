@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from oceano import policies, workflows  # noqa: E402
+from oceano import policies, tools, workflows  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -85,3 +85,11 @@ def test_confirm_policy_pauses_workflow_until_approved(monkeypatch):
     th.join(5)
     assert box["rec"]["status"] == "ok"
     assert decisions and decisions[0][0] is True
+
+
+def test_side_effecting_tools_have_auditable_capabilities():
+    assert policies.capability_for_tool("add_calendar_event") == "calendar_write"
+    assert policies.capability_for_tool("browser_eval") == "browser_control"
+    assert policies.capability_for_tool("update_note") == "notes_write"
+    assert policies.DEFAULTS["calendar_write"] == "allow"  # backward-compatible rollout
+    assert tools.tool_spec("add_calendar_event").side_effecting is True

@@ -350,3 +350,27 @@ def test_to_claude_stream_max_turns_honors_the_user_override(monkeypatch, tmp_pa
     core.set_max_delegate_turns(123)
     delegate.to_claude_stream("do the thing", cwd=str(tmp_path))
     assert "--max-turns 123" in argv_file.read_text()
+
+
+def test_claude_progress_preserves_tool_ids_arguments_and_error_flag(monkeypatch, tmp_path):
+    shim, _argv, _calls = _fake_claude_two_calls(
+        tmp_path,
+        first_lines=[
+            {"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "id": "tool-7", "name": "Write",
+                "input": {"file_path": "app.py", "content": "print(1)"}}]}},
+            {"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "tool-7",
+                "content": "permission denied", "is_error": True}]}},
+            {"type": "result", "result": "recovered", "is_error": False, "num_turns": 1},
+        ],
+        second_lines=[])
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    events = []
+    result = delegate.to_claude_stream("do it", cwd=str(tmp_path), on_progress=events.append)
+    assert result["ok"] is True
+    call = next(event for event in events if event["kind"] == "tool")
+    outcome = next(event for event in events if event["kind"] == "tool_result")
+    assert call["tool_use_id"] == "tool-7"
+    assert call["args"] == {"file_path": "app.py", "content": "print(1)"}
+    assert outcome["tool_use_id"] == "tool-7" and outcome["is_error"] is True

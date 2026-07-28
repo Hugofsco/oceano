@@ -81,6 +81,7 @@ class Route:
     recovery_level: int = 0
     loaded_bundles: tuple = ()
     policy: Policy = field(default_factory=Policy)
+    catalog_schema_tokens: int = 0
 
     @property
     def names(self):
@@ -345,9 +346,20 @@ def bundles():
     return out
 
 
+_GENERIC_ACTION_TERMS = {
+    "create", "delete", "inspect", "manage", "move", "open", "read", "run", "save",
+    "search", "send", "update", "use", "write",
+}
+
+
 def _bundle_score(bundle, query_tokens):
-    terms = _tokens(bundle.description + " " + " ".join(bundle.aliases) + " " + bundle.name)
-    return len(query_tokens & terms)
+    # Generic verbs occur in nearly every domain ("create" previously loaded calendar,
+    # notes, mail, desktop, and files together). Require at least one domain/distinctive
+    # term, then use all overlap only to rank bundles within that domain.
+    terms = _tokens(" ".join(bundle.aliases) + " " + bundle.name)
+    overlap = query_tokens & terms
+    specific = overlap - _GENERIC_ACTION_TERMS
+    return 3 * len(specific) + len(overlap) if specific else 0
 
 
 def _matched_bundles(query, all_bundles):
@@ -371,21 +383,21 @@ def route(schemas, query, model="", limit=None, force=None, surface="chat"):
     """Return a budgeted bootstrap catalog plus routing metadata."""
     schemas = list(schemas)
     policy = resolve_policy(model, surface, force)
+    total_cost = sum(schema_cost(s) for s in schemas)
     if limit is not None:
         policy = replace(policy, count_limit=max(MIN_LIMIT, int(limit)))
     if policy.mode != "hybrid":
         return Route(schemas, False, False, "full-policy", len(schemas), len(schemas), model,
-                     surface=surface, policy=policy)
-    total_cost = sum(schema_cost(s) for s in schemas)
+                     surface=surface, policy=policy, catalog_schema_tokens=total_cost)
     if total_cost <= policy.schema_budget:
         return Route(schemas, True, False, "catalog-within-budget", len(schemas), len(schemas), model,
-                     surface=surface, policy=policy)
+                     surface=surface, policy=policy, catalog_schema_tokens=total_cost)
 
     all_bundles = bundles()
     matched = _matched_bundles(query, all_bundles)
     if not matched and policy.ambiguous == "full":
         return Route(schemas, True, False, "ambiguous-full", len(schemas), len(schemas), model,
-                     surface=surface, policy=policy)
+                     surface=surface, policy=policy, catalog_schema_tokens=total_cost)
     by_name = {s["function"]["name"]: s for s in schemas}
     chosen = {}
     cap = policy.count_limit
@@ -402,20 +414,29 @@ def route(schemas, query, model="", limit=None, force=None, surface="chat"):
     for bundle_name in matched:
         for name in all_bundles[bundle_name].tools:
             _add(chosen, by_name, name, policy.schema_budget, cap)
-    # Description/name overlap fills remaining budget without inventing a hard dependency on tags.
+    # Only unbundled/custom tools use lexical fallback. Built-ins are selected through
+    # domain bundles above; scoring every built-in description reintroduced the same broad
+    # catalog whenever a prompt contained generic verbs such as "read" or "create".
     q = _tokens(query)
+    bundled_names = {name for bundle in all_bundles.values() for name in bundle.tools}
     scored = []
     for pos, schema in enumerate(schemas):
         fn = schema["function"]
-        score = 5 * len(q & _tokens(fn["name"].replace("_", " "))) + len(q & _tokens(fn.get("description", "")))
-        if score:
+        if fn["name"] in bundled_names:
+            continue
+        name_overlap = q & _tokens(fn["name"].replace("_", " "))
+        description_overlap = q & _tokens(fn.get("description", ""))
+        specific_description = description_overlap - _GENERIC_ACTION_TERMS
+        score = 5 * len(name_overlap) + len(specific_description)
+        if name_overlap or len(specific_description) >= 2:
             scored.append((score, -pos, fn["name"]))
     for _, _, name in sorted(scored, reverse=True):
         _add(chosen, by_name, name, policy.schema_budget, cap)
     selected = list(chosen.values())
     reason = "routed" if matched else "ambiguous-discovery"
     return Route(selected, True, True, reason, len(schemas), len(selected), model, surface,
-                 tuple(matched), loaded_bundles=tuple(policy.core_bundles) + tuple(matched), policy=policy)
+                 tuple(matched), loaded_bundles=tuple(policy.core_bundles) + tuple(matched), policy=policy,
+                 catalog_schema_tokens=total_cost)
 
 
 def select(schemas, query, limit=None, model="", force=None, surface="chat"):
@@ -524,6 +545,8 @@ def telemetry(route_info, event="selected", used_tools=(), errors=0, **extra):
         enabled=route_info.enabled, routed=route_info.routed, reason=route_info.reason,
         policy_source=route_info.policy.source, catalog_tools=route_info.total,
         advertised_tools=route_info.selected, schema_tokens=route_info.schema_tokens,
+        catalog_schema_tokens=route_info.catalog_schema_tokens,
+        schema_tokens_saved=max(0, route_info.catalog_schema_tokens - route_info.schema_tokens),
         schema_budget=route_info.policy.schema_budget, selected_tools=list(route_info.names),
         bundles=list(route_info.loaded_bundles), fallback=route_info.fallback,
         recovery_level=route_info.recovery_level, used_tools=sorted(set(used_tools)),

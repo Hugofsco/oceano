@@ -20,6 +20,7 @@ def test_calendar_query_gets_a_small_calendar_focused_catalog():
     assert "calendar_events" in names
     assert "mail_send" not in names
     assert route.schema_tokens <= route.policy.schema_budget
+    assert route.catalog_schema_tokens >= route.schema_tokens
 
 
 def test_code_task_keeps_execution_and_verification_tools():
@@ -158,4 +159,13 @@ def test_routing_telemetry_never_accepts_prompt_or_result_fields(tmp_path, monke
     payload = traces.query(limit=1)[0]
     assert payload["event"] == "tool_routing"
     assert payload["used_tools"] == ["calendar_events"]
+    assert payload["schema_tokens_saved"] >= 0
     assert "prompt" not in payload and "result" not in payload and "answer" not in payload
+
+
+def test_generic_file_request_does_not_load_unrelated_write_domains():
+    route = _route("Create and read a file named hello.txt")
+    names = set(route.names)
+    assert {"read_file", "write_file"} <= names
+    assert not names & {"add_calendar_event", "mail_send", "add_note", "desktop_save_file"}
+    assert route.selected <= 12
