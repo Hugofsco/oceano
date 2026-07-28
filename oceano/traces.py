@@ -104,6 +104,55 @@ def query(run_id=None, workflow_id=None, limit=500):
     return list(reversed(out))
 
 
+
+def turn_health(limit=20):
+    """Content-free health summary for recent agent/resident turns."""
+    events = query(limit=max(200, int(limit) * 20))
+    rows = []
+    for event in reversed(events):
+        if event.get("event") == "resident_turn":
+            rows.append({
+                "ts": event.get("ts"), "mind": event.get("mind") or "resident",
+                "healthy": not bool(event.get("incomplete")) and not int(event.get("errors") or 0),
+                "incomplete": bool(event.get("incomplete")),
+                "errors": int(event.get("errors") or 0),
+                "historical_errors": int(event.get("historical_errors") or 0),
+                "tool_calls": int(event.get("tool_calls") or 0),
+                "elapsed_ms": int(event.get("elapsed_ms") or 0),
+                "used_tools": list(event.get("used_tools") or []),
+                "advertised_tools": int(event.get("catalog_advertised") or 0),
+                "catalog_tools": int(event.get("catalog_catalog") or 0),
+                "schema_tokens": int(event.get("catalog_schema_tokens") or 0),
+                "catalog_schema_tokens": int(event.get("catalog_catalog_schema_tokens") or 0),
+            })
+        elif (event.get("event") == "tool_routing"
+              and event.get("phase") in {"completed", "step-limit"}):
+            errors = int(event.get("tool_errors") or event.get("errors") or 0)
+            rows.append({
+                "ts": event.get("ts"), "mind": event.get("model") or "api/local",
+                "healthy": event.get("phase") == "completed" and errors == 0,
+                "incomplete": event.get("phase") != "completed", "errors": errors,
+                "historical_errors": int(event.get("historical_errors") or errors),
+                "tool_calls": int(event.get("tool_calls") or 0),
+                "elapsed_ms": int(event.get("elapsed_ms") or 0),
+                "used_tools": list(event.get("used_tools") or []),
+                "advertised_tools": int(event.get("advertised_tools") or 0),
+                "catalog_tools": int(event.get("catalog_tools") or 0),
+                "schema_tokens": int(event.get("schema_tokens") or 0),
+                "catalog_schema_tokens": int(event.get("catalog_schema_tokens") or 0),
+            })
+        if len(rows) >= limit:
+            break
+    healthy = sum(row["healthy"] for row in rows)
+    return {
+        "summary": {"turns": len(rows), "healthy": healthy,
+                    "incomplete": sum(row["incomplete"] for row in rows),
+                    "unresolved_errors": sum(row["errors"] for row in rows),
+                    "avg_tool_calls": (round(sum(row["tool_calls"] for row in rows) / len(rows), 1)
+                                       if rows else 0)},
+        "recent": rows,
+    }
+
 def clear():
     try:
         TRACE_PATH.unlink()

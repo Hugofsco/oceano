@@ -825,6 +825,9 @@ compatibility, while the runtime uses
 `ToolResult.ok`, error codes, retryability, and side-effect records instead of parsing prose.
 Conversation folds now request structured checkpoints (decisions, constraints, artifacts,
 verification evidence, and unresolved work) and retain a lossless plain-summary fallback.
+The Health app shows recent content-free turn health: completion status, unresolved versus
+historical errors, tool-call counts, catalog size, and schema-token savings. Prompts, arguments,
+results, and answers are never stored in this telemetry.
 
 Hybrid tool loading separates three concerns: tools registered by the process, tools allowed
 to execute in a particular conversation, and schemas advertised to the model. It starts with
@@ -838,11 +841,14 @@ copy `tool-loading.toml.example` to the gitignored `tool-loading.toml`. Preceden
 allowlist → surface → first matching model rule → global environment/default policy. Legacy
 `OCEANO_DYNAMIC_TOOL_*` settings remain supported for existing installations.
 
-The supplied examples are a ready-to-use Qwen-only setup: non-Qwen models receive the full
-allowed catalog, while model IDs matching `qwen*` use hybrid loading with a 4,200-token initial
-schema budget and a 7,600-token cumulative discovery ceiling. Unscoped workflow agents use a
-6,000-token initial budget; workflows and delegates with explicit allowlists continue to expose
-exactly that allowed set.
+The supplied examples use hybrid loading for Qwen models and for the resident Claude/Codex
+MCP body. Qwen receives a 4,200-token initial budget and 7,600-token discovery ceiling; resident
+minds use 3,600 and 7,000 tokens respectively. Resident catalogs use the same bundles,
+`discover_tools`, cumulative expansion, telemetry, and execution allowlist separation as API/local
+agents. The opaque catalog ID also carries a daemon-enforced call budget. In resident hybrid mode,
+Claude file/shell work runs through this enforceable bridge; Codex native calls are observed and
+cancelled at their start event because its CLI does not expose a pre-execution hook. Workflows and
+delegates with explicit allowlists continue to expose exactly that allowed set.
 
 ```bash
 cp oceano.env.example oceano.env
@@ -852,7 +858,8 @@ chmod 600 oceano.env
 ```
 
 The two active tool-loading lines in `oceano.env.example` select the TOML file and keep the global
-mode at `full`; the more-specific `qwen*` model rule switches only Qwen models to `hybrid`.
+mode at `full`; the more-specific `qwen*` model rule and `resident` surface switch Qwen and resident
+MCP catalogs to `hybrid` respectively.
 Do not also enable the legacy `OCEANO_DYNAMIC_TOOL_*` variables in a new setup, because the TOML
 policy and `OCEANO_TOOL_*` settings replace them.
 

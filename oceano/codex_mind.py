@@ -281,7 +281,8 @@ def _tool_result(item):
     return ""
 
 
-def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=None, background=False):
+def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=None,
+               background=False, catalog_id=None):
     """Run one stateless Codex turn. The caller passes the WHOLE conversation in `prompt` (Oceano's
     self.messages is the single source of truth, mirroring the Claude mind), so every turn is a fresh
     ephemeral `codex exec` — no server-side thread to resume, drift, or lose. `session` is the chat
@@ -310,6 +311,8 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
         # Same per-turn mechanism for the channel: forwarded as X-Oceano-Background, so an
         # unattended turn's bridged tools are gated off the live browser/UI without any global state.
         cmd += ["-c", 'mcp_servers.oceano.env.OCEANO_MCP_BACKGROUND="1"']
+    if catalog_id:
+        cmd += ["-c", f'mcp_servers.oceano.env.OCEANO_MCP_CATALOG="{catalog_id}"']
     if cwd:
         cmd += ["--cd", str(cwd)]
     # Feed the WHOLE conversation on stdin, NOT as a positional argument: Linux caps a single argv
@@ -419,7 +422,8 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
             call = _tool_call(item)
             if call:
                 pending[item.get("id") or str(time.time())] = call[0]
-                emit({"type": "tool_call", "name": call[0], "args": call[1]})
+                source = "mcp" if (item.get("type") or "") in ("mcp_tool_call", "mcp_tool_use") else "native"
+                emit({"type": "tool_call", "name": call[0], "args": call[1], "source": source})
         elif typ == "item.updated":
             item = ev.get("item") or {}
             if (item.get("type") or "") == "agent_message":

@@ -227,3 +227,50 @@ def test_run_tool_channel_is_per_call_not_global():
     finally:
         mindbridge._ALLOW.discard("__probe_chan")
         tools.unregister_prefix("__probe_chan")
+
+
+def _resident_hybrid(monkeypatch, tmp_path):
+    from oceano import toolrouter
+    config_path = tmp_path / "resident-tools.toml"
+    config_path.write_text(
+        '[default]\nmode = "full"\n'
+        '[surfaces.resident]\nmode = "hybrid"\nschema_budget = 500\n'
+        'max_schema_budget = 3000\ndiscovery = true\n')
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(config_path))
+    toolrouter._CACHE.update({"path": None, "mtime": None, "data": {}})
+
+
+def test_resident_catalog_is_routed_discoverable_and_budgeted(monkeypatch, tmp_path):
+    _resident_hybrid(monkeypatch, tmp_path)
+    catalog_id, route = mindbridge.create_catalog("do it", "claude:test", max_calls=2)
+    assert route.enabled is True
+    assert "discover_tools" in mindbridge.tool_names(catalog_id=catalog_id)
+    result = mindbridge.run_tool(
+        "discover_tools", {"query": "calendar", "operation": "load"}, catalog_id=catalog_id)
+    assert '"loaded"' in result
+    assert "calendar_events" in mindbridge.tool_names(catalog_id=catalog_id)
+    # Discovery consumed one call; reserve the second without touching the real calendar,
+    # then prove a third operation is rejected before execution.
+    assert mindbridge.consume_catalog_call(catalog_id, "calendar_events")[0] is True
+    blocked = mindbridge.run_tool("calendar_events", {}, catalog_id=catalog_id)
+    assert "budget exhausted" in blocked
+    assert mindbridge.catalog_status(catalog_id)["calls"] == 2
+
+
+def test_resident_catalog_rejects_unadvertised_and_expired_ids(monkeypatch, tmp_path):
+    _resident_hybrid(monkeypatch, tmp_path)
+    catalog_id, _route = mindbridge.create_catalog("calendar", "codex:test", max_calls=2)
+    assert "not advertised" in mindbridge.run_tool("mail_send", {}, catalog_id=catalog_id)
+    assert mindbridge.tool_schemas(catalog_id="missing") == []
+    assert "expired or is invalid" in mindbridge.run_tool(
+        "calendar_events", {}, catalog_id="missing")
+
+
+def test_mcp_config_carries_opaque_catalog_id(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "WORKSPACE", tmp_path / "workspace")
+    path = mindbridge.mcp_config_path("chatQ", catalog_id="opaque-catalog-123")
+    cfg = json.loads(Path(path).read_text())
+    env = cfg["mcpServers"]["oceano"]["env"]
+    assert env["OCEANO_MCP_CATALOG"] == "opaque-catalog-123"
+    assert path.endswith("mind-mcp-chatQ-cat-opaque-c.json")

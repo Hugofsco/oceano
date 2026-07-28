@@ -5,6 +5,7 @@ blocking and streaming drivers use it as the common orchestration spine while th
 retain their existing transport-specific model I/O.
 """
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 import re
@@ -139,6 +140,8 @@ class TurnBudget:
 class ToolEvent:
     name: str
     result: ToolResult
+    operation_key: str = ""
+    targets: tuple[str, ...] = ()
     resolved: bool = False
     resolved_by: int | None = None
 
@@ -160,29 +163,56 @@ class TurnState:
     events: list[ToolEvent] = field(default_factory=list)
     corrected: bool = False
 
-    def record(self, name, result):
+    @staticmethod
+    def _arguments(value):
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _operation(cls, name, arguments):
+        args = cls._arguments(arguments)
+        canonical = json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+        digest = hashlib.sha256((str(name) + "\0" + canonical).encode()).hexdigest()[:16]
+        targets = tuple(dict.fromkeys(str(args[key]) for key in
+                                     ("path", "file_path", "directory", "cwd")
+                                     if args.get(key)))
+        return f"{name}:{digest}", targets
+
+    def record(self, name, result, arguments=None):
         structured = result if isinstance(result, ToolResult) else ToolResult.from_value(result)
-        event = ToolEvent(name, structured)
+        operation_key, targets = self._operation(name, arguments)
+        event = ToolEvent(name, structured, operation_key=operation_key, targets=targets)
         self.events.append(event)
         if structured.ok:
             current = len(self.events) - 1
-            # A successful retry of the same tool supersedes its earlier transient failure.
+            # Only the same concrete operation supersedes a retryable failure. A later,
+            # unrelated shell command must not erase evidence that an earlier command failed.
             for prior in self.events[:current]:
-                if prior.name == name and not prior.result.ok and prior.result.retryable:
+                if (prior.operation_key == operation_key and not prior.result.ok
+                        and prior.result.retryable):
                     prior.resolved = True
                     prior.resolved_by = current
-            # Passing verification after a successful mutation is evidence that transient
-            # setup/read failures encountered before the mutation no longer block completion.
+            # A successful file mutation plus verification may resolve a prior missing read of
+            # that exact artifact, even though read_file and write_file are different tools.
             verification = {"run_tests", "run_shell", "python_exec"}
             if name in verification:
-                last_effect = max(
-                    (i for i, item in enumerate(self.events[:current]) if item.result.ok
-                     and item.result.side_effects), default=-1)
-                if last_effect >= 0:
-                    for prior in self.events[:last_effect]:
-                        if not prior.result.ok and prior.result.retryable:
-                            prior.resolved = True
-                            prior.resolved_by = current
+                repaired = set()
+                for item in self.events[:current]:
+                    if not item.result.ok:
+                        continue
+                    for effect in item.result.side_effects:
+                        if effect.startswith(("file:", "directory:")):
+                            repaired.add(effect.split(":", 1)[1])
+                for prior in self.events[:current]:
+                    if (not prior.result.ok and prior.result.retryable
+                            and repaired.intersection(prior.targets)):
+                        prior.resolved = True
+                        prior.resolved_by = current
         return structured
 
     @property
@@ -276,6 +306,8 @@ class ResidentEventAdapter:
 
     def tool_call(self, name, args):
         normalized = self.normalize_name(name)
+        if normalized == "run_shell" and isinstance(args, str):
+            args = {"command": args}
         if not self.state.budget.consume_tool():
             self.state.record(normalized, ToolResult(
                 False, error="turn tool-call budget exhausted", code="budget_exhausted"))
@@ -328,14 +360,13 @@ class ResidentEventAdapter:
             elif spec and spec.side_effecting:
                 effects = (f"capability:{spec.capability}",)
             result = ToolResult(True, summary=text, side_effects=effects)
-        return self.state.record(normalized, result)
+        return self.state.record(normalized, result, args)
 
     def missing_result(self, name):
         """Record a call whose resident stream ended without a matching result event."""
         normalized = self.normalize_name(name)
         args_list = self.pending.get(normalized) or []
-        if args_list:
-            args_list.pop(0)
+        args = args_list.pop(0) if args_list else {}
         return self.state.record(normalized, ToolResult(
             False, error="resident tool call ended without a result event",
-            retryable=True, code="missing_result"))
+            retryable=True, code="missing_result"), args)

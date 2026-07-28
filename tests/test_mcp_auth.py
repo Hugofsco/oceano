@@ -48,3 +48,37 @@ def test_bridge_routes_still_gated_by_mind_token_not_cookie(client):
     # not the cookie gate (401) — proves the narrowed exemption didn't touch these two routes.
     assert client.get("/api/mcp/tools").status_code == 403
     assert client.post("/api/mcp/call", json={"tool": "x", "args": {}}).status_code == 403
+
+
+def test_dynamic_catalog_routes_schema_and_call_through_token_gated_bridge(
+        client, monkeypatch, tmp_path):
+    from oceano import mindbridge, toolrouter, tools
+    config_path = tmp_path / "resident-tools.toml"
+    config_path.write_text(
+        '[surfaces.resident]\nmode = "hybrid"\nschema_budget = 500\n'
+        'max_schema_budget = 2000\ndiscovery = true\n')
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(config_path))
+    toolrouter._CACHE.update({"path": None, "mtime": None, "data": {}})
+    schema = {"type": "function", "function": {
+        "name": "bridge_probe", "description": "Controlled bridge probe",
+        "parameters": {"type": "object", "properties": {"value": {"type": "string"}},
+                       "required": ["value"]}}}
+    tools.register("bridge_probe", schema, lambda value: "probe:" + value)
+    mindbridge._ALLOW.add("bridge_probe")
+    try:
+        catalog_id, _route = mindbridge.create_catalog(
+            "use the bridge probe", "claude:test", max_calls=1)
+        headers = {"X-Oceano-Mind-Token": mindbridge.token(),
+                   "X-Oceano-Catalog": catalog_id}
+        advertised = client.get("/api/mcp/tools", headers=headers)
+        assert advertised.status_code == 200
+        assert "bridge_probe" in {tool["function"]["name"] for tool in advertised.json()["tools"]}
+        called = client.post("/api/mcp/call", headers=headers,
+                             json={"name": "bridge_probe", "args": {"value": "ok"}})
+        assert called.json()["result"] == "probe:ok"
+        exhausted = client.post("/api/mcp/call", headers=headers,
+                                json={"name": "bridge_probe", "args": {"value": "again"}})
+        assert "budget exhausted" in exhausted.json()["result"]
+    finally:
+        mindbridge._ALLOW.discard("bridge_probe")
+        tools.unregister_prefix("bridge_probe")

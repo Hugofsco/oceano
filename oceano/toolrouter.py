@@ -401,12 +401,14 @@ def route(schemas, query, model="", limit=None, force=None, surface="chat"):
     by_name = {s["function"]["name"]: s for s in schemas}
     chosen = {}
     cap = policy.count_limit
-    for bundle_name in policy.core_bundles:
-        for name in all_bundles.get(bundle_name, Bundle(bundle_name, "", ())).tools:
-            _add(chosen, by_name, name, policy.schema_budget, cap)
+    # Reserve discovery first: under a tight schema budget the core bundle must never
+    # crowd out the only mechanism capable of expanding the catalog later in the turn.
     if policy.discovery:
         by_name["discover_tools"] = DISCOVER_SCHEMA
         _add(chosen, by_name, "discover_tools", policy.schema_budget, cap)
+    for bundle_name in policy.core_bundles:
+        for name in all_bundles.get(bundle_name, Bundle(bundle_name, "", ())).tools:
+            _add(chosen, by_name, name, policy.schema_budget, cap)
     for bundle_name in matched:
         bundle = all_bundles[bundle_name]
         for name in bundle.core:

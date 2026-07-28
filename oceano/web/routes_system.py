@@ -10,7 +10,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request, WebSocket
 
 import config
-from oceano import chats, embeddings, memory, rag, rerank, rivers, scheduler, secretcrypto, skills
+from oceano import chats, embeddings, memory, rag, rerank, rivers, scheduler, secretcrypto, skills, traces
 from oceano.web import telegram_runtime
 from oceano.web.state import (
     PROVIDERS,
@@ -329,6 +329,7 @@ def health_dashboard():
         "telegram": telegram_runtime.status(),
         "memory": {"count": memory.count()},
         "rag": docs,
+        "turn_health": traces.turn_health(),
         "hw": hw,
     }
 

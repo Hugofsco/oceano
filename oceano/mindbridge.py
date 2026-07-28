@@ -11,7 +11,10 @@ Flow:  Claude  →(stdio MCP)→  mcp_bridge_server  →(HTTP + token)→  /api/
 import json
 import os
 import secrets
+import threading
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from oceano import tools, turnctx
 
@@ -43,6 +46,10 @@ def active_session():
 # of the mind browsing invisibly with WebFetch. Kept reasonably small so Claude Code loads them all
 # up front (exact names in --allowedTools) instead of deferring them behind its flaky ToolSearch.
 _ALLOW = {
+    # In hybrid resident mode these replace native file/shell tools, allowing the daemon to
+    # enforce the same execution policy and per-turn budget before the operation starts.
+    "list_files", "read_file", "code_search", "write_file", "edit_file", "make_folder",
+    "run_shell", "python_exec", "run_tests", "git",
     "remember", "recall", "forget_memory", "update_memory",   # memory — Oceano's, the one the user sees
     "calendar_events", "manage_calendar", "find_free_slots",  # the calendar
     "schedule_task", "list_tasks", "update_task", "cancel_task",   # the PERSISTENT task scheduler — create/list/edit/cancel; the one the user sees, use instead of the mind's own cron
@@ -93,6 +100,91 @@ def _allowset(scope):
     return _SCOPES.get(scope, _ALLOW)
 
 
+@dataclass
+class _CatalogState:
+    route: object
+    catalog: list
+    allowed: set
+    query: str
+    model: str
+    max_calls: int
+    calls: int = 0
+    created: float = 0.0
+
+
+_CATALOGS = {}
+_CATALOG_LOCK = threading.RLock()
+_CATALOG_TTL = 6 * 3600
+
+
+def _catalog_state(catalog_id):
+    if not catalog_id:
+        return None
+    now = time.time()
+    with _CATALOG_LOCK:
+        for key in [key for key, value in _CATALOGS.items()
+                    if now - value.created > _CATALOG_TTL]:
+            _CATALOGS.pop(key, None)
+        return _CATALOGS.get(catalog_id)
+
+
+def create_catalog(query, model, max_calls, scope=None):
+    """Create one opaque, daemon-owned resident catalog and execution budget."""
+    from oceano import toolrouter
+    catalog = tool_schemas(scope=scope)
+    route = toolrouter.route(catalog, query or "", model=model or "resident",
+                             surface="resident")
+    catalog_id = secrets.token_urlsafe(18)
+    state = _CatalogState(route=route, catalog=catalog,
+                          allowed={schema["function"]["name"] for schema in catalog},
+                          query=query or "", model=model or "resident",
+                          max_calls=max(1, int(max_calls or 1)), created=time.time())
+    with _CATALOG_LOCK:
+        _CATALOGS[catalog_id] = state
+    toolrouter.telemetry(route, "resident-selected")
+    return catalog_id, route
+
+
+def consume_catalog_call(catalog_id, name, *, require_advertised=True):
+    """Atomically reserve one call before execution; shared by bridge and native events."""
+    state = _catalog_state(catalog_id)
+    if state is None:
+        return (False, "resident catalog expired or is invalid") if catalog_id else (True, "")
+    with _CATALOG_LOCK:
+        advertised = set(state.route.names)
+        if require_advertised and name not in advertised:
+            return False, f"tool {name!r} is not advertised in this resident catalog"
+        if state.calls >= state.max_calls:
+            return False, "resident tool-call budget exhausted"
+        state.calls += 1
+    return True, ""
+
+
+def discover_catalog(catalog_id, args):
+    """Expand one resident MCP catalog through the same bundle policy as API/local agents."""
+    from oceano import toolrouter
+    state = _catalog_state(catalog_id)
+    if state is None:
+        return json.dumps({"loaded": [], "message": "resident catalog expired"})
+    with _CATALOG_LOCK:
+        updated, result = toolrouter.discover(
+            state.route, state.catalog, state.allowed, args or {})
+        state.route = updated
+    toolrouter.telemetry(updated, "resident-discovered")
+    return result
+
+
+def catalog_status(catalog_id):
+    state = _catalog_state(catalog_id)
+    if state is None:
+        return None
+    return {"advertised": state.route.selected, "catalog": state.route.total,
+            "schema_tokens": state.route.schema_tokens,
+            "catalog_schema_tokens": state.route.catalog_schema_tokens,
+            "calls": state.calls, "max_calls": state.max_calls,
+            "bundles": list(state.route.loaded_bundles), "enabled": state.route.enabled}
+
+
 _TOKEN = None
 
 
@@ -125,18 +217,22 @@ def daemon_url():
     return f"http://{host}:{port}"
 
 
-def tool_schemas(scope=None):
-    """The Oceano tools offered to the mind: the curated body set plus every connected MCP
-    server's tools (or, for a contained sub-agent, the much narrower `scope`d set with no MCP
-    access — see _SCOPES), intersected with what's enabled."""
+def tool_schemas(scope=None, catalog_id=None):
+    """Tools offered to the mind, optionally narrowed by an opaque per-turn catalog."""
+    state = _catalog_state(catalog_id)
+    if state is not None:
+        return list(state.route.schemas)
+    if catalog_id:
+        return []
     return [s for s in tools.schemas() if s["function"]["name"] in _allowset(scope)]
 
 
-def tool_names(scope=None):
-    return [s["function"]["name"] for s in tool_schemas(scope)]
+def tool_names(scope=None, catalog_id=None):
+    return [schema["function"]["name"] for schema in tool_schemas(scope, catalog_id)]
 
 
-def run_tool(name, args, session=None, background=False, client="web", scope=None):
+def run_tool(name, args, session=None, background=False, client="web", scope=None,
+             catalog_id=None):
     """Execute an Oceano tool IN THE DAEMON. Interactive mind turns run on the 'web' channel (so ui_*
     reach the live browser the user is watching); an UNATTENDED (background) mind turn runs on the
     'background' channel instead — so it can't drive the live browser or UI. Returns the tool's
@@ -155,7 +251,16 @@ def run_tool(name, args, session=None, background=False, client="web", scope=Non
 
     `scope` narrows which tools are reachable (see _SCOPES) — e.g. a contained workflow sub-agent
     gets "skills" (list_skills/load_skill only, no memory), never the full body."""
-    if name not in _allowset(scope):
+    state = _catalog_state(catalog_id)
+    if catalog_id and state is None:
+        return "ERROR: resident catalog expired or is invalid"
+    if state is not None:
+        ok, reason = consume_catalog_call(catalog_id, name)
+        if not ok:
+            return f"ERROR: {reason}"
+        if name == "discover_tools":
+            return discover_catalog(catalog_id, args)
+    elif name not in _allowset(scope):
         return f"ERROR: tool {name!r} is not available to the mind"
     from oceano import safety
     with turnctx.push(session=session, channel="background" if background else "web", client=client):
@@ -166,7 +271,8 @@ def run_tool(name, args, session=None, background=False, client="web", scope=Non
         return result
 
 
-def mcp_config_path(sid=None, background=False, client="web", scope=None):
+def mcp_config_path(sid=None, background=False, client="web", scope=None,
+                    catalog_id=None):
     """Write the --mcp-config Claude Code loads to launch our stdio bridge (daemon URL + token, plus
     this TURN's attributes: the conversation `sid` so a spawn_job routes its result back to this
     chat, `background` so bridged tools run on the background channel — no live browser / UI for
@@ -194,6 +300,8 @@ def mcp_config_path(sid=None, background=False, client="web", scope=None):
         env["OCEANO_MCP_CLIENT"] = client
     if scope:
         env["OCEANO_MCP_SCOPE"] = scope
+    if catalog_id:
+        env["OCEANO_MCP_CATALOG"] = catalog_id
     cfg = {"mcpServers": {"oceano": {
         "command": sys.executable,
         "args": ["-m", "oceano.mcp_bridge_server"],
@@ -201,7 +309,8 @@ def mcp_config_path(sid=None, background=False, client="web", scope=None):
     }}}
     fname = ("mind-mcp" + (f"-{sid}" if sid else "")           # sid matches [A-Za-z0-9_-] → safe filename
              + ("-bg" if background else "") + (f"-{client}" if client and client != "web" else "")
-             + (f"-{scope}" if scope else "") + ".json")
+             + (f"-{scope}" if scope else "")
+             + (f"-cat-{catalog_id[:8]}" if catalog_id else "") + ".json")
     path = config.WORKSPACE.parent / "data" / fname
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -4675,19 +4675,19 @@ function openMemoryGraph() {
    ==================================================================== */
 let _healthTimer = null;
 function openHealth() {
-  const { body, reused } = createWindow({ id: "win-health", title: "Health — system", icon: "◉", width: 560, height: 600,
+  const { body, reused } = createWindow({ id: "win-health", title: "Health — system", icon: "◉", width: 620, height: 680,
     onClose: () => { if (_healthTimer) { clearInterval(_healthTimer); _healthTimer = null; } } });
   if (reused) return;
   body.classList.add("hd-win");
-  body.innerHTML = `<div class="hd-grid" id="hdGrid"></div><div class="hd-foot"><span id="hdUptime">—</span><button class="ed-btn" id="hdReload" title="refresh">↻</button></div>`;
-  const grid = $("#hdGrid", body);
+  body.innerHTML = `<div class="hd-grid" id="hdGrid"></div><div class="hd-turns" id="hdTurns"></div><div class="hd-foot"><span id="hdUptime">—</span><button class="ed-btn" id="hdReload" title="refresh">↻</button></div>`;
+  const grid = $("#hdGrid", body), turns = $("#hdTurns", body);
   const dot = ok => `<span class="hd-dot ${ok ? "ok" : "bad"}"></span>`;
   const fmtBytes = b => b == null ? "—" : (b >= 1e9 ? (b / 1073741824).toFixed(1) + " GB" : (b / 1048576).toFixed(0) + " MB");
   const fmtDur = s => { if (s == null) return "—"; s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + (h ? h + "h " : "") + m + "m"; };
   const card = (title, ok, rows) => `<div class="hd-card"><div class="hd-h">${dot(ok)}${escapeHtml(title)}</div>${rows.map(r => `<div class="hd-row"><span>${escapeHtml(r[0])}</span><b>${r[1]}</b></div>`).join("")}</div>`;
   async function load() {
     let d; try { d = await api("/api/health"); } catch { grid.innerHTML = `<div class="empty-note">health unavailable</div>`; return; }
-    const ls = d.llamaswap || {}, em = d.embed || {}, sc = d.scheduler || {}, tg = d.telegram || {}, hw = d.hw || {}, rg = d.rag || {};
+    const ls = d.llamaswap || {}, em = d.embed || {}, sc = d.scheduler || {}, tg = d.telegram || {}, hw = d.hw || {}, rg = d.rag || {}, th = d.turn_health || {}, ths = th.summary || {};
     grid.innerHTML = [
       card("Inference · llama-swap", ls.ok, [["loaded model", escapeHtml(ls.loaded || d.model || "—")], ["available", (ls.models || []).length || "—"]]),
       card("Embeddings · :8082", em.ok, [["model", escapeHtml(em.model || "—")]]),
@@ -4695,7 +4695,15 @@ function openHealth() {
       card("Scheduler", sc.beat_ago_s != null && sc.beat_ago_s < 180, [["last beat", sc.beat_ago_s != null ? Math.round(sc.beat_ago_s) + "s ago" : "—"], ["tasks", sc.tasks ?? "—"]]),
       card("Telegram", !!tg.running, [["bot", tg.running ? "@" + escapeHtml(tg.username || "on") : "off"]]),
       card("Knowledge", true, [["memories", d.memory ? d.memory.count : "—"], ["doc chunks", rg.chunks ?? "—"], ["files indexed", rg.files ?? "—"]]),
+      card("Agent turns", (ths.incomplete || 0) === 0 && (ths.unresolved_errors || 0) === 0,
+        [["healthy", `${ths.healthy || 0} / ${ths.turns || 0}`], ["unresolved errors", ths.unresolved_errors || 0], ["avg tool calls", ths.avg_tool_calls ?? 0]]),
     ].join("");
+    const recent = (th.recent || []).slice(0, 6);
+    turns.innerHTML = recent.length ? `<div class="hd-turn-h">Recent agent turns</div>${recent.map(t => {
+      const saved = Math.max(0, (t.catalog_schema_tokens || 0) - (t.schema_tokens || 0));
+      const tools = (t.used_tools || []).join(", ") || "no tools";
+      return `<div class="hd-turn ${t.healthy ? "ok" : "bad"}"><span class="hd-dot ${t.healthy ? "ok" : "bad"}"></span><b>${escapeHtml(t.mind || "agent")}</b><span>${t.tool_calls || 0} calls · ${t.errors || 0} errors · ${saved} schema tokens saved</span><small>${escapeHtml(tools)}</small></div>`;
+    }).join("")}` : `<div class="hd-turn-empty">No agent turn telemetry yet</div>`;
     $("#hdUptime", body).textContent = "uptime " + fmtDur(d.uptime_s);
   }
   $("#hdReload", body).onclick = load;

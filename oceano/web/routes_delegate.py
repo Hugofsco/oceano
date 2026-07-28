@@ -103,8 +103,9 @@ def mcp_tools(request: Request):
     if not _mcp_authed(request):
         raise HTTPException(403, "bad bridge token")
     from oceano import mindbridge
-    scope = request.headers.get("x-oceano-scope") or None    # narrows to a curated subset (e.g. "skills")
-    return {"tools": mindbridge.tool_schemas(scope=scope)}
+    scope = request.headers.get("x-oceano-scope") or None
+    catalog_id = request.headers.get("x-oceano-catalog") or None
+    return {"tools": mindbridge.tool_schemas(scope=scope, catalog_id=catalog_id)}
 
 
 @router.post("/api/mcp/call")
@@ -117,9 +118,11 @@ async def mcp_call(req: Request):
     session = req.headers.get("x-oceano-session") or None    # which chat this mind turn drives (spawn_job routing)
     background = req.headers.get("x-oceano-background") == "1"   # unattended turn → background channel (no live UI)
     client = req.headers.get("x-oceano-client") or "web"      # "desktop" unlocks oceano/tools/desktop.py's tools
-    scope = req.headers.get("x-oceano-scope") or None         # e.g. "skills" — a contained sub-agent's narrow bridge
-    print(f"[mind] tool {name}({list(args)})", flush=True)            # so the body's actions land in the journal
-    return {"result": await asyncio.to_thread(mindbridge.run_tool, name, args, session, background, client, scope)}
+    scope = req.headers.get("x-oceano-scope") or None
+    catalog_id = req.headers.get("x-oceano-catalog") or None
+    print(f"[mind] tool {name}({list(args)})", flush=True)
+    return {"result": await asyncio.to_thread(
+        mindbridge.run_tool, name, args, session, background, client, scope, catalog_id)}
 
 
 @router.get("/api/delegate")

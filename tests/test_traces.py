@@ -70,3 +70,24 @@ def test_agent_model_calls_are_traced(monkeypatch):
     assert out == "hello"
     assert any(e["event"] == "model_call_start" for e in evs)
     assert any(e["event"] == "model_call_end" for e in evs)
+
+
+def test_turn_health_aggregates_content_free_resident_metrics():
+    traces.record_global(
+        "resident_turn", mind="claude", incomplete=False, errors=0, historical_errors=1,
+        tool_calls=4, elapsed_ms=1200, used_tools=["write_file", "run_tests"],
+        catalog_advertised=9, catalog_catalog=50, catalog_schema_tokens=900,
+        catalog_catalog_schema_tokens=5000)
+    traces.record_global(
+        "resident_turn", mind="codex", incomplete=True, errors=1, historical_errors=1,
+        tool_calls=2, elapsed_ms=800, used_tools=["run_shell"],
+        catalog_advertised=8, catalog_catalog=50, catalog_schema_tokens=800,
+        catalog_catalog_schema_tokens=5000)
+    health = traces.turn_health()
+    assert health["summary"] == {
+        "turns": 2, "healthy": 1, "incomplete": 1,
+        "unresolved_errors": 1, "avg_tool_calls": 3.0,
+    }
+    assert health["recent"][0]["mind"] == "codex"
+    assert health["recent"][1]["historical_errors"] == 1
+    assert all("prompt" not in row and "result" not in row for row in health["recent"])

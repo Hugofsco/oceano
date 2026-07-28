@@ -1,8 +1,8 @@
 # Oceano tool-schema advertisement policy.
 #
 # Copy to tool-loading.toml and restart Oceano. The active file is gitignored. This controls
-# schemas shown to a model, never which tools may execute. Explicit workflow/delegate allowlists
-# remain the hard boundary and take precedence over every rule here.
+# schemas shown to models. Resident MCP catalogs also enforce that selected subset at execution;
+# explicit workflow/delegate allowlists remain the outer hard boundary and always take precedence.
 #
 # Precedence: explicit allowlist > surface > first matching model rule > default/environment.
 
@@ -27,12 +27,24 @@ max_schema_budget = 7600
 pattern = "*-large"
 mode = "full"
 
-# Surface rules override model and default settings. Do not set a surface-level mode here:
-# leaving it inherited ensures only the qwen* model rule enables hybrid loading.
+# Surface rules override model and default settings. Workflow mode stays inherited here;
+# resident mode is explicitly hybrid below.
 [surfaces.workflow]
 # Workflows commonly provide explicit tool scopes, which bypass routing. This setting applies
 # only to workflow agents without an explicit scope.
 schema_budget = 6000
+
+
+# Resident Claude/Codex minds use the same bundle router for their MCP body. Hybrid mode also
+# routes Claude file/shell calls through the daemon so catalog and call budgets are enforced
+# before execution. Native Codex calls are cancelled and recorded if they cross this catalog.
+[surfaces.resident]
+mode = "hybrid"
+schema_budget = 3600
+max_schema_budget = 7000
+discovery = true
+fallback = "full-once"
+ambiguous = "discover"
 
 # Override a built-in bundle or define a new one. Unknown/unavailable tool names are ignored.
 # [bundles.project-management]

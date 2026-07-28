@@ -50,9 +50,11 @@ def test_successful_retry_resolves_a_retryable_error():
 
 def test_verification_resolves_transient_setup_error_after_a_mutation():
     state = TurnState("build it", object(), set(), TaskSpec(True, True), TurnBudget.create(5))
-    state.record("read_file", ToolResult(False, error="missing", retryable=True, code="not_found"))
-    state.record("write_file", ToolResult(True, summary="saved", side_effects=("file:app.py",)))
-    state.record("run_tests", ToolResult(True, summary="(exit 0) pytest"))
+    state.record("read_file", ToolResult(False, error="missing", retryable=True, code="not_found"),
+                 {"path": "app.py"})
+    state.record("write_file", ToolResult(True, summary="saved", side_effects=("file:app.py",)),
+                 {"path": "app.py", "content": "print(1)"})
+    state.record("run_tests", ToolResult(True, summary="(exit 0) pytest"), {"path": "."})
     assert state.completion_issues() == []
     assert state.metrics()["historical_errors"] == 1
 
@@ -104,7 +106,7 @@ def test_resident_adapter_respects_claude_structured_error_flag():
     result = adapter.tool_result("Bash", "permission denied", is_error=True)
     assert result.ok is False and result.code == "command_failed" and result.retryable is True
     assert state.error_count == 1
-    adapter.tool_call("Bash", {"command": "echo recovered"})
+    adapter.tool_call("Bash", {"command": "false"})
     adapter.tool_result("Bash", "recovered")
     assert state.error_count == 0 and state.historical_error_count == 1
 
@@ -128,3 +130,23 @@ def test_resident_adapter_never_resolves_claude_policy_failures():
     adapter.tool_call("mcp__oceano__mail_send", {"to": "safe@example.test"})
     adapter.tool_result("mcp__oceano__mail_send", "sent")
     assert state.error_count == 1
+
+
+def test_unrelated_successful_shell_operation_does_not_erase_a_failure():
+    state = TurnState("check it", object(), set(), TaskSpec(True, True), TurnBudget.create(4))
+    state.record("run_shell", ToolResult(False, error="lint failed", retryable=True,
+                                         code="command_failed"), {"command": "ruff check ."})
+    state.record("run_shell", ToolResult(True, summary="tests passed",
+                                         side_effects=("capability:shell_exec",)),
+                 {"command": "pytest -q"})
+    assert state.error_count == 1
+    assert state.events[0].resolved is False
+
+
+def test_exact_shell_retry_resolves_only_its_matching_operation():
+    state = TurnState("retry", object(), set(), TaskSpec(), TurnBudget.create(4))
+    args = {"command": "pytest -q"}
+    state.record("run_shell", ToolResult(False, error="failed", retryable=True,
+                                         code="command_failed"), args)
+    state.record("run_shell", ToolResult(True, summary="passed"), args)
+    assert state.error_count == 0 and state.events[0].resolved is True

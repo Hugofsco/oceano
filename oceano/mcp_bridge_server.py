@@ -23,6 +23,7 @@ SESSION = os.environ.get("OCEANO_MCP_SESSION", "")   # the chat this mind turn d
 BACKGROUND = os.environ.get("OCEANO_MCP_BACKGROUND", "")   # unattended turn → tools run on the background channel
 CLIENT = os.environ.get("OCEANO_MCP_CLIENT", "")     # "desktop" if the web request that started this turn came from OceanoDesktop
 SCOPE = os.environ.get("OCEANO_MCP_SCOPE", "")       # narrows the bridge for a contained sub-agent (e.g. "skills")
+CATALOG = os.environ.get("OCEANO_MCP_CATALOG", "")   # opaque per-turn dynamic catalog + budget
 HEADERS = {"X-Oceano-Mind-Token": TOKEN}             # token in a header, never the URL/body (no log leak)
 if SESSION:
     HEADERS["X-Oceano-Session"] = SESSION            # so a spawn_job routes its result back to this chat
@@ -32,6 +33,8 @@ if CLIENT:
     HEADERS["X-Oceano-Client"] = CLIENT              # so oceano/tools/desktop.py's gate unlocks for this turn
 if SCOPE:
     HEADERS["X-Oceano-Scope"] = SCOPE                # so the daemon exposes only this scope's curated tools
+if CATALOG:
+    HEADERS["X-Oceano-Catalog"] = CATALOG            # opaque id; actual allowlist stays in the daemon
 
 server = Server("oceano")
 _SCHEMAS = []
@@ -53,6 +56,12 @@ async def call_tool(name, arguments):
                              json={"name": name, "args": arguments or {}}, headers=HEADERS, timeout=600)
             r.raise_for_status()
             out = r.json().get("result", "")
+            if name == "discover_tools" and CATALOG and not str(out).startswith("ERROR"):
+                listed = await c.get(f"{URL}/api/mcp/tools", headers=HEADERS, timeout=15)
+                listed.raise_for_status()
+                global _SCHEMAS
+                _SCHEMAS = listed.json().get("tools", [])
+                await server.request_context.session.send_tool_list_changed()
     except Exception as e:                                 # never crash Claude's tool loop
         out = f"ERROR reaching Oceano: {type(e).__name__}: {e}"
     return [t.TextContent(type="text", text=str(out))]
