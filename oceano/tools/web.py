@@ -113,8 +113,8 @@ def fetch_url(url):
         return refusal
     if not live_browser_available():  # off-web channel → plain HTTP, never the shared browser
         return safety.wrap_untrusted(url, _http_fetch(url))
-    # Web channel: render in a lightweight shared-browser reader tab. Heavy/background
-    # resources are blocked and the final tab is made static after text extraction.
+    # Web channel: render a normal public page in the shared browser. Cache entries are partitioned
+    # by an opaque cookie-state fingerprint and private/authenticated responses are never cached.
     def load():
         try:
             with webcontrol.permit(url):
@@ -126,9 +126,21 @@ def fetch_url(url):
             return {"ok": False, "text": "", "status": 0, "headers": {},
                     "error": f"fetch paused: {e}"}
 
-    result = webcontrol.cached(
-        "browser:" + webcontrol.cache_key(url), load,
-        cache_if=lambda value: bool(value.get("ok")) and int(value.get("status") or 0) < 400)
+    session_key = livebrowser.session_fingerprint()
+
+    def cacheable(value):
+        meta = value.get("cache") or {}
+        directives = str(meta.get("cache_control") or "").lower()
+        return (bool(value.get("ok")) and int(value.get("status") or 0) < 400
+                and not meta.get("authenticated") and not meta.get("sets_cookie")
+                and not any(flag in directives for flag in ("private", "no-store", "no-cache")))
+
+    if session_key:
+        result = webcontrol.cached(
+            "browser:" + session_key + ":" + webcontrol.cache_key(url), load,
+            cache_if=cacheable)
+    else:
+        result = load()  # fingerprint failure must fail closed for cache isolation
     status = int(result.get("status") or 0)
     cooldown = int(result.get("cooldown") or 0)
     if status >= 400:
@@ -174,12 +186,14 @@ def _check_url_allowlisted(url):
 def http_request(url, method="GET", headers=None, json=None, body=None, params=None):
     import requests as _rq
     from urllib.parse import urlparse
-    _SENSITIVE_HEADERS = ("authorization", "cookie", "proxy-authorization", "x-api-key")
     method = (method or "GET").upper()
+    initial_method = method
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
         return "ERROR: method must be GET/POST/PUT/PATCH/DELETE/HEAD"
     hdrs = dict(headers) if isinstance(headers, dict) else {}
     qp = params if isinstance(params, dict) else None
+    request_json = json
+    request_body = body
     _origin = lambda u: (lambda x: (x.scheme, x.hostname, x.port))(urlparse(u))
     cur = url
     for _ in range(4):                            # follow redirects manually, re-checking each hop
@@ -188,27 +202,44 @@ def http_request(url, method="GET", headers=None, json=None, body=None, params=N
             return refusal
         try:
             with webcontrol.permit(cur):
-                r = _rq.request(method, cur, headers=hdrs,
-                                json=json if json is not None else None,
-                                data=body if (json is None and body is not None) else None,
-                                params=qp, timeout=25, allow_redirects=False)
+                hostname = (urlparse(cur).hostname or "").lower()
+                request_fn = _rq.request if hostname in config.HTTP_ALLOW else safety.guarded_request
+                r = request_fn(method, cur, headers=hdrs,
+                               json=request_json if request_json is not None else None,
+                               data=request_body if (request_json is None
+                                                     and request_body is not None) else None,
+                               params=qp, timeout=25, allow_redirects=False)
                 cooldown = webcontrol.observe_response(cur, r.status_code, r.headers)
         except webcontrol.CoolingDown as e:
             return f"(request paused: {e})"
+        except safety.Blocked as b:
+            return str(b)
         except _rq.RequestException as e:
             return f"(request failed: {type(e).__name__}: {e})"
         loc = r.headers.get("Location")
         if r.status_code in (301, 302, 303, 307, 308) and loc:
             nxt = _rq.compat.urljoin(cur, loc)
-            if _origin(nxt) != _origin(cur):      # cross-origin redirect → never forward credentials
-                hdrs = {k: v for k, v in hdrs.items() if k.lower() not in _SENSITIVE_HEADERS}
+            if _origin(nxt) != _origin(cur):
+                # Never replay caller headers or bodies to another origin. For 301/302/303, follow
+                # standard browser semantics and convert non-safe methods to a bodyless GET. A
+                # cross-origin 307/308 explicitly requires replay, so refuse it instead.
+                hdrs = {}
+                request_json = None
+                request_body = None
+                if method not in ("GET", "HEAD"):
+                    if r.status_code in (301, 302, 303):
+                        method = "GET"
+                    else:
+                        return (f"REFUSED cross-origin HTTP {r.status_code} redirect for {method}: "
+                                "would replay the request body to another origin")
             qp = None                             # query params belong to the ORIGINAL request only
             cur = nxt
             continue
         head = f"HTTP {r.status_code} {r.reason}  ({r.headers.get('Content-Type', '')})"
         if cooldown:
             head += f"  [host cooldown {cooldown}s]"
-        return safety.wrap_untrusted(f"http_request:{method} {url}", f"{head}\n\n{r.text[:8000]}")
+        return safety.wrap_untrusted(
+            f"http_request:{initial_method} {url}", f"{head}\n\n{r.text[:8000]}")
     return f"(too many redirects for {url})"
 
 

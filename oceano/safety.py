@@ -170,13 +170,10 @@ class _PinnedAdapter(HTTPAdapter):
         return super().send(request, **kw)
 
 
-def guarded_get(url, **kw):
-    """SSRF-guarded GET that PINS the connection to the validated IP — defeats DNS rebinding (the
-    resolve-then-reconnect TOCTOU that plain `check_url(); requests.get()` leaves open). Returns a
-    requests.Response; raises safety.Blocked if the URL is internal/unresolvable. Guard off
-    (OCEANO_URL_GUARD=0) → a plain requests.get."""
+def guarded_request(method, url, **kw):
+    """SSRF-guarded request pinned to a validated IP for the connection's lifetime."""
     if not URL_GUARD:
-        return requests.get(url, **kw)
+        return requests.request(method, url, **kw)
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise Blocked(_refuse("only http/https URLs with a host are allowed"))
@@ -184,9 +181,14 @@ def guarded_get(url, **kw):
     sess = requests.Session()
     sess.mount(p.scheme + "://", _PinnedAdapter(p.hostname, ip))
     try:
-        return sess.get(url, **kw)
+        return sess.request(method, url, **kw)
     finally:
         sess.close()
+
+
+def guarded_get(url, **kw):
+    """Rebinding-resistant SSRF-guarded GET; see guarded_request()."""
+    return guarded_request("GET", url, **kw)
 
 
 # Per-turn "this turn ingested untrusted content" flag — lives on the ONE per-turn TurnContext

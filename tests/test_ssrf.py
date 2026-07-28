@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-from oceano import safety  # noqa: E402
+from oceano import livebrowser, safety  # noqa: E402
 
 
 @pytest.mark.parametrize("addr", [
@@ -59,3 +59,96 @@ def test_guarded_get_and_check_url_agree_via_shared_classifier(monkeypatch):
     assert safety.check_url("http://internal.example.com/") is not None
     with pytest.raises(safety.Blocked):
         safety._safe_ip("internal.example.com")
+
+
+class _BrowserRequest:
+    def __init__(self, url):
+        self.url = url
+
+
+class _BrowserRoute:
+    def __init__(self, url):
+        self.request = _BrowserRequest(url)
+        self.aborted = False
+        self.continued = False
+
+    def abort(self):
+        self.aborted = True
+
+    def continue_(self):
+        self.continued = True
+
+
+class _BrowserContext:
+    def route(self, pattern, handler):
+        self.pattern = pattern
+        self.handler = handler
+
+    def route_web_socket(self, pattern, handler):
+        self.websocket_pattern = pattern
+        self.websocket_handler = handler
+
+
+class _WebSocketRoute:
+    def __init__(self, url):
+        self.url = url
+        self.closed = False
+        self.connected = False
+
+    def close(self):
+        self.closed = True
+
+    def connect_to_server(self):
+        self.connected = True
+
+
+def test_browser_guard_blocks_internal_subresources(monkeypatch):
+    ctx = _BrowserContext()
+    monkeypatch.setattr(
+        safety, "check_url", lambda url: "blocked" if "127.0.0.1" in url else None)
+    livebrowser._install_ssrf_guard(ctx)
+    route = _BrowserRoute("http://127.0.0.1:8080/private.js")
+    ctx.handler(route)
+    assert route.aborted
+    assert not route.continued
+
+
+def test_browser_guard_preserves_public_subresources(monkeypatch):
+    ctx = _BrowserContext()
+    monkeypatch.setattr(safety, "check_url", lambda url: None)
+    livebrowser._install_ssrf_guard(ctx)
+    route = _BrowserRoute("https://cdn.example.test/application.css")
+    ctx.handler(route)
+    assert route.continued
+    assert not route.aborted
+
+
+def test_browser_network_guard_fails_closed(monkeypatch):
+    ctx = _BrowserContext()
+    monkeypatch.setattr(safety, "check_url", lambda url: (_ for _ in ()).throw(RuntimeError()))
+    livebrowser._install_ssrf_guard(ctx)
+    route = _BrowserRoute("https://example.test/application.js")
+    ctx.handler(route)
+    assert route.aborted
+    assert not route.continued
+
+
+def test_browser_guard_blocks_internal_websockets(monkeypatch):
+    ctx = _BrowserContext()
+    monkeypatch.setattr(
+        safety, "check_url", lambda url: "blocked" if "127.0.0.1" in url else None)
+    livebrowser._install_ssrf_guard(ctx)
+    route = _WebSocketRoute("ws://127.0.0.1:8080/events")
+    ctx.websocket_handler(route)
+    assert route.closed
+    assert not route.connected
+
+
+def test_browser_guard_preserves_public_websockets(monkeypatch):
+    ctx = _BrowserContext()
+    monkeypatch.setattr(safety, "check_url", lambda url: None)
+    livebrowser._install_ssrf_guard(ctx)
+    route = _WebSocketRoute("wss://events.example.test/socket")
+    ctx.websocket_handler(route)
+    assert route.connected
+    assert not route.closed

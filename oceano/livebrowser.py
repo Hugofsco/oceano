@@ -16,6 +16,8 @@ Research lifecycle:
     preceding search just navigates — tabs are left alone
 """
 import base64
+import hashlib
+import json
 import os
 import queue
 import threading
@@ -81,25 +83,38 @@ def _launch(p):
 
 
 def _install_ssrf_guard(ctx):
-    """Re-apply the SSRF guard to every NAVIGATION the browser makes — not just the first URL
-    a tool checked. A fetched page can 3xx / <meta refresh> / JS-redirect to an internal address
-    (llama-swap :8081, embeddings :8082, SearXNG :8080, cloud metadata); without this the
-    live-browser path (fetch_url / browser_open on the web channel) would follow the redirect and
-    feed the internal response back to the model. We gate navigation requests only — each redirect
-    hop is its own navigation request, so hops are re-checked too — and let subresources through
-    (they don't return readable page text to the agent). Only http(s) is checked, so about:/data:
-    navigations still work; a no-op when OCEANO_URL_GUARD is off (check_url returns None)."""
+    """Block every browser request whose destination resolves to an internal address.
+
+    Applying the guard to subresources as well as navigations prevents untrusted public pages from
+    using images, fetch/XHR, forms, or WebSockets for blind requests into localhost, the LAN, or
+    cloud metadata. Public HTML/CSS/JS/image/API behavior remains unchanged.
+    """
     from oceano import safety
 
+    def _refusal(url):
+        checked = url
+        if url.startswith("ws://"):
+            checked = "http://" + url[5:]
+        elif url.startswith("wss://"):
+            checked = "https://" + url[6:]
+        return safety.check_url(checked)
+
     def _route(route):
+        req = None
         try:
             req = route.request
-            if (req.is_navigation_request() and req.url.startswith(("http://", "https://"))
-                    and safety.check_url(req.url)):
+            if req.url.startswith(("http://", "https://")) and _refusal(req.url):
                 route.abort()
                 return
         except Exception:
-            pass
+            # Security checks fail closed for network requests. Non-network browser URLs such as
+            # about:, data:, and blob: keep working because they never enter this branch.
+            if req is not None and req.url.startswith(("http://", "https://")):
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+                return
         try:
             route.continue_()
         except Exception:
@@ -110,11 +125,28 @@ def _install_ssrf_guard(ctx):
     except Exception:
         pass
 
+    def _websocket_route(route):
+        try:
+            if _refusal(route.url):
+                route.close()
+                return
+            route.connect_to_server()
+        except Exception:
+            try:
+                route.close()
+            except Exception:
+                pass
+
+    try:
+        ctx.route_web_socket("**/*", _websocket_route)
+    except Exception:
+        pass
+
 
 def _new_context(br):
     """A context that looks like a normal desktop browser: real UA (the bundled
     build's UA minus the 'Headless' token), a locale, and an Accept-Language header."""
-    opts = {"viewport": VIEWPORT}
+    opts = {"viewport": VIEWPORT, "service_workers": "block"}
     if STEALTH:
         try:                           # derive UA from this very browser so it tracks its version
             probe = br.new_context()
@@ -156,6 +188,7 @@ def _launch_persistent(p):
     profile = config.WORKSPACE.parent / "data" / "chrome-profile"
     profile.mkdir(parents=True, exist_ok=True)
     opts = {"channel": "chrome", "headless": True, "viewport": VIEWPORT, "locale": "en-US",
+            "service_workers": "block",
             "args": ["--disable-blink-features=AutomationControlled"] if STEALTH else [],
             "ignore_default_args": ["--enable-automation"] if STEALTH else []}
     if STEALTH:
@@ -474,6 +507,12 @@ def _worker():
                         closing = True
                     elif cmd == "research_arm":         # a web_search → open results as tabs from here on
                         st["armed_until"] = time.monotonic() + RESEARCH_TTL
+                    elif cmd == "session_fingerprint":  # cache partition without exposing cookies
+                        # storage_state covers cookies and origin localStorage (common bearer-token
+                        # storage). Only its digest leaves this browser-owned worker.
+                        material = json.dumps(ctx.storage_state(), sort_keys=True, separators=(",", ":"))
+                        out = {"ok": True,
+                               "fingerprint": hashlib.sha256(material.encode()).hexdigest()[:20]}
                     elif cmd == "fetch":               # full-fidelity visible page for fetch_url
                         if len(tabs) >= MAX_TABS:
                             close_record(tabs.pop(0))
@@ -483,6 +522,24 @@ def _worker():
                         response = nav(t, arg)
                         status = response.status if response is not None else 0
                         headers = response.headers if response is not None else {}
+                        cache_meta = {"authenticated": False, "sets_cookie": False,
+                                      "cache_control": ""}
+                        if response is not None:
+                            try:
+                                headers = response.all_headers()
+                            except Exception:
+                                pass
+                            try:
+                                request_headers = response.request.all_headers()
+                            except Exception:
+                                request_headers = {}
+                            cache_meta = {
+                                "authenticated": bool(
+                                    request_headers.get("cookie")
+                                    or request_headers.get("authorization")),
+                                "sets_cookie": "set-cookie" in headers,
+                                "cache_control": headers.get("cache-control", ""),
+                            }
                         try:
                             pg.wait_for_load_state("load", timeout=RENDER_WAIT)
                         except Exception:
@@ -493,6 +550,7 @@ def _worker():
                             text = ""
                         out = {"ok": bool(text), "text": text[:8000], "status": status,
                                "headers": {"Retry-After": headers.get("retry-after", "")},
+                               "cache": cache_meta,
                                "error": "" if text else "page had no readable text"}
                     elif cmd == "open":                # agent fetch/open a source
                         if RESEARCH_TTL and time.monotonic() < st["armed_until"]:
@@ -756,6 +814,11 @@ def capture(url, path, full_page=True, timeout=30000):
 def start_research():
     """A web_search arms research mode so explicit browser_open calls open persistent tabs."""
     submit("research_arm")
+
+
+def session_fingerprint():
+    """Opaque cache partition for browser auth state; secret values never leave the worker."""
+    return submit("session_fingerprint", wait=True).get("fingerprint", "")
 
 
 def fetch(url):

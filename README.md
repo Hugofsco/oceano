@@ -844,12 +844,16 @@ policy and `OCEANO_TOOL_*` settings replace them.
 Oceano uses one browsing policy across local-model and Claude/Codex tool calls. Interactive
 `fetch_url` renders in the shared browser with normal HTML, CSS, JavaScript, images, fonts, and API
 behavior. Oceano controls request volume between top-level page loads instead of filtering
-subresources, since filtering can break modern sites. Background jobs use the guarded HTTP reader.
+public subresources, since filtering can break modern sites. Destinations resolving to private,
+loopback, link-local, or metadata addresses are blocked for every navigation and subresource.
+Service workers are disabled so they cannot bypass that policy, and WebSockets use the same guard.
+Background jobs and API requests use IP-pinned connections to prevent DNS rebinding.
 
 All web entry points share per-origin serialization, a global concurrency cap, safe-GET caching
 and in-flight deduplication, and host cooldowns after HTTP 403/429 responses. `Retry-After` is
 honored. The defaults are a 1.5-second per-origin interval, four simultaneous origins, a five-minute
-cache, and a two-minute minimum block cooldown. Configure these with `OCEANO_WEB_MIN_INTERVAL`,
+cache, and a two-minute minimum block cooldown capped at one hour. Authenticated/private browser
+responses are not cached. Configure these with `OCEANO_WEB_MIN_INTERVAL`,
 `OCEANO_WEB_MAX_CONCURRENCY`, `OCEANO_WEB_CACHE_TTL`, `OCEANO_WEB_CACHE_ENTRIES`, and
 `OCEANO_WEB_BLOCK_COOLDOWN`; see `oceano.env.example` for browser controls. The initial browser
 load wait is tunable with `OCEANO_BROWSER_RENDER_WAIT`; the page remains live after that wait.
