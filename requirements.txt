@@ -13,8 +13,9 @@ croniter>=2.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-telegram-bot>=21
-# MCP client — connect Oceano to external tool servers (Settings/data/mcp.json)
-mcp>=1.0
+# MCP client/server bridge — 2.x removed the Server.list_tools()/call_tool() registration API
+# used by oceano.mcp_bridge_server. Stay on the tested 1.x line (requirements.lock pins 1.27.2).
+mcp>=1.0,<2.0
 # Voice over Telegram (speech-in/out). Models live under Oceano/assets; needs ffmpeg
 # on the host. STT = faster-whisper, TTS = Piper (espeak-ng is the fallback voice).
 faster-whisper>=1.0
