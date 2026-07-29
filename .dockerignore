@@ -13,7 +13,16 @@ __pycache__
 **/__pycache__
 *.pyc
 *.log
+# Secrets must never enter the build context. oceano.env.key is the AES key that decrypts every
+# secret field in data/ — secretcrypto.py deliberately keeps it OUTSIDE data/ so a copy of the data
+# folder alone can't unlock it, and `COPY . /app` would have inverted exactly that, baking the key
+# into an image layer. Set OCEANO_DATA_KEY via the compose env_file instead of shipping the file.
 oceano.env
+oceano.env.key
+.env
+tool-loading.toml
 # build artifacts / editor cruft
 *.tmp
 .DS_Store
+.pytest_cache
+.ruff_cache

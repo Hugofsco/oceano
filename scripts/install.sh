@@ -391,7 +391,8 @@ summary() {
   command -v claude >/dev/null && ok "Claude CLI    present (optional mind/delegate)" || skip "Claude CLI    absent (optional mind/delegate)"
   command -v codex  >/dev/null && ok "Codex CLI     present (optional mind/delegate)" || skip "Codex CLI     absent (optional mind/delegate)"
   echo
-  say "Open the web UI at http://127.0.0.1:8800  (default login: admin / admin)"
+  say "Open the web UI at http://127.0.0.1:8800  (user: admin)"
+  say "First boot prints a RANDOM password above; it is also saved to data/initial-password"
   command -v oceano >/dev/null && say "Or chat from the terminal:  oceano" \
     || say "Terminal client: scripts/install-cli.sh  →  then run 'oceano'"
 }
@@ -463,7 +464,8 @@ docker_main() {
   say "Health"
   port_up 8800 && ok "web UI :8800 up" \
     || warn ":8800 not answering yet — give it a moment ($DOCKER compose ${files[*]} logs -f oceano)"
-  say "Open the web UI at http://127.0.0.1:8800  (default login: admin / admin)"
+  say "Open the web UI at http://127.0.0.1:8800  (user: admin)"
+  say "First boot prints a RANDOM password above; it is also saved to data/initial-password"
 }
 
 # ============================================================================

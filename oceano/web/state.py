@@ -124,19 +124,62 @@ def _totp_uri(secret, account, issuer="Oceano"):
             f"&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30")
 
 
+INITIAL_PW_FILE = config.WORKSPACE.parent / "data" / "initial-password"
+
+
+def _mint_initial_password():
+    """The first-boot password. Random by default, so there is NO shipped credential an
+    attacker can look up: the web UI binds 0.0.0.0 for LAN/Tailscale reach, and the old
+    'admin'/'admin' default meant whoever reached the port first between install and the
+    owner's first login could log in, change the password, and own an instance that runs
+    shell commands. The forced-change gate never stopped that — it only ever confined the
+    session to /api/account, which is exactly the call an attacker needs.
+
+    Set OCEANO_INITIAL_PASSWORD to inject a known value instead (compose/vault/CI)."""
+    return os.environ.get("OCEANO_INITIAL_PASSWORD") or secrets.token_urlsafe(12)
+
+
+def _announce_initial_password(pw):
+    """Surface the generated password exactly once, two ways: stdout (so it lands in the
+    installer output and `journalctl -u oceano`) and a 0600 file for anyone who missed it.
+    Written through atomicio so it can't land world-readable."""
+    banner = ("\n" + "=" * 66 + "\n"
+              "  Oceano first boot — your login is:\n\n"
+              f"      user:     admin\n"
+              f"      password: {pw}\n\n"
+              "  You'll be asked to change it on first sign-in. Also saved to\n"
+              f"  {INITIAL_PW_FILE} (delete it once you've changed the password).\n"
+              + "=" * 66 + "\n")
+    print(banner, flush=True)
+    try:
+        atomicio.write_text(INITIAL_PW_FILE, pw + "\n")
+    except OSError:
+        pass
+
+
 def _auth_seed():
-    """Default login: admin / admin. Secret signs session cookies (persisted so
-    logins survive restarts). Override the default password in Settings → Account."""
+    """First-boot login: admin / a RANDOM password (see _mint_initial_password). `must_change`
+    forces the change-password flow on first sign-in even though the password isn't guessable —
+    so the UX the old 'admin' default provided is preserved without shipping a known credential.
+    Secret signs session cookies (persisted so logins survive restarts)."""
     salt = secrets.token_hex(16)
-    return {"user": "admin", "salt": salt, "pwhash": _hash_pw("admin", salt),
-            "secret": secrets.token_hex(32)}
+    pw = _mint_initial_password()
+    _announce_initial_password(pw)
+    return {"user": "admin", "salt": salt, "pwhash": _hash_pw(pw, salt),
+            "secret": secrets.token_hex(32), "must_change": True}
 
 
 def _is_default_pw(auth):
-    """True while the password is still the shipped default ('admin'). Stateless — the
-    UI uses it to force a password change before letting the user in. Self-clears the
-    moment the password is changed to anything else."""
+    """True while the password is still the one this install was seeded with. The UI and the
+    API middleware use it to force a password change before letting the user in.
+
+    Two sources, in cost order: the `must_change` flag set by _auth_seed and cleared by
+    /api/account, and — for installs seeded before the random-password change — the legacy
+    'admin' hash check, so an existing admin/admin store is still flagged after upgrading.
+    Checking the flag first also keeps the common case off the 200k-iteration PBKDF2 path."""
     try:
+        if auth.get("must_change"):
+            return True
         return hmac.compare_digest(_hash_pw("admin", auth.get("salt", "")), auth.get("pwhash", ""))
     except Exception:
         return False

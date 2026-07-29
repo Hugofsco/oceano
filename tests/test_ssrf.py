@@ -23,6 +23,12 @@ from oceano import livebrowser, safety  # noqa: E402
     "::ffff:169.254.169.254",      # IPv4-mapped IPv6 wrapping metadata — the bug
     "::ffff:10.0.0.5",             # IPv4-mapped IPv6 wrapping RFC1918
     "2002:a9fe:aafe::",            # 6to4 wrapping 169.254.170.254
+    # CGNAT / Tailscale: NOT is_private, so the named-flag checks alone missed the whole tailnet,
+    # including Tailscale's 100.100.100.100 MagicDNS/metadata endpoint.
+    "100.64.0.1", "100.100.100.100",
+    # Deprecated IPv6 site-local: reports is_global=True AND is_private=False on CPython 3.12,
+    # so it needs the explicit is_site_local check.
+    "fec0::1",
 ])
 def test_internal_addresses_are_blocked(addr):
     assert safety._internal_ip(addr) is not None, f"{addr} should classify as internal"
@@ -49,6 +55,79 @@ def test_check_url_allows_a_public_host(monkeypatch):
     monkeypatch.setattr(safety.socket, "getaddrinfo",
                         lambda host, *a, **k: [(0, 0, 0, "", ("93.184.216.34", 0, 0, 0))])
     assert safety.check_url("http://example.com/") is None
+
+
+@pytest.mark.parametrize("url", [
+    # A backslash terminates the authority for urllib3 (the parser the HTTP client uses) but not for
+    # urllib.parse: this URL is 'example.com' to urlparse (public → allowed) and '127.0.0.1' to the
+    # socket that actually connects. Validating one and connecting to the other is a straight bypass.
+    "http://127.0.0.1:8899\\@example.com/latest/meta-data/",
+    "http://example.com\t/",          # tab — urllib3 keeps it in the host, urlparse strips it
+    "http://exa\nmple.com/",
+])
+def test_check_url_refuses_urls_the_two_parsers_read_differently(url, monkeypatch):
+    # Resolve everything to a public address, so a refusal can only come from the parser check.
+    monkeypatch.setattr(safety.socket, "getaddrinfo",
+                        lambda host, *a, **k: [(0, 0, 0, "", ("93.184.216.34", 0, 0, 0))])
+    assert safety.check_url(url) is not None, f"{url!r} must be refused as ambiguous"
+
+
+@pytest.mark.parametrize("url", [
+    "http://example.com/", "https://example.com:8443/a/b?c=d",
+    "http://[2606:4700:4700::1111]/",     # bracketed IPv6 must NOT read as parser disagreement
+    "http://user:pw@example.com/",        # userinfo is stripped by both parsers
+    # A literal space in the PATH or QUERY is ordinary (requests percent-encodes it) and cannot move
+    # the host — only the authority is checked for suspicious characters. Scanning the whole URL
+    # refused these, which broke plain search/file links.
+    "http://example.com/search?q=hello world",
+    "http://example.com/my file.pdf",
+])
+def test_check_url_still_allows_well_formed_public_urls(url, monkeypatch):
+    monkeypatch.setattr(safety.socket, "getaddrinfo",
+                        lambda host, *a, **k: [(0, 0, 0, "", ("93.184.216.34", 0, 0, 0))])
+    assert safety.check_url(url) is None, f"{url!r} should be allowed"
+
+
+def test_pinned_adapter_fails_closed_when_the_url_host_is_not_the_validated_host():
+    # The adapter used to fall through to super().send() on a host mismatch — emitting the request
+    # unpinned and unvalidated (reachable via a redirect, or via the parser divergence above, since
+    # requests rewrites request.url with urllib3's parser before the adapter sees it).
+    adapter = safety._PinnedAdapter("example.com", "93.184.216.34", scheme="http")
+
+    class _Req:
+        url = "http://127.0.0.1:8899/%5C@example.com/"
+        headers = {}
+
+    with pytest.raises(safety.Blocked):
+        adapter.send(_Req())
+
+
+def test_guarded_request_works_over_plain_http(monkeypatch):
+    # assert_hostname/server_hostname are HTTPSConnection-only but landed in connection_pool_kw for
+    # BOTH connection classes, so every plain-http request through the guard raised
+    # TypeError("unexpected keyword argument 'assert_hostname'") — uncaught by callers, meaning the
+    # rebinding-proof path never actually ran for http. Exercise it against a real local socket.
+    import http.server
+    import socketserver
+    import threading
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK-HTTP")
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # Pin to loopback deliberately: this test is about the adapter, not the address classifier.
+    monkeypatch.setattr(safety, "_safe_ip", lambda host: "127.0.0.1")
+    try:
+        r = safety.guarded_get(f"http://localhost:{port}/", timeout=5)
+        assert r.status_code == 200 and r.text == "OK-HTTP"
+    finally:
+        srv.shutdown(); srv.server_close()
 
 
 def test_guarded_get_and_check_url_agree_via_shared_classifier(monkeypatch):

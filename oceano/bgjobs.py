@@ -124,7 +124,7 @@ def spawn(argv, cwd, display, label="", sid=None):
     reaper thread so it's never left a zombie. `sid` is the conversation that spawned it (so its
     result can be delivered back there); None when spawned outside a chat (telegram/scheduler).
     Returns the job record dict."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     jid = next(_counter)
     log_path = LOG_DIR / f"{jid}.log"
     rec = {"id": jid, "label": (label or display)[:140], "command": display,
@@ -134,6 +134,10 @@ def spawn(argv, cwd, display, label="", sid=None):
     with _mx:
         _jobs[jid] = rec
     logf = open(log_path, "wb")
+    # 0600: this log is the full stdout+stderr of an agent-spawned command, so it can contain
+    # anything the command printed (env dumps, tokens, API responses). open() lands at the process
+    # umask (0644 — world-readable); agentjobs.py already calls this and bgjobs.py was missed.
+    atomicio.secure(log_path)
     try:
         proc = subprocess.Popen(argv, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)

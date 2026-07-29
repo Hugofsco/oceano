@@ -7,6 +7,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from oceano.web.state import (
+    INITIAL_PW_FILE,
     SESSION_COOKIE,
     _current_user,
     _hash_pw,
@@ -116,6 +117,13 @@ async def change_account(request: Request, response: Response):
         # cookie is invalidated — the instinctive "I've been compromised, change my password" must
         # actually evict a thief's stolen cookie, which HMAC'ing with the old secret no longer will.
         auth["secret"] = secrets.token_hex(32)
+        # The first-boot password has been replaced: clear the forced-change flag and drop the
+        # 0600 copy of the seeded password so it can't linger on disk after it stops being valid.
+        auth.pop("must_change", None)
+        try:
+            INITIAL_PW_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
     auth["user"] = new_user
     data["auth"] = auth
     save(data)

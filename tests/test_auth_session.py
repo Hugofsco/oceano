@@ -21,9 +21,17 @@ from oceano.web import routes_auth, state  # noqa: E402
 from oceano.web.server import _require_auth  # noqa: E402
 
 
+SEED_PW = "seeded-first-boot-pw"
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STORE", tmp_path / "web.json")
+    # The store is seeded with a RANDOM password now, so pin it for the test — and redirect the
+    # 0600 copy into tmp_path so seeding never touches the real data/ dir.
+    monkeypatch.setenv("OCEANO_INITIAL_PASSWORD", SEED_PW)
+    monkeypatch.setattr(state, "INITIAL_PW_FILE", tmp_path / "initial-password")
+    monkeypatch.setattr(routes_auth, "INITIAL_PW_FILE", tmp_path / "initial-password")
     routes_auth._LOGIN_FAILS.clear()
 
 
@@ -34,7 +42,7 @@ def _app():
     return app
 
 
-def _login(client, user="admin", pw="admin"):
+def _login(client, user="admin", pw=SEED_PW):
     r = client.post("/api/login", json={"user": user, "password": pw})
     assert r.status_code == 200 and r.json().get("ok")
     return r.cookies.get(state.SESSION_COOKIE)
@@ -47,7 +55,7 @@ def test_password_change_revokes_other_outstanding_cookies():
 
     # the real user changes the password (from a different session — its own cookie is re-issued)
     r = client.post("/api/account",
-                    json={"current_password": "admin", "new_password": "a-strong-passphrase"})
+                    json={"current_password": SEED_PW, "new_password": "a-strong-passphrase"})
     assert r.status_code == 200
 
     # the stolen cookie no longer authenticates — the signing secret rotated out from under it
@@ -57,11 +65,11 @@ def test_password_change_revokes_other_outstanding_cookies():
 def test_logout_revokes_the_session_server_side():
     client = TestClient(_app())
     _login(client)
-    # Move off the default admin/admin first — the middleware blocks other state-changing POSTs
+    # Move off the seeded first-boot password first — the middleware blocks other state-changing POSTs
     # (like logout) while the default password stands, so this both satisfies that gate and gives
     # us a fresh post-rotation cookie to test logout revocation against.
     assert client.post("/api/account",
-                       json={"current_password": "admin", "new_password": "a-strong-passphrase"}).status_code == 200
+                       json={"current_password": SEED_PW, "new_password": "a-strong-passphrase"}).status_code == 200
     cookie = _login(client, pw="a-strong-passphrase")
     assert client.get("/api/me", cookies={state.SESSION_COOKIE: cookie}).status_code == 200
 

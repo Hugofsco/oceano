@@ -581,7 +581,8 @@ Browse and provision local models from the UI (Brain → Rivers):
 
 Served on **all interfaces** at port `8800` — reach it from any device on your trusted
 network at `http://<this-machine-ip>:8800` (or `http://127.0.0.1:8800` on the box itself).
-Login required — default **admin / admin**, **change it** in Settings → Account, and ideally
+Login required — user **admin** with a **random password generated on first boot** (printed to the
+console/journal and saved to `data/initial-password`). You're forced to change it on first sign-in, and ideally
 enable 2FA. To restrict it back to this machine only, set `OCEANO_WEB_HOST=127.0.0.1`.
 It's a single-page app with:
 
@@ -637,7 +638,7 @@ It's a single-page app with:
 
 > ⚠️ **Binds `0.0.0.0` (all interfaces)** for easy reach across a trusted LAN/Tailscale.
 > The agent can run shell commands, so the UI is gated by **login + optional TOTP 2FA** — but
-> that only protects you if you **change the default `admin/admin` password** and keep Oceano on
+> that only protects you if you **set your own password on first sign-in** and keep Oceano on
 > a **trusted network**. Do **not** put it on an untrusted network or expose it to the public
 > internet. To lock it to this machine, set `OCEANO_WEB_HOST=127.0.0.1` and reach it via an SSH
 > tunnel or `tailscale serve`.
@@ -746,7 +747,8 @@ journalctl -u oceano -f        # unified logs (web · telegram · scheduler · e
 sudo systemctl restart oceano  # restart everything
 ```
 
-Then open `http://127.0.0.1:8800` and log in with **admin / admin**.
+Then open `http://127.0.0.1:8800` and log in as **admin** with the random first-boot password the
+installer printed (also in `data/initial-password`). You'll be asked to set your own immediately.
 
 If only the **systemd unit** is broken (e.g. a wrong `WorkingDirectory` makes the engine fail with
 *"No module named 'oceano'"*), `scripts/install-daemon.sh` re-renders and reinstalls just the unit —
@@ -977,7 +979,7 @@ Oceano runs powerful tools (shell, file writes, a browser) for one trusted local
 - **Network binding** — the web UI binds all interfaces (`0.0.0.0`) by default for easy reach
   across a trusted LAN/Tailscale, gated by **login auth** + **optional TOTP 2FA** (RFC 6238 —
   authenticator app + QR; secret stays in the hardened `data/web.json`). The agent runs shell
-  commands, so this is **trusted-network-only**: change the default `admin/admin` password,
+  commands, so this is **trusted-network-only**: set your own password at first sign-in,
   enable 2FA, and never expose it to the public internet. Set `OCEANO_WEB_HOST=127.0.0.1` to
   bind loopback-only (reach it via SSH tunnel or `tailscale serve`).
 - **Secrets & tokens** — `data/web.json` (password hash, cookie-signing secret, endpoint API

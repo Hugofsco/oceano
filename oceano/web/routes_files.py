@@ -54,13 +54,43 @@ def list_all_files():
     return {"files": sorted(files), "dirs": sorted(dirs)}
 
 
+# Content types /api/raw will serve INLINE with their real media type — a browser renders these in
+# its own viewer and they carry no script. Everything else (HTML, SVG, XML, unknown) is forced to
+# download as octet-stream. Mirrors _INLINE_OK in routes_mail.py; SVG is deliberately NOT here —
+# it is a scriptable document, not a passive image.
+_RAW_INLINE_OK = ("image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/x-icon",
+                  "application/pdf", "text/plain")
+
+
 @router.get("/api/raw")
 def raw_file(path: str):
-    """Serve a workspace file with its real content-type (for images in chat, downloads)."""
+    """Serve a workspace file for the chat's inline images and the explorer's download.
+
+    Hardened because the workspace is NOT trusted input: the agent writes files there on
+    instruction from web pages, emails, and documents it reads. Served from the app's own origin,
+    an .html/.svg would otherwise execute with the session cookie — and same-origin script doesn't
+    need to *read* an HttpOnly cookie to use it, so it could drive /api/chat or open the
+    /api/terminal/ws PTY (whose gates are same-origin + cookie, both of which in-origin script
+    satisfies). So: nosniff always, `CSP: sandbox` to force an opaque origin however the response
+    is loaded, and a forced download for anything not on the passive-media allowlist above."""
     p = _wresolve(path)
     if not p.is_file():
         raise HTTPException(404, "not a file")
-    return FileResponse(str(p))
+    import mimetypes
+    ctype = mimetypes.guess_type(p.name)[0] or ""
+    fn = p.name.replace('"', "").replace("\n", "").replace("\r", "")
+    headers = {
+        # sandbox with no allow-same-origin → opaque origin even on a direct navigation
+        # (window.open / a pasted link), so the response can never touch the session.
+        "Content-Security-Policy": "sandbox",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+    if ctype in _RAW_INLINE_OK:
+        headers["Content-Disposition"] = f'inline; filename="{fn}"'
+        return FileResponse(str(p), media_type=ctype, headers=headers)
+    headers["Content-Disposition"] = f'attachment; filename="{fn}"'
+    return FileResponse(str(p), media_type="application/octet-stream", headers=headers)
 
 
 # Folders never worth statting for app auto-reload — they're what blows a preview

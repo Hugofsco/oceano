@@ -109,6 +109,19 @@ WAKE_WORD = os.environ.get("OCEANO_WAKE_WORD", "oceano")
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
+# Runtime state lives here: every SQLite store, web.json (password hash, cookie-signing secret,
+# endpoint keys), hosts.json + the SSH keys, mail.json, and the job/agent logs. Individual files are
+# written 0600 by atomicio, but the DIRECTORY was left at the process umask (0775 — group-writable,
+# world-listable). Two consequences that 0700 closes at the root: a group member could replace
+# data/.mind-token and then authenticate to /api/mcp/call (full tool execution), and 0700 also
+# denies traversal to everything beneath, which covers log files written before they were hardened.
+DATA_DIR = WORKSPACE.parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.chmod(0o700)                    # re-applied every boot, so an existing install is fixed too
+except OSError:
+    pass
+
 # Encryption-at-rest key for the secret fields in ./data (mail passwords, SSH credentials,
 # API keys, the calendar feed URL). Resolved/generated once, here, so a bad key-file write
 # fails loudly at boot instead of surfacing later when a user first saves a secret.

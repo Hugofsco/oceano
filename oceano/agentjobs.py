@@ -132,7 +132,7 @@ def spawn(task, provider="", label="", tools=None, timeout=0, cwd=None, sid=None
     if model and p not in ("claude", "codex"):   # an endpoint-pinned agent IS an api-style run
         p = "api"
     timeout = min(int(timeout) or DEFAULT_TIMEOUT, delegate._DELEGATE_MAX)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)   # 0700: holds full sub-agent transcripts
     with _mx:
         running = [j for j in _jobs.values() if j["state"] in ("starting", "running")]
         if len(running) >= MAX_AGENTS:

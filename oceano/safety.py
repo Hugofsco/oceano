@@ -75,12 +75,60 @@ def _unwrap_ip(ip):
 
 def _internal_ip(addr):
     """Given a resolved address string, return the classified ip if it's an internal/non-routable
-    target that SSRF must block, else None. One place so check_url and _safe_ip can't drift apart."""
+    target that SSRF must block, else None. One place so check_url and _safe_ip can't drift apart.
+
+    `not is_global` is the primary test because the named flags have real gaps: 100.64.0.0/10
+    (CGNAT — and the whole Tailscale tailnet, including the 100.100.100.100 MagicDNS/metadata
+    endpoint) is NOT is_private, and neither is fec0::/10. Since the README recommends reaching
+    Oceano over Tailscale, an agent that could fetch 100.64/10 could reach every node on the
+    tailnet. The explicit flags stay as belt-and-braces in case a stdlib definition shifts."""
     ip = _unwrap_ip(ipaddress.ip_address(addr))
-    if (ip.is_private or ip.is_loopback or ip.is_link_local
+    # is_site_local is checked separately: on CPython 3.12 fec0::/10 reports is_global=True and
+    # is_private=False, so neither the primary test nor the flags below would catch it.
+    if (not ip.is_global
+            or getattr(ip, "is_site_local", False)
+            or ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
         return ip
     return None
+
+
+# A URL string must mean the SAME host to us and to the HTTP client, or validating one and
+# connecting to the other is a straight SSRF bypass. urllib.parse and urllib3 disagree on several
+# shapes — most importantly a backslash, which terminates the authority for urllib3 but not for
+# urlparse: 'http://127.0.0.1:8899\\@example.com/' is 'example.com' to urlparse (public → allowed)
+# and '127.0.0.1' to the client that actually connects. Resolve the host with the parser the client
+# uses, and refuse outright when the two disagree.
+_URL_BAD_CHARS = re.compile(r"[\\\s\x00-\x1f\x7f]")
+# Only the AUTHORITY is checked for those characters. Scanning the whole URL would refuse ordinary
+# links whose path/query contains a literal space ('…/search?q=hello world', '…/my file.pdf') —
+# requests percent-encodes those itself, and they can't move the host.
+_URL_AUTHORITY = re.compile(r"\A[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]*)")
+
+
+def _url_host(url):
+    """(host, refusal) for `url` — host is what the HTTP client will really connect to.
+    Exactly one of the two is None."""
+    m = _URL_AUTHORITY.match(url or "")
+    if m and _URL_BAD_CHARS.search(m.group(1)):
+        return None, _refuse("URL authority contains a backslash, whitespace, or a control character")
+    try:
+        loose = urlparse(url).hostname
+    except ValueError:
+        return None, _refuse("cannot parse URL")
+    try:
+        from urllib3.util import parse_url
+        strict = parse_url(url).host
+    except Exception:
+        return None, _refuse("cannot parse URL")
+    if not strict or not loose:
+        return None, _refuse("no host in URL")
+
+    def _norm(h):
+        return h.lower().strip("[]")            # urllib3 keeps IPv6 brackets, urlparse strips them
+    if _norm(strict) != _norm(loose):
+        return None, _refuse(f"ambiguous URL: host parses as {loose!r} or {strict!r}")
+    return _norm(strict), None
 
 
 def check_url(url):
@@ -91,9 +139,9 @@ def check_url(url):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return _refuse(f"only http/https allowed (got {parsed.scheme or 'none'!r})")
-    host = parsed.hostname
-    if not host:
-        return _refuse("no host in URL")
+    host, refusal = _url_host(url)
+    if refusal:
+        return refusal
     try:
         addrs = {info[4][0] for info in socket.getaddrinfo(host, None)}
     except socket.gaierror:
@@ -153,20 +201,33 @@ def _safe_ip(host):
 class _PinnedAdapter(HTTPAdapter):
     """Pin the socket to a pre-validated IP while keeping the hostname for the Host header and TLS
     SNI / cert verification — so DNS can't rebind to an internal IP between the check and the connect."""
-    def __init__(self, host, ip, **kw):
-        self._host, self._ip = host, ip
+    def __init__(self, host, ip, scheme="https", **kw):
+        self._host, self._ip, self._scheme = host, ip, scheme
         super().__init__(**kw)
 
     def init_poolmanager(self, connections, maxsize, block=False, **kw):
-        kw["server_hostname"] = self._host                 # SNI + cert hostname stay the real host
-        kw["assert_hostname"] = self._host
+        # HTTPS-only kwargs. They land in connection_pool_kw, which is passed to BOTH
+        # HTTPConnection and HTTPSConnection — and HTTPConnection accepts neither, so setting them
+        # unconditionally made every plain-http request through this adapter raise
+        # TypeError("unexpected keyword argument 'assert_hostname'"). That is not caught by callers'
+        # `except Blocked / RequestException`, so the guarded http path raised instead of fetching.
+        if self._scheme == "https":
+            kw["server_hostname"] = self._host             # SNI + cert hostname stay the real host
+            kw["assert_hostname"] = self._host
         super().init_poolmanager(connections, maxsize, block=block, **kw)
 
     def send(self, request, **kw):
         p = urlparse(request.url)
-        if (p.hostname or "").lower() == self._host.lower():
-            request.headers["Host"] = p.netloc             # keep the original host[:port]
-            request.url = p._replace(netloc=self._ip + (f":{p.port}" if p.port else "")).geturl()
+        if (p.hostname or "").lower() != self._host.lower():
+            # FAIL CLOSED. Previously this fell through to super().send() — sending the request
+            # unpinned and unvalidated. That is reachable two ways: a redirect to another host, and
+            # a URL the two parsers read differently (requests rewrites request.url via urllib3's
+            # parser, so 'http://127.0.0.1:8899\\@example.com/' arrives here with hostname
+            # 127.0.0.1 while we validated example.com). Never emit an unvalidated request.
+            raise Blocked(_refuse(f"URL host {p.hostname!r} is not the validated host "
+                                  f"{self._host!r} — refusing to send unvalidated"))
+        request.headers["Host"] = p.netloc                 # keep the original host[:port]
+        request.url = p._replace(netloc=self._ip + (f":{p.port}" if p.port else "")).geturl()
         return super().send(request, **kw)
 
 
@@ -175,11 +236,14 @@ def guarded_request(method, url, **kw):
     if not URL_GUARD:
         return requests.request(method, url, **kw)
     p = urlparse(url)
-    if p.scheme not in ("http", "https") or not p.hostname:
+    if p.scheme not in ("http", "https"):
         raise Blocked(_refuse("only http/https URLs with a host are allowed"))
-    ip = _safe_ip(p.hostname)
+    host, refusal = _url_host(url)                 # the host the CLIENT will connect to
+    if refusal:
+        raise Blocked(refusal)
+    ip = _safe_ip(host)
     sess = requests.Session()
-    sess.mount(p.scheme + "://", _PinnedAdapter(p.hostname, ip))
+    sess.mount(p.scheme + "://", _PinnedAdapter(host, ip, scheme=p.scheme))
     try:
         return sess.request(method, url, **kw)
     finally:

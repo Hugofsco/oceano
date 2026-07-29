@@ -4,6 +4,21 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const api = (p, o) => fetch(p, o).then(r => { if (r.status === 401) { showLogin(); throw new Error("unauthorized"); } return r.json(); });
 const escapeHtml = s => (s || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+/* Download a workspace file. Uses a real <a download> rather than window.open: the workspace holds
+   agent-written files whose content can be attacker-influenced, and a top-level navigation to one
+   would render it (an .html/.svg executes in our own origin with the session cookie). /api/raw also
+   forces a download server-side for anything but passive image/PDF/text — this keeps the client from
+   even attempting the navigation. */
+function downloadRaw(path, name) {
+  const a = document.createElement("a");
+  a.href = "/api/raw?path=" + encodeURIComponent(path);
+  a.download = name || path.split("/").pop() || "download";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 /* themed confirm dialog — returns a Promise<boolean> */
 function confirmAction(title, msg, okLabel = "Delete") {
   return new Promise(resolve => {
@@ -2812,7 +2827,7 @@ async function expLoad(path) {
         : [...(isPreviewable(e.name) ? [{ label: previewLabel(e.name), action: () => openPreview(e.path) }] : []),
            { label: "Open here", action: () => expOpenFile(e.path) },
            { label: "Open in new window", action: () => openFileWindow(e.path) },
-           { label: "Download", action: () => window.open("/api/raw?path=" + encodeURIComponent(e.path), "_blank") }];
+           { label: "Download", action: () => downloadRaw(e.path, e.name) }];
       items.push({ label: "Rename", action: () => expRename(e) }, { sep: true }, { label: "Delete", danger: true, action: () => expDelete(e) });
       showCtx(ev.clientX, ev.clientY, items);
     };
