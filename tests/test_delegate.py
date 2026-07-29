@@ -260,6 +260,32 @@ def test_to_claude_stream_skills_true_wires_the_scoped_bridge_not_memory(monkeyp
     assert "--mcp-config" in argv and "--strict-mcp-config" in argv
     assert "mcp__oceano__list_skills" in argv and "mcp__oceano__load_skill" in argv
     assert "mcp__oceano__remember" not in argv and "mcp__oceano__recall" not in argv
+    assert "--disallowedTools Skill,Agent,Workflow,SendMessage" in argv
+    assert "Never invoke Claude's native Skill" in argv
+    assert "Never use native Agent/Workflow/Task tools" in argv
+
+
+def test_to_claude_stream_isolated_resident_disables_inherited_surfaces(
+        monkeypatch, tmp_path):
+    argv_file = tmp_path / "argv.txt"
+    env_file = tmp_path / "env.txt"
+    script = tmp_path / "fake_claude.py"
+    script.write_text(
+        "import json, os, sys\n"
+        f"open({str(argv_file)!r}, 'w').write(repr(sys.argv))\n"
+        f"open({str(env_file)!r}, 'w').write(os.environ.get('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', ''))\n"
+        "print(json.dumps({'type':'result','result':'ok','is_error':False,'num_turns':1}))\n")
+    shim = tmp_path / "claude"
+    shim.write_text(f"#!/bin/sh\nexec python3 {script} \"$@\"\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr("oceano.delegate.find_claude", lambda: str(shim))
+    result = delegate.to_claude_stream(
+        "do it", cwd=str(tmp_path), isolated_resident=True)
+    assert result["ok"] is True
+    argv = argv_file.read_text()
+    assert "--setting-sources" in argv and "--disable-slash-commands" in argv
+    assert "--permission-mode" in argv and "dontAsk" in argv
+    assert env_file.read_text() == "1"
 
 
 def test_to_codex_skills_true_uses_a_private_subagent_home_and_keeps_the_scoped_config(monkeypatch, tmp_path):

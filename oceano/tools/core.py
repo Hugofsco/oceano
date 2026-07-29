@@ -8,7 +8,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import config
 from oceano import atomicio, policies, traces, turnctx
@@ -144,7 +144,10 @@ class ToolResult:
     error: str | None = None
     retryable: bool = False
     side_effects: tuple[str, ...] = field(default_factory=tuple)
+    verification: tuple[str, ...] = field(default_factory=tuple)
     code: str = ""
+
+    WIRE_PROTOCOL: ClassVar[str] = "oceano.tool-result.v1"
 
     def text(self) -> str:
         if self.ok:
@@ -157,6 +160,43 @@ class ToolResult:
             return json.dumps(self.data, ensure_ascii=False, default=str)
         message = self.error or self.summary or "tool execution failed"
         return message if message.lstrip().upper().startswith("ERROR") else f"ERROR: {message}"
+
+    def to_wire(self) -> dict:
+        """Versioned transport envelope used by the resident MCP bridge."""
+        data = json.loads(json.dumps(self.data, ensure_ascii=False, default=str))
+        return {
+            "protocol": self.WIRE_PROTOCOL,
+            "ok": self.ok,
+            "summary": self.summary,
+            "data": data,
+            "error": self.error,
+            "retryable": self.retryable,
+            "side_effects": list(self.side_effects),
+            "verification": list(self.verification),
+            "code": self.code,
+        }
+
+    @classmethod
+    def from_wire(cls, value):
+        """Decode a bridge envelope, returning None for legacy/unstructured values."""
+        payload = value
+        if isinstance(value, str):
+            try:
+                payload = json.loads(value)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(payload, dict) or payload.get("protocol") != cls.WIRE_PROTOCOL:
+            return None
+        return cls(
+            ok=bool(payload.get("ok")),
+            summary=str(payload.get("summary") or ""),
+            data=payload.get("data"),
+            error=(str(payload["error"]) if payload.get("error") is not None else None),
+            retryable=bool(payload.get("retryable")),
+            side_effects=tuple(str(effect) for effect in payload.get("side_effects") or ()),
+            verification=tuple(str(item) for item in payload.get("verification") or ()),
+            code=str(payload.get("code") or ""),
+        )
 
     @classmethod
     def from_value(cls, value, *, spec=None):
@@ -189,10 +229,18 @@ def _normalize_result(name, args, value, spec):
         if match and int(match.group(1)) != 0:
             code = "tests_failed" if name == "run_tests" else "command_failed"
             return ToolResult(False, error=text, retryable=True, code=code)
-        if "timed out" in low:
+        # shell.py emits this marker as the first line only when Oceano itself kills a
+        # command at the configured deadline. Command output may legitimately discuss
+        # something that "timed out" while still exiting successfully.
+        if low.lstrip().startswith("(timed out after "):
             return ToolResult(False, error=text, retryable=True, code="timeout")
     if result.ok and name in {"list_files", "edit_file"} and low.startswith("(no such"):
         return ToolResult(False, error=text, retryable=True, code="not_found")
+    if result.ok and name in {"run_tests", "run_shell", "python_exec"}:
+        result = ToolResult(
+            True, summary=result.summary, data=result.data,
+            side_effects=result.side_effects,
+            verification=result.verification + (f"{name}:ok",), code=result.code)
     if not result.ok and not result.code:
         retryable = any(term in low for term in ("not found", "timed out", "temporar", "try again"))
         code = "not_found" if "not found" in low else "tool_error"
@@ -206,7 +254,8 @@ def _normalize_result(name, args, value, spec):
         }.get(name)
         if effects:
             return ToolResult(True, summary=result.summary, data=result.data,
-                              side_effects=effects, code=result.code)
+                              side_effects=effects, verification=result.verification,
+                              code=result.code)
     return result
 
 

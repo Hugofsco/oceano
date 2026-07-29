@@ -105,7 +105,12 @@ def mcp_tools(request: Request):
     from oceano import mindbridge
     scope = request.headers.get("x-oceano-scope") or None
     catalog_id = request.headers.get("x-oceano-catalog") or None
-    return {"tools": mindbridge.tool_schemas(scope=scope, catalog_id=catalog_id)}
+    session = request.headers.get("x-oceano-session") or None
+    background = request.headers.get("x-oceano-background") == "1"
+    client = request.headers.get("x-oceano-client") or "web"
+    return {"tools": mindbridge.tool_schemas(
+        scope=scope, catalog_id=catalog_id, session=session,
+        background=background, client=client)}
 
 
 @router.post("/api/mcp/call")
@@ -120,9 +125,12 @@ async def mcp_call(req: Request):
     client = req.headers.get("x-oceano-client") or "web"      # "desktop" unlocks oceano/tools/desktop.py's tools
     scope = req.headers.get("x-oceano-scope") or None
     catalog_id = req.headers.get("x-oceano-catalog") or None
+    operation_id = req.headers.get("x-oceano-operation-id") or None
     print(f"[mind] tool {name}({list(args)})", flush=True)
-    return {"result": await asyncio.to_thread(
-        mindbridge.run_tool, name, args, session, background, client, scope, catalog_id)}
+    result = await asyncio.to_thread(
+        mindbridge.run_tool_result, name, args, session=session, background=background,
+        client=client, scope=scope, catalog_id=catalog_id, operation_id=operation_id)
+    return {"result": result.text(), "structured": result.to_wire()}
 
 
 @router.get("/api/delegate")

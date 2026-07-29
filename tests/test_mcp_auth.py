@@ -64,7 +64,6 @@ def test_dynamic_catalog_routes_schema_and_call_through_token_gated_bridge(
         "parameters": {"type": "object", "properties": {"value": {"type": "string"}},
                        "required": ["value"]}}}
     tools.register("bridge_probe", schema, lambda value: "probe:" + value)
-    mindbridge._ALLOW.add("bridge_probe")
     try:
         catalog_id, _route = mindbridge.create_catalog(
             "use the bridge probe", "claude:test", max_calls=1)
@@ -76,9 +75,59 @@ def test_dynamic_catalog_routes_schema_and_call_through_token_gated_bridge(
         called = client.post("/api/mcp/call", headers=headers,
                              json={"name": "bridge_probe", "args": {"value": "ok"}})
         assert called.json()["result"] == "probe:ok"
+        assert called.json()["structured"]["protocol"] == "oceano.tool-result.v1"
+        assert called.json()["structured"]["ok"] is True
         exhausted = client.post("/api/mcp/call", headers=headers,
                                 json={"name": "bridge_probe", "args": {"value": "again"}})
         assert "budget exhausted" in exhausted.json()["result"]
     finally:
-        mindbridge._ALLOW.discard("bridge_probe")
         tools.unregister_prefix("bridge_probe")
+
+
+def test_bridge_idempotency_replays_non_idempotent_side_effect_once(client):
+    from oceano import mindbridge, tools
+    calls = []
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "bridge_mutation_probe",
+            "description": "Controlled side-effecting bridge probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+        },
+        "x-oceano": {
+            "capability": "bridge_mutation",
+            "side_effecting": True,
+            "idempotent": False,
+            "risk": "medium",
+        },
+    }
+
+    def mutate(value):
+        calls.append(value)
+        return "mutated:" + value
+
+    tools.register("bridge_mutation_probe", schema, mutate)
+    headers = {
+        "X-Oceano-Mind-Token": mindbridge.token(),
+        "X-Oceano-Operation-ID": "mutation-request-1",
+    }
+    try:
+        first = client.post(
+            "/api/mcp/call", headers=headers,
+            json={"name": "bridge_mutation_probe", "args": {"value": "one"}})
+        replay = client.post(
+            "/api/mcp/call", headers=headers,
+            json={"name": "bridge_mutation_probe", "args": {"value": "one"}})
+        conflict = client.post(
+            "/api/mcp/call", headers=headers,
+            json={"name": "bridge_mutation_probe", "args": {"value": "two"}})
+        assert first.json()["result"] == "mutated:one"
+        assert replay.json()["structured"] == first.json()["structured"]
+        assert conflict.json()["structured"]["code"] == "idempotency_conflict"
+        assert calls == ["one"]
+    finally:
+        tools.unregister_prefix("bridge_mutation_probe")

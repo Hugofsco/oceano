@@ -430,7 +430,7 @@ vector:
   can never be deleted.
 - **Audited** — every action lands in the **Logs** feed.
 
-Both the local model and the **Claude mind** get these tools (the mind via the curated MCP bridge).
+The local model and both resident minds get these tools through the same enabled registry and MCP bridge.
 Uses Python's stdlib `imaplib` / `smtplib` (no new dependencies); Gmail / iCloud / Yahoo / Fastmail
 and self-hosted IMAP all work with an app password. Accounts live in `data/mail.json` (gitignored).
 
@@ -486,7 +486,13 @@ reset time in the error, and partial work from earlier attempts is kept.
 model, or the local model (with a weak-model warning) — owned by the daemon, not the turn. It's
 capped (`OCEANO_AGENTS_MAX`, default 3, one local slot), can't recurse (a spawned agent gets no
 spawn/delegate/workflow tools), streams progress to `data/agent-logs/`, and its result is
-**delivered back into the chat that spawned it**. `spawn_job` does the same for a plain
+**delivered back into the chat that spawned it**. Starting a child is asynchronous: the parent
+continues any immediate independent work and emits a normal progress response, then its model turn
+closes while the daemon-owned child keeps running. Oceano detects a tool-only parent exit and grants
+exactly one correction pass; `spawn_agent` is removed and daemon-blocked during that pass so the
+child cannot be duplicated. Cancellation skips correction, and a second empty exit produces an
+honest visible fallback plus a recoverable checkpoint. If the parent needs the child result before
+it can answer, it must use blocking `delegate` instead. `spawn_job` does the same for a plain
 long-running command (same gates as `run_shell`), and workflows fan out with the
 **agent + await** nodes. All of it shows in the background-jobs indicator, and a daemon restart
 marks orphaned runs `lost` — never a stale `running`.
@@ -830,7 +836,9 @@ historical errors, tool-call counts, catalog size, and schema-token savings. Pro
 results, and answers are never stored in this telemetry.
 
 Hybrid tool loading separates three concerns: tools registered by the process, tools allowed
-to execute in a particular conversation, and schemas advertised to the model. It starts with
+to execute in a particular conversation, and schemas advertised to the model. Resident `full`
+means every globally enabled registered built-in plus every currently connected MCP tool; contained
+workflow/delegate scopes remain explicit narrower boundaries. It starts with
 budgeted capability bundles selected from the request. The virtual `discover_tools` schema can
 then add only already-allowed tools for later calls in the same turn. If selection still fails,
 the configured recovery expands relevant bundles once and may expose the complete allowed catalog
@@ -841,14 +849,77 @@ copy `tool-loading.toml.example` to the gitignored `tool-loading.toml`. Preceden
 allowlist → surface → first matching model rule → global environment/default policy. Legacy
 `OCEANO_DYNAMIC_TOOL_*` settings remain supported for existing installations.
 
+Bundle matching supports both broad `aliases` and conjunctive `requires` intent groups. Every
+nested `requires` group must match at least one request token, allowing a bundle to require both a
+domain (for example `email`) and an operation (`reply`) instead of loading read and write tools for
+every mention of that domain. Schema budgets are applied only after matching; routing telemetry and
+the resident benchmark report expected-versus-selected bundles, recall, precision, missing tools,
+budget fit, direct completion, discovery calls, and delegation without retaining prompt or result
+content.
+
+Run the deterministic routing benchmark with `python -m oceano.resident_bench`. For an isolated
+live Claude/Codex/Grok comparison using an xAI endpoint already saved in Oceano, run:
+
+```bash
+python -m oceano.resident_bench --live --providers claude,codex,api --modes hybrid \
+  --suite extended \
+  --api-base-url https://api.x.ai/v1 --api-model grok-4.3 --api-label grok-4.3
+```
+
+The endpoint key is resolved from Oceano's encrypted runtime settings and is never accepted on the
+command line or written to the report.
+
+Live suites include `basic`, `extended`, unseen `holdout` contracts, and longer seeded-repair
+loops. Use `--cases id,id` for a focused comparison and `--repetitions N` to measure variance:
+
+```bash
+python -m oceano.resident_bench --live --suite holdout \
+  --cases chunking-contract --repetitions 3 --providers claude,codex,api \
+  --modes hybrid --api-base-url https://api.x.ai/v1 \
+  --api-model grok-4.3 --api-label grok-4.3
+```
+
+Live reports record functional passes, score/latency/tool-call variance, time to first action,
+post-write verification, call-budget overage, repeated and unrelated tool counts, unexpected
+files, delegation, discovery, and scope adherence. They retain tool names and aggregate counts
+only—never prompts, answers, tool arguments/results, endpoint keys, or generated file contents.
+
 The supplied examples use hybrid loading for Qwen models and for the resident Claude/Codex
 MCP body. Qwen receives a 4,200-token initial budget and 7,600-token discovery ceiling; resident
 minds use 3,600 and 7,000 tokens respectively. Resident catalogs use the same bundles,
 `discover_tools`, cumulative expansion, telemetry, and execution allowlist separation as API/local
 agents. The opaque catalog ID also carries a daemon-enforced call budget. In resident hybrid mode,
-Claude file/shell work runs through this enforceable bridge; Codex native calls are observed and
-cancelled at their start event because its CLI does not expose a pre-execution hook. Workflows and
-delegates with explicit allowlists continue to expose exactly that allowed set.
+Claude file/shell work runs through this enforceable bridge. Resident Codex requests a read-only
+sandbox and installs a `PreToolUse` guard that denies native shell and mutation paths before they
+run, directing those operations through Oceano MCP instead. Workflows and delegates with explicit
+allowlists continue to expose exactly that allowed set.
+
+The resident bridge carries a versioned structured result alongside its legacy text response, so
+all minds receive the same success flag, error code, retryability, side-effect and verification evidence, and data.
+Each MCP request also carries an operation ID. Repeated delivery of a non-idempotent side-effecting
+call replays the original result instead of executing it or consuming the catalog budget twice.
+The local proxy retries one transport loss with that same ID, covering a lost response after a
+successful mutation; reusing an operation ID for different arguments is rejected. Each catalog is
+bound to its originating session, interactive/background channel, client, and scope. It is closed
+when a resident turn completes; a six-hour TTL and bounded LRU registry clean up interrupted
+processes and abandoned streams.
+
+Resident turns also maintain an atomic, mode-0600 recovery checkpoint. It contains operation
+fingerprints, typed outcomes, side effects, and verification evidence only--never prompts, tool
+arguments/results, or answers. A clean turn removes it; an interrupted or failed turn injects the
+compact record into the next turn so the mind inspects current state and avoids replaying mutations.
+The Health app reports recoverable turns, active catalogs, provider reliability, discovery use,
+catalog misses, budget pressure, duplicate operations, verification, and repeated failing tools.
+
+A repeatable resident benchmark compares Claude, Codex, and the configured API/cloud agent in both
+full and hybrid tool modes. The default run is deterministic and credential-free; `--live` opts into
+real provider executions inside isolated temporary workspaces. Reports are content-free, written at
+0600 under gitignored `data/`:
+
+```bash
+python -m oceano.resident_bench
+python -m oceano.resident_bench --live --providers claude,codex
+```
 
 ```bash
 cp oceano.env.example oceano.env
@@ -944,8 +1015,10 @@ oceano/
   agentjobs.py       daemon-owned background sub-agents (spawn_agent) — Claude / Codex / cloud / local
   personality.py     the user-edited persona (Brain → Identity), injected first each turn
   delegate.py        delegation to Claude Code / a cloud model (per-role config) + the "mind" toggle
-  mindbridge.py      Claude-as-mind: Oceano's tools exposed to the mind, executed in the daemon
-  mcp_bridge_server.py  stdio MCP proxy Claude Code launches to reach those tools (token-gated)
+  mindbridge.py      turn-bound Claude/Codex tool catalogs, policy, budgets, and execution bridge
+  mcp_bridge_server.py  stdio MCP proxy resident minds launch to reach those tools (token-gated)
+  turncheckpoints.py durable content-free recovery state for interrupted resident turns
+  resident_bench.py repeatable full-vs-hybrid benchmark matrix for Claude, Codex, and API minds
   desktopbridge.py   request/response RPC to the OceanoDesktop app (native file dialogs, clipboard, …)
   notes.py           Kanban board (JSON-persisted)
   notebook.py        longer-form Markdown notes (JSON-persisted)

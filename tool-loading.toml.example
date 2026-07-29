@@ -7,7 +7,7 @@
 # Precedence: explicit allowlist > surface > first matching model rule > default/environment.
 
 [default]
-mode = "full"                   # non-Qwen models keep the complete allowed catalog
+mode = "full"                   # non-Qwen models keep every enabled built-in + connected MCP tool
 schema_budget = 5000            # approximate schema tokens on the first call
 max_schema_budget = 9000        # cumulative ceiling after discover_tools
 discovery = true
@@ -50,5 +50,10 @@ ambiguous = "discover"
 # [bundles.project-management]
 # description = "Read and update project-management issues"
 # aliases = ["issue", "ticket", "project", "sprint"]
+# Every nested `requires` group must contribute at least one request token. This distinguishes
+# domain + intent (for example, reading a ticket from changing one) and avoids broad keyword hits.
+# requires = [["issue", "ticket"], ["read", "list", "update", "close"]]
+# `excludes` suppresses known semantic collisions even when aliases match.
+# excludes = ["release"]
 # tools = ["issues_list", "issue_read", "issue_update"]
 # core = ["issues_list", "issue_read"]

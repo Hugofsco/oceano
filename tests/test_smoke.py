@@ -89,13 +89,11 @@ def test_schemas_are_registered():
     assert not missing, f"schemas with no registered implementation: {missing}"
 
 
-def test_mindbridge_allow_is_real():
-    """Every tool exposed to the resident mind (Claude/Codex) actually exists.
-    This is the assertion that would have caught the scheduler-tools gap."""
-    from oceano import mindbridge
-    _tools, registered, _schema = _registry()
-    missing = sorted(mindbridge._ALLOW - registered)
-    assert not missing, f"mindbridge._ALLOW names not registered: {missing}"
+def test_mindbridge_full_surface_matches_enabled_registry():
+    """Resident full mode means every globally enabled built-in and connected MCP tool."""
+    from oceano import mindbridge, tools
+    expected = {schema["function"]["name"] for schema in tools.schemas()}
+    assert set(mindbridge.tool_names()) == expected
 
 
 def test_memory_tools_are_real():
@@ -145,7 +143,9 @@ def test_mindbridge_schemas_build():
     assert schemas, "mindbridge exposes no tools to the mind"
     for s in schemas:
         assert s.get("function", {}).get("name"), f"malformed bridge schema: {s}"
-    assert set(mindbridge.tool_names()) <= mindbridge._ALLOW
+    from oceano import tools
+    assert set(mindbridge.tool_names()) == {
+        schema["function"]["name"] for schema in tools.schemas()}
 
 
 if __name__ == "__main__":  # run without pytest: `venv/bin/python tests/test_smoke.py`

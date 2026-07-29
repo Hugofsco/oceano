@@ -302,6 +302,11 @@ def _llamaswap_status():
     return out
 
 
+def _resident_runtime_health():
+    from oceano import mindbridge, turncheckpoints
+    return {**turncheckpoints.status(), "catalogs": mindbridge.catalog_inventory()}
+
+
 @router.get("/api/health")
 def health_dashboard():
     """Aggregated live health of the whole self-hosted stack, for the Health window:
@@ -330,6 +335,7 @@ def health_dashboard():
         "memory": {"count": memory.count()},
         "rag": docs,
         "turn_health": traces.turn_health(),
+        "resident_runtime": _resident_runtime_health(),
         "hw": hw,
     }
 

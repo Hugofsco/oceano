@@ -14,7 +14,10 @@ def test_turn_state_uses_structured_results_for_evidence_and_metrics():
     assert state.error_count == 1
     assert state.side_effects == ["file:a.py"]
     assert state.metrics()["model_steps"] == 1
-    assert state.completion_issues() == ["at least one tool returned an error"]
+    assert state.completion_issues() == [
+        "at least one tool returned an error",
+        "the changed code was not exercised",
+    ]
 
 
 def test_turn_budget_bounds_multiple_tool_calls_per_model_step(monkeypatch):
@@ -150,3 +153,46 @@ def test_exact_shell_retry_resolves_only_its_matching_operation():
                                          code="command_failed"), args)
     state.record("run_shell", ToolResult(True, summary="passed"), args)
     assert state.error_count == 0 and state.events[0].resolved is True
+
+
+def test_resident_adapter_prefers_structured_bridge_evidence():
+    state = TurnState("write it", object(), set(), TaskSpec(True, False), TurnBudget.create(3))
+    adapter = ResidentEventAdapter(state)
+    adapter.tool_call("mcp__oceano__write_file", {"path": "app.py", "content": "x"})
+    envelope = ToolResult(
+        False, error="write rejected", retryable=False,
+        side_effects=(), code="policy_blocked").to_wire()
+    result = adapter.tool_result("mcp__oceano__write_file", envelope)
+    assert result.ok is False
+    assert result.code == "policy_blocked"
+    assert result.retryable is False
+    assert state.error_count == 1
+
+
+def test_turn_metrics_expose_actionable_content_free_diagnostics():
+    state = TurnState("private prompt", object(), set(), TaskSpec(), TurnBudget.create(2))
+    args = {"command": "private command"}
+    state.record("run_shell", ToolResult(False, error="private output", retryable=False,
+                                             code="policy_blocked"), args)
+    state.record("run_shell", ToolResult(True, summary="done", verification=("exit:0",)), args)
+    metrics = state.metrics()
+    assert metrics["failed_tools"] == ["run_shell"]
+    assert metrics["error_codes"] == ["policy_blocked"]
+    assert metrics["duplicate_calls"] == 1
+    assert metrics["verification_count"] == 1
+    assert "private" not in str(metrics)
+
+
+def test_spawn_obligation_requires_text_after_the_successful_spawn():
+    state = TurnState("coordinate", object(), set(), TaskSpec(), TurnBudget.create(3))
+    state.observe_assistant_text("text before spawning does not count")
+    state.record("spawn_agent", ToolResult(
+        True, summary="started agent #42", side_effects=("capability:agent_spawn",)))
+    assert state.post_spawn_required is True
+    assert state.spawned_agent_ids == [42]
+    assert state.begin_post_spawn_continuation() is True
+    assert state.begin_post_spawn_continuation() is False
+    assert "#42 is already running" in state.post_spawn_prompt()
+    state.observe_assistant_text("Agent 42 is running; I continued the parent response.")
+    assert state.post_spawn_required is False
+    assert state.checkpoint_data()["post_spawn_attempted"] is True

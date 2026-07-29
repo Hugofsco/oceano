@@ -50,6 +50,8 @@ class Bundle:
     tools: tuple
     aliases: tuple = ()
     core: tuple = ()
+    requires: tuple[tuple[str, ...], ...] = ()
+    excludes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,14 +122,31 @@ _BUILTIN_BUNDLES = {
                    ("inspect", "read", "delegate", "skill")),
     "files-read": Bundle("files-read", "Read, list, and search files or source code",
                          ("list_files", "read_file", "code_search"),
-                         ("file", "folder", "source", "repository", "repo", "inspect")),
+                         ("file", "folder", "source", "repository", "repo", "inspect"),
+                         requires=(("file", "folder", "directory", "source", "repository", "repo",
+                                    "project", "code", "script", "module", "py", "js", "ts",
+                                    "readme", "csv", "dataset"),
+                                   ("read", "search", "inspect", "explain", "review",
+                                    "show", "find", "analyze", "what", "does")),
+                         excludes=("online", "internet", "website", "web", "public")),
     "files-write": Bundle("files-write", "Create and edit files and folders",
                           ("write_file", "edit_file", "make_folder"),
-                          ("write", "edit", "create", "change", "modify", "implement", "build")),
+                          ("write", "edit", "create", "change", "modify", "implement", "build"),
+                          requires=(("file", "folder", "directory", "source", "repository", "repo",
+                                     "project", "code", "script", "module", "py", "js", "ts",
+                                     "readme", "json", "toml", "yaml", "html", "css", "test"),
+                                    ("write", "edit", "create", "change", "modify", "implement",
+                                     "build", "fix", "repair", "update", "add"))),
     "code-execution": Bundle("code-execution", "Run commands, tests, Python, and Git",
                              ("run_shell", "python_exec", "run_tests", "git"),
                              ("code", "implement", "build", "debug", "test", "lint", "git", "fix"),
-                             ("run_tests", "git")),
+                             ("run_tests", "git"),
+                             requires=(("code", "script", "module", "project", "repository", "repo",
+                                        "py", "js", "ts", "python", "test", "unittest", "pytest",
+                                        "assertion", "command", "shell", "git"),
+                                       ("run", "rerun", "execute", "test", "unittest", "pytest",
+                                        "debug", "lint", "fix", "repair", "assertion", "command",
+                                        "shell", "git"))),
     "web-research": Bundle("web-research", "Search and retrieve public internet sources",
                            ("web_search", "fetch_url", "http_request", "rss"),
                            ("web", "online", "internet", "research", "latest", "source", "url"),
@@ -142,36 +161,53 @@ _BUILTIN_BUNDLES = {
     "email-read": Bundle("email-read", "Inspect email accounts, folders, and messages",
                          ("mail_accounts", "mail_folders", "mail_list", "mail_read", "mail_save_attachment"),
                          ("email", "mail", "inbox", "sender", "message", "attachment"),
-                         ("mail_list", "mail_read")),
+                         ("mail_list", "mail_read"),
+                         requires=(("email", "mail", "inbox", "sender", "message", "attachment"),
+                                   ("read", "inspect", "show", "list", "find", "newest", "latest",
+                                    "attachment"))),
     "email-write": Bundle("email-write", "Reply, send, move, flag, or delete email",
                           ("mail_send", "mail_reply", "mail_move", "mail_delete", "mail_flag", "mail_folder"),
                           ("email", "mail", "reply", "send", "move", "delete", "flag"),
-                          ("mail_reply", "mail_send")),
+                          ("mail_reply", "mail_send"),
+                          requires=(("email", "mail", "inbox", "sender", "message"),
+                                    ("reply", "send", "move", "delete", "flag", "draft", "forward"))),
     "calendar-read": Bundle("calendar-read", "Inspect calendar events and availability",
                             ("calendar_events", "find_free_slots"),
-                            ("calendar", "meeting", "schedule", "availability", "appointment", "event", "tomorrow")),
+                            ("calendar", "meeting", "schedule", "availability", "appointment", "event", "tomorrow"),
+                            requires=(("calendar", "meeting", "availability", "appointment", "event", "free"),
+                                      ("read", "inspect", "show", "list", "find", "check",
+                                       "availability", "free", "what"))),
     "calendar-write": Bundle("calendar-write", "Create, update, delete, or manage calendar events",
                              ("add_calendar_event", "add_calendar_events", "update_calendar_event",
                               "delete_calendar_event", "manage_calendar"),
-                             ("calendar", "meeting", "schedule", "book", "create", "reschedule", "cancel")),
+                             ("calendar", "meeting", "schedule", "book", "create", "reschedule", "cancel"),
+                             requires=(("calendar", "meeting", "appointment", "event"),
+                                       ("schedule", "book", "create", "reschedule", "cancel", "update",
+                                        "delete", "move"))),
     "memory": Bundle("memory", "Recall and update long-term memory or chat history",
                      ("remember", "recall", "update_memory", "forget_memory", "search_chats"),
                      ("remember", "memory", "recall", "forget", "earlier", "conversation"),
-                     ("recall", "remember")),
+                     ("recall", "remember"),
+                     requires=(("remember", "memory", "recall", "forget", "earlier", "conversation"),
+                               ("remember", "recall", "forget", "search", "previously", "asked",
+                                "earlier", "conversation"))),
     "knowledge": Bundle("knowledge", "Index and search local documents and knowledge",
                         ("index_docs", "search_docs"), ("document", "docs", "knowledge", "pdf")),
     "workflows": Bundle("workflows", "List and run saved workflows",
                         ("run_workflow", "list_workflows"), ("workflow", "automation", "automate")),
     "scheduling": Bundle("scheduling", "Create and manage scheduled tasks and notifications",
                          ("schedule_task", "list_tasks", "update_task", "cancel_task", "notify"),
-                         ("task", "schedule", "cron", "reminder", "notify")),
+                         ("task", "schedule", "cron", "reminder", "notify"),
+                         requires=(("task", "cron", "reminder", "notification", "notify"),
+                                   ("schedule", "create", "update", "cancel", "list", "remind", "notify"))),
     "hosts-read": Bundle("hosts-read", "Inspect configured remote hosts",
                          ("list_hosts",), ("host", "server", "ssh", "remote")),
     "hosts-execute": Bundle("hosts-execute", "Run SSH or SFTP operations on configured hosts",
                             ("ssh_run", "sftp"), ("host", "server", "ssh", "sftp", "remote", "deploy")),
     "notes": Bundle("notes", "Search, read, create, and update notes or notebooks",
                     ("search_notebook", "get_note", "add_note", "update_note", "delete_note"),
-                    ("note", "notebook", "journal"), ("search_notebook", "get_note")),
+                    ("note", "notebook", "journal"), ("search_notebook", "get_note"),
+                    excludes=("release",)),
     "kanban": Bundle("kanban", "Read and update Kanban boards and cards",
                      ("kanban_board", "add_kanban_card", "update_kanban_card", "delete_kanban_card"),
                      ("kanban", "board", "card")),
@@ -189,7 +225,10 @@ _BUILTIN_BUNDLES = {
                    ("sql_query", "python_exec")),
     "agents": Bundle("agents", "Delegate work and manage spawned agents or jobs",
                      ("delegate", "spawn_agent", "agent_status", "spawn_job", "job_status"),
-                     ("delegate", "agent", "parallel", "background", "job"), ("delegate",)),
+                     ("delegate", "agent", "parallel", "background", "job"), ("delegate",),
+                     requires=(("delegate", "agent", "parallel", "background", "job"),
+                               ("delegate", "spawn", "start", "parallel", "background", "check",
+                                "manage"))),
 }
 
 _INABILITY = re.compile(
@@ -342,6 +381,10 @@ def bundles():
             tools=tuple(spec.get("tools") or prior.tools),
             aliases=tuple(spec.get("aliases") or prior.aliases),
             core=tuple(spec.get("core") or prior.core),
+            requires=tuple(tuple(str(term) for term in group)
+                           for group in (spec.get("requires") or prior.requires)
+                           if isinstance(group, (list, tuple))),
+            excludes=tuple(str(term) for term in (spec.get("excludes") or prior.excludes)),
         )
     return out
 
@@ -356,6 +399,13 @@ def _bundle_score(bundle, query_tokens):
     # Generic verbs occur in nearly every domain ("create" previously loaded calendar,
     # notes, mail, desktop, and files together). Require at least one domain/distinctive
     # term, then use all overlap only to rank bundles within that domain.
+    if query_tokens & set(bundle.excludes):
+        return 0
+    if bundle.requires:
+        groups = [set(group) for group in bundle.requires]
+        if not all(query_tokens & group for group in groups):
+            return 0
+        return 10 * len(groups) + sum(len(query_tokens & group) for group in groups)
     terms = _tokens(" ".join(bundle.aliases) + " " + bundle.name)
     overlap = query_tokens & terms
     specific = overlap - _GENERIC_ACTION_TERMS
@@ -427,10 +477,11 @@ def route(schemas, query, model="", limit=None, force=None, surface="chat"):
         if fn["name"] in bundled_names:
             continue
         name_overlap = q & _tokens(fn["name"].replace("_", " "))
+        specific_name = name_overlap - _GENERIC_ACTION_TERMS - {"add", "find", "get", "list", "show"}
         description_overlap = q & _tokens(fn.get("description", ""))
         specific_description = description_overlap - _GENERIC_ACTION_TERMS
-        score = 5 * len(name_overlap) + len(specific_description)
-        if name_overlap or len(specific_description) >= 2:
+        score = 5 * len(specific_name) + len(specific_description)
+        if specific_name or len(specific_description) >= 2:
             scored.append((score, -pos, fn["name"]))
     for _, _, name in sorted(scored, reverse=True):
         _add(chosen, by_name, name, policy.schema_budget, cap)

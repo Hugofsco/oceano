@@ -10,6 +10,7 @@ fast and can't accidentally run a tool in this detached process. Config via env:
   OCEANO_MCP_TOKEN  the shared localhost secret
 """
 import asyncio
+import json
 import os
 
 import httpx
@@ -48,15 +49,33 @@ async def list_tools():
             for s in _SCHEMAS]
 
 
+async def _post_tool(client, name, arguments, headers):
+    """Retry one local transport loss with the same operation ID."""
+    for attempt in range(2):
+        try:
+            return await client.post(
+                f"{URL}/api/mcp/call", json={"name": name, "args": arguments or {}},
+                headers=headers, timeout=600)
+        except httpx.TransportError:
+            if attempt:
+                raise
+    raise RuntimeError("unreachable")
+
+
 @server.call_tool()
 async def call_tool(name, arguments):
     try:
+        call_headers = dict(HEADERS)
+        call_headers["X-Oceano-Operation-ID"] = str(server.request_context.request_id)
         async with httpx.AsyncClient() as c:
-            r = await c.post(f"{URL}/api/mcp/call",
-                             json={"name": name, "args": arguments or {}}, headers=HEADERS, timeout=600)
+            r = await _post_tool(c, name, arguments, call_headers)
             r.raise_for_status()
-            out = r.json().get("result", "")
-            if name == "discover_tools" and CATALOG and not str(out).startswith("ERROR"):
+            payload = r.json()
+            legacy = payload.get("result", "")
+            structured = payload.get("structured")
+            out = (json.dumps(structured, ensure_ascii=False, default=str)
+                   if isinstance(structured, dict) else str(legacy))
+            if name == "discover_tools" and CATALOG and not str(legacy).startswith("ERROR"):
                 listed = await c.get(f"{URL}/api/mcp/tools", headers=HEADERS, timeout=15)
                 listed.raise_for_status()
                 global _SCHEMAS

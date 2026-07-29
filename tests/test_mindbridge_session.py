@@ -51,13 +51,29 @@ def test_run_tool_marks_then_restores_the_call_thread():
                    {"type": "function", "function": {"name": "__probe_sess",
                     "parameters": {"type": "object", "properties": {}}}},
                    lambda: "S=" + str(mindbridge.active_session()))
-    mindbridge._ALLOW.add("__probe_sess")
     try:
         assert mindbridge.run_tool("__probe_sess", {}, session="chatZ") == "S=chatZ"
         assert mindbridge.active_session() is None       # restored after the call
     finally:
-        mindbridge._ALLOW.discard("__probe_sess")
         tools.unregister_prefix("__probe_sess")
+
+
+def test_catalog_carries_originating_workspace_across_bridge_threads(tmp_path):
+    from oceano import tools
+    from oceano.tools import core
+    tools.register("__probe_workspace",
+                   {"type": "function", "function": {"name": "__probe_workspace",
+                    "parameters": {"type": "object", "properties": {}}}},
+                   lambda: str(core._ws()))
+    try:
+        with tools.background_workspace(tmp_path):
+            catalog_id, _route = mindbridge.create_catalog(
+                "workspace probe", "fixture", max_calls=1, force=False)
+        result = mindbridge.run_tool("__probe_workspace", {}, catalog_id=catalog_id)
+        assert result == str(tmp_path.resolve())
+        assert core._ws() != tmp_path.resolve()
+    finally:
+        tools.unregister_prefix("__probe_workspace")
 
 
 def test_per_session_mcp_config_carries_the_sid(tmp_path, monkeypatch):
@@ -128,7 +144,6 @@ def test_run_tool_client_is_per_call_not_global():
                    {"type": "function", "function": {"name": "__probe_client",
                     "parameters": {"type": "object", "properties": {}}}},
                    probe)
-    mindbridge._ALLOW.add("__probe_client")
     seen = {}
     try:
         def call(key, client):
@@ -139,16 +154,15 @@ def test_run_tool_client_is_per_call_not_global():
         t1.start(); t2.start(); t1.join(); t2.join()
         assert seen == {"desktop": "CLI=desktop", "web": "CLI=web"}
     finally:
-        mindbridge._ALLOW.discard("__probe_client")
         tools.unregister_prefix("__probe_client")
 
 
 def test_desktop_tools_are_allowed_to_the_mind():
-    """Regression lock: these must stay in _ALLOW or the Claude/Codex mind can never see them at
-    all, no matter how the client/taint gates in oceano/tools/desktop.py are configured."""
+    """Desktop tools travel in the full registry; their runtime client/taint gates still apply."""
+    names = set(mindbridge.tool_names())
     for name in ("desktop_notify", "desktop_pick_file", "desktop_save_file", "desktop_reveal_path",
                  "desktop_open_path", "desktop_clipboard_read", "desktop_clipboard_write", "desktop_screenshot"):
-        assert name in mindbridge._ALLOW, name
+        assert name in names, name
 
 
 def test_run_tool_desktop_gate_follows_the_threaded_client():
@@ -171,6 +185,12 @@ def test_skills_scope_exposes_only_list_and_load_skill():
         assert leaked not in names
     # the unscoped (full) bridge still has everything, unaffected
     assert "remember" in mindbridge.tool_names()
+
+
+def test_unknown_scope_fails_closed():
+    assert mindbridge.tool_names(scope="unknown-scope") == []
+    result = mindbridge.run_tool_result("remember", {}, scope="unknown-scope")
+    assert result.code == "not_allowed"
 
 
 def test_run_tool_scope_refuses_tools_outside_the_scope():
@@ -214,7 +234,6 @@ def test_run_tool_channel_is_per_call_not_global():
                    {"type": "function", "function": {"name": "__probe_chan",
                     "parameters": {"type": "object", "properties": {}}}},
                    probe)
-    mindbridge._ALLOW.add("__probe_chan")
     seen = {}
     try:
         def call(key, background):
@@ -225,7 +244,6 @@ def test_run_tool_channel_is_per_call_not_global():
         t1.start(); t2.start(); t1.join(); t2.join()
         assert seen == {"bg": "CH=background", "web": "CH=web"}
     finally:
-        mindbridge._ALLOW.discard("__probe_chan")
         tools.unregister_prefix("__probe_chan")
 
 
@@ -246,7 +264,8 @@ def test_resident_catalog_is_routed_discoverable_and_budgeted(monkeypatch, tmp_p
     assert route.enabled is True
     assert "discover_tools" in mindbridge.tool_names(catalog_id=catalog_id)
     result = mindbridge.run_tool(
-        "discover_tools", {"query": "calendar", "operation": "load"}, catalog_id=catalog_id)
+        "discover_tools", {"query": "inspect calendar", "operation": "load"},
+        catalog_id=catalog_id)
     assert '"loaded"' in result
     assert "calendar_events" in mindbridge.tool_names(catalog_id=catalog_id)
     # Discovery consumed one call; reserve the second without touching the real calendar,
@@ -274,3 +293,129 @@ def test_mcp_config_carries_opaque_catalog_id(tmp_path, monkeypatch):
     env = cfg["mcpServers"]["oceano"]["env"]
     assert env["OCEANO_MCP_CATALOG"] == "opaque-catalog-123"
     assert path.endswith("mind-mcp-chatQ-cat-opaque-c.json")
+
+
+def test_catalog_replay_does_not_execute_or_consume_budget_twice(monkeypatch, tmp_path):
+    from oceano import toolrouter, tools
+    _resident_hybrid(monkeypatch, tmp_path)
+    config_path = tmp_path / "resident-tools-wide.toml"
+    config_path.write_text(
+        '[surfaces.resident]\nmode = "hybrid"\nschema_budget = 3000\n'
+        'max_schema_budget = 4000\ndiscovery = true\n')
+    monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(config_path))
+    toolrouter._CACHE.update({"path": None, "mtime": None, "data": {}})
+    calls = []
+    monkeypatch.setitem(
+        tools._TOOLS, "write_file",
+        lambda path, content: calls.append((path, content)) or f"wrote {path}")
+    catalog_id, route = mindbridge.create_catalog(
+        "write a Python file", "codex:test", max_calls=1)
+    assert "write_file" in route.names
+    args = {"path": "app.py", "content": "print(1)"}
+    first = mindbridge.run_tool_result(
+        "write_file", args, catalog_id=catalog_id, operation_id="write-1")
+    replay = mindbridge.run_tool_result(
+        "write_file", args, catalog_id=catalog_id, operation_id="write-1")
+    assert first.ok is True and replay.to_wire() == first.to_wire()
+    assert calls == [("app.py", "print(1)")]
+    assert mindbridge.catalog_status(catalog_id)["calls"] == 1
+
+
+def test_concurrent_duplicate_side_effect_waits_for_first_result():
+    from oceano import tools
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "concurrent_mutation_probe",
+            "description": "Controlled concurrent mutation",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        "x-oceano": {
+            "capability": "concurrent_mutation",
+            "side_effecting": True,
+            "idempotent": False,
+        },
+    }
+
+    def mutate():
+        calls.append("called")
+        entered.set()
+        assert release.wait(2)
+        return "done"
+
+    tools.register("concurrent_mutation_probe", schema, mutate)
+    results = []
+
+    def invoke():
+        results.append(mindbridge.run_tool_result(
+            "concurrent_mutation_probe", {}, operation_id="concurrent-operation"))
+
+    try:
+        first = threading.Thread(target=invoke)
+        second = threading.Thread(target=invoke)
+        first.start()
+        assert entered.wait(2)
+        second.start()
+        release.set()
+        first.join(2)
+        second.join(2)
+        assert calls == ["called"]
+        assert len(results) == 2
+        assert results[0].to_wire() == results[1].to_wire()
+    finally:
+        release.set()
+        tools.unregister_prefix("concurrent_mutation_probe")
+
+
+def test_catalog_is_bound_to_its_turn_context(monkeypatch, tmp_path):
+    _resident_hybrid(monkeypatch, tmp_path)
+    catalog_id, _route = mindbridge.create_catalog(
+        "calendar", "codex:test", 3, session="chat-a", client="desktop")
+    try:
+        assert mindbridge.tool_schemas(
+            catalog_id=catalog_id, session="chat-b", client="desktop") == []
+        rejected = mindbridge.run_tool_result(
+            "discover_tools", {}, catalog_id=catalog_id,
+            session="chat-a", client="web")
+        assert rejected.code == "catalog_context_mismatch"
+        assert mindbridge.tool_names(
+            catalog_id=catalog_id, session="chat-a", client="desktop")
+    finally:
+        assert mindbridge.close_catalog(catalog_id) is True
+    assert mindbridge.catalog_status(catalog_id) is None
+
+
+def test_catalog_lru_cap_is_a_crash_fallback(monkeypatch, tmp_path):
+    _resident_hybrid(monkeypatch, tmp_path)
+    with mindbridge._CATALOG_LOCK:
+        prior = dict(mindbridge._CATALOGS)
+        mindbridge._CATALOGS.clear()
+    monkeypatch.setattr(mindbridge, "_CATALOG_MAX", 2)
+    try:
+        identifiers = [mindbridge.create_catalog(
+            "calendar", "codex:test", 2, session=f"chat-{index}")[0]
+            for index in range(3)]
+        assert mindbridge.catalog_inventory() == {"active": 2, "limit": 2}
+        assert mindbridge.catalog_status(identifiers[0]) is None
+        assert all(mindbridge.catalog_status(item) is not None for item in identifiers[1:])
+    finally:
+        with mindbridge._CATALOG_LOCK:
+            mindbridge._CATALOGS.clear()
+            mindbridge._CATALOGS.update(prior)
+
+
+def test_continuation_catalog_hides_and_blocks_spawn_agent():
+    catalog_id, _route = mindbridge.create_catalog(
+        "coordinate background work", "claude:test", 3, force=False)
+    try:
+        assert "spawn_agent" in mindbridge.tool_names(catalog_id=catalog_id)
+        assert mindbridge.block_catalog_tools(catalog_id, {"spawn_agent"}) is True
+        assert "spawn_agent" not in mindbridge.tool_names(catalog_id=catalog_id)
+        result = mindbridge.run_tool_result(
+            "spawn_agent", {"task": "duplicate"}, catalog_id=catalog_id)
+        assert result.code == "continuation_tool_blocked"
+    finally:
+        mindbridge.close_catalog(catalog_id)

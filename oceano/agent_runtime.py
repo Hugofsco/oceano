@@ -162,6 +162,10 @@ class TurnState:
     only_tools: object = None
     events: list[ToolEvent] = field(default_factory=list)
     corrected: bool = False
+    on_change: object = None
+    post_spawn_required: bool = False
+    post_spawn_attempted: bool = False
+    spawned_agent_ids: list[int] = field(default_factory=list)
 
     @staticmethod
     def _arguments(value):
@@ -188,6 +192,13 @@ class TurnState:
         operation_key, targets = self._operation(name, arguments)
         event = ToolEvent(name, structured, operation_key=operation_key, targets=targets)
         self.events.append(event)
+        if name == "spawn_agent" and structured.ok:
+            self.post_spawn_required = True
+            self.post_spawn_attempted = False
+            for value in re.findall(r"agent\s+#(\d+)", structured.summary or "", re.IGNORECASE):
+                agent_id = int(value)
+                if agent_id not in self.spawned_agent_ids:
+                    self.spawned_agent_ids.append(agent_id)
         if structured.ok:
             current = len(self.events) - 1
             # Only the same concrete operation supersedes a retryable failure. A later,
@@ -213,7 +224,56 @@ class TurnState:
                             and repaired.intersection(prior.targets)):
                         prior.resolved = True
                         prior.resolved_by = current
+        if self.on_change:
+            try:
+                self.on_change(self)
+            except Exception:
+                pass
         return structured
+
+    def observe_assistant_text(self, text):
+        """Only meaningful text emitted after a successful spawn satisfies the parent turn."""
+        if self.post_spawn_required and str(text or "").strip():
+            self.post_spawn_required = False
+            if self.on_change:
+                try:
+                    self.on_change(self)
+                except Exception:
+                    pass
+
+    def begin_post_spawn_continuation(self):
+        """Reserve the one allowed correction pass for a tool-only post-spawn termination."""
+        if not self.post_spawn_required or self.post_spawn_attempted:
+            return False
+        self.post_spawn_attempted = True
+        return True
+
+    def post_spawn_prompt(self):
+        refs = ", ".join(f"#{value}" for value in self.spawned_agent_ids) or "the child agent"
+        return (
+            f"POST-SPAWN CONTINUATION: {refs} is already running. Do not spawn it again and do "
+            "not wait or poll. Continue any independent work that remains, then give the user a "
+            "clear progress response describing what is running and what happens next."
+        )
+
+    def checkpoint_data(self):
+        """Compact durable state without prompts, arguments, results, or answers."""
+        return {
+            "events": [{
+                "name": event.name,
+                "operation": event.operation_key,
+                "ok": event.result.ok,
+                "code": event.result.code,
+                "retryable": event.result.retryable,
+                "resolved": event.resolved,
+            } for event in self.events],
+            "side_effects": list(dict.fromkeys(self.side_effects)),
+            "verification": list(dict.fromkeys(
+                item for event in self.events for item in event.result.verification)),
+            "post_spawn_required": self.post_spawn_required,
+            "post_spawn_attempted": self.post_spawn_attempted,
+            "spawned_agent_ids": list(self.spawned_agent_ids),
+        }
 
     @property
     def legacy_events(self):
@@ -256,11 +316,22 @@ class TurnState:
         if self.error_count:
             issues.append("at least one tool returned an error")
         verification = {"run_tests", "run_shell", "python_exec"}
-        if self.task.verify_code and "delegate" not in calls and not (calls & verification):
+        verified = any(
+            event.result.ok
+            and (event.name in verification or bool(event.result.verification))
+            for event in self.events)
+        if self.task.verify_code and "delegate" not in calls and not verified:
             issues.append("the changed code was not exercised")
         return issues
 
     def metrics(self):
+        unresolved = self.unresolved_errors
+        seen_operations = set()
+        duplicate_calls = 0
+        for event in self.events:
+            if event.operation_key in seen_operations:
+                duplicate_calls += 1
+            seen_operations.add(event.operation_key)
         return {
             "used_tools": self.used_tools,
             "errors": self.error_count,
@@ -269,6 +340,15 @@ class TurnState:
             "model_steps": self.budget.steps,
             "elapsed_ms": round(self.budget.elapsed * 1000),
             "side_effect_count": len(self.side_effects),
+            "verification_count": sum(
+                len(event.result.verification) for event in self.events if event.result.ok),
+            "failed_tools": list(dict.fromkeys(event.name for event in unresolved)),
+            "error_codes": list(dict.fromkeys(
+                event.result.code or "tool_error" for event in unresolved)),
+            "duplicate_calls": duplicate_calls,
+            "max_tool_calls": self.budget.max_tool_calls,
+            "post_spawn_required": self.post_spawn_required,
+            "post_spawn_attempted": self.post_spawn_attempted,
         }
 
 
@@ -320,6 +400,9 @@ class ResidentEventAdapter:
         normalized = self.normalize_name(name)
         args_list = self.pending.get(normalized) or []
         args = args_list.pop(0) if args_list else {}
+        structured = ToolResult.from_wire(value)
+        if structured is not None:
+            return self.state.record(normalized, structured, args)
         text = str(value or "")
         low = text.lstrip().lower()
         match = self._EXIT.search(text)
@@ -359,7 +442,10 @@ class ResidentEventAdapter:
                 effects = (f"directory:{path}",)
             elif spec and spec.side_effecting:
                 effects = (f"capability:{spec.capability}",)
-            result = ToolResult(True, summary=text, side_effects=effects)
+            verification = ((f"{normalized}:ok",)
+                            if normalized in {"run_tests", "run_shell", "python_exec"} else ())
+            result = ToolResult(
+                True, summary=text, side_effects=effects, verification=verification)
         return self.state.record(normalized, result, args)
 
     def missing_result(self, name):

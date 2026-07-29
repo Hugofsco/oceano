@@ -4687,7 +4687,7 @@ function openHealth() {
   const card = (title, ok, rows) => `<div class="hd-card"><div class="hd-h">${dot(ok)}${escapeHtml(title)}</div>${rows.map(r => `<div class="hd-row"><span>${escapeHtml(r[0])}</span><b>${r[1]}</b></div>`).join("")}</div>`;
   async function load() {
     let d; try { d = await api("/api/health"); } catch { grid.innerHTML = `<div class="empty-note">health unavailable</div>`; return; }
-    const ls = d.llamaswap || {}, em = d.embed || {}, sc = d.scheduler || {}, tg = d.telegram || {}, hw = d.hw || {}, rg = d.rag || {}, th = d.turn_health || {}, ths = th.summary || {};
+    const ls = d.llamaswap || {}, em = d.embed || {}, sc = d.scheduler || {}, tg = d.telegram || {}, hw = d.hw || {}, rg = d.rag || {}, th = d.turn_health || {}, ths = th.summary || {}, rr = d.resident_runtime || {}, cats = rr.catalogs || {};
     grid.innerHTML = [
       card("Inference · llama-swap", ls.ok, [["loaded model", escapeHtml(ls.loaded || d.model || "—")], ["available", (ls.models || []).length || "—"]]),
       card("Embeddings · :8082", em.ok, [["model", escapeHtml(em.model || "—")]]),
@@ -4696,14 +4696,20 @@ function openHealth() {
       card("Telegram", !!tg.running, [["bot", tg.running ? "@" + escapeHtml(tg.username || "on") : "off"]]),
       card("Knowledge", true, [["memories", d.memory ? d.memory.count : "—"], ["doc chunks", rg.chunks ?? "—"], ["files indexed", rg.files ?? "—"]]),
       card("Agent turns", (ths.incomplete || 0) === 0 && (ths.unresolved_errors || 0) === 0,
-        [["healthy", `${ths.healthy || 0} / ${ths.turns || 0}`], ["unresolved errors", ths.unresolved_errors || 0], ["avg tool calls", ths.avg_tool_calls ?? 0]]),
+        [["healthy", `${ths.healthy || 0} / ${ths.turns || 0}`], ["unresolved errors", ths.unresolved_errors || 0], ["budget pressure", ths.budget_pressure_turns || 0], ["catalog misses", ths.catalog_misses || 0], ["duplicate calls", ths.duplicate_calls || 0]]),
+      card("Resident runtime", (rr.recoverable || 0) === 0 && (cats.active || 0) < (cats.limit || 1),
+        [["recoverable turns", rr.recoverable || 0], ["active catalogs", `${cats.active || 0} / ${cats.limit || 0}`], ["discoveries", ths.discoveries || 0]]),
     ].join("");
     const recent = (th.recent || []).slice(0, 6);
-    turns.innerHTML = recent.length ? `<div class="hd-turn-h">Recent agent turns</div>${recent.map(t => {
+    const providers = (th.providers || []).map(p => `${p.mind}: ${p.health_pct}% (${p.healthy}/${p.turns})`).join(" · ");
+    const failures = (th.failed_tools || []).slice(0, 5).map(f => `${f.name} ×${f.count}`).join(", ");
+    const diagnostics = (providers || failures) ? `<div class="hd-turn-h">Turn diagnostics</div><div class="hd-turn ok"><b>Provider reliability</b><span>${escapeHtml(providers || "no completed turns")}</span><small>${escapeHtml(failures ? "Repeated failures: " + failures : "No repeated failing tools")}</small></div>` : "";
+    turns.innerHTML = diagnostics + (recent.length ? `<div class="hd-turn-h">Recent agent turns</div>${recent.map(t => {
       const saved = Math.max(0, (t.catalog_schema_tokens || 0) - (t.schema_tokens || 0));
       const tools = (t.used_tools || []).join(", ") || "no tools";
-      return `<div class="hd-turn ${t.healthy ? "ok" : "bad"}"><span class="hd-dot ${t.healthy ? "ok" : "bad"}"></span><b>${escapeHtml(t.mind || "agent")}</b><span>${t.tool_calls || 0} calls · ${t.errors || 0} errors · ${saved} schema tokens saved</span><small>${escapeHtml(tools)}</small></div>`;
-    }).join("")}` : `<div class="hd-turn-empty">No agent turn telemetry yet</div>`;
+      const flags = [t.budget_pressure ? "budget pressure" : "", t.duplicate_calls ? `${t.duplicate_calls} duplicate` : "", t.verification_count ? `${t.verification_count} verified` : ""].filter(Boolean).join(" · ");
+      return `<div class="hd-turn ${t.healthy ? "ok" : "bad"}"><span class="hd-dot ${t.healthy ? "ok" : "bad"}"></span><b>${escapeHtml(t.mind || "agent")}</b><span>${t.tool_calls || 0} calls · ${t.errors || 0} errors · ${saved} schema tokens saved</span><small>${escapeHtml(tools + (flags ? " · " + flags : ""))}</small></div>`;
+    }).join("")}` : `<div class="hd-turn-empty">No agent turn telemetry yet</div>`);
     $("#hdUptime", body).textContent = "uptime " + fmtDur(d.uptime_s);
   }
   $("#hdReload", body).onclick = load;

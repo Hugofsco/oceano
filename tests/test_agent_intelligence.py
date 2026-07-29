@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from oceano.agent import Agent, _outcome_issues, _parse_facts, _task_plan  # noqa: E402
+from oceano.agent import Agent, SYSTEM_PROMPT, _outcome_issues, _parse_facts, _task_plan  # noqa: E402
 
 
 def test_planning_is_adaptive_not_universal():
@@ -12,6 +12,12 @@ def test_planning_is_adaptive_not_universal():
     plan = _task_plan("Implement these changes across the codebase in sequence and run the test suite")
     assert plan["requires_action"] is True
     assert plan["verify_code"] is True
+
+
+def test_bounded_multifile_work_and_tests_are_not_automatic_delegation_triggers():
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "Multiple files or a request for tests alone are NOT delegation triggers" in prompt
+    assert "Default to doing bounded work yourself" in prompt
 
 
 def test_complex_plan_is_injected_for_only_the_current_turn(monkeypatch):
@@ -125,3 +131,35 @@ def test_streaming_discovery_updates_schemas_without_registry_execution(monkeypa
     assert any(ev.get("text") == "Ready." for ev in events)
     assert "calendar_events" not in seen[0]
     assert "calendar_events" in seen[1]
+
+
+def test_streaming_api_parent_retries_once_after_tool_only_spawn(monkeypatch):
+    from oceano.tools.core import ToolResult
+    calls = []
+
+    def fake_stream(*args, **kwargs):
+        schemas = {schema["function"]["name"] for schema in (kwargs.get("tools") or [])}
+        calls.append(schemas)
+        if len(calls) == 1:
+            yield {"tool_calls": [{"id": "spawn-1", "name": "spawn_agent",
+                                    "args": '{"task":"inspect"}'}]}
+        elif len(calls) == 2:
+            yield {"usage": 1, "prompt_tokens": 10}
+        else:
+            yield {"content": "The child is running; the parent continued."}
+            yield {"usage": 2, "prompt_tokens": 12}
+
+    def fake_tool(name, args, allowed):
+        assert name == "spawn_agent"
+        yield "result", ToolResult(
+            True, summary="started agent #91",
+            side_effects=("capability:agent_spawn",))
+
+    monkeypatch.setattr("oceano.llm.stream", fake_stream)
+    monkeypatch.setattr("oceano.toolrouter.telemetry", lambda *a, **k: None)
+    agent = Agent(model="fixture", learn=False, inject_context=False, dynamic_tools=False)
+    monkeypatch.setattr(agent, "_run_tool_streamed", fake_tool)
+    events = list(agent.run_stream("Coordinate this with a background agent"))
+    assert len(calls) == 3
+    assert "spawn_agent" in calls[0] and "spawn_agent" not in calls[2]
+    assert any("parent continued" in event.get("text", "") for event in events)

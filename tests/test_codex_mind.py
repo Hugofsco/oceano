@@ -8,12 +8,13 @@ private, disposable home per call instead.
 """
 import os
 import sys
+import tomllib
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from oceano import codex_mind  # noqa: E402
+from oceano import codex_guard, codex_mind  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -138,3 +139,44 @@ def test_tool_call_labels_shell_and_mcp():
     name, _detail = codex_mind._tool_call(
         {"type": "mcp_tool_call", "server": "oceano", "tool": "recall", "arguments": {"query": "x"}})
     assert name == "recall"
+    name, detail = codex_mind._tool_call(
+        {"type": "collab_tool_call", "tool": "spawn_agent",
+         "arguments": {"prompt": "inspect"}})
+    assert name == "spawn_agent" and "inspect" in detail
+
+
+def test_resident_config_is_read_only_and_installs_native_mutation_guard(tmp_path, monkeypatch):
+    target = tmp_path / "resident-config.toml"
+    monkeypatch.setattr(codex_mind, "_CONFIG", target)
+    codex_mind._write_config()
+    cfg = target.read_text()
+    parsed = tomllib.loads(cfg)
+    assert parsed["sandbox_mode"] == "read-only"
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["multi_agent"] is False
+    assert parsed["features"]["plugins"] is False
+    assert parsed["features"]["skill_search"] is False
+    assert parsed["agents"]["enabled"] is False
+    assert 'sandbox_mode = "read-only"' in cfg
+    assert "[[hooks.PreToolUse]]" in cfg
+    assert "codex_guard.py" in cfg
+    assert "mcp_servers.oceano" in cfg
+
+
+def test_codex_guard_blocks_native_mutations_but_allows_mcp_and_reads():
+    denied = codex_guard.decision({"tool_name": "Bash"})
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert codex_guard.decision({"tool_name": "apply_patch"})["hookSpecificOutput"][
+        "permissionDecision"] == "deny"
+    assert codex_guard.decision({"tool_name": "spawn_agent"})["hookSpecificOutput"][
+        "permissionDecision"] == "deny"
+    assert codex_guard.decision({"tool_name": "mcp__oceano__run_shell"}) == {}
+    assert codex_guard.decision({"tool_name": "read_file"}) == {}
+
+
+def test_codex_guard_fails_closed_for_malformed_payloads():
+    for payload in ({}, [], {"tool_name": None}):
+        denied = codex_guard.decision(payload)
+        output = denied["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert "Malformed" in output["permissionDecisionReason"]

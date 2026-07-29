@@ -1,7 +1,6 @@
 """Self-improvement: learned skills, independent review, and delegation."""
-import config
 from oceano import skills
-from oceano.tools.core import _TOOLS, emit_progress, tool
+from oceano.tools.core import _TOOLS, _ws, emit_progress, tool
 
 # --- self-improvement: learned skills + delegation ---------------------------
 @tool({
@@ -79,7 +78,7 @@ def delegate_tool(instructions):
     def on_prog(ev):                         # surface the delegate's live work to the frontend
         emit_progress({"source": "delegate", **ev})
 
-    r = delegate.run(instructions, cwd=config.WORKSPACE, on_progress=on_prog)  # Settings → Delegation
+    r = delegate.run(instructions, cwd=_ws(), on_progress=on_prog)  # Settings → Delegation
     if r["ok"]:
         return r["output"][:8000] or "(the delegate finished but returned no text)"
     # Failed/stalled/capped. Hand back any partial work AND tell the local model NOT to attempt
@@ -140,13 +139,16 @@ def spawn_agent(task, provider="", label="", timeout=0):
     access = web_state.load().get("prefs", {}).get("chat_agent_access", "read")
     try:
         rec = agentjobs.spawn(task, provider=provider, label=label, timeout=timeout,
-                              tools=_chat_agent_tool_scope(access), cwd=config.WORKSPACE,
+                              tools=_chat_agent_tool_scope(access), cwd=_ws(),
                               sid=mindbridge.active_session())
     except RuntimeError as e:                  # cap / unknown provider → relay the reason verbatim
         return f"could not spawn the agent: {e}"
-    out = (f"started agent #{rec['id']} ({rec['provider']}) \"{rec['label']}\" — running in the "
+    out = (f"started agent #{rec['id']} ({rec['provider']}) {rec['label']} - running in the "
            f"background; check it with agent_status(agent_id={rec['id']}). The user is notified "
-           f"and the result is delivered here when it finishes.")
+           f"and the result is delivered here when it finishes. This asynchronous start does "
+           "not complete the parent turn: continue any independent work, start any other "
+           "requested agents, and give the user a proper progress response. Do not wait or poll "
+           "unless the user explicitly asked you to.")
     if rec.get("warning"):
         out += "\n" + rec["warning"]
     return out

@@ -28,6 +28,32 @@ def test_code_task_keeps_execution_and_verification_tools():
     assert {"read_file", "write_file", "run_shell", "run_tests", "delegate"} <= names
 
 
+def test_python_artifact_actions_select_write_and_execution_without_magic_words():
+    names = _names("Create hello.py that prints OK, then run it to verify the output")
+    assert {"write_file", "run_shell", "run_tests"} <= names
+
+
+def test_read_only_file_intent_does_not_select_mutation_tools():
+    names = _names("Read hello.py and explain what it does")
+    assert "read_file" in names
+    assert not names & {"write_file", "edit_file", "make_folder"}
+
+
+def test_calendar_intent_direction_avoids_opposite_and_scheduler_bundles():
+    read = _route("Show my calendar availability tomorrow afternoon")
+    assert "calendar-read" in read.loaded_bundles
+    assert "calendar-write" not in read.loaded_bundles
+    write = _route("Schedule a project planning meeting tomorrow afternoon")
+    assert "calendar-write" in write.loaded_bundles
+    assert "calendar-read" not in write.loaded_bundles
+    assert "scheduling" not in write.loaded_bundles
+
+
+def test_generic_list_word_does_not_select_unrelated_custom_named_tool():
+    names = _names("Return a list of tuples from intervals.py")
+    assert "list_suggestions" not in names
+
+
 def test_ambiguous_request_keeps_core_and_discovery_instead_of_all_tools():
     schemas = tools.schemas()
     route = toolrouter.route(schemas, "do it", force=True)
@@ -46,6 +72,7 @@ def test_routing_is_disabled_by_default(monkeypatch):
 def test_model_allow_and_exclude_patterns(monkeypatch, tmp_path):
     # Keep a developer's ignored tool-loading.toml from overriding this legacy-env-only test.
     monkeypatch.setenv("OCEANO_TOOL_CONFIG", str(tmp_path / "absent.toml"))
+    monkeypatch.delenv("OCEANO_TOOL_LOADING_MODE", raising=False)
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOLS", "1")
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOL_MODELS", "qwen*,local-*")
     monkeypatch.setenv("OCEANO_DYNAMIC_TOOL_EXCLUDE_MODELS", "*-large")

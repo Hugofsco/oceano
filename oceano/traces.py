@@ -106,20 +106,27 @@ def query(run_id=None, workflow_id=None, limit=500):
 
 
 def turn_health(limit=20):
-    """Content-free health summary for recent agent/resident turns."""
-    events = query(limit=max(200, int(limit) * 20))
+    """Content-free, actionable health summary for recent agent/resident turns."""
+    events = query(limit=max(500, int(limit) * 30))
     rows = []
     for event in reversed(events):
         if event.get("event") == "resident_turn":
+            calls = int(event.get("tool_calls") or 0)
+            max_calls = int(event.get("catalog_max_calls") or event.get("max_tool_calls") or 0)
             rows.append({
                 "ts": event.get("ts"), "mind": event.get("mind") or "resident",
                 "healthy": not bool(event.get("incomplete")) and not int(event.get("errors") or 0),
                 "incomplete": bool(event.get("incomplete")),
                 "errors": int(event.get("errors") or 0),
                 "historical_errors": int(event.get("historical_errors") or 0),
-                "tool_calls": int(event.get("tool_calls") or 0),
+                "tool_calls": calls, "max_tool_calls": max_calls,
+                "budget_pressure": bool(max_calls and calls / max_calls >= 0.8),
                 "elapsed_ms": int(event.get("elapsed_ms") or 0),
                 "used_tools": list(event.get("used_tools") or []),
+                "failed_tools": list(event.get("failed_tools") or []),
+                "error_codes": list(event.get("error_codes") or []),
+                "duplicate_calls": int(event.get("duplicate_calls") or 0),
+                "verification_count": int(event.get("verification_count") or 0),
                 "advertised_tools": int(event.get("catalog_advertised") or 0),
                 "catalog_tools": int(event.get("catalog_catalog") or 0),
                 "schema_tokens": int(event.get("catalog_schema_tokens") or 0),
@@ -128,14 +135,21 @@ def turn_health(limit=20):
         elif (event.get("event") == "tool_routing"
               and event.get("phase") in {"completed", "step-limit"}):
             errors = int(event.get("tool_errors") or event.get("errors") or 0)
+            calls = int(event.get("tool_calls") or 0)
+            max_calls = int(event.get("max_tool_calls") or 0)
             rows.append({
                 "ts": event.get("ts"), "mind": event.get("model") or "api/local",
                 "healthy": event.get("phase") == "completed" and errors == 0,
                 "incomplete": event.get("phase") != "completed", "errors": errors,
                 "historical_errors": int(event.get("historical_errors") or errors),
-                "tool_calls": int(event.get("tool_calls") or 0),
+                "tool_calls": calls, "max_tool_calls": max_calls,
+                "budget_pressure": bool(max_calls and calls / max_calls >= 0.8),
                 "elapsed_ms": int(event.get("elapsed_ms") or 0),
                 "used_tools": list(event.get("used_tools") or []),
+                "failed_tools": list(event.get("failed_tools") or []),
+                "error_codes": list(event.get("error_codes") or []),
+                "duplicate_calls": int(event.get("duplicate_calls") or 0),
+                "verification_count": int(event.get("verification_count") or 0),
                 "advertised_tools": int(event.get("advertised_tools") or 0),
                 "catalog_tools": int(event.get("catalog_tools") or 0),
                 "schema_tokens": int(event.get("schema_tokens") or 0),
@@ -144,12 +158,37 @@ def turn_health(limit=20):
         if len(rows) >= limit:
             break
     healthy = sum(row["healthy"] for row in rows)
+    providers = {}
+    failed_tools = {}
+    catalog_misses = 0
+    for row in rows:
+        provider = providers.setdefault(row["mind"], {"turns": 0, "healthy": 0, "tool_calls": 0})
+        provider["turns"] += 1
+        provider["healthy"] += int(row["healthy"])
+        provider["tool_calls"] += row["tool_calls"]
+        for name in row["failed_tools"]:
+            failed_tools[name] = failed_tools.get(name, 0) + 1
+        catalog_misses += sum(code in {"not_advertised", "catalog_context_mismatch", "catalog_invalid"}
+                              for code in row["error_codes"])
+    provider_rows = [{
+        "mind": name, "turns": value["turns"], "healthy": value["healthy"],
+        "health_pct": round(100 * value["healthy"] / value["turns"]),
+        "avg_tool_calls": round(value["tool_calls"] / value["turns"], 1),
+    } for name, value in sorted(providers.items())]
+    discoveries = sum(event.get("event") == "tool_routing"
+                      and event.get("phase") == "resident-discovered" for event in events)
     return {
         "summary": {"turns": len(rows), "healthy": healthy,
                     "incomplete": sum(row["incomplete"] for row in rows),
                     "unresolved_errors": sum(row["errors"] for row in rows),
                     "avg_tool_calls": (round(sum(row["tool_calls"] for row in rows) / len(rows), 1)
-                                       if rows else 0)},
+                                       if rows else 0),
+                    "budget_pressure_turns": sum(row["budget_pressure"] for row in rows),
+                    "duplicate_calls": sum(row["duplicate_calls"] for row in rows),
+                    "catalog_misses": catalog_misses, "discoveries": discoveries},
+        "providers": provider_rows,
+        "failed_tools": [{"name": name, "count": count}
+                         for name, count in sorted(failed_tools.items(), key=lambda item: (-item[1], item[0]))],
         "recent": rows,
     }
 

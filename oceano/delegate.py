@@ -486,7 +486,8 @@ def _tool_detail(inp):
 
 def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=None,
                      max_total=None, max_turns=None, on_progress=None, append_system=None,
-                     mcp_config=None, disallow=None, cancel=None, skills=False):
+                     mcp_config=None, disallow=None, cancel=None, skills=False,
+                     isolated_resident=False):
     """Run a headless Claude Code task, STREAMING its events (--output-format stream-json).
 
     Three wins over the old blocking call:
@@ -518,6 +519,19 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             names = mindbridge.tool_names(scope="skills")
             if names:
                 tools = (tools + "," if tools else "") + ",".join("mcp__oceano__" + n for n in names)
+    if skills:
+        skill_note = (
+            "Reuse procedures only through Oceano MCP tools mcp__oceano__list_skills and "
+            "mcp__oceano__load_skill. Never invoke Claude's native Skill tool or Skill "
+            "statement. Never use native Agent/Workflow/Task tools; delegate only through "
+            "Oceano MCP. These separate namespaces are disabled for this worker."
+        )
+        append_system = ((append_system + "\n\n") if append_system else "") + skill_note
+        denied = [item.strip() for item in (disallow or "").split(",") if item.strip()]
+        disallow = ",".join(dict.fromkeys(denied + [
+            "Skill", "Agent", "Workflow", "SendMessage", "TaskCreate", "TaskGet",
+            "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+        ]))
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose",
            "--max-turns", str(int(max_turns))] + _claude_model_args() + _claude_effort_args()
     if tools:
@@ -528,6 +542,9 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
         cmd += ["--mcp-config", mcp_config, "--strict-mcp-config"]   # only Oceano's tool-bridge, not the user's other MCP servers
     if disallow:
         cmd += ["--disallowedTools", disallow]      # block native write/shell so it acts through Oceano + can't touch ~/.claude
+    if isolated_resident:
+        cmd += ["--setting-sources", "", "--disable-slash-commands",
+                "--permission-mode", "dontAsk"]
 
     def emit(ev):
         if on_progress:
@@ -545,9 +562,13 @@ def to_claude_stream(instructions, cwd=None, tools=DEFAULT_TOOLS, idle_timeout=N
             # MAX_ARG_STRLEN (128 KB), so a long transcript (e.g. continuing a big chat, or one grown
             # under the Codex mind before switching to Claude) overflows it and execve fails with E2BIG
             # ("Argument list too long"). `claude -p` reads the prompt from stdin when none is given.
+            child_env = os.environ.copy()
+            if isolated_resident or skills:
+                child_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
             proc = subprocess.Popen(cmd + (["--resume", resume_id] if resume_id else []),
                                     cwd=str(cwd or config.WORKSPACE), stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    bufsize=1, env=child_env)
         except OSError as e:
             return {"ok": False, "output": "", "error": f"could not launch claude: {e}", "partial": False,
                     "turns": 0, "cost": 0.0, "_session": resume_id, "_rl": False, "_reset": None}

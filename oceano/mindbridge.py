@@ -6,15 +6,16 @@ DAEMON with full runtime context — ui_open reaches the live browser, memory/ca
 DBs, search hits the running SearXNG. A detached subprocess couldn't drive the daemon's UI or share
 its state, hence the proxy.
 
-Flow:  Claude  →(stdio MCP)→  mcp_bridge_server  →(HTTP + token)→  /api/mcp/call  →  tools.run()
+Flow:  Claude  →(stdio MCP)→  mcp_bridge_server  →(HTTP + token)→  /api/mcp/call  →  tools.run_result()
 """
+import hashlib
 import json
 import os
 import secrets
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from oceano import tools, turnctx
 
@@ -40,41 +41,8 @@ def active_session():
     return turnctx.get().session
 
 
-# The mind's BODY: Oceano's own tools, so the mind acts THROUGH Oceano (and the user can see it).
-# Its native Read/Write/Bash cover files+shell, but the WEB is routed here on purpose — Oceano's
-# web tools drive the shared live browser, so the user can watch (and hand-solve captchas) instead
-# of the mind browsing invisibly with WebFetch. Kept reasonably small so Claude Code loads them all
-# up front (exact names in --allowedTools) instead of deferring them behind its flaky ToolSearch.
-_ALLOW = {
-    # In hybrid resident mode these replace native file/shell tools, allowing the daemon to
-    # enforce the same execution policy and per-turn budget before the operation starts.
-    "list_files", "read_file", "code_search", "write_file", "edit_file", "make_folder",
-    "run_shell", "python_exec", "run_tests", "git",
-    "remember", "recall", "forget_memory", "update_memory",   # memory — Oceano's, the one the user sees
-    "calendar_events", "manage_calendar", "find_free_slots",  # the calendar
-    "schedule_task", "list_tasks", "update_task", "cancel_task",   # the PERSISTENT task scheduler — create/list/edit/cancel; the one the user sees, use instead of the mind's own cron
-    "spawn_job", "job_status",                                # background OS jobs Oceano itself owns/outlives — use INSTEAD of your own native background execution, which dies or is orphaned the instant this turn's CLI process exits
-    "spawn_agent", "agent_status",                            # background SUB-AGENTS (contained delegate runs) Oceano owns — parallel subtasks that report back into this chat
-    "list_skills", "load_skill", "learn_skill",              # skills — reuse + grow Oceano's skill library (parity with the local mind)
-    "run_workflow", "list_workflows",                        # workflows — run Oceano's saved multi-step recipes
-    "search_docs", "index_docs",                             # RAG — search (and add to) the user's indexed documents
-    "list_suggestions", "accept_suggestion", "dismiss_suggestion",   # the self-improvement queue (reflection → approve → act)
-    "ui_open", "ui_close", "ui_arrange",                      # the windows (JARVIS bit)
-    "notify",                                                 # push a notification to the user
-    "web_search", "fetch_url",                               # the web — via the SHARED live browser, so the user watches
-    "browser_open", "browser_click", "browser_scroll", "browser_screenshot",   # drive that browser
-    "browser_snapshot", "browser_fill", "browser_select", "browser_press",      # …operate forms: map elements, fill, select, submit
-    "browser_wait", "browser_extract", "browser_read",                          # …wait for content, extract data, read as markdown
-    "browser_eval", "browser_hover", "browser_upload", "browser_dialog", "browser_tab",   # …JS eval (web-only), hover, upload, dialogs, tabs
-    "list_hosts", "ssh_run", "sftp",                         # the SSH keychain (still web-channel + per-host policy gated)
-    "mail_accounts", "mail_folders", "mail_list", "mail_read",          # email — discover + read
-    "mail_move", "mail_delete", "mail_flag", "mail_send", "mail_reply",  # …organize + send (same gates apply)
-    "mail_folder", "mail_save_attachment",                              # folders (gated) + save an email attachment to the workspace
-    "desktop_notify", "desktop_pick_file", "desktop_save_file",         # OceanoDesktop-only native actions — no-op
-    "desktop_reveal_path", "desktop_open_path",                        # unless this turn's client is threaded
-    "desktop_clipboard_read", "desktop_clipboard_write", "desktop_screenshot",   # through below (client=...)
-}
-
+# The resident mind's full body is the live, globally enabled tool registry. A narrower
+# contained-agent scope below deliberately exposes only its explicit capability set.
 # A narrower bridge for CONTAINED sub-agents (workflow Delegate / Agent Spawn / Orchestrator-
 # plugged nodes): let them reuse Oceano's published skills — so a background sub-agent doesn't
 # have to reinvent a procedure Oceano already learned — but NOTHING else from the body. No
@@ -82,7 +50,7 @@ _ALLOW = {
 # self-contained and must not see or change what the user's own mind remembers. No learn_skill
 # either — growing the skill library is a bigger act than reusing it, left to the full bridge
 # above. A flow that genuinely needs memory (or the rest of the body) should use an Instructions
-# node instead, which runs through the full _ALLOW bridge (scope=None).
+# node instead, which runs through the full registry bridge (scope=None).
 _SCOPES = {
     "skills": {"list_skills", "load_skill"},
 }
@@ -90,14 +58,11 @@ _SCOPES = {
 
 def _allowset(scope):
     if scope is None:
-        # the full body bridge: the curated set PLUS whatever MCP servers are connected right
-        # now — MCP connections are part of Oceano's body, so the mind sees the same ones the
-        # local model does. Computed fresh (not cached) since servers connect/disconnect at
-        # runtime (oceano.mcp_client.reload()); a narrow sub-agent `scope` deliberately does NOT
-        # get this — see the _SCOPES docstring above.
-        return _ALLOW | {s["function"]["name"] for s in tools.schemas()
-                         if s["function"]["name"].startswith("mcp__")}
-    return _SCOPES.get(scope, _ALLOW)
+        # Full means every globally enabled registered tool, including live MCP tools. Compute
+        # this fresh because Settings toggles and MCP reloads change the registry at runtime.
+        return {schema["function"]["name"] for schema in tools.schemas()}
+    # Named contained-agent scopes are explicit capability boundaries. Unknown scopes fail shut.
+    return _SCOPES.get(scope, set())
 
 
 @dataclass
@@ -108,13 +73,33 @@ class _CatalogState:
     query: str
     model: str
     max_calls: int
+    session: str | None = None
+    background: bool = False
+    client: str = "web"
+    scope: str | None = None
+    workspace: object = None
+    blocked: set[str] = field(default_factory=set)
     calls: int = 0
     created: float = 0.0
+    last_used: float = 0.0
 
 
 _CATALOGS = {}
 _CATALOG_LOCK = threading.RLock()
 _CATALOG_TTL = 6 * 3600
+_CATALOG_MAX = 256
+
+
+def _cleanup_catalogs(now=None):
+    now = now or time.time()
+    for key in [key for key, value in _CATALOGS.items()
+                if now - value.last_used > _CATALOG_TTL]:
+        _CATALOGS.pop(key, None)
+    overflow = len(_CATALOGS) - _CATALOG_MAX
+    if overflow > 0:
+        oldest = sorted(_CATALOGS, key=lambda key: _CATALOGS[key].last_used)
+        for key in oldest[:overflow]:
+            _CATALOGS.pop(key, None)
 
 
 def _catalog_state(catalog_id):
@@ -122,25 +107,59 @@ def _catalog_state(catalog_id):
         return None
     now = time.time()
     with _CATALOG_LOCK:
-        for key in [key for key, value in _CATALOGS.items()
-                    if now - value.created > _CATALOG_TTL]:
-            _CATALOGS.pop(key, None)
-        return _CATALOGS.get(catalog_id)
+        _cleanup_catalogs(now)
+        state = _CATALOGS.get(catalog_id)
+        if state is not None:
+            state.last_used = now
+        return state
 
 
-def create_catalog(query, model, max_calls, scope=None):
-    """Create one opaque, daemon-owned resident catalog and execution budget."""
+def _catalog_owner_error(state, *, session=None, background=False, client="web", scope=None):
+    supplied = (session, bool(background), client or "web", scope)
+    expected = (state.session, state.background, state.client, state.scope)
+    return "" if supplied == expected else "resident catalog does not belong to this turn context"
+
+
+def close_catalog(catalog_id):
+    """Explicitly discard a completed turn catalog; TTL/LRU remain crash fallbacks."""
+    with _CATALOG_LOCK:
+        return _CATALOGS.pop(catalog_id, None) is not None
+
+
+def catalog_inventory():
+    with _CATALOG_LOCK:
+        _cleanup_catalogs()
+        return {"active": len(_CATALOGS), "limit": _CATALOG_MAX}
+
+
+def block_catalog_tools(catalog_id, names):
+    """Deny tools for the remainder of one live catalog, including later discovery."""
+    state = _catalog_state(catalog_id)
+    if state is None:
+        return False
+    with _CATALOG_LOCK:
+        state.blocked.update(str(name) for name in names)
+    return True
+
+
+def create_catalog(query, model, max_calls, scope=None, *, session=None, background=False,
+                   client="web", force=None):
+    """Create one opaque, turn-bound daemon catalog and execution budget."""
     from oceano import toolrouter
     catalog = tool_schemas(scope=scope)
     route = toolrouter.route(catalog, query or "", model=model or "resident",
-                             surface="resident")
+                             surface="resident", force=force)
     catalog_id = secrets.token_urlsafe(18)
     state = _CatalogState(route=route, catalog=catalog,
                           allowed={schema["function"]["name"] for schema in catalog},
                           query=query or "", model=model or "resident",
-                          max_calls=max(1, int(max_calls or 1)), created=time.time())
+                          max_calls=max(1, int(max_calls or 1)), session=session,
+                          background=bool(background), client=client or "web", scope=scope,
+                          workspace=turnctx.get().workspace,
+                          created=time.time(), last_used=time.time())
     with _CATALOG_LOCK:
         _CATALOGS[catalog_id] = state
+        _cleanup_catalogs()
     toolrouter.telemetry(route, "resident-selected")
     return catalog_id, route
 
@@ -185,6 +204,64 @@ def catalog_status(catalog_id):
             "bundles": list(state.route.loaded_bundles), "enabled": state.route.enabled}
 
 
+@dataclass
+class _ReplayEntry:
+    fingerprint: str
+    created: float
+    event: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+
+
+_REPLAYS = {}
+_REPLAY_LOCK = threading.RLock()
+_REPLAY_TTL = 6 * 3600
+_REPLAY_MAX = 2048
+
+
+def _replay_start(operation_id, name, args, *, catalog_id, session, background, client, scope):
+    """Claim an idempotency key, or return the matching in-flight/completed operation."""
+    if not operation_id:
+        return True, None, None
+    operation_id = str(operation_id)
+    if len(operation_id) > 256:
+        return False, None, tools.ToolResult(
+            False, error="idempotency operation ID is too long", code="bad_operation_id")
+    canonical = json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
+    fingerprint = hashlib.sha256((name + "\0" + canonical).encode()).hexdigest()
+    owner = catalog_id or "|".join((
+        str(session or ""), str(scope or ""), "1" if background else "0", str(client or "web")))
+    key = (owner, operation_id)
+    now = time.time()
+    with _REPLAY_LOCK:
+        expired = [item for item, entry in _REPLAYS.items()
+                   if entry.event.is_set() and now - entry.created > _REPLAY_TTL]
+        for item in expired:
+            _REPLAYS.pop(item, None)
+        if len(_REPLAYS) >= _REPLAY_MAX:
+            completed = sorted(
+                ((entry.created, item) for item, entry in _REPLAYS.items() if entry.event.is_set()))
+            for _created, item in completed[:max(1, len(_REPLAYS) - _REPLAY_MAX + 1)]:
+                _REPLAYS.pop(item, None)
+        existing = _REPLAYS.get(key)
+        if existing:
+            if existing.fingerprint != fingerprint:
+                return False, None, tools.ToolResult(
+                    False, error="idempotency key was reused for a different operation",
+                    code="idempotency_conflict")
+            return False, existing, None
+        entry = _ReplayEntry(fingerprint=fingerprint, created=now)
+        _REPLAYS[key] = entry
+        return True, entry, None
+
+
+def _replay_finish(entry, result):
+    if entry is None:
+        return
+    with _REPLAY_LOCK:
+        entry.result = result
+        entry.event.set()
+
+
 _TOKEN = None
 
 
@@ -217,58 +294,104 @@ def daemon_url():
     return f"http://{host}:{port}"
 
 
-def tool_schemas(scope=None, catalog_id=None):
-    """Tools offered to the mind, optionally narrowed by an opaque per-turn catalog."""
+def tool_schemas(scope=None, catalog_id=None, *, session=None, background=False, client="web"):
+    """Tools offered to the mind, optionally narrowed by a turn-bound catalog."""
     state = _catalog_state(catalog_id)
     if state is not None:
-        return list(state.route.schemas)
+        if _catalog_owner_error(
+                state, session=session, background=background, client=client, scope=scope):
+            return []
+        return [schema for schema in state.route.schemas
+                if schema["function"]["name"] not in state.blocked]
     if catalog_id:
         return []
     return [s for s in tools.schemas() if s["function"]["name"] in _allowset(scope)]
 
 
-def tool_names(scope=None, catalog_id=None):
-    return [schema["function"]["name"] for schema in tool_schemas(scope, catalog_id)]
+def tool_names(scope=None, catalog_id=None, *, session=None, background=False, client="web"):
+    return [schema["function"]["name"] for schema in tool_schemas(
+        scope, catalog_id, session=session, background=background, client=client)]
+
+
+def run_tool_result(name, args, session=None, background=False, client="web", scope=None,
+                    catalog_id=None, operation_id=None):
+    """Execute one body tool and retain its structured result across the MCP boundary."""
+    args = args if isinstance(args, dict) else {}
+    state = _catalog_state(catalog_id)
+    if catalog_id and state is None:
+        return tools.ToolResult(False, error="resident catalog expired or is invalid",
+                                code="catalog_invalid")
+    if state is not None:
+        owner_error = _catalog_owner_error(
+            state, session=session, background=background, client=client, scope=scope)
+        if owner_error:
+            return tools.ToolResult(False, error=owner_error, code="catalog_context_mismatch")
+        if name in state.blocked:
+            return tools.ToolResult(
+                False, error=f"tool {name!r} is blocked during parent-turn continuation",
+                code="continuation_tool_blocked")
+        if name not in set(state.route.names):
+            return tools.ToolResult(
+                False, error=f"tool {name!r} is not advertised in this resident catalog",
+                code="not_advertised")
+    elif name not in _allowset(scope):
+        return tools.ToolResult(False, error=f"tool {name!r} is not available to the mind",
+                                code="not_allowed")
+
+    spec = tools.tool_spec(name)
+    replayable = bool(operation_id and spec and spec.side_effecting and not spec.idempotent)
+    replay_owner, replay_entry, replay_error = (True, None, None)
+    if replayable:
+        replay_owner, replay_entry, replay_error = _replay_start(
+            operation_id, name, args, catalog_id=catalog_id, session=session,
+            background=background, client=client, scope=scope)
+        if replay_error is not None:
+            return replay_error
+        if not replay_owner:
+            if not replay_entry.event.wait(timeout=600):
+                return tools.ToolResult(
+                    False, error="matching operation is still in progress",
+                    retryable=True, code="idempotency_in_progress")
+            return replay_entry.result or tools.ToolResult(
+                False, error="matching operation ended without a result",
+                retryable=True, code="idempotency_missing_result")
+
+    result = None
+    try:
+        if state is not None:
+            ok, reason = consume_catalog_call(catalog_id, name)
+            if not ok:
+                code = "budget_exhausted" if "budget" in reason else "not_advertised"
+                result = tools.ToolResult(False, error=reason, code=code)
+                return result
+            if name == "discover_tools":
+                result = tools.ToolResult(True, summary=discover_catalog(catalog_id, args))
+                return result
+        from oceano import safety
+        context = {"session": session,
+                   "channel": "background" if background else "web",
+                   "client": client}
+        if state is not None:
+            context["workspace"] = state.workspace
+        with turnctx.push(**context):
+            safety.reset_untrusted()
+            result = tools.run_result(name, json.dumps(args or {}))
+            if safety.untrusted_seen():
+                safety.mark_bridge_untrusted()
+            return result
+    finally:
+        if replayable and replay_owner:
+            _replay_finish(replay_entry, result or tools.ToolResult(
+                False, error="operation ended without a result", retryable=True,
+                code="execution_interrupted"))
 
 
 def run_tool(name, args, session=None, background=False, client="web", scope=None,
-             catalog_id=None):
-    """Execute an Oceano tool IN THE DAEMON. Interactive mind turns run on the 'web' channel (so ui_*
-    reach the live browser the user is watching); an UNATTENDED (background) mind turn runs on the
-    'background' channel instead — so it can't drive the live browser or UI. Returns the tool's
-    string result. Re-checks the denylist so the proxy can't reach a withheld tool.
-
-    `session`, `background`, and `client` are per-CALL turn attributes (from the X-Oceano-Session /
-    X-Oceano-Background / X-Oceano-Client headers the mind's bridge forwards, themselves from the
-    per-turn MCP config) — NOT process-globals, so concurrent turns for different chats never
-    inherit each other's session, channel, or client. `session` routes a spawn_job's result back to
-    the right chat; `client` is what oceano/tools/desktop.py's gate checks (only "desktop" — the
-    original web request that started this mind turn came from OceanoDesktop — unlocks those tools).
-
-    Carries the injection taint across the bridge: each call runs in its own request thread, so we
-    reset the thread-local taint, run, and if the tool read untrusted content (web page / email /
-    doc) raise the PROCESS-WIDE bridge taint — so a later ssh_run in the same mind turn is blocked.
-
-    `scope` narrows which tools are reachable (see _SCOPES) — e.g. a contained workflow sub-agent
-    gets "skills" (list_skills/load_skill only, no memory), never the full body."""
-    state = _catalog_state(catalog_id)
-    if catalog_id and state is None:
-        return "ERROR: resident catalog expired or is invalid"
-    if state is not None:
-        ok, reason = consume_catalog_call(catalog_id, name)
-        if not ok:
-            return f"ERROR: {reason}"
-        if name == "discover_tools":
-            return discover_catalog(catalog_id, args)
-    elif name not in _allowset(scope):
-        return f"ERROR: tool {name!r} is not available to the mind"
-    from oceano import safety
-    with turnctx.push(session=session, channel="background" if background else "web", client=client):
-        safety.reset_untrusted()                       # clean slate for this per-call thread
-        result = tools.run(name, json.dumps(args or {}))
-        if safety.untrusted_seen():                    # this tool ingested untrusted content → taint the turn
-            safety.mark_bridge_untrusted()
-        return result
+             catalog_id=None, operation_id=None):
+    """Compatibility wrapper returning the historical model-facing string."""
+    return run_tool_result(
+        name, args, session=session, background=background, client=client, scope=scope,
+        catalog_id=catalog_id, operation_id=operation_id).text()
 
 
 def mcp_config_path(sid=None, background=False, client="web", scope=None,

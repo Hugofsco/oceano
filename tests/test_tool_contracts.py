@@ -57,3 +57,38 @@ def test_native_test_failure_is_typed(monkeypatch):
     monkeypatch.setitem(tools._TOOLS, "run_tests", lambda path=".": "(exit 1) pytest\nfailed")
     result = tools.run_result("run_tests", '{}')
     assert result.ok is False and result.code == "tests_failed" and result.retryable is True
+
+
+def test_successful_shell_output_that_mentions_timed_out_stays_successful(monkeypatch):
+    monkeypatch.setitem(
+        tools._TOOLS,
+        "run_shell",
+        lambda command: "(exit 0)\nthe request timed out but was retried successfully",
+    )
+    result = tools.run_result("run_shell", '{"command":"demo"}')
+    assert result.ok is True
+    assert not result.code
+    assert result.verification == ("run_shell:ok",)
+
+
+def test_real_shell_timeout_marker_is_typed(monkeypatch):
+    monkeypatch.setitem(
+        tools._TOOLS,
+        "run_shell",
+        lambda command: "(timed out after 300s)\npartial output",
+    )
+    result = tools.run_result("run_shell", '{"command":"demo"}')
+    assert result.ok is False
+    assert result.code == "timeout" and result.retryable is True
+
+
+def test_tool_result_wire_round_trip_preserves_typed_evidence():
+    original = tools.ToolResult(
+        False, error="temporary failure", retryable=True,
+        side_effects=("file:app.py",), verification=("run_tests:ok",),
+        code="temporary", data={"attempt": 2})
+    wire = original.to_wire()
+    restored = tools.ToolResult.from_wire(wire)
+    assert wire["protocol"] == "oceano.tool-result.v1"
+    assert restored == original
+    assert tools.ToolResult.from_wire("legacy text") is None

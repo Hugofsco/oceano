@@ -6,6 +6,7 @@ its own MCP bridge config without inheriting the user's broader Codex setup.
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -35,6 +36,22 @@ def _j(s):
     return json.dumps(str(s))
 
 
+_DISABLED_RESIDENT_FEATURES = (
+    "multi_agent", "apps", "browser_use", "browser_use_external",
+    "browser_use_full_cdp_access", "computer_use", "goals", "image_generation",
+    "in_app_browser", "plugins", "plugin_sharing", "remote_plugin", "skill_search",
+    "shell_tool", "unified_exec",
+)
+
+
+def _isolation_lines(home):
+    lines = [f"{name} = false" for name in _DISABLED_RESIDENT_FEATURES]
+    lines += ["", "[agents]", "enabled = false", ""]
+    for skill in sorted(Path(home).glob("skills/**/SKILL.md")):
+        lines += ["[[skills.config]]", f"path = {_j(skill)}", "enabled = false", ""]
+    return lines
+
+
 def _auth_source_home():
     src = os.environ.get("OCEANO_CODEX_AUTH_HOME", "").strip()
     return Path(src).expanduser() if src else (Path.home() / ".codex")
@@ -60,8 +77,19 @@ def _write_config():
     import sys
     lines = [
         'approval_policy = "never"',
-        'sandbox_mode = "workspace-write"',
+        'sandbox_mode = "read-only"',
         'web_search = "disabled"',
+        '',
+        '[features]',
+        'hooks = true',
+    ] + _isolation_lines(_HOME) + [
+        '[[hooks.PreToolUse]]',
+        'matcher = "^(Bash|shell|exec_command|apply_patch|Edit|Write|write_file|edit_file|make_folder|run_shell|python_exec|run_tests|git|spawn_agent|send_input|resume_agent|wait_agent|close_agent)$"',
+        '',
+        '[[hooks.PreToolUse.hooks]]',
+        'type = "command"',
+        f'command = {_j(shlex.join([str(sys.executable), str(Path(__file__).with_name("codex_guard.py"))]))}',
+        'timeout = 10',
         '',
         '[mcp_servers.oceano]',
         f'command = {_j(sys.executable)}',
@@ -124,6 +152,9 @@ def _write_subagent_config(dst):
         'sandbox_mode = "workspace-write"',
         'web_search = "disabled"',
         '',
+        '[features]',
+        'hooks = true',
+    ] + _isolation_lines(Path(dst).parent) + [
         '[mcp_servers.oceano]',
         f'command = {_j(sys.executable)}',
         'args = ["-m", "oceano.mcp_bridge_server"]',
@@ -233,7 +264,31 @@ def _tool_call(item):
         return (str(name), detail[:400])
     if t == "web_search":
         return ("web_search", str(item.get("query") or ""))
+    if t == "collab_tool_call":
+        name = item.get("tool") or item.get("tool_name") or item.get("name") or "collab_tool_call"
+        detail = item.get("arguments") or item.get("input") or item.get("prompt") or ""
+        if not isinstance(detail, str):
+            try:
+                detail = json.dumps(detail, ensure_ascii=False)
+            except Exception:
+                detail = str(detail)
+        return (str(name), detail[:400])
+    if t in ("dynamic_tool_call", "image_generation", "computer_use"):
+        name = item.get("tool") or item.get("tool_name") or item.get("name") or t
+        detail = item.get("arguments") or item.get("input") or ""
+        return (str(name), str(detail)[:400])
     return None
+
+
+def _bounded_result_text(value, limit=2000):
+    text = str(value or "").strip()
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("protocol") == "oceano.tool-result.v1":
+        return text
+    return text[:limit]
 
 
 def _tool_result(item):
@@ -243,9 +298,9 @@ def _tool_result(item):
     if isinstance(err, dict):
         msg = err.get("message")
         if isinstance(msg, str) and msg.strip():
-            return msg.strip()[:2000]
+            return _bounded_result_text(msg)
     if isinstance(err, str) and err.strip():
-        return err.strip()[:2000]
+        return _bounded_result_text(err)
     # Shell command (item.type == "command_execution"): codex puts the combined stdout/stderr in
     # `aggregated_output` and the status in `exit_code` — NOT in output/text/result — so the old
     # lookups below missed it entirely and shell chips showed a BLANK result. Keep the tail (a
@@ -265,15 +320,15 @@ def _tool_result(item):
                     texts.append(part["text"].strip())
             txt = "\n".join(t for t in texts if t)
             if txt:
-                return txt[:2000]
+                return _bounded_result_text(txt)
         for k in ("text", "summary", "result"):
             v = nested.get(k)
             if isinstance(v, str) and v.strip():
-                return v.strip()[:2000]
+                return _bounded_result_text(v)
     for k in ("output", "text", "summary", "result"):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
-            return v.strip()[:2000]
+            return _bounded_result_text(v)
     # A command that ran but printed nothing: surface its exit status instead of a blank chip.
     if "exit_code" in item:
         code = item.get("exit_code")
@@ -282,7 +337,7 @@ def _tool_result(item):
 
 
 def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=None,
-               background=False, catalog_id=None):
+               background=False, catalog_id=None, client="web"):
     """Run one stateless Codex turn. The caller passes the WHOLE conversation in `prompt` (Oceano's
     self.messages is the single source of truth, mirroring the Claude mind), so every turn is a fresh
     ephemeral `codex exec` — no server-side thread to resume, drift, or lose. `session` is the chat
@@ -299,9 +354,13 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
     cmd = [binary, "exec"]
     if model:
         cmd += ["--model", str(model)]
-    sandbox = delegate.codex_sandbox_mode("workspace-write")    # falls back off bwrap if it can't sandbox here
+    # Resident mutation paths are denied by PreToolUse and run through MCP. Read-only is
+    # defense in depth; codex_sandbox_mode retains its compatibility fallback on hosts where
+    # nested Linux sandboxing is unavailable, while the pre-execution hook still applies.
+    sandbox = delegate.codex_sandbox_mode("read-only")
     cmd += delegate._codex_effort_args()                        # honour the configured reasoning effort
-    cmd += ["--json", "--sandbox", sandbox, "-c", 'approval_policy="never"', "--ephemeral"]
+    cmd += ["--json", "--sandbox", sandbox, "--skip-git-repo-check",
+            "-c", 'approval_policy="never"', "--ephemeral"]
     if session:
         # Per-turn config override (merges one leaf into the shared config.toml's env table, so
         # concurrent Codex turns for different chats never share a sid): the MCP bridge subprocess
@@ -313,6 +372,8 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
         cmd += ["-c", 'mcp_servers.oceano.env.OCEANO_MCP_BACKGROUND="1"']
     if catalog_id:
         cmd += ["-c", f'mcp_servers.oceano.env.OCEANO_MCP_CATALOG="{catalog_id}"']
+    if client and client != "web":
+        cmd += ["-c", f'mcp_servers.oceano.env.OCEANO_MCP_CLIENT="{client}"']
     if cwd:
         cmd += ["--cd", str(cwd)]
     # Feed the WHOLE conversation on stdin, NOT as a positional argument: Linux caps a single argv
@@ -421,9 +482,12 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
             item = ev.get("item") or {}
             call = _tool_call(item)
             if call:
-                pending[item.get("id") or str(time.time())] = call[0]
-                source = "mcp" if (item.get("type") or "") in ("mcp_tool_call", "mcp_tool_use") else "native"
-                emit({"type": "tool_call", "name": call[0], "args": call[1], "source": source})
+                source = ("mcp" if (item.get("type") or "") in
+                          ("mcp_tool_call", "mcp_tool_use") else "native")
+                pending[item.get("id") or str(time.time())] = {
+                    "name": call[0], "source": source}
+                emit({"type": "tool_call", "name": call[0], "args": call[1],
+                      "source": source})
         elif typ == "item.updated":
             item = ev.get("item") or {}
             if (item.get("type") or "") == "agent_message":
@@ -441,12 +505,18 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
                     emit({"type": "token", "text": txt})
             else:
                 iid = item.get("id")
-                name = pending.pop(iid, "") if iid else ""
-                if not name:
+                pending_call = pending.pop(iid, None) if iid else None
+                if pending_call:
+                    name = pending_call["name"]
+                    source = pending_call["source"]
+                else:
                     call = _tool_call(item)
                     name = call[0] if call else ""
+                    source = ("mcp" if itype in ("mcp_tool_call", "mcp_tool_use")
+                              else "native")
                 if name:
-                    emit({"type": "tool_result", "name": name, "result": _tool_result(item)})
+                    emit({"type": "tool_result", "name": name,
+                          "result": _tool_result(item), "source": source})
         elif typ == "turn.failed":
             break
 

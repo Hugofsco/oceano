@@ -87,7 +87,26 @@ def test_turn_health_aggregates_content_free_resident_metrics():
     assert health["summary"] == {
         "turns": 2, "healthy": 1, "incomplete": 1,
         "unresolved_errors": 1, "avg_tool_calls": 3.0,
+        "budget_pressure_turns": 0, "duplicate_calls": 0,
+        "catalog_misses": 0, "discoveries": 0,
     }
     assert health["recent"][0]["mind"] == "codex"
     assert health["recent"][1]["historical_errors"] == 1
     assert all("prompt" not in row and "result" not in row for row in health["recent"])
+
+
+def test_turn_health_surfaces_provider_and_routing_diagnostics():
+    traces.record_global(
+        "resident_turn", mind="codex", incomplete=True, errors=1,
+        tool_calls=8, catalog_max_calls=10, duplicate_calls=2,
+        failed_tools=["run_shell"], error_codes=["not_advertised"],
+        verification_count=0)
+    traces.record_global(
+        "tool_routing", phase="resident-discovered", model="codex:test")
+    health = traces.turn_health()
+    assert health["summary"]["budget_pressure_turns"] == 1
+    assert health["summary"]["catalog_misses"] == 1
+    assert health["summary"]["duplicate_calls"] == 2
+    assert health["summary"]["discoveries"] == 1
+    assert health["providers"][0]["health_pct"] == 0
+    assert health["failed_tools"] == [{"name": "run_shell", "count": 1}]
