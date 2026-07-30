@@ -57,6 +57,11 @@ TOOL_CAPABILITIES = {
     )},
     "run_shell": "shell_exec",
     "git": "shell_exec",
+    # run_tests EXECUTES a runner chosen from workspace files (make/npm/cargo/a project venv's
+    # python), so it belongs with run_shell. It was unmapped, and an unmapped tool resolves to
+    # capability "" → mode "allow" permanently — so a user who set shell_exec: block reasonably
+    # believed code execution was off while this stayed wide open.
+    "run_tests": "shell_exec",
     "python_exec": "python_exec",
     "spawn_job": "background_job",
     "spawn_agent": "background_job",
