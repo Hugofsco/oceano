@@ -235,9 +235,9 @@ async def run():
 
     log(f"⚓ Oceano engine — web http://{host}:{port} · telegram + scheduler + embeddings in-process")
     if host not in ("127.0.0.1", "localhost", "::1"):
-        log(f"[web] bound to {host} — reachable across the network. Keep it on a TRUSTED network, "
-            f"change the default admin password, and enable 2FA (Settings → Account). "
-            f"Set OCEANO_WEB_HOST=127.0.0.1 to restrict to this machine.")
+        log(f"[web] bound to {host} — reachable across the network. Keep it on a TRUSTED network "
+            f"and enable 2FA (Settings → Account). The agent runs shell commands, so never expose "
+            f"this to the public internet. Set OCEANO_WEB_HOST=127.0.0.1 to restrict to this machine.")
     try:
         # Runs the app lifespan (which starts the Telegram bot), then serves until
         # request_stop() fires; on the way out the lifespan stops the bot.

@@ -24,8 +24,6 @@ from oceano.web.server import _require_auth  # noqa: E402
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STORE", tmp_path / "web.json")
-    monkeypatch.setattr(state, "INITIAL_PW_FILE", tmp_path / "initial-password")
-    monkeypatch.setattr(routes_auth, "INITIAL_PW_FILE", tmp_path / "initial-password")
     monkeypatch.delenv("OCEANO_INITIAL_PASSWORD", raising=False)
     routes_auth._LOGIN_FAILS.clear()
 
@@ -49,7 +47,7 @@ def test_seed_password_is_random_and_not_the_old_default(tmp_path):
 
 def test_seeded_password_is_written_0600_and_usable_to_log_in(tmp_path):
     state.load()                                    # seeds the store
-    pw_file = tmp_path / "initial-password"
+    pw_file = state._initial_pw_file()
     assert pw_file.exists(), "the generated password must be recoverable"
     assert oct(pw_file.stat().st_mode & 0o777) == "0o600"
     pw = pw_file.read_text().strip()
@@ -63,7 +61,7 @@ def test_seeded_password_is_written_0600_and_usable_to_log_in(tmp_path):
 
 def test_first_boot_session_is_confined_to_the_change_password_call():
     state.load()
-    pw = (state.INITIAL_PW_FILE).read_text().strip()
+    pw = state._initial_pw_file().read_text().strip()
     client = TestClient(_app())
     assert client.post("/api/login", json={"user": "admin", "password": pw}).status_code == 200
     # every other authenticated API path is refused while must_change stands
@@ -73,7 +71,7 @@ def test_first_boot_session_is_confined_to_the_change_password_call():
                        json={"current_password": pw, "new_password": "a-strong-passphrase"}).status_code == 200
     # gate self-clears, normal operation resumes
     assert client.post("/api/logout").status_code == 200
-    assert not state.INITIAL_PW_FILE.exists(), "the seeded password file must be removed once changed"
+    assert not state._initial_pw_file().exists(), "the seeded password file must be removed once changed"
     assert state._is_default_pw(state.load()["auth"]) is False
 
 
@@ -90,3 +88,20 @@ def test_env_override_lets_a_deployment_inject_a_known_initial_password(monkeypa
     auth = state._auth_seed()
     assert state._hash_pw("from-the-vault", auth["salt"]) == auth["pwhash"]
     assert auth["must_change"] is True
+
+
+def test_seeding_never_writes_into_the_real_data_dir(tmp_path, monkeypatch):
+    """Regression: _initial_pw_file() must follow STORE.
+
+    It was a module-level constant pinned to the real data/ dir, so any test that pointed STORE at a
+    tmp path and then seeded (test_mcp_auth, test_chat_agent_access, test_suggestions_api,
+    test_secretcrypto_wiring) silently wrote a generated password into the developer's own
+    data/initial-password. Deriving it from STORE means redirecting the store redirects both.
+    """
+    import config
+    real = config.WORKSPACE.parent / "data" / "initial-password"
+    monkeypatch.setattr(state, "STORE", tmp_path / "sub" / "web.json")
+    state.load()                                        # seeds, writing the password file
+    assert state._initial_pw_file() == tmp_path / "sub" / "initial-password"
+    assert state._initial_pw_file().exists()
+    assert not real.exists(), "seeding a temp store must not touch the real data/ dir"

@@ -27,11 +27,9 @@ SEED_PW = "seeded-first-boot-pw"
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STORE", tmp_path / "web.json")
-    # The store is seeded with a RANDOM password now, so pin it for the test — and redirect the
-    # 0600 copy into tmp_path so seeding never touches the real data/ dir.
+    # The store is seeded with a RANDOM password now, so pin it for the test. The 0600 copy
+    # follows STORE automatically (state._initial_pw_file), so tmp_path gets it, not data/.
     monkeypatch.setenv("OCEANO_INITIAL_PASSWORD", SEED_PW)
-    monkeypatch.setattr(state, "INITIAL_PW_FILE", tmp_path / "initial-password")
-    monkeypatch.setattr(routes_auth, "INITIAL_PW_FILE", tmp_path / "initial-password")
     routes_auth._LOGIN_FAILS.clear()
 
 

@@ -7,7 +7,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from oceano.web.state import (
-    INITIAL_PW_FILE,
+    _initial_pw_file,
     SESSION_COOKIE,
     _current_user,
     _hash_pw,
@@ -121,7 +121,7 @@ async def change_account(request: Request, response: Response):
         # 0600 copy of the seeded password so it can't linger on disk after it stops being valid.
         auth.pop("must_change", None)
         try:
-            INITIAL_PW_FILE.unlink(missing_ok=True)
+            _initial_pw_file().unlink(missing_ok=True)
         except OSError:
             pass
     auth["user"] = new_user

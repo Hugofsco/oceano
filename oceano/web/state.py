@@ -124,7 +124,12 @@ def _totp_uri(secret, account, issuer="Oceano"):
             f"&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30")
 
 
-INITIAL_PW_FILE = config.WORKSPACE.parent / "data" / "initial-password"
+def _initial_pw_file():
+    """Where the generated first-boot password is saved. Derived from STORE at call time, NOT a
+    module constant: the seeded password belongs beside the store it was seeded into, so anything
+    that redirects STORE (every test that points it at a tmp dir) redirects this too. As a constant
+    it silently wrote into the real data/ whenever a test seeded a temp store."""
+    return STORE.parent / "initial-password"
 
 
 def _mint_initial_password():
@@ -143,16 +148,17 @@ def _announce_initial_password(pw):
     """Surface the generated password exactly once, two ways: stdout (so it lands in the
     installer output and `journalctl -u oceano`) and a 0600 file for anyone who missed it.
     Written through atomicio so it can't land world-readable."""
+    path = _initial_pw_file()
     banner = ("\n" + "=" * 66 + "\n"
               "  Oceano first boot — your login is:\n\n"
               f"      user:     admin\n"
               f"      password: {pw}\n\n"
               "  You'll be asked to change it on first sign-in. Also saved to\n"
-              f"  {INITIAL_PW_FILE} (delete it once you've changed the password).\n"
+              f"  {path} (delete it once you've changed the password).\n"
               + "=" * 66 + "\n")
     print(banner, flush=True)
     try:
-        atomicio.write_text(INITIAL_PW_FILE, pw + "\n")
+        atomicio.write_text(path, pw + "\n")
     except OSError:
         pass
 
