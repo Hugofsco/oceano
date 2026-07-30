@@ -409,7 +409,7 @@ def _dispatch(source, instruction, ref=None, model=None, base_url=None):
     from oceano import tools, jobs
 
     def task_agent():
-        ag = Agent()
+        ag = Agent(trusted_origin=False)
         ag.tool_surface = "scheduled"
         return ag
 

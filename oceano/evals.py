@@ -268,7 +268,8 @@ def _run_case(case, model, cancel=None, dynamic_tools=None):
                     pass
             ag = Agent(model=model, learn=False, inject_context=False, only_tools=allowed,
                        dynamic_tools=dynamic_tools,
-                       routing_catalog=all_schemas if dynamic_tools is not None else None)
+                       routing_catalog=all_schemas if dynamic_tools is not None else None,
+                       trusted_origin=False)
             ag.tool_surface = "eval"
             deadline = t0 + (case.get("timeout") or CASE_TIMEOUT)
             for ev in ag.run_stream(case["prompt"]):

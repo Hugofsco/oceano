@@ -994,7 +994,8 @@ def to_api(instructions, cwd=None, role="default", tools=DEFAULT_TOOLS, timeout=
         # and run_workflow, so a spawned agent can't fan out further).
         ag = Agent(model=model, base_url=base_url, api_key=api_key, learn=False,
                    inject_context=False, exclude_tools=(exclude or {"delegate", "delegate_to_claude"}),
-                   only_tools=_api_only_tools(tools, skills=skills), on_event=_on_ev)
+                   only_tools=_api_only_tools(tools, skills=skills), on_event=_on_ev,
+                   trusted_origin=False)   # a delegate inherits its caller's taint
         ag.tool_surface = "delegate"
         deadline = (time.monotonic() + timeout) if timeout else None
         ctx = _tools.background_workspace(cwd) if cwd else _tools.background()

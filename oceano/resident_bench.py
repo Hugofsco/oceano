@@ -329,7 +329,8 @@ def _live_case(provider, mode, case, api_target=None):
             api_key=target.get("api_key") if provider == "api" else None,
             learn=False,
             dynamic_tools=(mode == "hybrid") if provider == "api" else None,
-            resident_tool_mode=(mode == "hybrid"))
+            resident_tool_mode=(mode == "hybrid"),
+            trusted_origin=False)
         events = []
         first_action_ms = None
         stream_failed = False

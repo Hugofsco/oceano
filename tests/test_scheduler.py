@@ -132,6 +132,9 @@ def test_dispatch_follows_primary_intelligence_when_task_has_no_model_override(m
     calls = []
 
     class FakeAgent:
+        def __init__(self, **kw):
+            self.kw = kw
+
         def run_claude(self, instruction, cancel=None):
             calls.append("claude")
             return "ran via claude mind"

@@ -276,6 +276,14 @@ def untrusted_seen():
     return turnctx.get().tainted
 
 
+def mark_untrusted():
+    """Taint this turn WITHOUT fencing any text — for callers that know the run is operating on
+    externally-authored input but aren't producing a model-visible string right here (e.g. a workflow
+    resumed from a checkpoint, where the fenced message is restored but the flag was never persisted)."""
+    from oceano import turnctx
+    turnctx.mutate(tainted=True)
+
+
 def reset_untrusted():
     from oceano import turnctx
     turnctx.mutate(tainted=False)
@@ -283,6 +291,30 @@ def reset_untrusted():
 
 def bridge_untrusted_seen():
     return _bridge_seen
+
+
+def injection_tainted():
+    """True if THIS turn ingested untrusted content — either via a tool on this thread (turnctx) or
+    via a resident-mind bridge call (process-wide). Gates should call THIS rather than checking one
+    half: a gate that tests only untrusted_seen() stays open on the Claude/Codex mind path, where
+    every bridged call lands on its own request thread."""
+    return untrusted_seen() or bridge_untrusted_seen()
+
+
+# Refusal for the tools that START A NEW TURN (delegate, spawn_agent, run_workflow, schedule_task).
+# Those turns used to begin with the taint cleared, so a tainted turn could reach any capability it
+# was just refused by laundering it through a child — the child ran clean with the full catalog.
+# Child turns now inherit taint (Agent(trusted_origin=False)); this gate closes the same hole at the
+# call site, so an injected page can't even start the new execution context.
+SPAWN_TAINTED = ("Blocked for safety: this turn already read external content (a web page, email, or "
+                 "document), so starting new autonomous work (delegate / spawn_agent / run_workflow / "
+                 "schedule_task) is disabled — injected text must not be able to launder itself into a "
+                 "fresh, unsupervised turn. Ask the user to send a fresh message to run this.")
+
+
+def spawn_blocked():
+    """Refusal string if this turn may not start new autonomous work, else None."""
+    return SPAWN_TAINTED if injection_tainted() else None
 
 
 def mark_bridge_untrusted():

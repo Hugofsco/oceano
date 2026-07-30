@@ -1,5 +1,5 @@
 """Scheduled tasks, self-improvement suggestions, workflows, and notifications."""
-from oceano import scheduler
+from oceano import safety, scheduler
 from oceano.tools.core import tool
 
 # --- scheduled tasks + notifications ---------------------------------------
@@ -20,6 +20,12 @@ from oceano.tools.core import tool
     },
 })
 def schedule_task(instruction, cron="", at=""):
+    # A persisted, unattended, full-catalog turn is the most durable thing an injection can create:
+    # the instruction outlives this turn and later runs with no human watching. Refuse once this turn
+    # has read external content.
+    refusal = safety.spawn_blocked()
+    if refusal:
+        return refusal
     return scheduler.schedule_task(cron, instruction, run_once_at=(at or None))
 
 
@@ -202,6 +208,9 @@ def _run_one_workflow(name, inp=""):
 def run_workflow(name, input=""):
     """Run one workflow, or several in sequence: pass a comma-separated list of names. `input`
     is the workflow's argument (used by workflows that declare they take one)."""
+    refusal = safety.spawn_blocked()          # a workflow node turn is a fresh full-catalog agent
+    if refusal:
+        return refusal
     inp = str(input or "")
     names = [n.strip() for n in str(name or "").split(",") if n.strip()]
     if len(names) > 1:

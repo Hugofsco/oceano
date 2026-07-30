@@ -254,8 +254,10 @@ def test_instruction_model_pin_runs_on_pinned_agent_with_shared_context(monkeypa
 
     class FakeAgent:
         def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
-                     exclude_tools=None, only_tools=None, inject_context=True):
+                     exclude_tools=None, only_tools=None, inject_context=True,
+                                  trusted_origin=True, **kw):
             self.model, self.base_url, self.api_key = model, base_url, api_key
+            self.trusted_origin = trusted_origin
             self.messages = []
             self.on_event = on_event or (lambda k, d: None)
             made.append(self)
@@ -294,8 +296,10 @@ def test_shared_and_pinned_agents_never_inject_personal_context(monkeypatch):
 
     class FakeAgent:
         def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
-                     exclude_tools=None, only_tools=None, inject_context=True):
+                     exclude_tools=None, only_tools=None, inject_context=True,
+                                  trusted_origin=True, **kw):
             self.model, self.base_url, self.api_key = model, base_url, api_key
+            self.trusted_origin = trusted_origin
             self.inject_context = inject_context
             self.messages = [{"role": "system", "content": "sys"}]
             self.on_event = on_event or (lambda k, d: None)
@@ -368,8 +372,10 @@ class FakeMindAgent:
     each turn actually took, so tests can tell a mind-routed turn from a plain OpenAI-loop one."""
 
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
-                 exclude_tools=None, only_tools=None, inject_context=True):
+                 exclude_tools=None, only_tools=None, inject_context=True,
+                              trusted_origin=True, **kw):
         self.model, self.base_url, self.api_key = model, base_url, api_key
+        self.trusted_origin = trusted_origin
         self.messages = []
         self.on_event = on_event or (lambda k, d: None)
         self.calls = []

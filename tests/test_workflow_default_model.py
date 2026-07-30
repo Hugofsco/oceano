@@ -33,8 +33,10 @@ class FakeAgent:
     calls = []
 
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
-                 exclude_tools=None, only_tools=None, inject_context=True):
+                 exclude_tools=None, only_tools=None, inject_context=True,
+                              trusted_origin=True, **kw):
         self.model, self.base_url, self.api_key = model, base_url, api_key
+        self.trusted_origin = trusted_origin
         self.messages = []
         self.on_event = on_event or (lambda k, d: None)
 

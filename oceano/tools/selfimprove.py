@@ -1,5 +1,5 @@
 """Self-improvement: learned skills, independent review, and delegation."""
-from oceano import skills
+from oceano import safety, skills
 from oceano.tools.core import _TOOLS, _ws, emit_progress, tool
 
 # --- self-improvement: learned skills + delegation ---------------------------
@@ -74,6 +74,12 @@ def evaluate_skill(name=""):
 })
 def delegate_tool(instructions):
     from oceano import delegate
+    # `instructions` is a free-form string the model controls, handed to a full agentic CLI that can
+    # read, write and run things. That is at least as powerful as ssh_run (which IS gated), so it
+    # gets the same anti-laundering gate.
+    refusal = safety.spawn_blocked()
+    if refusal:
+        return refusal
 
     def on_prog(ev):                         # surface the delegate's live work to the frontend
         emit_progress({"source": "delegate", **ev})
@@ -134,6 +140,9 @@ def _chat_agent_tool_scope(access):
     },
 })
 def spawn_agent(task, provider="", label="", timeout=0):
+    refusal = safety.spawn_blocked()           # an unattended sub-agent must not start from a tainted turn
+    if refusal:
+        return refusal
     from oceano import agentjobs, mindbridge   # lazy: mindbridge imports tools (avoid an import cycle)
     from oceano.web import state as web_state
     access = web_state.load().get("prefs", {}).get("chat_agent_access", "read")

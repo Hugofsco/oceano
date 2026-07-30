@@ -233,7 +233,7 @@ def _run_with_model(prompt, model, base_url, cancel=None):
     from oceano.agent import Agent
 
     def research_agent():
-        ag = Agent()
+        ag = Agent(trusted_origin=False)
         ag.tool_surface = "research"
         return ag
 

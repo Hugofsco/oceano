@@ -242,7 +242,7 @@ def _run_local(task, tools_spec, timeout, cwd, on_progress, skills=False):
         ag = Agent(model=prim["model"], base_url=prim["base_url"] or None,
                    api_key=prim["api_key"] or None, learn=False, inject_context=False,
                    exclude_tools=EXCLUDE, only_tools=delegate._api_only_tools(tools_spec, skills=skills),
-                   on_event=_on_ev)
+                   on_event=_on_ev, trusted_origin=False)   # a spawned sub-agent inherits taint
         ag.tool_surface = "delegate"
         deadline = (time.monotonic() + timeout) if timeout else None
         with jobs.job("agent", label=str(task)[:140], gate=True) as jid:

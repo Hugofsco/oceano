@@ -644,7 +644,8 @@ _FOLD_CHUNK_CHARS = max(2000, int(os.environ.get("OCEANO_CTX_FOLD_CHUNK_CHARS", 
 class Agent:
     def __init__(self, model=None, on_event=None, base_url=None, api_key=None, learn=True,
                  exclude_tools=None, only_tools=None, inject_context=True, dynamic_tools=None,
-                 routing_catalog=None, tool_surface="chat", resident_tool_mode=None):
+                 routing_catalog=None, tool_surface="chat", resident_tool_mode=None,
+                 trusted_origin=True):
         if model:                                    # explicit model → caller owns base_url/api_key
             self.model, self.base_url, self.api_key = model, base_url, api_key
         else:                                        # default → primary model AND its endpoint
@@ -673,6 +674,18 @@ class Agent:
         # None follows the resident surface policy; True forces hybrid and False forces full.
         # Used by controlled resident benchmarks without mutating process-global configuration.
         self.resident_tool_mode = resident_tool_mode
+        # Does a turn on this Agent START a fresh trust boundary?
+        #
+        # True (default) = a real user is speaking: the web/CLI/Telegram entry points, where a new
+        # message legitimately clears the injection taint from the previous turn.
+        #
+        # False = this Agent runs work DERIVED from somewhere else — a workflow node, a spawned
+        # sub-agent, a delegate, a scheduled dispatch. Those must INHERIT the caller's taint instead
+        # of clearing it, because clearing it is privilege laundering: an injected page could get
+        # run_shell refused and then reach the same capability through run_workflow / spawn_agent /
+        # delegate / schedule_task, whose child turn started clean. Note this only ever PRESERVES
+        # taint — it never invents it — so a genuinely clean derived turn is unaffected.
+        self.trusted_origin = trusted_origin
         # inject_context=False for delegates: give operational context (date/workspace/channel)
         # but NOT the user's personal memories/research/skills — a delegate gets a self-contained
         # task, and we shouldn't ship personal data to it (esp. a cloud delegate).
@@ -716,7 +729,12 @@ class Agent:
             # from the user's own first message, silently disabling shell/SSH/mail/MCP on any prompt
             # that matched a research doc. In `finally` so the reset is unconditional even if context
             # assembly raises — the ordering fix must not turn into a missed reset.
-            safety.reset_untrusted(); safety.reset_bridge_untrusted()
+            #
+            # ONLY for a trusted origin. A derived turn (workflow node, sub-agent, delegate,
+            # scheduled dispatch) inherits its caller's taint instead — see self.trusted_origin.
+            # Without this, every taint gate in the system was one hop from irrelevant.
+            if self.trusted_origin:
+                safety.reset_untrusted(); safety.reset_bridge_untrusted()
 
     def context_metrics(self):
         """(message count, ~token estimate) for this conversation. The estimate is
