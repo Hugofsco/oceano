@@ -184,7 +184,13 @@ def _run_one_workflow(name, inp=""):
     for s in rec.get("steps", []):
         mark = "✓" if s["ok"] else "✗"
         lines.append(f"  {mark} {s['label']}: {(s['output'] or '').strip()[:240]}")
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    # workflows.run() scopes its taint so it can't leak into a reused threadpool thread. If the run
+    # DID read untrusted content, the caller must still inherit it — the step outputs below are that
+    # content. Fence them like any other content-returning tool, which taints this turn too.
+    if rec.get("tainted"):
+        return safety.wrap_untrusted(f"workflow:{wf['name']}", out)
+    return out
 
 
 @tool({

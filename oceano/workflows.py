@@ -1140,6 +1140,12 @@ def _decide(node, last_output, ag):
     q = node.get("question", "") or "Should the workflow take the YES branch?"
     if mode == "delegate":
         from oceano import delegate
+        # A decision node in delegate mode still starts a contained agent run — same gate as the
+        # delegate/agent nodes. On a tainted run, fall back to a refusal rather than letting
+        # attacker-influenced text steer a branch through an autonomous sub-run.
+        _refusal = safety.spawn_blocked()
+        if _refusal:
+            return False, f"delegate decision blocked: {_refusal}"
         r = delegate.run(f"{q}\n\nMost recent step output:\n{last_output[:2000]}\n\n"
                          "Answer with exactly one word: YES or NO.",
                          cwd=config.WORKSPACE, tools="Read", timeout=300, role=node.get("role", "default"))
@@ -1399,6 +1405,10 @@ def _run_orchestrate(node, agents, ctx, ag, spawned, emit, beat):
         # attached agent's OWN "write" setting (from its inspector) travels with it into the
         # orchestrator, so plugging an agent in doesn't change its privilege level either way.
         tool_scope = _tool_scope_for(a.get("write"))
+        # Orchestrator fan-out spawns agents directly too — same gate as the standalone agent node.
+        _refusal = safety.spawn_blocked()
+        if _refusal:
+            raise RuntimeError(_refusal)
         # no per-node provider/model → the agent follows the run's mind (task pin, else the
         # delegation default via spawn's own resolution); a node-level endpoint pin still wins
         rec = agentjobs.spawn(task,
@@ -1647,6 +1657,39 @@ def resume(wid, on_step=None):
 
 
 def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _depth=0,
+        nested=False, _resume=None, default_model="", default_base_url=""):
+    """Taint-scoping wrapper around the graph walk (see _run_inner for the real work).
+
+    A run marks its own context tainted for an untrusted trigger, and its nodes taint it further by
+    reading pages/mail. None of that may ESCAPE the run: webhook_run_sync executes inline on a
+    FastAPI threadpool thread, and those threads are REUSED, so a bare mutate would leave the next
+    unrelated request on that thread permanently gated. (This never showed before because Agent.run()
+    used to scrub taint unconditionally on exit; making that conditional removed the accidental
+    cleanup.) So snapshot on the way in and restore on the way out.
+
+    The run's taint still reaches a CALLING AGENT — but through the run_workflow tool fencing its
+    returned output, which is the same path every other content-returning tool uses, rather than by
+    leaking a thread-global flag.
+    """
+    from oceano import turnctx
+    before = turnctx.get().tainted
+    ended_tainted = False
+    try:
+        rec = _run_inner(wf, trigger=trigger, on_step=on_step, _chain_seen=_chain_seen, inp=inp,
+                         _depth=_depth, nested=nested, _resume=_resume,
+                         default_model=default_model, default_base_url=default_base_url)
+        ended_tainted = turnctx.get().tainted
+        if isinstance(rec, dict):
+            rec["tainted"] = bool(ended_tainted)     # so run_workflow can fence its output
+        return rec
+    finally:
+        # A nested sub-workflow must still hand its taint up to the parent RUN, so only restore at
+        # the outermost level; nesting keeps the monotonic "may add, never clear" rule.
+        turnctx.mutate(tainted=(before or ended_tainted) if nested else before)
+
+
+
+def _run_inner(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _depth=0,
         nested=False, _resume=None, default_model="", default_base_url=""):
     """Walk the workflow graph from its start node, executing nodes and branching at decision/switch
     nodes, iterating loop nodes, retrying failures and taking 'error' edges, and pausing at approval
@@ -2002,20 +2045,35 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                 ag.on_event = lambda kind, d: None
                             elif ok and t == "delegate":
                                 from oceano import delegate
-                                tool_scope = _tool_scope_for(cur.get("write"))
-                                text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
-                                r = delegate.run(text, cwd=config.WORKSPACE,
-                                                 tools=tool_scope, timeout=cur.get("timeout") or None,
-                                                 role=cur.get("role", "default"),
-                                                 skills=True)
-                                ok = bool(r.get("ok"))
-                                output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
+                                # delegate_tool() is gated, but this node calls delegate.run()
+                                # DIRECTLY — so without this an email/webhook/chain-triggered
+                                # workflow reaches autonomous execution without ever passing
+                                # spawn_blocked(). Same check, same failure shape as a delegate error.
+                                _refusal = safety.spawn_blocked()
+                                if _refusal:
+                                    ok, output = False, _refusal
+                                else:
+                                    tool_scope = _tool_scope_for(cur.get("write"))
+                                    text = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("text", ""), ctx)
+                                    r = delegate.run(text, cwd=config.WORKSPACE,
+                                                     tools=tool_scope, timeout=cur.get("timeout") or None,
+                                                     role=cur.get("role", "default"),
+                                                     skills=True)
+                                    ok = bool(r.get("ok"))
+                                    output = (r.get("output") or "") if ok else f"delegate failed: {r.get('error', '')}"
                                 ag.messages.append({"role": "user", "content": f"(delegated → {output[:1500]})"})
                             elif ok and t == "agent":
                                 from oceano import agentjobs
-                                tool_scope = _tool_scope_for(cur.get("write"))
-                                task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
-                                rec = agentjobs.spawn(task,
+                                # spawn_agent() the TOOL is gated, but this node calls agentjobs.spawn() DIRECTLY —
+                                # without this an email/webhook/chain-triggered workflow reaches autonomous execution
+                                # without ever passing spawn_blocked().
+                                _refusal = safety.spawn_blocked()
+                                if _refusal:
+                                    ok, output = False, _refusal
+                                else:
+                                    tool_scope = _tool_scope_for(cur.get("write"))
+                                    task = _persona_prefix(cur.get("persona", "")) + _tmpl(cur.get("task", ""), ctx)
+                                    rec = agentjobs.spawn(task,
                                                       provider=cur.get("provider")
                                                       or ("" if cur.get("model") else getattr(ag, "wf_mind_pin", "")),
                                                       model=cur.get("model", ""),
@@ -2024,8 +2082,8 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
                                                       timeout=cur.get("timeout", 600),
                                                       tools=tool_scope, skills=True,
                                                       cwd=config.WORKSPACE)
-                                spawned[cur["id"]] = rec["id"]
-                                output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
+                                    spawned[cur["id"]] = rec["id"]
+                                    output = json.dumps({"agent_id": rec["id"], "label": rec["label"],
                                                      "provider": rec["provider"], "state": rec["state"]})
                             elif ok and t == "await":
                                 from oceano import agentjobs

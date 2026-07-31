@@ -141,6 +141,14 @@ def browser_snapshot():
     },
 })
 def browser_fill(field, text, enter=False):
+    # This is EGRESS, not navigation. `text` is arbitrary model-controlled content and enter=True
+    # submits the form in the same call, so an injected page can have the conversation pasted into
+    # a field it controls. Classifying it with browser_open/click as "the read path" was wrong:
+    # clicking a link is reading, typing a payload into someone else's form is sending. Navigation
+    # and GET fetching stay open, so multi-page research still works.
+    refusal = safety.egress_blocked()
+    if refusal:
+        return refusal
     if not live_browser_available():
         return _BG_BROWSER_NOTE
     r = livebrowser.fill(field, text, enter=enter)

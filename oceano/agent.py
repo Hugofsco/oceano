@@ -734,7 +734,7 @@ class Agent:
             # scheduled dispatch) inherits its caller's taint instead — see self.trusted_origin.
             # Without this, every taint gate in the system was one hop from irrelevant.
             if self.trusted_origin:
-                safety.reset_untrusted(); safety.reset_bridge_untrusted()
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
 
     def context_metrics(self):
         """(message count, ~token estimate) for this conversation. The estimate is
@@ -1019,7 +1019,12 @@ class Agent:
         try:
             return self._run(user_message, deadline=deadline, cancel=cancel)
         finally:
-            safety.reset_untrusted(); safety.reset_bridge_untrusted()
+            # Same trusted_origin condition as _prepare_turn. Gating only the ENTRY was a half-fix:
+            # a derived turn inherited taint on the way in and then wiped it on the way out, so in a
+            # multi-node email/webhook workflow one harmless instruction node cleared the taint for
+            # every node after it.
+            if self.trusted_origin:
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
 
     def _run(self, user_message: str, deadline=None, cancel=None) -> str:
         """`deadline` (a time.monotonic() instant) bounds a delegated run: checked
@@ -1658,7 +1663,12 @@ class Agent:
         try:
             yield from self._run_stream(user_message, only_tools=only_tools, cancel=cancel, voice=voice)
         finally:
-            safety.reset_untrusted(); safety.reset_bridge_untrusted()
+            # Same trusted_origin condition as _prepare_turn. Gating only the ENTRY was a half-fix:
+            # a derived turn inherited taint on the way in and then wiped it on the way out, so in a
+            # multi-node email/webhook workflow one harmless instruction node cleared the taint for
+            # every node after it.
+            if self.trusted_origin:
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
 
     def _run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat

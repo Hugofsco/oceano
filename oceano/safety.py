@@ -16,6 +16,7 @@ import ipaddress
 import os
 import re
 import socket
+import threading
 from urllib.parse import urlparse
 
 import requests
@@ -243,7 +244,14 @@ def guarded_request(method, url, **kw):
         raise Blocked(refusal)
     ip = _safe_ip(host)
     sess = requests.Session()
-    sess.mount(p.scheme + "://", _PinnedAdapter(host, ip, scheme=p.scheme))
+    # Mount the pinned adapter on BOTH schemes, not just the initial one. requests.Session ships
+    # default adapters for http:// and https://, so mounting only the request's own scheme left the
+    # other one as an ordinary unpinned HTTPAdapter — and a cross-scheme redirect (https → http)
+    # would then be issued through it, unvalidated. Same-scheme host changes already failed closed;
+    # this closes the cross-scheme path the same way, since _PinnedAdapter.send raises Blocked on any
+    # host that isn't the one we validated.
+    for scheme in ("http", "https"):
+        sess.mount(scheme + "://", _PinnedAdapter(host, ip, scheme=scheme))
     try:
         return sess.request(method, url, **kw)
     finally:
@@ -263,12 +271,27 @@ def guarded_get(url, **kw):
 # other's taint, and turnctx.carry() keeps it alive across worker-thread handoffs.
 
 # The Claude-mind reaches Oceano's tools over an MCP bridge that handles each call in its OWN request
-# thread, so the thread-local _taint can't carry "this turn read untrusted content" from one bridge
-# call (fetch_url) to the next (ssh_run). This PROCESS-WIDE flag fills that gap: mindbridge.run_tool
-# sets it when a bridge tool reads untrusted content, the agent clears it at the start of each turn,
-# and ssh_run honours it too. (Concurrent mind turns share it — that only ever over-blocks, never
-# under-blocks the common single-turn case.)
-_bridge_seen = False
+# thread, so the thread-local taint can't carry "this turn read untrusted content" from one bridge
+# call (fetch_url) to the next (ssh_run). This fills that gap: mindbridge.run_tool marks it when a
+# bridge tool reads untrusted content, the agent clears it at its own turn boundaries, and the gates
+# honour it too.
+#
+# Keyed BY SESSION, not a single process-wide bool. As one flag shared by every turn it could
+# UNDER-block, despite the old comment claiming otherwise: any concurrent turn calling
+# reset_bridge_untrusted() cleared it out from under a resident turn that was still tainted, which is
+# a silent gate bypass rather than a false alarm. A session only ever clears its own entry.
+_bridge_seen = set()          # session keys currently tainted
+_bridge_lock = threading.Lock()
+_BRIDGE_DEFAULT = "__no_session__"
+
+
+def _bridge_key(session=None):
+    """The taint key for this call: the explicit session, else the turn context's, else a shared
+    default for utility/non-chat agents (which are single-threaded per run)."""
+    if session:
+        return str(session)
+    from oceano import turnctx
+    return str(turnctx.get().session or _BRIDGE_DEFAULT)
 
 
 def untrusted_seen():
@@ -289,8 +312,9 @@ def reset_untrusted():
     turnctx.mutate(tainted=False)
 
 
-def bridge_untrusted_seen():
-    return _bridge_seen
+def bridge_untrusted_seen(session=None):
+    with _bridge_lock:
+        return _bridge_key(session) in _bridge_seen
 
 
 def injection_tainted():
@@ -353,14 +377,15 @@ def persist_blocked():
     return PERSIST_TAINTED if injection_tainted() else None
 
 
-def mark_bridge_untrusted():
-    global _bridge_seen
-    _bridge_seen = True
+def mark_bridge_untrusted(session=None):
+    with _bridge_lock:
+        _bridge_seen.add(_bridge_key(session))
 
 
-def reset_bridge_untrusted():
-    global _bridge_seen
-    _bridge_seen = False
+def reset_bridge_untrusted(session=None):
+    """Clear ONLY this session's bridge taint — never another concurrent turn's."""
+    with _bridge_lock:
+        _bridge_seen.discard(_bridge_key(session))
 
 
 def wrap_untrusted(source, content, taint=True):
