@@ -190,6 +190,13 @@ def http_request(url, method="GET", headers=None, json=None, body=None, params=N
     initial_method = method
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
         return "ERROR: method must be GET/POST/PUT/PATCH/DELETE/HEAD"
+    # Only the body-carrying/mutating methods are gated: a GET still lets the agent keep reading
+    # (which is the whole point of a research turn), while POST/PUT/PATCH/DELETE — the clean way to
+    # ship a conversation's contents to an attacker endpoint — are refused once the turn is tainted.
+    if method not in ("GET", "HEAD"):
+        refusal = safety.egress_blocked()
+        if refusal:
+            return refusal
     hdrs = dict(headers) if isinstance(headers, dict) else {}
     qp = params if isinstance(params, dict) else None
     request_json = json

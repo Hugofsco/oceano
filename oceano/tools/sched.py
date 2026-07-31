@@ -258,4 +258,7 @@ def list_workflows():
     },
 })
 def notify(message, title="Oceano"):
+    refusal = safety.egress_blocked()      # arbitrary text to ntfy/Telegram is a clean exfil channel
+    if refusal:
+        return refusal
     return scheduler.notify(message, title)

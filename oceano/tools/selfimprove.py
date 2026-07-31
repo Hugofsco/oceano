@@ -19,6 +19,12 @@ from oceano.tools.core import _TOOLS, _ws, emit_progress, tool
     },
 })
 def learn_skill(name, description, body):
+    # The two-model review pipeline is a real control, but a tainted turn shouldn't even be able to
+    # put a candidate into the queue — the reviewer is another model, and its input would be
+    # attacker-authored.
+    refusal = safety.persist_blocked()
+    if refusal:
+        return refusal
     return skills.learn_skill(name, description, body)
 
 

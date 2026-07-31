@@ -277,6 +277,9 @@ def browser_read():
     },
 })
 def browser_eval(code):
+    refusal = safety.egress_blocked()      # arbitrary JS in a profile holding live logins
+    if refusal:
+        return refusal
     if not live_browser_available():
         return _BG_BROWSER_NOTE      # inherently web-only → no arbitrary JS in unattended runs
     r = livebrowser.evaluate_js(code)
@@ -320,6 +323,9 @@ def browser_hover(target):
     },
 })
 def browser_upload(field, path):
+    refusal = safety.egress_blocked()      # pushing a workspace file into someone else's form
+    if refusal:
+        return refusal
     if not live_browser_available():
         return _BG_BROWSER_NOTE
     try:

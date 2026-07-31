@@ -29,6 +29,12 @@ from oceano.tools.core import tool
     },
 })
 def remember(text, category="fact", tags="", source=""):
+    # identity/preference memories are injected UNFENCED into every future system prompt, so an
+    # injected "remember that X is pre-approved" is a self-reinforcing compromise that outlives
+    # the turn and survives restarts.
+    refusal = safety.persist_blocked()
+    if refusal:
+        return refusal
     return memory.remember(text, tags, category=category, source=source)
 
 
@@ -60,6 +66,9 @@ def recall(query):
     },
 })
 def update_memory(about, new_text):
+    refusal = safety.persist_blocked()     # rewriting a remembered fact is planting one
+    if refusal:
+        return refusal
     m = memory.best_match(about)
     if not m or m["score"] < 0.5:
         memory.remember(new_text)
@@ -80,6 +89,9 @@ def update_memory(about, new_text):
     },
 })
 def forget_memory(about):
+    refusal = safety.persist_blocked()     # deleting memory can erase what the user relies on
+    if refusal:
+        return refusal
     m = memory.best_match(about)
     if not m or m["score"] < 0.5:
         return f"no clearly-matching memory found for {about!r} — nothing forgotten"
