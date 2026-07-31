@@ -59,9 +59,14 @@ class _FakeResp:
 
 
 def _stub_requests(monkeypatch, seen, reply_text):
+    """Stub the GUARDED request path. The http node used to call requests.request directly, which
+    re-resolved the host after check_url had already resolved it — reopening the DNS-rebinding window
+    the pinned adapter exists to close. Patching safety.guarded_request (rather than the requests
+    module) both keeps these tests working and pins that the node goes through the guard."""
     def request(method, url, headers=None, data=None, timeout=0, allow_redirects=True):
         seen.update(method=method, url=url, headers=headers or {}, data=data)
         return _FakeResp(reply_text)
+    monkeypatch.setattr("oceano.safety.guarded_request", request)
     monkeypatch.setitem(sys.modules, "requests",
                         types.SimpleNamespace(request=request,
                                               compat=types.SimpleNamespace(urljoin=lambda a, b: b)))

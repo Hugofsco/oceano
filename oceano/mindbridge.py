@@ -122,6 +122,8 @@ def _catalog_owner_error(state, *, session=None, background=False, client="web",
 
 def close_catalog(catalog_id):
     """Explicitly discard a completed turn catalog; TTL/LRU remain crash fallbacks."""
+    from oceano import safety
+    safety.reset_bridge_untrusted(catalog_id)   # the turn owning this key is over — don't leak it
     with _CATALOG_LOCK:
         return _CATALOGS.pop(catalog_id, None) is not None
 
@@ -369,6 +371,11 @@ def run_tool_result(name, args, session=None, background=False, client="web", sc
                 return result
         from oceano import safety
         context = {"session": session,
+                   # Bridge taint is keyed on this, NOT on session: session is None for
+                   # workflow/scheduler/Telegram-driven resident turns, which would put them all in
+                   # one bucket that races itself clean. The catalog id is already unique per
+                   # resident turn, and both the marker (here) and the gates resolve the same key.
+                   "taint_scope": catalog_id or session,
                    "channel": "background" if background else "web",
                    "client": client}
         if state is not None:

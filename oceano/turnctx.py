@@ -31,6 +31,11 @@ class TurnContext:
     workspace: object = None  # Path override for file/shell tools (None → config.WORKSPACE)
     session: str = None       # the chat sid this turn drives (spawn_job result routing)
     tainted: bool = False     # this turn ingested untrusted content (web page / email / doc)
+    # Key for the BRIDGE taint (safety._bridge_seen). Deliberately separate from `session`: session
+    # is None for Telegram/workflow/scheduler/researcher/utility agents, so keying bridge taint on it
+    # collapsed every one of them into a single bucket where they raced each other clean. The
+    # resident path sets this to the catalog id, which is already unique per resident turn.
+    taint_scope: str = None
 
 
 _var = contextvars.ContextVar("oceano_turnctx", default=TurnContext())

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import datetime
@@ -694,6 +695,10 @@ class Agent:
         # the mind's per-turn MCP bridge so a spawn_job routes its result back to THIS chat; None for
         # utility/delegate agents and non-web callers (their jobs just notify, unattributed).
         self.session_id = None
+        # Unique per-Agent bridge-taint scope. session_id is None for Telegram/workflow/scheduler/
+        # researcher/utility agents, so keying resets on it alone put every one of them in the same
+        # bucket where a finishing turn cleared a concurrent one's taint.
+        self._taint_scope = f"agent:{secrets.token_urlsafe(6)}"
         # Set by the resident-mind streams to the delegate's failure reason when a mind turn did NOT
         # finish cleanly (stalled past the idle cap, hit the wall-clock cap, rate-limited, cancelled);
         # None on a clean finish. Lets a caller (the workflow instruction node) record a truncated
@@ -734,7 +739,7 @@ class Agent:
             # scheduled dispatch) inherits its caller's taint instead — see self.trusted_origin.
             # Without this, every taint gate in the system was one hop from irrelevant.
             if self.trusted_origin:
-                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id or self._taint_scope)
 
     def context_metrics(self):
         """(message count, ~token estimate) for this conversation. The estimate is
@@ -1024,7 +1029,7 @@ class Agent:
             # multi-node email/webhook workflow one harmless instruction node cleared the taint for
             # every node after it.
             if self.trusted_origin:
-                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id or self._taint_scope)
 
     def _run(self, user_message: str, deadline=None, cancel=None) -> str:
         """`deadline` (a time.monotonic() instant) bounds a delegated run: checked
@@ -1668,7 +1673,7 @@ class Agent:
             # multi-node email/webhook workflow one harmless instruction node cleared the taint for
             # every node after it.
             if self.trusted_origin:
-                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id)
+                safety.reset_untrusted(); safety.reset_bridge_untrusted(self.session_id or self._taint_scope)
 
     def _run_stream(self, user_message: str, only_tools=None, cancel=None, voice=False):
         """Agent loop. `only_tools` narrows the available tools for this turn — e.g. chat

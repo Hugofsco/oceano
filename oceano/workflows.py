@@ -1222,23 +1222,35 @@ def _run_http(node, ctx):
     headers = {str(k): _tmpl(_fill_secrets(str(v), used), ctx) for k, v in (node.get("headers") or {}).items()}
     body = _tmpl(_fill_secrets(node.get("body", ""), used), ctx)
     import requests
+    # An HTTP node with a body/mutating method is bulk egress, exactly like the http_request TOOL —
+    # and this node's url/body can be templated from the trigger payload. Make the policy explicit
+    # rather than leaving it an accidental bypass: reads stay available on a tainted run, writes don't.
+    if method not in ("GET", "HEAD"):
+        refusal = safety.egress_blocked()
+        if refusal:
+            return False, _redact(refusal, used)
     # SSRF guard: the URL may be templated from untrusted upstream data ({{last}}, an email body…),
     # so a public URL that redirects to a loopback/metadata address would slip past a one-time check.
-    # Follow redirects MANUALLY and re-validate every hop before issuing it.
+    # Follow redirects MANUALLY and re-validate every hop before issuing it — through
+    # safety.guarded_request, NOT plain requests: check_url resolves the host and a bare
+    # requests.request resolves it AGAIN, so DNS can change in between and reopen the rebinding
+    # window that the pinned adapter exists to close.
     cur = url
     try:
         for _ in range(6):
             refusal = safety.check_url(cur)
             if refusal:
                 return False, _redact(refusal, used)
-            resp = requests.request(method, cur, headers=headers or None,
-                                    data=body.encode("utf-8") if body else None,
-                                    timeout=30, allow_redirects=False)
+            resp = safety.guarded_request(method, cur, headers=headers or None,
+                                          data=body.encode("utf-8") if body else None,
+                                          timeout=30, allow_redirects=False)
             if resp.is_redirect and resp.headers.get("Location"):
                 cur = requests.compat.urljoin(cur, resp.headers["Location"])
                 continue
             return resp.ok, _redact(f"HTTP {resp.status_code}\n{resp.text[:_HTTP_CAP]}", used)
         return False, "too many redirects"
+    except safety.Blocked as e:                      # SSRF refusal from the pinned adapter
+        return False, _redact(str(e), used)
     except Exception as e:                           # noqa: BLE001
         return False, _redact(f"request failed: {e}", used)
 
@@ -1671,21 +1683,29 @@ def run(wf, trigger="manual", on_step=None, _chain_seen=frozenset(), inp=None, _
     returned output, which is the same path every other content-returning tool uses, rather than by
     leaking a thread-global flag.
     """
-    from oceano import turnctx
-    before = turnctx.get().tainted
-    ended_tainted = False
+    # BOTH halves. Snapshotting only the local flag let a resident (Claude/Codex) node's BRIDGE taint
+    # escape the run entirely: the run recorded itself clean, its output went unfenced to the caller,
+    # and the bridge key stayed set afterwards.
+    before_local, before_bridge = safety.taint_state()
     try:
         rec = _run_inner(wf, trigger=trigger, on_step=on_step, _chain_seen=_chain_seen, inp=inp,
                          _depth=_depth, nested=nested, _resume=_resume,
                          default_model=default_model, default_base_url=default_base_url)
-        ended_tainted = turnctx.get().tainted
         if isinstance(rec, dict):
-            rec["tainted"] = bool(ended_tainted)     # so run_workflow can fence its output
+            local, bridge = safety.taint_state()
+            rec["tainted"] = bool(local or bridge)   # so run_workflow can fence its output
         return rec
     finally:
-        # A nested sub-workflow must still hand its taint up to the parent RUN, so only restore at
-        # the outermost level; nesting keeps the monotonic "may add, never clear" rule.
-        turnctx.mutate(tainted=(before or ended_tainted) if nested else before)
+        # Read the CURRENT state here rather than a value captured on the success path: an exception
+        # inside _run_inner (a malicious input crashing a nested run) would otherwise restore a
+        # stale "clean" snapshot and hand a parent error branch an untainted context.
+        end_local, end_bridge = safety.taint_state()
+        # A nested sub-workflow hands its taint up to the parent RUN, so only the outermost level
+        # restores; nesting keeps the monotonic "may add, never clear" rule.
+        if nested:
+            safety.set_taint(before_local or end_local, before_bridge or end_bridge)
+        else:
+            safety.set_taint(before_local, before_bridge)
 
 
 

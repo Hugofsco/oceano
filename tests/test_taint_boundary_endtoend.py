@@ -255,3 +255,128 @@ def test_a_nested_subworkflow_hands_its_taint_up_to_the_parent_run(monkeypatch, 
     monkeypatch.setattr("oceano.logs.log_run", lambda *a, **k: None)
     workflows.run(_tiny_wf(), trigger="email", inp="x", nested=True)
     assert safety.untrusted_seen() is True, "a nested run must propagate taint to its parent run"
+
+
+# ================= second review pass: four adjacent boundary gaps =================
+def _wf_stub():
+    return {"id": 9, "name": "w", "graph": {
+        "nodes": [{"id": 1, "type": "start"}, {"id": 2, "type": "end"}],
+        "edges": [{"from": 1, "to": 2}]}}
+
+
+@pytest.fixture()
+def _wf(monkeypatch, tmp_path):
+    from oceano import workflows
+    monkeypatch.setattr(workflows, "RUNS_STORE", tmp_path / "runs.json")
+    monkeypatch.setattr(workflows, "_LIVE", {})
+    monkeypatch.setattr("oceano.logs.log_run", lambda *a, **k: None)
+    return workflows
+
+
+# ---- 1. workflow scoping must cover BRIDGE taint, not just the thread-local flag ----
+def test_a_resident_node_s_bridge_taint_is_recorded_and_contained(_wf, monkeypatch):
+    """A Claude/Codex node taints via the BRIDGE without touching turnctx.tainted. Snapshotting only
+    the local flag recorded the run as clean, left its output unfenced, and leaked the bridge key."""
+    def _inner(*a, **kw):
+        safety.mark_bridge_untrusted()               # what a resident node's bridged read does
+        return {"summary": "ok", "steps": []}
+
+    monkeypatch.setattr(_wf, "_run_inner", _inner)
+    rec = _wf.run(_wf_stub(), trigger="manual")
+    assert rec["tainted"] is True, "a bridge-tainted run must not record itself clean"
+    assert safety.bridge_untrusted_seen() is False, "bridge taint must not survive the run"
+    assert safety.untrusted_seen() is False
+
+
+def test_bridge_taint_present_before_a_run_is_preserved_after_it(_wf, monkeypatch):
+    monkeypatch.setattr(_wf, "_run_inner", lambda *a, **kw: {"summary": "ok", "steps": []})
+    safety.mark_bridge_untrusted()
+    _wf.run(_wf_stub(), trigger="manual")
+    assert safety.bridge_untrusted_seen() is True, "restoring must not clear taint the caller already had"
+
+
+# ---- 2. sessionless agents must not share one taint bucket ----
+def test_two_sessionless_agents_do_not_clear_each_others_bridge_taint():
+    """session_id is None for Telegram/workflow/scheduler/researcher/utility agents."""
+    a = Agent(learn=False, inject_context=False)
+    b = Agent(learn=False, inject_context=False)
+    assert a.session_id is None and b.session_id is None
+    assert a._taint_scope != b._taint_scope, "each Agent needs its own taint scope"
+    safety.mark_bridge_untrusted(a._taint_scope)
+    _stub_run(b).run("an unrelated concurrent turn")             # b's boundary reset
+    assert safety.bridge_untrusted_seen(a._taint_scope) is True, (
+        "a concurrent sessionless agent finishing must not clear another's bridge taint")
+
+
+def test_the_taint_scope_tier_beats_session_when_both_are_present():
+    from oceano import turnctx
+    with turnctx.push(session="chat-1", taint_scope="catalog-abc"):
+        safety.mark_bridge_untrusted()
+        assert safety.bridge_untrusted_seen() is True
+    assert safety.bridge_untrusted_seen("catalog-abc") is True, "keyed on the catalog, not the chat"
+    assert safety.bridge_untrusted_seen("chat-1") is False
+
+
+def test_closing_a_resident_catalog_clears_its_bridge_taint():
+    from oceano import mindbridge
+    safety.mark_bridge_untrusted("catalog-xyz")
+    assert safety.bridge_untrusted_seen("catalog-xyz") is True
+    mindbridge.close_catalog("catalog-xyz")
+    assert safety.bridge_untrusted_seen("catalog-xyz") is False, "a finished turn must not leak its key"
+
+
+# ---- 3. the workflow HTTP node uses the pinned path ----
+def test_workflow_http_node_goes_through_guarded_request(monkeypatch):
+    from oceano import workflows
+    calls = []
+    monkeypatch.setattr(safety, "check_url", lambda u: None)
+    monkeypatch.setattr(safety, "guarded_request",
+                        lambda m, u, **kw: calls.append((m, u)) or type("R", (), {
+                            "ok": True, "status_code": 200, "text": "hi",
+                            "is_redirect": False, "headers": {}})())
+
+    class _Boom:
+        def request(self, *a, **kw):
+            raise AssertionError("used plain requests instead of the pinned guarded path")
+
+    ok, out = workflows._run_http({"method": "GET", "url": "https://example.com"}, {})
+    assert ok and calls and calls[0][0] == "GET"
+
+
+def test_workflow_http_writes_are_egress_gated_but_reads_are_not(monkeypatch):
+    from oceano import workflows
+    monkeypatch.setattr(safety, "check_url", lambda u: None)
+    monkeypatch.setattr(safety, "guarded_request",
+                        lambda m, u, **kw: type("R", (), {
+                            "ok": True, "status_code": 200, "text": "hi",
+                            "is_redirect": False, "headers": {}})())
+    safety.wrap_untrusted("web", "injected trigger payload")
+    ok, out = workflows._run_http({"method": "POST", "url": "https://x.test", "body": "stolen"}, {})
+    assert ok is False and "Blocked for safety" in out, "a tainted run must not POST out"
+    ok, out = workflows._run_http({"method": "GET", "url": "https://x.test"}, {})
+    assert ok is True, "reads must stay available so research still works"
+
+
+# ---- 4. an exception must not lose taint acquired before it ----
+def test_taint_acquired_before_a_nested_failure_is_not_lost(_wf, monkeypatch):
+    """ended_tainted was captured only on the success path, so a raise restored a stale 'clean'
+    snapshot and handed the parent's error branch an untainted context."""
+    def _boom(*a, **kw):
+        safety.wrap_untrusted("web", "attacker content read before the crash")
+        raise RuntimeError("node blew up")
+
+    monkeypatch.setattr(_wf, "_run_inner", _boom)
+    with pytest.raises(RuntimeError):
+        _wf.run(_wf_stub(), trigger="manual", nested=True)
+    assert safety.untrusted_seen() is True, "a nested failure must still hand its taint to the parent"
+
+
+def test_bridge_taint_acquired_before_a_nested_failure_is_not_lost(_wf, monkeypatch):
+    def _boom(*a, **kw):
+        safety.mark_bridge_untrusted()
+        raise RuntimeError("node blew up")
+
+    monkeypatch.setattr(_wf, "_run_inner", _boom)
+    with pytest.raises(RuntimeError):
+        _wf.run(_wf_stub(), trigger="manual", nested=True)
+    assert safety.bridge_untrusted_seen() is True

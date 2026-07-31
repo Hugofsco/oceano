@@ -286,12 +286,31 @@ _BRIDGE_DEFAULT = "__no_session__"
 
 
 def _bridge_key(session=None):
-    """The taint key for this call: the explicit session, else the turn context's, else a shared
-    default for utility/non-chat agents (which are single-threaded per run)."""
+    """The taint key for this call, most specific first: an explicit key, then the turn's taint_scope
+    (the resident catalog id — unique per resident turn), then the chat session, then a shared
+    fallback. The taint_scope tier exists because session is None for Telegram/workflow/scheduler/
+    researcher/utility agents, which collapsed them all into one bucket that raced itself clean."""
     if session:
         return str(session)
     from oceano import turnctx
-    return str(turnctx.get().session or _BRIDGE_DEFAULT)
+    ctx = turnctx.get()
+    return str(ctx.taint_scope or ctx.session or _BRIDGE_DEFAULT)
+
+
+def taint_state(session=None):
+    """(local, bridge) taint right now — for callers scoping a whole run (see workflows.run)."""
+    return (untrusted_seen(), bridge_untrusted_seen(session))
+
+
+def set_taint(local, bridge, session=None):
+    """Restore both halves. Scoping only the local flag lets a resident node's BRIDGE taint leak past
+    the run that acquired it, and makes that run look clean to its caller."""
+    from oceano import turnctx
+    turnctx.mutate(tainted=bool(local))
+    if bridge:
+        mark_bridge_untrusted(session)
+    else:
+        reset_bridge_untrusted(session)
 
 
 def untrusted_seen():
