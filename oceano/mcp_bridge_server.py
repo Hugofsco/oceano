@@ -14,7 +14,7 @@ import json
 import os
 
 import httpx
-from mcp.server import Server
+from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 import mcp.types as t
 
@@ -76,14 +76,30 @@ async def call_tool(name, arguments):
             out = (json.dumps(structured, ensure_ascii=False, default=str)
                    if isinstance(structured, dict) else str(legacy))
             if name == "discover_tools" and CATALOG and not str(legacy).startswith("ERROR"):
-                listed = await c.get(f"{URL}/api/mcp/tools", headers=HEADERS, timeout=15)
-                listed.raise_for_status()
-                global _SCHEMAS
-                _SCHEMAS = listed.json().get("tools", [])
-                await server.request_context.session.send_tool_list_changed()
+                # The catalog already expanded in the daemon. A failure to re-advertise it is a
+                # degraded result, not a failed discovery — don't overwrite `out` with an error,
+                # or the mind is told discovery broke when only the refresh did.
+                try:
+                    listed = await c.get(f"{URL}/api/mcp/tools", headers=HEADERS, timeout=15)
+                    listed.raise_for_status()
+                    global _SCHEMAS
+                    _SCHEMAS = listed.json().get("tools", [])
+                    await server.request_context.session.send_tool_list_changed()
+                except Exception as e:                     # noqa: BLE001 - degraded, not fatal
+                    out += f"\n(note: could not refresh the advertised tool list: {type(e).__name__})"
     except Exception as e:                                 # never crash Claude's tool loop
         out = f"ERROR reaching Oceano: {type(e).__name__}: {e}"
     return [t.TextContent(type="text", text=str(out))]
+
+
+def initialization_options():
+    """Declare tools.listChanged, WITHOUT which hybrid tool loading silently does nothing.
+
+    discover_tools expands the daemon's per-turn catalog and call_tool() below then sends
+    notifications/tools/list_changed. A client only honours that notification when the server
+    advertised the capability during initialize — the SDK's default is listChanged=false, so
+    the notification was dropped and the mind never saw a discovered tool."""
+    return server.create_initialization_options(NotificationOptions(tools_changed=True))
 
 
 async def main():
@@ -96,7 +112,7 @@ async def main():
     except Exception:
         _SCHEMAS = []                                      # daemon unreachable → expose nothing, don't crash
     async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+        await server.run(read, write, initialization_options())
 
 
 if __name__ == "__main__":

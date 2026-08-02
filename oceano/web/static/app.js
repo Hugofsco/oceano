@@ -247,12 +247,23 @@ function addUser(text, scroll = true, ts = null, index = null) {
   attachMsgActions(el, { role: "user", raw: text, ts, index });
   if (scroll) toBottom(); return el;
 }
+// ONE working cue per thread, reused for the whole turn. It is moved to the bottom as the turn
+// grows rather than rebuilt: creating a fresh node per step made a new "…" box pop up for every
+// tool call (and, in a parallel batch, left the earlier ones orphaned in the DOM, since the caller
+// overwrote its only handle to them).
 function addThinking() {
   clearWelcome();
-  const el = document.createElement("div"); el.className = "msg assistant thinking";
-  el.innerHTML = `<div class="who"><span class="orb"></span><span>Oceano</span></div>
+  const thread = $("#thread");
+  const existing = $$("#thread > .msg.assistant.thinking");
+  const el = existing.shift() || document.createElement("div");
+  existing.forEach(n => n.remove());                  // strays from an interrupted earlier turn
+  if (!el.isConnected) {
+    el.className = "msg assistant thinking";
+    el.innerHTML = `<div class="who"><span class="orb"></span><span>Oceano</span></div>
     <div class="bubble"><span class="sounding"><i></i><i></i><i></i></span></div>`;
-  $("#thread").appendChild(el); toBottom(); return el;
+  }
+  if (thread.lastElementChild !== el) thread.appendChild(el);   // keep it trailing the thread
+  toBottom(); return el;
 }
 function addAssistant(text = "", done = false, ts = null) {
   clearWelcome();
@@ -480,7 +491,21 @@ async function send() {
   const payload = { session: mySession, message: text, model: state.model, base_url: state.baseUrl, agent_mode: state.agent,
                     voice: !!_voiceSpeak,            // hands-free converse turn → ask for a short, spoken reply
                     attachments: atts.map(a => ({ path: a.path, name: a.name, kind: a.kind })) };
-  let sounding = renderable() ? addThinking() : null, bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null, _lastDraw = 0, stats = null, livePopped = false;
+  let sounding = renderable() ? addThinking() : null, bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, _lastDraw = 0, stats = null, livePopped = false;
+  // A resident mind emits SEVERAL tool_call events before ANY of their results (Claude batches
+  // parallel tool_use blocks — "read these 5 mails"). Correlate by the event's id so each result
+  // fills its own card, and only show the "working" cue once the whole batch has landed.
+  const toolPending = new Map();          // id → { card, name, args }
+  const toolOrder = [];                   // call order, for older events that carry no id
+  let toolSeq = 0;
+  const takePending = id => {             // exact id, else the oldest still-open call
+    const key = (id != null && toolPending.has(id)) ? id : toolOrder.find(k => toolPending.has(k));
+    if (key === undefined) return null;
+    const item = toolPending.get(key); toolPending.delete(key);
+    const at = toolOrder.indexOf(key); if (at >= 0) toolOrder.splice(at, 1);
+    return item;
+  };
+  const resetTools = () => { toolPending.clear(); toolOrder.length = 0; };
   const killSounding = () => { if (sounding) { sounding.remove(); sounding = null; } };
   // throttle the live re-render to ~10/s — renderMD re-parses the WHOLE answer each call, so drawing
   // every token/frame is O(n²) on a long reply. Skipped frames are caught by the final full render.
@@ -503,19 +528,25 @@ async function send() {
       if (renderable() && !bubble) bubble = addAssistant("");
       draw();                                                        // throttled internally; final render catches the tail
     } else if (ev.type === "tool_call") {
-      killSounding(); flushThink(); flushBubble();
-      lastTool = { name: ev.name, args: ev.args };
+      flushThink(); flushBubble();
+      let card = null;
       if (renderable()) {
         if (!livePopped && /^(fetch_url|browser_)/.test(ev.name)) { openLiveView(); livePopped = true; }  // pop the Live view when it starts browsing
-        lastCard = addTool(ev.name, ev.args);
-        maybePreviewChip(lastCard, ev.name, ev.args);   // ▶ Preview chip if it's an .html file
+        card = lastCard = addTool(ev.name, ev.args);
+        maybePreviewChip(card, ev.name, ev.args);       // ▶ Preview chip if it's an .html file
       }
+      const key = ev.id != null ? ev.id : "_seq" + (toolSeq++);
+      toolPending.set(key, { card, name: ev.name, args: ev.args });
+      toolOrder.push(key);
+      if (renderable()) sounding = addThinking();       // the same cue, moved below the new card
     } else if (ev.type === "tool_progress") {
-      killSounding(); if (renderable()) appendToolProgress(lastCard, ev);
+      const item = ev.id != null ? toolPending.get(ev.id) : null;
+      if (renderable()) appendToolProgress((item && item.card) || lastCard, ev);
     } else if (ev.type === "tool_result") {
-      if (renderable()) fillTool(lastCard, ev.result);
-      if (lastTool) { myT.push({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; }
-      if (renderable()) sounding = addThinking();       // keep a "working" cue during the next step
+      const item = takePending(ev.id);
+      if (renderable()) fillTool((item && item.card) || lastCard, ev.result);
+      if (item) myT.push({ role: "tool", name: item.name, args: item.args, result: ev.result });
+      if (renderable()) sounding = addThinking();       // still working — keep the one cue trailing
     } else if (ev.type === "answer_done") {
       killSounding(); flushThink(); if (renderable() && bubble) renderMD(bubble, acc, true);
     } else if (ev.type === "answer") {                 // fallback (max steps)
@@ -542,7 +573,7 @@ async function send() {
     try {
       if (renderable()) { while (ue.nextSibling) ue.nextSibling.remove(); addSysNote("↻ reconnecting — the reply is still being generated…"); }
       myT.length = turnBase;                              // rewind: drop the partial assistant side, we replay it from the buffer
-      acc = ""; bubble = null; thinkCard = null; thinkText = ""; lastCard = null; lastTool = null; stats = null; livePopped = true;
+      acc = ""; bubble = null; thinkCard = null; thinkText = ""; lastCard = null; resetTools(); stats = null; livePopped = true;
       const pull = list => (list || []).forEach(ev => { try { applyEvent(ev); } catch {} });
       pull(live.events);
       let since = live.total != null ? live.total : (live.events || []).length, running = live.running;
@@ -784,16 +815,24 @@ async function reconnectChat(sid, live, displayOnly = false) {
   if (!displayOnly) { state.busy = true; setSendMode(true); const uTs = _nowISO(); addUser(live.message, true, uTs); appendT({ role: "user", content: live.message, ts: uTs }); }
   addSysNote("↻ reconnected to a reply that was still being generated…");
   const here = () => state.session === sid;          // user may switch away again mid-replay
-  let bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null, lastTool = null;
+  let bubble = null, acc = "", thinkCard = null, thinkText = "", lastCard = null;
+  const toolPending = new Map(); const toolOrder = []; let toolSeq = 0;   // parallel batches — see send()
+  const takePending = id => {
+    const key = (id != null && toolPending.has(id)) ? id : toolOrder.find(k => toolPending.has(k));
+    if (key === undefined) return null;
+    const item = toolPending.get(key); toolPending.delete(key);
+    const at = toolOrder.indexOf(key); if (at >= 0) toolOrder.splice(at, 1);
+    return item;
+  };
   const flushThink = () => { if (thinkCard) { finalizeThink(thinkCard); if (!displayOnly) appendT({ role: "thinking", text: thinkText }); thinkCard = null; thinkText = ""; } };
   const flushBubble = () => { if (bubble) { renderMD(bubble, acc, true); if (!displayOnly) appendT({ role: "assistant", content: acc, ts: _nowISO() }); bubble = null; acc = ""; } };
   const apply = ev => {
     if (!here()) return;
     if (ev.type === "reasoning") { flushBubble(); if (!thinkCard) thinkCard = addThinkCard(); thinkText += ev.text; appendThink(thinkCard, ev.text); }
     else if (ev.type === "token") { flushThink(); if (!bubble) bubble = addAssistant(""); acc += ev.text; renderMD(bubble, acc + " ▌"); toBottom(); }
-    else if (ev.type === "tool_call") { flushThink(); flushBubble(); lastCard = addTool(ev.name, ev.args); lastTool = { name: ev.name, args: ev.args }; maybePreviewChip(lastCard, ev.name, ev.args); }
-    else if (ev.type === "tool_progress") { appendToolProgress(lastCard, ev); }
-    else if (ev.type === "tool_result") { fillTool(lastCard, ev.result); if (lastTool) { if (!displayOnly) appendT({ role: "tool", name: lastTool.name, args: lastTool.args, result: ev.result }); lastTool = null; } }
+    else if (ev.type === "tool_call") { flushThink(); flushBubble(); lastCard = addTool(ev.name, ev.args); maybePreviewChip(lastCard, ev.name, ev.args); const key = ev.id != null ? ev.id : "_seq" + (toolSeq++); toolPending.set(key, { card: lastCard, name: ev.name, args: ev.args }); toolOrder.push(key); }
+    else if (ev.type === "tool_progress") { const it = ev.id != null ? toolPending.get(ev.id) : null; appendToolProgress((it && it.card) || lastCard, ev); }
+    else if (ev.type === "tool_result") { const it = takePending(ev.id); fillTool((it && it.card) || lastCard, ev.result); if (it && !displayOnly) appendT({ role: "tool", name: it.name, args: it.args, result: ev.result }); }
     else if (ev.type === "answer_done") { flushThink(); if (bubble) renderMD(bubble, acc, true); }
     else if (ev.type === "answer") { flushThink(); if (!bubble) bubble = addAssistant(""); acc = ev.text; renderMD(bubble, acc, true); toBottom(); }
     else if (ev.type === "notice") { flushThink(); flushBubble(); addSysNote(escapeHtml(ev.text)); }

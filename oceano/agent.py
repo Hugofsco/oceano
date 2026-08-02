@@ -570,7 +570,10 @@ def _resident_body_note(tool_names, mind):
     ]
     if "discover_tools" in names:
         lines.append("If a needed body capability is absent, call discover_tools with a precise "
-                     "capability query; newly loaded tools appear in the MCP catalog.")
+                     "capability query; newly loaded tools appear in the MCP catalog. When the "
+                     "reply carries `candidates` and an empty `loaded`, no bundle matched the "
+                     "wording: call discover_tools again with the exact `bundles` names from that "
+                     "list. Do not conclude a capability is unavailable until that second call.")
     if names & {"list_skills", "load_skill"}:
         lines.append("For reusable procedures, use Oceano MCP list_skills and load_skill only. "
                      "Never invoke Claude's native Skill tool or Skill statement; it is a separate "
@@ -1297,8 +1300,11 @@ class Agent:
                         accepted = adapter.tool_call(raw_name, data.get("args"))
                     if not accepted:
                         budget_cancel.set()
+                    # `id` rides through to the UI: Claude emits several tool_use blocks before
+                    # any of their results, so the client needs the correlation key to fill the
+                    # right card (and to know when the whole batch has landed).
                     yield _feed_shell_event({"type": "tool_call", "name": display_name,
-                                             "args": data.get("detail", "")})
+                                             "args": data.get("detail", ""), "id": key})
                 pending[key] = {"name": raw_name, "display": display_name,
                                 "hidden": is_hidden, "accepted": accepted}
                 pending_order.append(key)
@@ -1318,7 +1324,7 @@ class Agent:
                             is_error=data.get("is_error", False))
                         display_result = structured.text()
                     yield _feed_shell_event({"type": "tool_result", "name": item["display"],
-                                             "result": display_result[:2000]})
+                                             "result": display_result[:2000], "id": key})
             elif kind == "token":
                 parts.append(data)
                 state.observe_assistant_text(data)
@@ -1329,7 +1335,8 @@ class Agent:
                 continue
             if item["accepted"]:
                 adapter.missing_result(item["name"])
-            yield _feed_shell_event({"type": "tool_result", "name": item["display"], "result": ""})
+            yield _feed_shell_event({"type": "tool_result", "name": item["display"],
+                                     "result": "", "id": key})
 
         res = holder.get("res") or {}
         if state.post_spawn_required and (res.get("output") or "").strip():
@@ -1394,7 +1401,7 @@ class Agent:
                     correction_order.append(key)
                     yield _feed_shell_event({
                         "type": "tool_call", "name": display_name,
-                        "args": str(event.get("detail", ""))})
+                        "args": str(event.get("detail", "")), "id": key})
                 elif kind == "tool_result":
                     key = event.get("tool_use_id")
                     if key not in correction_pending:
@@ -1412,14 +1419,14 @@ class Agent:
                             display_result = structured.text()
                         yield _feed_shell_event({
                             "type": "tool_result", "name": item["display"],
-                            "result": display_result[:2000]})
+                            "result": display_result[:2000], "id": key})
             for key in correction_order:
                 item = correction_pending.get(key)
                 if item and item["accepted"]:
                     adapter.missing_result(item["name"])
                 if item:
                     yield _feed_shell_event({
-                        "type": "tool_result", "name": item["display"], "result": ""})
+                        "type": "tool_result", "name": item["display"], "result": "", "id": key})
             if not correction_text and (correction_res.get("output") or "").strip():
                 text = correction_res["output"].strip()
                 parts.append(text)
@@ -1810,7 +1817,7 @@ class Agent:
                                 "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
                                for c in norm]})
             for c in norm:
-                yield {"type": "tool_call", "name": c["name"], "args": c["args"]}
+                yield {"type": "tool_call", "name": c["name"], "args": c["args"], "id": c["id"]}
                 if not state.budget.consume_tool():
                     structured = tools.ToolResult(False, error="turn tool-call budget exhausted",
                                                   code="budget_exhausted")
@@ -1826,12 +1833,13 @@ class Agent:
                     structured = None
                     for kind, payload in self._run_tool_streamed(c["name"], c["args"], allowed):
                         if kind == "progress":
-                            yield {"type": "tool_progress", "name": c["name"], **payload}
+                            yield {"type": "tool_progress", "name": c["name"], "id": c["id"], **payload}
                         else:
                             structured = payload
                     result = structured.text()
                 state.record(c["name"], structured, c.get("args"))
-                yield {"type": "tool_result", "name": c["name"], "result": result[:2000]}
+                yield {"type": "tool_result", "name": c["name"], "result": result[:2000],
+                       "id": c["id"]}
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
             if toolrouter.should_expand(route_info, tool_events=state.legacy_events):
                 route_info, phase, _ = self._recover_tool_route(

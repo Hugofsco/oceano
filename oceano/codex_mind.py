@@ -484,10 +484,12 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
             if call:
                 source = ("mcp" if (item.get("type") or "") in
                           ("mcp_tool_call", "mcp_tool_use") else "native")
-                pending[item.get("id") or str(time.time())] = {
-                    "name": call[0], "source": source}
+                iid = item.get("id") or str(time.time())
+                pending[iid] = {"name": call[0], "source": source}
+                # `id` rides through to the UI so a parallel batch's results land on their own
+                # cards instead of all overwriting the most recently opened one.
                 emit({"type": "tool_call", "name": call[0], "args": call[1],
-                      "source": source})
+                      "source": source, "id": iid})
         elif typ == "item.updated":
             item = ev.get("item") or {}
             if (item.get("type") or "") == "agent_message":
@@ -516,7 +518,7 @@ def run_stream(prompt, cwd=None, cancel=None, model="", on_event=None, session=N
                               else "native")
                 if name:
                     emit({"type": "tool_result", "name": name,
-                          "result": _tool_result(item), "source": source})
+                          "result": _tool_result(item), "source": source, "id": iid})
         elif typ == "turn.failed":
             break
 
