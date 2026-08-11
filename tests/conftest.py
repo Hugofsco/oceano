@@ -27,3 +27,15 @@ def _isolate_injection_taint():
     yield
     safety.reset_untrusted()
     safety._bridge_seen.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_security_settings(monkeypatch, tmp_path):
+    """Point the Settings → Security store at a per-test temp file, so the guard/gate tests always
+    run against the shipped defaults (all protective) instead of whatever the developer toggled in
+    their live data/security.json — and so tests exercising set_security never write into data/."""
+    from oceano import safety
+    monkeypatch.setattr(safety, "_security_path", lambda: tmp_path / "security.json")
+    safety._sec_cache = None
+    yield
+    safety._sec_cache = None

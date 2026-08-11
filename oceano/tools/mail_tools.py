@@ -263,7 +263,7 @@ def mail_send(to, subject, body, cc="", account="", attachments=None):
     from oceano import mail, logs
     if current_channel() != "web":
         return _MAIL_WEB_ONLY
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+    if safety.taint_active("egress"):
         return _MAIL_SEND_TAINTED
     a, err = _mail_target(account)
     if err:
@@ -304,7 +304,7 @@ def mail_reply(uid, body, account="", folder="INBOX", attachments=None):
     from oceano import mail, logs
     if current_channel() != "web":
         return _MAIL_WEB_ONLY
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+    if safety.taint_active("egress"):
         return _MAIL_SEND_TAINTED
     a, err = _mail_target(account)
     if err:
@@ -383,7 +383,7 @@ def mail_folder(op, name, new="", account=""):
         return "op must be one of: create, rename, delete"
     if current_channel() != "web":
         return _MAIL_WEB_ONLY
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+    if safety.taint_active("egress"):
         return ("Blocked for safety: this turn read email or other external content, so restructuring "
                 "folders is disabled — injected text must not add/rename/delete the user's folders. Ask "
                 "the user to send a fresh message.")

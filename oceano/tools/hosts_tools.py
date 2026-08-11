@@ -3,6 +3,8 @@ from oceano import safety
 from oceano.tools.core import current_channel, tool
 
 # ---------------- remote servers (SSH keychain) ----------------
+_HOSTS_OFF = ("Remote host access is turned off (Settings → Security → 'Agent may connect to "
+              "your servers'). The user has to enable it before ssh_run/sftp can be used.")
 @tool({
     "type": "function",
     "function": {
@@ -14,7 +16,9 @@ from oceano.tools.core import current_channel, tool
     },
 })
 def list_hosts():
-    if current_channel() != "web":
+    if not safety.remote_hosts_enabled():
+        return _HOSTS_OFF
+    if current_channel() != "web" and not safety.remote_background_allowed():
         return "(remote hosts are only usable from the web UI — not in this context)"
     from oceano import hosts
     hs = hosts.list_all()
@@ -36,7 +40,8 @@ def list_hosts():
                        "connection (opened then closed for this call). Returns each command's exit "
                        "code and output. Call list_hosts first for the host name. SAFETY (if it "
                        "refuses, relay the exact reason to the user, don't retry blindly): it only "
-                       "works in the web UI with the user present; it will NOT run if this turn has "
+                       "works in the web UI with the user present (unless the user allowed "
+                       "unattended use in Settings → Security); it will NOT run if this turn has "
                        "read any web page, email, or document (prevents injected text from reaching "
                        "the user's servers); and each host has a policy — read-only hosts reject "
                        "changes, and 'armed' hosts must be unlocked by the user in the Hosts panel.",
@@ -52,11 +57,14 @@ def ssh_run(host, commands):
     cmds = [commands] if isinstance(commands, str) else [str(c) for c in (commands or []) if str(c).strip()]
     if not cmds:
         return "no commands given"
-    # --- gates (channel → injection-taint → host → policy) ---
-    if current_channel() != "web":
+    # --- gates (master switch → channel → injection-taint → host → policy) ---
+    if not safety.remote_hosts_enabled():
+        return _HOSTS_OFF
+    if current_channel() != "web" and not safety.remote_background_allowed():
         return ("ssh_run only runs in the web UI with the user present — it's blocked in "
-                "background, scheduled, and Telegram runs.")
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+                "background, scheduled, and Telegram runs. (The user can allow this in "
+                "Settings → Security.)")
+    if safety.taint_active("remote"):
         return ("Blocked for safety: this turn already read external content (a web page, email, or "
                 "document), so connecting to the user's servers is disabled — injected text must not "
                 "reach them. Ask the user to send a fresh message to run remote commands.")
@@ -109,9 +117,12 @@ def sftp(action, host, remote_path="", local_path=""):
     action = (action or "").strip().lower()
     if action not in ("list", "get", "put"):
         return "action must be one of: list, get, put"
-    if current_channel() != "web":
-        return "sftp only runs in the web UI with the user present — blocked in background, scheduled, and Telegram runs."
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+    if not safety.remote_hosts_enabled():
+        return _HOSTS_OFF
+    if current_channel() != "web" and not safety.remote_background_allowed():
+        return ("sftp only runs in the web UI with the user present — blocked in background, "
+                "scheduled, and Telegram runs. (The user can allow this in Settings → Security.)")
+    if safety.taint_active("remote"):
         return ("Blocked for safety: this turn read external content (a web page, email, or document), "
                 "so transferring files to/from the user's servers is disabled. Ask for a fresh message.")
     h = hosts._resolve(host)

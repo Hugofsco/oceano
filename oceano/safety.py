@@ -10,9 +10,12 @@ Three layers:
   check_url()      — block SSRF to localhost/private/link-local (your DBs, LLM, cloud metadata)
   wrap_untrusted() — fence external text so the model treats it as DATA, not instructions
 
-All guards are on by default; disable individually with OCEANO_SHELL_GUARD=0 / OCEANO_URL_GUARD=0.
+All guards are on by default. Each is togglable at runtime in Settings → Security (persisted in
+data/security.json — see security_settings()). The OCEANO_SHELL_GUARD=0 / OCEANO_URL_GUARD=0 env
+vars remain as hard kill-switches: when one forces a guard off, the Settings toggle can't re-arm it.
 """
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -24,6 +27,73 @@ from requests.adapters import HTTPAdapter
 
 SHELL_GUARD = os.environ.get("OCEANO_SHELL_GUARD", "1") == "1"
 URL_GUARD = os.environ.get("OCEANO_URL_GUARD", "1") == "1"
+
+
+# ---------------- runtime security settings (Settings → Security) ----------------
+# The user-facing toggles for each guard and taint gate. Defaults are the protective posture;
+# data/security.json overlays them. Taint TRACKING itself (wrap_untrusted marking the turn) is not
+# togglable — a gate turned off only opens its own capability to tainted turns, it never stops the
+# taint from being recorded, so re-enabling a gate is effective immediately.
+SECURITY_DEFAULTS = {
+    "shell_guard": True,            # check_shell / check_python — catastrophic-command filter
+    "url_guard": True,              # check_url / guarded_request — SSRF to internal addresses
+    "taint_exec": True,             # run_shell / python_exec / git / run_tests on a tainted turn
+    "taint_spawn": True,            # delegate / spawn_agent / run_workflow / schedule_task
+    "taint_egress": True,           # http_request bodies / notify / mail send / browser JS+upload
+    "taint_persist": True,          # remember / update_memory / learn_skill
+    "taint_remote": True,           # ssh_run / sftp to the user's registered servers
+    "taint_desktop": True,          # native actions on the user's computer (OceanoDesktop)
+    "taint_mcp": True,              # calling connected MCP servers' tools
+    "remote_hosts_enabled": True,   # master switch: may the agent touch registered servers AT ALL
+    "remote_hosts_background": False,  # allow ssh_run/sftp outside the web UI channel
+}
+_sec_lock = threading.Lock()
+_sec_cache = None               # ((path, mtime_ns), settings) — refreshed when the file changes
+
+
+def _security_path():
+    import config
+    return config.WORKSPACE.parent / "data" / "security.json"
+
+
+def security_settings():
+    """Effective toggles: SECURITY_DEFAULTS overlaid with data/security.json. Cached by file
+    mtime, so an edit from the web UI reaches every process (daemon, CLI) without a restart."""
+    global _sec_cache
+    path = _security_path()
+    try:
+        stamp = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        stamp = (str(path), None)
+    with _sec_lock:
+        if _sec_cache is not None and _sec_cache[0] == stamp:
+            return dict(_sec_cache[1])
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raw = {}
+    eff = {k: bool(raw.get(k, v)) for k, v in SECURITY_DEFAULTS.items()}
+    with _sec_lock:
+        _sec_cache = (stamp, eff)
+    return dict(eff)
+
+
+def set_security(changes):
+    """Persist toggle changes (unknown keys ignored) and return the new effective settings."""
+    global _sec_cache
+    from oceano import atomicio
+    eff = security_settings()
+    eff.update({k: bool(v) for k, v in (changes or {}).items() if k in SECURITY_DEFAULTS})
+    path = _security_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomicio.write_text(path, json.dumps(eff, indent=2))
+    with _sec_lock:
+        _sec_cache = None
+    return eff
+
+
+def _sec_on(key):
+    return security_settings().get(key, True)
 
 _DANGEROUS = [
     (r":\(\)\s*\{.*\};\s*:", "fork bomb"),
@@ -42,12 +112,12 @@ _RM_TARGETS = r"""(\s|=|['"])(/|~|/\*|\$HOME|/home|/etc|/usr|/var|/boot|/bin|/li
 
 def _refuse(why):
     return (f"REFUSED by Oceano safety guard: {why}. If this is genuinely intended, "
-            f"run it yourself or relax the relevant OCEANO_*_GUARD env var.")
+            f"run it yourself or turn the guard off in Settings → Security.")
 
 
 def check_shell(command):
     """Return a refusal string if the command looks catastrophic, else None."""
-    if not SHELL_GUARD:
+    if not (SHELL_GUARD and _sec_on("shell_guard")):
         return None
     for pat, label in _DANGEROUS:
         if re.search(pat, command, re.IGNORECASE):
@@ -135,7 +205,7 @@ def _url_host(url):
 def check_url(url):
     """Block URLs that resolve to loopback/private/link-local/reserved addresses
     (SSRF guard). Returns a refusal string, or None if the URL is safe."""
-    if not URL_GUARD:
+    if not (URL_GUARD and _sec_on("url_guard")):
         return None
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -166,7 +236,7 @@ def check_python(code):
     sidestep the shell guard. Catches a catastrophic command passed to os.system/subprocess/os.popen
     (the shell patterns match the source string) and an obvious destructive rmtree of a system path.
     NOT a sandbox — for real isolation run under a container/bubblewrap. Returns a refusal or None."""
-    if not SHELL_GUARD:
+    if not (SHELL_GUARD and _sec_on("shell_guard")):
         return None
     refusal = check_shell(code)                  # rm -rf /, mkfs, dd of=/dev, pipe|bash, shutdown, …
     if refusal:
@@ -234,7 +304,7 @@ class _PinnedAdapter(HTTPAdapter):
 
 def guarded_request(method, url, **kw):
     """SSRF-guarded request pinned to a validated IP for the connection's lifetime."""
-    if not URL_GUARD:
+    if not (URL_GUARD and _sec_on("url_guard")):
         return requests.request(method, url, **kw)
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
@@ -344,6 +414,29 @@ def injection_tainted():
     return untrusted_seen() or bridge_untrusted_seen()
 
 
+def taint_active(gate):
+    """True when the `taint_<gate>` Settings toggle is on AND this turn is injection-tainted.
+    Every taint gate — the *_blocked() helpers here and the call sites that keep their own refusal
+    wording (shell, dev, mail, hosts) — decides through this, so Settings → Security governs them
+    all in one place. Turning a gate off never clears or stops the taint itself."""
+    return _sec_on("taint_" + gate) and injection_tainted()
+
+
+def remote_hosts_enabled():
+    """Settings → Security master switch: whether the agent may touch the registered servers at
+    all (list_hosts / ssh_run / sftp) — any channel, tainted or not. Distinct from the taint gate
+    (which only locks a tainted turn) and from disabling the tools in Settings → Tools (which
+    removes them from the prompt): this refuses the call while keeping the tools visible."""
+    return _sec_on("remote_hosts_enabled")
+
+
+def remote_background_allowed():
+    """Settings → Security: whether ssh_run/sftp may run outside the web UI channel
+    (Telegram, scheduled tasks, workflows). Off by default — unattended runs are exactly
+    where an injected instruction has no human watching."""
+    return _sec_on("remote_hosts_background")
+
+
 # Refusal for the tools that START A NEW TURN (delegate, spawn_agent, run_workflow, schedule_task).
 # Those turns used to begin with the taint cleared, so a tainted turn could reach any capability it
 # was just refused by laundering it through a child — the child ran clean with the full catalog.
@@ -357,7 +450,7 @@ SPAWN_TAINTED = ("Blocked for safety: this turn already read external content (a
 
 def spawn_blocked():
     """Refusal string if this turn may not start new autonomous work, else None."""
-    return SPAWN_TAINTED if injection_tainted() else None
+    return SPAWN_TAINTED if taint_active("spawn") else None
 
 
 # Refusal for tools whose PURPOSE is to push data outward. Refusing the mail send tool was never an
@@ -378,7 +471,7 @@ EGRESS_TAINTED = ("Blocked for safety: this turn already read external content (
 
 def egress_blocked():
     """Refusal string if this turn may not push data outward, else None."""
-    return EGRESS_TAINTED if injection_tainted() else None
+    return EGRESS_TAINTED if taint_active("egress") else None
 
 
 # Refusal for tools that write DURABLE state the agent reads back later. Long-term memory is the
@@ -393,7 +486,7 @@ PERSIST_TAINTED = ("Blocked for safety: this turn already read external content 
 
 def persist_blocked():
     """Refusal string if this turn may not write durable memory/skills, else None."""
-    return PERSIST_TAINTED if injection_tainted() else None
+    return PERSIST_TAINTED if taint_active("persist") else None
 
 
 def mark_bridge_untrusted(session=None):

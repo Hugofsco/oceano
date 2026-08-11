@@ -75,7 +75,22 @@ def _normalize_prefs(value):
     prefs.setdefault("agent_mode", False)
     if prefs.get("chat_agent_access") not in ("read", "write", "shell"):
         prefs["chat_agent_access"] = "read"
+    # Tri-state (Settings → Security): True = bind 0.0.0.0, False = 127.0.0.1, absent = follow
+    # the OCEANO_WEB_HOST env var. Applied by server.main() on the next restart.
+    if "remote_access" in prefs and not isinstance(prefs["remote_access"], bool):
+        prefs.pop("remote_access")
     return prefs
+
+
+def web_bind_host():
+    """The interface the web UI binds to. An explicit Settings → Security choice wins over
+    OCEANO_WEB_HOST (so the toggle works on systemd installs, which pin the env var to 0.0.0.0);
+    with no choice saved, the env var decides, defaulting to localhost-only. Read once at
+    startup by server.main() — changing the setting needs a service restart."""
+    pref = load().get("prefs", {}).get("remote_access")
+    if isinstance(pref, bool):
+        return "0.0.0.0" if pref else "127.0.0.1"
+    return os.environ.get("OCEANO_WEB_HOST", "127.0.0.1")
 
 
 def _hash_pw(password, salt):

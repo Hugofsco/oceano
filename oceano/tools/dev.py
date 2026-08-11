@@ -19,7 +19,7 @@ _EXEC_TAINTED = ("Blocked for safety: this turn already read external content (a
 
 
 def _exec_blocked():
-    return _EXEC_TAINTED if safety.injection_tainted() else None
+    return _EXEC_TAINTED if safety.taint_active("exec") else None
 
 
 # ============================ dev: git · code_search · run_tests ============================

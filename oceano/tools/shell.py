@@ -21,7 +21,7 @@ _SHELL_TAINTED = ("Blocked for safety: this turn already read external content (
 
 
 def _shell_blocked():
-    return _SHELL_TAINTED if (safety.untrusted_seen() or safety.bridge_untrusted_seen()) else None
+    return _SHELL_TAINTED if safety.taint_active("exec") else None
 
 
 # Defense-in-depth filesystem confinement for the agent's shell (run_shell / python_exec). The
