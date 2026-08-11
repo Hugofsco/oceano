@@ -425,6 +425,50 @@ async def jobs_set_serialize(req: Request):
     return {"ok": True, "serialize": s["serialize"], "serialize_chat": s["serialize_chat"]}
 
 
+# ---------------- security (Settings → Security) ----------------
+
+
+@router.get("/api/security")
+def security_get():
+    """Guard/taint-gate toggles plus the web bind preference, with env context so the UI can
+    show when a kill-switch env var pins a guard off or what OCEANO_WEB_HOST would do."""
+    import os
+    from oceano import safety
+    from oceano.web.state import web_bind_host
+    prefs = load().get("prefs", {})
+    return {
+        "settings": safety.security_settings(),
+        # False here = the env kill-switch pins that guard OFF regardless of its toggle
+        "env": {"shell_guard": safety.SHELL_GUARD, "url_guard": safety.URL_GUARD},
+        "remote_access": {"pref": prefs.get("remote_access"),
+                          "env_host": os.environ.get("OCEANO_WEB_HOST"),
+                          "effective": web_bind_host()},
+    }
+
+
+@router.post("/api/security")
+async def security_set(req: Request):
+    """Persist changed toggles. Guard/gate toggles apply immediately in every channel;
+    `remote_access` (true / false / null = follow env) lands in web.json prefs and takes
+    effect on the next service restart."""
+    from oceano import safety
+    b = await req.json()
+    out = {"ok": True}
+    toggles = {k: v for k, v in b.items() if k in safety.SECURITY_DEFAULTS}
+    if toggles:
+        out["settings"] = safety.set_security(toggles)
+    if "remote_access" in b:
+        data = load()
+        prefs = data.setdefault("prefs", {})
+        if b["remote_access"] is None:
+            prefs.pop("remote_access", None)
+        else:
+            prefs["remote_access"] = bool(b["remote_access"])
+        save(data)
+        out["restart_needed"] = True
+    return out
+
+
 # ---------------- agent tools (read-only list for Settings → Tools) ----------
 
 

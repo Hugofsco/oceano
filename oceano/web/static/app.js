@@ -1423,7 +1423,7 @@ function _setShortcutOverride(id, combo) {
 }
 const SETTINGS_TABS = [
   ["account", "◐", "Account"], ["appearance", "◧", "Appearance"], ["shortcuts", "⌨", "Shortcuts"], ["endpoints", "◇", "Endpoints"], ["telegram", "✈", "Telegram"],
-  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["delegate", "⇅", "Delegation"],
+  ["memory", "✶", "Memory"], ["tools", "⚒", "Tools"], ["security", "⛨", "Security"], ["delegate", "⇅", "Delegation"],
   ["voice", "🔊", "Voice"], ["services", "◉", "Services"], ["wipe", "🗑", "Wipe"], ["about", "≈", "About"],
 ];
 // each wipe target: [key, label, description, confirm-detail]
@@ -1565,6 +1565,41 @@ const SETTINGS_PAGES = {
       </div>
       <div class="tool-acts"><span class="lbl-sub" style="flex:1">All tools (both modes)</span><button class="exp-btn" id="toolAllOn">Enable all</button><button class="exp-btn" id="toolAllOff">Disable all</button></div>
       <div class="tool-list" id="toolList"></div>
+    </div>`,
+  security: `
+    <div class="drawer-section">
+      <h3>Prompt-injection containment</h3>
+      <p class="sub">Once a turn reads external content — a web page, an email, a document — it's marked <b>tainted</b> and the capabilities below lock until your next message, so instructions hidden in that content can't act as you. Tainting itself always runs; each toggle only decides whether a tainted turn keeps that capability. <b>Leave these on</b> unless a workflow genuinely needs one open.</p>
+      <label class="set-toggle"><input type="checkbox" id="secTaintExec"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block code execution <span class="st-note">— run_shell · python_exec · git · run_tests (injected text must not run commands)</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintSpawn"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block starting autonomous work <span class="st-note">— delegate · spawn_agent · run_workflow · schedule_task (no laundering into a fresh unsupervised turn)</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintEgress"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block sending data out <span class="st-note">— HTTP request bodies · notify · mail send/reply · page JS &amp; uploads (no exfiltration); reading stays open</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintPersist"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block durable writes <span class="st-note">— memories &amp; skills (no planting a fact your future agent will trust)</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintRemote"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block your servers <span class="st-note">— ssh_run · sftp (injected text must not reach your machines)</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintDesktop"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block desktop actions <span class="st-note">— native dialogs, clipboard writes, opening paths via OceanoDesktop</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secTaintMcp"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Block MCP tools <span class="st-note">— tools on connected MCP servers (turn off only if a research flow needs MCP after reading pages)</span></span></label>
+    </div>
+    <div class="drawer-section">
+      <h3>Command &amp; network guards</h3>
+      <p class="sub">Hard filters that run on every call, in every channel — tainted or not.</p>
+      <label class="set-toggle"><input type="checkbox" id="secShellGuard"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Shell command guard <span class="st-note">— refuses catastrophic commands (rm&nbsp;-rf&nbsp;/, mkfs, dd to a disk, fork bombs, curl|sh) in run_shell / python_exec</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secUrlGuard"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Network (SSRF) guard <span class="st-note">— blocks fetches that resolve to localhost / LAN / tailnet / cloud-metadata addresses, with DNS-rebinding protection</span></span></label>
+      <div class="kn-note" id="secGuardEnvNote" style="display:none"></div>
+    </div>
+    <div class="drawer-section">
+      <h3>Remote hosts (SSH / SFTP)</h3>
+      <p class="sub">Whether — and when — the agent may touch the servers registered in the Hosts panel. Per-host policies (read-only, arming) always apply on top.</p>
+      <label class="set-toggle"><input type="checkbox" id="secRemoteBlocked"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Agent cannot connect to your servers <span class="st-note">— blocks list_hosts / ssh_run / sftp entirely, in every channel; uncheck to allow remote host access</span></span></label>
+      <label class="set-toggle"><input type="checkbox" id="secRemoteBg"><span class="st-track"><span class="st-thumb"></span></span><span class="st-lbl">Allow remote hosts in unattended runs <span class="st-note">— Telegram, scheduled tasks and workflows may use ssh_run / sftp too (default: web UI only, with you present)</span></span></label>
+    </div>
+    <div class="drawer-section">
+      <h3>Remote access to this web UI</h3>
+      <p class="sub">Which network interfaces this web UI listens on. <span id="secBindNow" class="tg-status"></span></p>
+      <div class="dg-providers">
+        <label class="dg-prov"><input type="radio" name="sec-bind" value="env"><span><b>Follow environment</b><i>OCEANO_WEB_HOST decides — systemd installs ship 0.0.0.0, bare runs default to localhost</i></span></label>
+        <label class="dg-prov"><input type="radio" name="sec-bind" value="local"><span><b>This machine only</b><i>bind 127.0.0.1 — no LAN or tailnet access</i></span></label>
+        <label class="dg-prov"><input type="radio" name="sec-bind" value="all"><span><b>LAN / Tailscale</b><i>bind 0.0.0.0 — reachable from your other devices; login (and optional 2FA) still required</i></span></label>
+      </div>
+      <div class="kn-note" id="secBindMsg"></div>
     </div>`,
   delegate: `
     <div class="drawer-section">
@@ -1750,7 +1785,59 @@ async function wipeTarget(key) {
     if (key === "workflows") { const w = document.getElementById("win-workflows"); if (w) wfRenderList($(".win-body", w)); }
   } catch { if (msg) { msg.textContent = "wipe failed"; msg.className = "kn-note err"; } }
 }
-function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadShellPanelSetting(); loadBrowserSetting(); loadVoiceSettings(); }
+function loadSettingsAll() { loadProviders(); loadEndpoints(); loadTelegram(); loadServices(); loadTools(); loadSecurity(); loadDelegation(); loadMind(); loadClaudeModel(); loadCodexModel(); loadAccount(); loadMemoryPolicy(); loadJobsSetting(); loadShellPanelSetting(); loadBrowserSetting(); loadVoiceSettings(); }
+/* ---------------- security (Settings → Security) ---------------- */
+// checkbox id → data/security.json key; every toggle saves on change (no Save button, matching
+// the other switch-style settings) and reverts itself if the POST fails. A plain string means
+// checked == stored value == protective. `invert` flips the checkbox against the stored value
+// (a "cannot do X" label over an "X enabled" key); `protectiveWhenChecked: false` marks a
+// permission-granting toggle, so the toast says what actually happened instead of calling an
+// allowance "protection on".
+const _SEC_KEYS = {
+  secShellGuard: "shell_guard", secUrlGuard: "url_guard",
+  secTaintExec: "taint_exec", secTaintSpawn: "taint_spawn", secTaintEgress: "taint_egress",
+  secTaintPersist: "taint_persist", secTaintRemote: "taint_remote",
+  secTaintDesktop: "taint_desktop", secTaintMcp: "taint_mcp",
+  secRemoteBlocked: { key: "remote_hosts_enabled", invert: true },
+  secRemoteBg: { key: "remote_hosts_background", protectiveWhenChecked: false },
+};
+async function loadSecurity() {
+  let d; try { d = await api("/api/security"); } catch { return; }
+  const s = d.settings || {}, env = d.env || {};
+  for (const [id, spec] of Object.entries(_SEC_KEYS)) {
+    const { key, invert = false, protectiveWhenChecked = true } =
+      typeof spec === "string" ? { key: spec } : spec;
+    const t = $("#" + id); if (!t) continue;
+    t.checked = invert ? !s[key] : !!s[key];
+    t.onchange = () => {
+      const protective = protectiveWhenChecked ? t.checked : !t.checked;
+      _postJ("/api/security", { [key]: invert ? !t.checked : t.checked })
+        .then(() => toast(protective ? "protection on" : "⚠ access allowed", protective ? "info" : "err"))
+        .catch(() => { t.checked = !t.checked; toast("couldn't save the security setting", "err"); });
+    };
+  }
+  // an OCEANO_*_GUARD=0 env kill-switch pins its guard off — the toggle can't re-arm it
+  const pinned = [];
+  if (env.shell_guard === false) { const t = $("#secShellGuard"); if (t) { t.checked = false; t.disabled = true; } pinned.push("OCEANO_SHELL_GUARD=0"); }
+  if (env.url_guard === false) { const t = $("#secUrlGuard"); if (t) { t.checked = false; t.disabled = true; } pinned.push("OCEANO_URL_GUARD=0"); }
+  const note = $("#secGuardEnvNote");
+  if (note && pinned.length) { note.style.display = ""; note.textContent = "pinned off by environment: " + pinned.join(", ") + " — clear the env var to give these toggles control"; }
+  // web bind preference (tri-state: env / local / all) — applied on the next service restart
+  const ra = d.remote_access || {};
+  const val = ra.pref === true ? "all" : ra.pref === false ? "local" : "env";
+  $$('input[name="sec-bind"]').forEach(r => {
+    r.checked = r.value === val;
+    r.onchange = () => {
+      const v = r.value === "all" ? true : r.value === "local" ? false : null;
+      const m = $("#secBindMsg");
+      _postJ("/api/security", { remote_access: v })
+        .then(() => { if (m) { m.textContent = "saved — restart the Oceano service to apply"; m.className = "kn-note ok"; } })
+        .catch(() => { if (m) { m.textContent = "couldn't save"; m.className = "kn-note err"; } });
+    };
+  });
+  const now = $("#secBindNow");
+  if (now) now.textContent = "currently listening on " + (ra.effective === "127.0.0.1" ? "127.0.0.1 (this machine only)" : (ra.effective || "?") + " (all interfaces)");
+}
 async function _wireEffort(selId, endpoint, label) {   // reasoning-effort dropdown for a mind (Claude/Codex)
   const esel = $("#" + selId); if (!esel) return;
   let e; try { e = await api(endpoint); } catch { return; }

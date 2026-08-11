@@ -23,7 +23,7 @@ def _desktop_gate():
     notification, a clipboard write, opening/revealing a path, a screenshot)."""
     if not is_desktop_client():
         return "desktop tools are only available when chatting through the OceanoDesktop app."
-    if safety.untrusted_seen() or safety.bridge_untrusted_seen():
+    if safety.taint_active("desktop"):
         return ("Blocked for safety: this turn already read external content (a web page, email, or "
                 "document), so triggering a native action on the user's computer is disabled this "
                 "turn. Ask them to send a fresh message to use a desktop tool.")

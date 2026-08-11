@@ -52,6 +52,7 @@ from oceano.web.state import (  # noqa: F401
     list_models,
     load,
     save,
+    web_bind_host,
 )
 
 
@@ -169,7 +170,7 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 def main():
     import uvicorn
-    host = os.environ.get("OCEANO_WEB_HOST", "127.0.0.1")
+    host = web_bind_host()
     port = int(os.environ.get("OCEANO_WEB_PORT", "8800"))
     print(f"Oceano web UI on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
